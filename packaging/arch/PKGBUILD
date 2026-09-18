@@ -1,0 +1,28 @@
+# Maintainer: sodahub-org <https://github.com/sodahub-org/sodam>
+pkgname=sodam
+pkgver=0.1.0
+pkgrel=7
+pkgdesc='Native Qishui Music client built with GPUI'
+arch=('aarch64')
+url='https://github.com/sodahub-org/sodam'
+license=('AGPL-3.0-or-later')
+depends=('alsa-lib' 'dbus' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxcb')
+options=('!emptydirs')
+source=()
+sha256sums=()
+
+build() {
+    local project_root="$startdir/../.."
+    cd "$project_root"
+    SODAM_BUILD_JOBS="${SODAM_BUILD_JOBS:-4}" scripts/build.sh --release
+}
+
+package() {
+    local project_root="$startdir/../.."
+    install -Dm755 "$project_root/target/release/sodam" "$pkgdir/usr/bin/sodam"
+    install -Dm644 "$startdir/sodam.desktop" "$pkgdir/usr/share/applications/sodam.desktop"
+    install -Dm644 "$project_root/crates/sodam/assets/brand/sodam-logo.png" \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/sodam.png"
+    install -Dm644 "$project_root/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

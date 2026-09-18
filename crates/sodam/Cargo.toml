@@ -1,0 +1,21 @@
+[package]
+name = "sodam"
+description = "SodaM —— 基于 GPUI + libresoda 的原生汽水音乐客户端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sodam"
+path = "src/main.rs"
+
+[dependencies]
+sodam-core = { path = "../sodam-core" }
+anyhow.workspace = true
+sys-locale.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+ksni = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }

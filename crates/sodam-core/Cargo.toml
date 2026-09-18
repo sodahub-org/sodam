@@ -1,0 +1,23 @@
+[package]
+name = "sodam-core"
+description = "SodaM的领域层：配置、会话、队列与音乐库数据（不含 UI）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libresoda.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+ureq.workspace = true
+qrcode = "0.14"
+# 封面在落盘前先缩到列表需要的大小：GPUI 在主线程解码图片，
+# 直接塞原始大图会让长列表首帧卡住。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# 0.20 的 symphonia 解码器遇到「MP4 容器 + FLAC」会在初始化 seek 时报错并 panic
+# （rodio 内部 unreachable!()）；0.22 已修好，实测可直接解码 libresoda 解密后的文件
+rodio = { version = "0.22", default-features = false, features = ["playback", "flac", "mp3", "mp4"] }

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SodaM
+GenericName=Music Player
+Comment=SodaM music client
+Exec=/usr/bin/sodam
+Icon=sodam
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+Keywords=music;qishui;soda;sodam;
+StartupWMClass=SodaM

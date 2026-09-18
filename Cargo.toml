@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/sodam", "crates/sodam-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/sodahub-org/sodam"
+authors = ["sodahub-org"]
+
+[workspace.dependencies]
+# sodahub-org/gpui：fork 自 sonorahq/gpui（Zed gpui 新代码库），
+# sonora 的丝滑滚动（Glide + Scroller + 自绘滚动条）就建立在它之上。
+gpui = { git = "https://github.com/sodahub-org/gpui", rev = "68d1d0b", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/sodahub-org/gpui", rev = "68d1d0b", features = ["font-kit", "wayland", "x11"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sys-locale = "0.3"
+dirs = "6"
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+
+# 公开源码依赖；本地联调可用 `[patch."https://github.com/sodahub-org/libresoda"]`
+# 指向同级 clone，见 README「开发环境」。
+libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "7efd2ca2f05a945b77741638284bb9a0b4c74744" }
