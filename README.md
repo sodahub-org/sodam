@@ -16,6 +16,27 @@
 SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操作手感、稳定的本地播放体验、
 会员账号的无损音质播放，以及干净自适应的主题系统**。
 
+### 维护者与贡献者
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <a href="https://github.com/zephyr-cheung">
+        <img src="https://avatars.githubusercontent.com/u/221658147?v=4" width="72" alt="ZephyrCheung"><br />
+        <strong>ZephyrCheung</strong><br />
+        Maintainer
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/aBER0724">
+        <img src="https://avatars.githubusercontent.com/u/69146982?v=4" width="72" alt="aBER0724"><br />
+        <strong>aBER0724</strong><br />
+        Contributor
+      </a>
+    </td>
+  </tr>
+</table>
+
 ### 平台支持
 
 | 平台 | 状态 |
