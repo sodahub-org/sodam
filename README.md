@@ -50,7 +50,7 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 | --- | --- |
 | Linux / Omarchy | 已实测 |
 | macOS（Apple Silicon） | 已实测，提供 `.app` 下载 |
-| Windows（x64） | 已实测，提供便携包 |
+| Windows（x64） | 已实测，提供安装包 |
 
 ## 界面预览
 
@@ -113,7 +113,7 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 - 中文 / English 界面语言，首次启动跟随系统语言
 - 系统托盘：播放控制、显示主窗口、真正退出（Linux 为 SNI 托盘，macOS 为菜单栏 NSStatusItem，Windows 为通知区域图标）
 - 关闭主窗口不退出进程，保留后台播放
-- Linux 提供原生窗口与桌面入口；macOS 提供自绘标题栏的 `.app`；Windows 提供自绘标题栏（拖拽、双击最大化、Win11 贴靠布局）的便携 zip
+- Linux 提供原生窗口与桌面入口；macOS 提供自绘标题栏的 `.app`；Windows 提供自绘标题栏（拖拽、双击最大化、Win11 贴靠布局）的安装包
 
 ### 性能与稳定性
 
