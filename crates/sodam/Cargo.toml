@@ -26,3 +26,11 @@ ksni = "0.2"
 # macOS / Windows 共用 tray-icon：macOS 走 NSStatusItem，Windows 走 shell 通知区域。
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = "0.25"
+
+# Windows：启用 gpui 的 manifest 资源（PerMonitorV2 DPI / Win10 声明 / SegmentHeap）。
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { workspace = true, features = ["windows-manifest"] }
+
+# 把应用图标嵌入 sodam.exe（快捷方式 / 资源管理器显示）。
+[build-dependencies]
+winresource = "0.1"

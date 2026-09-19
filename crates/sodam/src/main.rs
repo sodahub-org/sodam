@@ -1,4 +1,8 @@
 //! SodaM——GPUI 原生客户端入口。
+//
+// 发布版不分配控制台窗口（双击/快捷方式启动不再弹 terminal）；
+// debug 构建保留终端，便于查看 eprintln 日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 // 托盘：Linux 走 ksni/SNI，macOS 走 NSStatusItem，见 tray.rs。

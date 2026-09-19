@@ -1,8 +1,9 @@
-; SodaM Windows 安装包脚本（Inno Setup 6）。
-; 构建方式（在仓库根目录）：
+; SodaM Windows installer script (Inno Setup 6).
+; Build (from repo root):
 ;   ISCC.exe /DMyAppVersion=<version> packaging/windows/sodam.iss
-; 产物：release/sodam-<version>-windows-x64-setup.exe
-; 按用户安装（无需管理员权限），默认目录 {localappdata}\Programs\SodaM。
+; Output: release/sodam-<version>-windows-x64-setup.exe
+; Per-user install (no admin required), default dir {localappdata}\Programs\SodaM.
+; NOTE: keep this file ASCII-only; Inno reads non-BOM files in the ANSI codepage.
 
 #define MyAppName "SodaM"
 #ifndef MyAppVersion
