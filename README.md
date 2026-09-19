@@ -213,7 +213,7 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 
 ## Arch Linux 下载安装
 
-SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.1.2`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.2)。
 
 ### 1. 确认系统架构
 
@@ -231,7 +231,7 @@ mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
 arch=$(uname -m)
-version=0.1.1
+version=0.1.2
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -242,7 +242,7 @@ grep "sodam-${version}-1-${arch}\.pkg\.tar\.zst$" SHA256SUMS | sha256sum -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.1.1-1-x86_64.pkg.tar.zst: OK
+sodam-0.1.2-1-x86_64.pkg.tar.zst: OK
 ```
 
 ### 3. 安装
@@ -268,7 +268,7 @@ sodam
 ## macOS 下载安装（Apple Silicon）
 
 macOS 版已在 Apple Silicon（M 系列）真机实测，GitHub Release 提供 `.app` 压缩包，
-当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+当前版本为 [`v0.1.2`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.2)。
 
 ### 1. 下载并校验
 
@@ -276,7 +276,7 @@ macOS 版已在 Apple Silicon（M 系列）真机实测，GitHub Release 提供 
 mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
-version=0.1.1
+version=0.1.2
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -287,7 +287,7 @@ grep "sodam-${version}-macos-aarch64\.zip$" SHA256SUMS | shasum -a 256 -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.1.1-macos-aarch64.zip: OK
+sodam-0.1.2-macos-aarch64.zip: OK
 ```
 
 ### 2. 安装
@@ -324,14 +324,14 @@ open -a SodaM
 
 Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Setup 安装包
 （按用户安装，无需管理员权限），当前版本为
-[`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+[`v0.1.2`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.2)。
 
 ### 1. 下载并校验
 
 ```powershell
 mkdir C:\sodam-install; cd C:\sodam-install
 
-$version = "0.1.1"
+$version = "0.1.2"
 $base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
 
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS

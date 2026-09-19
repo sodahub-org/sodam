@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sodam", "crates/sodam-core"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
