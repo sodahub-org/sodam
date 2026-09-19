@@ -95,9 +95,41 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows-package:
+    name: Windows x64 portable
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows runner 自带 VS Build Tools。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+
+      - name: Create Windows package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          $zip = "sodam-$version-windows-x64.zip"
+          Compress-Archive -Path target/release/sodam.exe -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Move-Item $zip, "$zip.sha256" release/
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-windows-x64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
   github-release:
     name: Publish GitHub Release
-    needs: [linux-package, macos-app]
+    needs: [linux-package, macos-app, windows-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -128,6 +160,9 @@ jobs:
 
             macOS (Apple Silicon, unsigned / ad-hoc signed):
             - `aarch64` `.app` zip，首次打开见 README「macOS 下载安装」
+
+            Windows (x64 portable):
+            - `windows-x64` 便携 zip，解压后运行 `sodam.exe`，见 README「Windows 下载安装」
 
             - `SHA256SUMS`
           files: |

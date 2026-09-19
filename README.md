@@ -8,7 +8,7 @@
     <a href="https://github.com/sodahub-org/gpui"><img src="https://img.shields.io/badge/UI-GPUI%200.2.2-8B5CF6.svg" alt="GPUI 0.2.2"></a>
     <a href="https://omarchy.org/"><img src="https://img.shields.io/badge/Linux%20%7C%20Omarchy-tested-success.svg" alt="Linux / Omarchy tested"></a>
     <a href="https://github.com/sodahub-org/sodam/releases"><img src="https://img.shields.io/badge/macOS%20arm64%20%7C%20Apple%20Silicon-tested-success.svg" alt="macOS arm64 tested"></a>
-    <img src="https://img.shields.io/badge/Windows-in%20development-yellow.svg" alt="Windows in development">
+    <img src="https://img.shields.io/badge/Windows%20x64-tested-success.svg" alt="Windows x64 tested">
   </p>
   <p>音乐能力由 <a href="https://github.com/sodahub-org/libresoda">libresoda</a> 提供；应用签名服务可对接
     <a href="https://github.com/sodahub-org/libmssdk">libmssdk</a>。</p>
@@ -50,7 +50,7 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 | --- | --- |
 | Linux / Omarchy | 已实测 |
 | macOS（Apple Silicon） | 已实测，提供 `.app` 下载 |
-| Windows | 开发中 |
+| Windows（x64） | 已实测，提供便携包 |
 
 ## 界面预览
 
@@ -111,9 +111,9 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 
 - Dark / Light 双主题，首次启动跟随系统偏好
 - 中文 / English 界面语言，首次启动跟随系统语言
-- 系统托盘：播放控制、显示主窗口、真正退出（Linux 为 SNI 托盘，macOS 为菜单栏 NSStatusItem）
+- 系统托盘：播放控制、显示主窗口、真正退出（Linux 为 SNI 托盘，macOS 为菜单栏 NSStatusItem，Windows 为通知区域图标）
 - 关闭主窗口不退出进程，保留后台播放
-- Linux 提供原生窗口、桌面入口与 Arch Linux ARM64 包；macOS 提供自绘标题栏的 `.app`
+- Linux 提供原生窗口与桌面入口；macOS 提供自绘标题栏的 `.app`；Windows 提供自绘标题栏（拖拽、双击最大化、Win11 贴靠布局）的便携 zip
 
 ### 性能与稳定性
 
@@ -143,6 +143,7 @@ UI 规范见 [`docs/UI-SPEC.md`](docs/UI-SPEC.md)。
 - Linux：Wayland 或 X11 运行时
 - macOS：Apple Silicon（M 系列），macOS 12+；构建需完整版 Xcode（Metal shader 编译，
   仅装 Command Line Tools 会报 `xcrun: unable to find utility "metal"`）
+- Windows：Windows 10+ x64；源码构建需 VS 2022 Build Tools（C++ 工作负载）
 - Chromium / Chrome / Edge 等浏览器用于扫码登录签名页
 - `libresoda` 与 `sodam` 同级 clone（可选）：本地联调时可用
   `[patch."https://github.com/sodahub-org/libresoda"]` 指向 `../libresoda`，
@@ -167,11 +168,13 @@ scripts/run.sh
 
 ## 配置
 
-配置文件：
+配置文件（随平台不同）：
 
-```text
-~/.config/sodam/config.json
-```
+| 平台 | 路径 |
+| --- | --- |
+| Linux | `~/.config/sodam/config.json` |
+| macOS | `~/Library/Application Support/sodam/config.json` |
+| Windows | `%APPDATA%\sodam\config.json` |
 
 环境变量只在配置字段为空时补全。常用配置：
 
@@ -306,7 +309,48 @@ open -a SodaM
 
 从启动台或 Finder 打开 **SodaM**，首次启动会进入设置页，按提示扫码登录后即可使用。
 后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本，
-重复步骤 2 覆盖到 `/Applications` 即可（配置在 `~/.config/sodam/`，不会丢失）。
+重复步骤 2 覆盖到 `/Applications` 即可（配置在
+`~/Library/Application Support/sodam/`，不会丢失）。
+
+## Windows 下载安装（x64）
+
+Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供便携 zip（免安装），
+当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+
+### 1. 下载并校验
+
+```powershell
+mkdir C:\sodam-install; cd C:\sodam-install
+
+$version = "0.1.1"
+$base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
+
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+Invoke-WebRequest "$base/sodam-$version-windows-x64.zip" -OutFile "sodam-$version-windows-x64.zip"
+
+$expected = (Select-String -Path SHA256SUMS -Pattern "sodam-$version-windows-x64\.zip$").Line.Split(' ')[0]
+$actual = (Get-FileHash "sodam-$version-windows-x64.zip" -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
+```
+
+输出 `SHA256 OK` 即校验通过。
+
+### 2. 解压并运行
+
+解压后得到 `sodam.exe`，双击即可运行（便携式，无需安装，可放在任意目录）：
+
+```powershell
+Expand-Archive "sodam-$version-windows-x64.zip" -DestinationPath C:\sodam
+C:\sodam\sodam.exe
+```
+
+### 3. 首次启动（SmartScreen 提示）
+
+当前发行包未经代码签名，首次运行 Windows 可能弹出
+**「Windows 已保护你的电脑」**：点击「更多信息」→「仍要运行」即可。
+
+首次启动会进入设置页，按提示扫码登录后即可使用。配置保存在
+`%APPDATA%\sodam\config.json`，升级时覆盖新版 `sodam.exe` 不影响配置。
 
 ## 打包
 
