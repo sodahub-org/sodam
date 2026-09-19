@@ -96,7 +96,7 @@ jobs:
           retention-days: 7
 
   windows-package:
-    name: Windows x64 portable
+    name: Windows x64 installer
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -107,19 +107,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --workspace
 
-      - name: Create Windows package
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+        shell: pwsh
+
+      - name: Create Windows installer
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
             Select-Object -First 1).Matches.Groups[1].Value
-          $zip = "sodam-$version-windows-x64.zip"
-          Compress-Archive -Path target/release/sodam.exe -DestinationPath $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Move-Item $zip, "$zip.sha256" release/
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" `
+            packaging/windows/sodam.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "release/sodam-$version-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "installer not found: $setup" }
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "$setup.sha256" -Encoding ascii
 
-      - name: Upload package artifact
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: sodam-windows-x64
@@ -144,7 +149,7 @@ jobs:
         run: |
           cd release
           rm -f SHA256SUMS
-          sha256sum *.pkg.tar.zst *.zip > SHA256SUMS
+          sha256sum *.pkg.tar.zst *.zip *.exe > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -161,13 +166,14 @@ jobs:
             macOS (Apple Silicon, unsigned / ad-hoc signed):
             - `aarch64` `.app` zip，首次打开见 README「macOS 下载安装」
 
-            Windows (x64 portable):
-            - `windows-x64` 便携 zip，解压后运行 `sodam.exe`，见 README「Windows 下载安装」
+            Windows (x64 installer, per-user):
+            - `windows-x64` 安装包，双击安装，见 README「Windows 下载安装」
 
             - `SHA256SUMS`
           files: |
             release/*.pkg.tar.zst
             release/*.zip
+            release/*.exe
             release/SHA256SUMS
           draft: false
           prerelease: false

@@ -314,8 +314,9 @@ open -a SodaM
 
 ## Windows 下载安装（x64）
 
-Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供便携 zip（免安装），
-当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Setup 安装包
+（按用户安装，无需管理员权限），当前版本为
+[`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
 
 ### 1. 下载并校验
 
@@ -326,31 +327,33 @@ $version = "0.1.1"
 $base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
 
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
-Invoke-WebRequest "$base/sodam-$version-windows-x64.zip" -OutFile "sodam-$version-windows-x64.zip"
+Invoke-WebRequest "$base/sodam-$version-windows-x64-setup.exe" -OutFile "sodam-$version-windows-x64-setup.exe"
 
-$expected = (Select-String -Path SHA256SUMS -Pattern "sodam-$version-windows-x64\.zip$").Line.Split(' ')[0]
-$actual = (Get-FileHash "sodam-$version-windows-x64.zip" -Algorithm SHA256).Hash.ToLower()
+$expected = (Select-String -Path SHA256SUMS -Pattern "sodam-$version-windows-x64-setup\.exe$").Line.Split(' ')[0]
+$actual = (Get-FileHash "sodam-$version-windows-x64-setup.exe" -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
 ```
 
 输出 `SHA256 OK` 即校验通过。
 
-### 2. 解压并运行
+### 2. 安装
 
-解压后得到 `sodam.exe`，双击即可运行（便携式，无需安装，可放在任意目录）：
+双击运行安装包，按向导完成安装：
 
-```powershell
-Expand-Archive "sodam-$version-windows-x64.zip" -DestinationPath C:\sodam
-C:\sodam\sodam.exe
-```
+- 默认安装目录 `%LOCALAPPDATA%\Programs\SodaM`
+- 自动创建开始菜单快捷方式，可选创建桌面快捷方式
 
 ### 3. 首次启动（SmartScreen 提示）
 
-当前发行包未经代码签名，首次运行 Windows 可能弹出
+当前发行包未经代码签名，首次运行可能弹出
 **「Windows 已保护你的电脑」**：点击「更多信息」→「仍要运行」即可。
 
 首次启动会进入设置页，按提示扫码登录后即可使用。配置保存在
-`%APPDATA%\sodam\config.json`，升级时覆盖新版 `sodam.exe` 不影响配置。
+`%APPDATA%\sodam\config.json`，升级安装不会影响配置。
+
+### 卸载
+
+在「设置 → 应用」或「控制面板 → 程序和功能」中卸载 SodaM。
 
 ## 打包
 
