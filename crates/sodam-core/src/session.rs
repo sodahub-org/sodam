@@ -51,8 +51,8 @@ impl Session {
         if actual == 0 {
             return None;
         }
-        let quality_path = crate::audio::cache_dir()
-            .join(format!("{track_id}-{}.quality", self.quality_tag()));
+        let quality_path =
+            crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
         let mut fields = text.split('\t');
         let quality = fields.next()?.trim().to_string();
@@ -293,10 +293,7 @@ impl Session {
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if info.size > 0 && written as i64 != info.size {
             let _ = std::fs::remove_file(&part);
-            anyhow::bail!(
-                "下载不完整（预期 {} 字节，实际 {written} 字节）",
-                info.size
-            );
+            anyhow::bail!("下载不完整（预期 {} 字节，实际 {written} 字节）", info.size);
         }
 
         let quality = describe_quality(&info);

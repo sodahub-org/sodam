@@ -1506,9 +1506,8 @@ impl Root {
                         root.liked_loaded = true;
                         // 全量列表是收藏的权威快照：同步修复全局 ids，
                         // 避免启动时 ids 拉取失败后爱心状态一直错。
-                        root.liked_ids = Arc::new(
-                            tracks.iter().map(|track| track.id.clone()).collect(),
-                        );
+                        root.liked_ids =
+                            Arc::new(tracks.iter().map(|track| track.id.clone()).collect());
                         root.liked_ids_failed = false;
                         root.liked_detail_list.reset(tracks.len() + 1);
                         root.set_status("我喜欢的音乐：{} 首", &[tracks.len().to_string()]);
