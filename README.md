@@ -179,6 +179,60 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 
 不要在 GUI 运行时编译；不要绕过脚本反复执行全量 cargo 构建。
 
+## Arch Linux 下载安装
+
+SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+
+### 1. 确认系统架构
+
+```bash
+uname -m
+```
+
+- `x86_64`：选择 `x86_64` 包
+- `aarch64`：选择 `aarch64` 包，例如 ARM64 笔记本或 ARM 服务器
+
+### 2. 下载并校验安装包
+
+```bash
+mkdir -p /tmp/sodam-install
+cd /tmp/sodam-install
+
+arch=$(uname -m)
+version=0.1.1
+base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
+
+curl -fLO ${base_url}/SHA256SUMS
+curl -fLO ${base_url}/sodam-${version}-1-${arch}.pkg.tar.zst
+grep "sodam-${version}-1-${arch}\.pkg\.tar\.zst$" SHA256SUMS | sha256sum -c -
+```
+
+校验输出必须包含 `OK`：
+
+```text
+sodam-0.1.1-1-x86_64.pkg.tar.zst: OK
+```
+
+### 3. 安装
+
+```bash
+sudo pacman -U ./sodam-${version}-1-${arch}.pkg.tar.zst
+```
+
+`pacman` 会自动处理 `alsa-lib`、`dbus`、`fontconfig`、`freetype2`、`libxkbcommon` 等依赖。
+
+### 4. 启动
+
+命令行启动：
+
+```bash
+sodam
+```
+
+也可以从桌面环境的应用菜单中启动 **SodaM**。首次启动会进入设置页，按提示扫码登录后即可使用。
+
+后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本的对应架构包，并再次执行 `sudo pacman -U` 即可。
+
 ## 打包
 
 ```bash
