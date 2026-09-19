@@ -83,7 +83,12 @@ impl Language {
             "等待扫码…" => "Waiting for scan…",
             "轮询异常（会自动重试）：{err}" => "Polling error (retrying): {err}",
             "登录成功但保存失败：{err}" => "Signed in, but saving failed: {err}",
-            "服务端要求二次验证（短信）：当前 libresoda 尚未闭环，请改用官方客户端导出 Cookie" => "The server requires SMS verification. Export a cookie from the official client for now.",
+            "已打开二次验证窗口，请在其中完成验证" => {
+                "Second-verification window opened. Complete the verification there."
+            }
+            "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
+                "Failed to open the verification window: {err}. Export a cookie from the official client instead."
+            }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "账号" => "Account",
             "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {}",
@@ -308,7 +313,12 @@ impl Language {
             "等待扫码…" => "Waiting for scan…",
             "轮询异常（会自动重试）：{err}" => "Polling error (retrying): {err}",
             "登录成功但保存失败：{err}" => "Signed in, but saving failed: {err}",
-            "服务端要求二次验证（短信）：当前 libresoda 尚未闭环，请改用官方客户端导出 Cookie" => "The server requires SMS verification. Export a cookie from the official client for now.",
+            "已打开二次验证窗口，请在其中完成验证" => {
+                "Second-verification window opened. Complete the verification there."
+            }
+            "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
+                "Failed to open the verification window: {err}. Export a cookie from the official client instead."
+            }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "非 VIP" => "Non-VIP",
             "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {quality}",

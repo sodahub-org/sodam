@@ -251,8 +251,12 @@ impl Root {
                 Ok(created) => created,
                 Err(err) => {
                     let _ = this.update(cx, |root, cx| {
-                        root.login = LoginState::Failed(root.localized("创建二维码失败：{err}", &[err.to_string()]));
-                        root.status = language.text("创建二维码失败，可点「重新获取二维码」重试").to_string();
+                        root.login = LoginState::Failed(
+                            root.localized("创建二维码失败：{err}", &[err.to_string()]),
+                        );
+                        root.status = language
+                            .text("创建二维码失败，可点「重新获取二维码」重试")
+                            .to_string();
                         cx.notify();
                     });
                     return;
@@ -262,7 +266,9 @@ impl Root {
                 Ok(matrix) => matrix,
                 Err(err) => {
                     let _ = this.update(cx, |root, cx| {
-                        root.login = LoginState::Failed(root.localized("二维码编码失败：{err}", &[err.to_string()]));
+                        root.login = LoginState::Failed(
+                            root.localized("二维码编码失败：{err}", &[err.to_string()]),
+                        );
                         cx.notify();
                     });
                     return;
@@ -280,6 +286,8 @@ impl Root {
             });
 
             // 轮询：libresoda 内部有 2.5s 最小间隔 + 5s 限流冷却，这里 3s 一次足够温和
+            // 二次验证窗口只自动拉起一次（误关可重试登录流程）；完成后轮询自动领取结果
+            let mut verify_window_opened = false;
             for _ in 0..80 {
                 // 6 秒一次：3 秒会触发服务端限流（error_code=7），确认握手会被丢掉
                 cx.background_executor()
@@ -296,7 +304,8 @@ impl Root {
                         // 单次失败（限流 / 网络抖动）不该结束整个登录流程，继续等下一轮
                         let _ = this.update(cx, |root, cx| {
                             if let LoginState::Waiting { status, .. } = &mut root.login {
-                                *status = language.textf("轮询异常（会自动重试）：{err}", &[err.to_string()]);
+                                *status = language
+                                    .textf("轮询异常（会自动重试）：{err}", &[err.to_string()]);
                             }
                             cx.notify();
                         });
@@ -316,13 +325,19 @@ impl Root {
                             Some(session) => match session.apply_login_cookie(&cookie) {
                                 Ok(()) => {
                                     root.settings = session.settings().clone();
-                                    root.status = language.text("登录成功，正在读取账号信息…").to_string();
+                                    root.status =
+                                        language.text("登录成功，正在读取账号信息…").to_string();
                                 }
                                 Err(err) => {
-                                    root.set_status("登录成功但保存失败：{err}", &[err.to_string()]);
+                                    root.set_status(
+                                        "登录成功但保存失败：{err}",
+                                        &[err.to_string()],
+                                    );
                                 }
                             },
-                            None => root.status = language.text("登录成功（会话未初始化）").to_string(),
+                            None => {
+                                root.status = language.text("登录成功（会话未初始化）").to_string()
+                            }
                         }
                         root.login = LoginState::Idle;
                         root.login_modal_open = false;
@@ -341,10 +356,26 @@ impl Root {
                         .await;
                 }
                 let expired = result.is_terminal_failure();
-                if result.need_second_verify {
+                if result.need_second_verify && !verify_window_opened {
+                    verify_window_opened = true;
+                    // 自动拉起验证窗口（libresoda 会经签名页桥接官方验证组件）；
+                    // 用户在窗口里完成验证后，下一次轮询会拿到登录成功
+                    let open_settings = settings.clone();
+                    let open_token = token.clone();
+                    let open = cx.background_spawn(async move {
+                        Session::new(open_settings).open_second_verify(&open_token)
+                    });
+                    let message = match open.await {
+                        Ok(_) => language
+                            .text("已打开二次验证窗口，请在其中完成验证")
+                            .to_string(),
+                        Err(err) => language.textf(
+                            "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie",
+                            &[err.to_string()],
+                        ),
+                    };
                     let _ = this.update(cx, |root, cx| {
-                        root.status =
-                            language.text("服务端要求二次验证（短信）：当前 libresoda 尚未闭环，请改用官方客户端导出 Cookie").to_string();
+                        root.status = message;
                         cx.notify();
                     });
                 }

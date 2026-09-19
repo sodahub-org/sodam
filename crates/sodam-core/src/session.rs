@@ -179,6 +179,17 @@ impl Session {
         })
     }
 
+    /// 打开二次验证窗口（系统浏览器），返回窗口地址。
+    ///
+    /// 仅在 [`Self::check_qr_login`] 返回 `need_second_verify=true` 后有意义；
+    /// 窗口里跑官方验证组件，完成后下一次轮询会自动领取登录结果。
+    /// 窗口误关时可重复调用再次打开。
+    pub fn open_second_verify(&self, token: &str) -> anyhow::Result<String> {
+        self.pumpkin
+            .open_second_verify(token)
+            .map_err(|err| anyhow::anyhow!("打开二次验证窗口失败: {err}"))
+    }
+
     /// 当前账号是否为 VIP（用 `/luna/pc/me` 的 `my_info.is_vip`，失败时回落探测曲目）。
     pub fn is_vip(&self) -> anyhow::Result<bool> {
         self.pumpkin
