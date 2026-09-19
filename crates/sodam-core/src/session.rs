@@ -41,13 +41,29 @@ impl Session {
         }
     }
 
-    /// 这首是否已经在本地缓存里（**按当前音质档位**判断；
-    /// 切换音质后旧档位的缓存不算命中，会重新拉取对应音质）。
-    pub fn is_cached(&self, track_id: &str) -> bool {
+    /// 命中有效缓存：文件存在，且 sidecar 记录的字节数与实际一致。
+    /// 只检查「非空文件」会让被截断的半截下载永久冒充有效缓存，
+    /// 表现为同一首歌每次都从中间开始/中途跳下一首。
+    /// 旧格式 sidecar（只有音质、没记大小）视为 miss：重下一次完成自愈。
+    fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
-        std::fs::metadata(path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
+        let actual = std::fs::metadata(&path).ok()?.len();
+        if actual == 0 {
+            return None;
+        }
+        let quality_path = crate::audio::cache_dir()
+            .join(format!("{track_id}-{}.quality", self.quality_tag()));
+        let text = std::fs::read_to_string(&quality_path).ok()?;
+        let mut fields = text.split('\t');
+        let quality = fields.next()?.trim().to_string();
+        let size = fields.next()?.trim().parse::<u64>().ok()?;
+        (size == actual && !quality.is_empty()).then_some(CachedTrack { path, quality })
+    }
+
+    /// 这首是否已经在本地缓存里（**按当前音质档位**判断，
+    /// 且要求 sidecar 大小校验一致；切换音质后旧档位的缓存不算命中）。
+    pub fn is_cached(&self, track_id: &str) -> bool {
+        self.cached_track(track_id).is_some()
     }
 }
 
@@ -244,15 +260,10 @@ impl Session {
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
         let path = dir.join(format!("{0}-{tag}.m4a", track.id));
-        // 音质标签用 sidecar 文件记住（命中缓存时也能显示「实际拉的是什么档」）
+        // sidecar 记录「音质标签 + 期望字节数」，用于命中时的大小校验。
         let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > 0 {
-                let quality = std::fs::read_to_string(&quality_path)
-                    .map(|text| text.trim().to_string())
-                    .unwrap_or_default();
-                return Ok(CachedTrack { path, quality });
-            }
+        if let Some(cached) = self.cached_track(&track.id) {
+            return Ok(cached);
         }
 
         let song = libresoda::Song {
@@ -266,12 +277,31 @@ impl Session {
             extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
             ..Default::default()
         };
+        // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
+        let part = dir.join(format!("{0}-{tag}.m4a.part", track.id));
+        let _ = std::fs::remove_file(&part);
         let info = self
             .pumpkin
-            .download_with_info(&song, &path)
-            .map_err(|err| anyhow::anyhow!("下载失败: {err}"))?;
+            .download_with_info(&song, &part)
+            .map_err(|err| {
+                let _ = std::fs::remove_file(&part);
+                anyhow::anyhow!("下载失败: {err}")
+            })?;
+
+        // 完整性校验：服务端声明的字节数 vs 实际落盘字节数。
+        // 响应体被截断（连接提前断开时可能静默 EOF）在这里会被拒绝。
+        let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+        if info.size > 0 && written as i64 != info.size {
+            let _ = std::fs::remove_file(&part);
+            anyhow::bail!(
+                "下载不完整（预期 {} 字节，实际 {written} 字节）",
+                info.size
+            );
+        }
+
         let quality = describe_quality(&info);
-        let _ = std::fs::write(&quality_path, &quality);
+        std::fs::rename(&part, &path).map_err(|err| anyhow::anyhow!("缓存落盘失败: {err}"))?;
+        let _ = std::fs::write(&quality_path, format!("{quality}\t{written}"));
         Ok(CachedTrack { path, quality })
     }
 
