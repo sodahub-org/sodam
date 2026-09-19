@@ -613,13 +613,13 @@ fn queue_slots(root: &Root) -> Vec<QueueSlot> {
 
     // 顺序仍是「已播放 → 正在播放 → 接下来」；
     // 打开抽屉时把滚动位置锚到「正在播放」（向上滑看已播放，向下滑看接下来）。
-    // 已播放 = 真实播过的歌（root.played_history，最近在后），
+    // 已播放 = 真实播过的歌（root.played_history 按播放顺序追加，最近在后），
+    // 展示保持时序：最老的在顶，刚播完的一首紧邻「正在播放」。
     // 不是「当前下标之前的所有歌」——那会把跳过的歌也算进去。
     if !root.played_history.is_empty() {
         let history: Vec<usize> = root
             .played_history
             .iter()
-            .rev()
             .filter_map(|id| tracks.iter().position(|track| &track.id == id))
             .filter(|index| *index != current)
             .collect();
