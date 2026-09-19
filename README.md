@@ -23,6 +23,14 @@
 SodaM 面向 Linux / macOS / Windows 桌面，重点做四件事：**接近官方客户端的操作手感、稳定的本地播放体验、
 会员账号的无损音质播放，以及干净自适应的主题系统**。
 
+<div align="center">
+  <img src="docs/img/main/1.jpg" width="880" alt="SodaM 主界面预览 1">
+</div>
+
+<div align="center">
+  <img src="docs/img/main/2.jpg" width="880" alt="SodaM 主界面预览 2">
+</div>
+
 ### 维护者与贡献者
 
 <table align="center">
