@@ -45,3 +45,24 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+  test-macos:
+    name: macOS arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # 仓库无额外系统依赖：DBus 只在 Linux 托盘（ksni）用，macOS 托盘走 NSStatusItem。
+      # Metal shader 编译需要完整版 Xcode，macOS runner 镜像自带。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace

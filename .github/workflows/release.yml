@@ -1,4 +1,4 @@
-name: Release Linux packages
+name: Release packages
 
 on:
   push:
@@ -67,9 +67,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  macos-app:
+    name: macOS arm64 .app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Metal shader 编译需要完整版 Xcode，macOS runner 镜像自带。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+
+      - name: Create macOS app bundle
+        run: |
+          package=$(packaging/macos/make-macos-app.sh)
+          test -s "$package"
+          test -s "$package.sha256"
+          mkdir -p release
+          mv "$package" "$package.sha256" release/
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-macos-aarch64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
   github-release:
     name: Publish GitHub Release
-    needs: linux-package
+    needs: [linux-package, macos-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -84,7 +112,7 @@ jobs:
         run: |
           cd release
           rm -f SHA256SUMS
-          sha256sum *.pkg.tar.zst > SHA256SUMS
+          sha256sum *.pkg.tar.zst *.zip > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -92,13 +120,19 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: SodaM ${{ env.RELEASE_TAG }}
           body: |
-            Linux packages built by GitHub Actions.
+            Packages built by GitHub Actions.
 
+            Linux (pacman):
             - `x86_64` pacman package
             - `aarch64` pacman package
+
+            macOS (Apple Silicon, unsigned / ad-hoc signed):
+            - `aarch64` `.app` zip，首次打开见 README「macOS 下载安装」
+
             - `SHA256SUMS`
           files: |
             release/*.pkg.tar.zst
+            release/*.zip
             release/SHA256SUMS
           draft: false
           prerelease: false
