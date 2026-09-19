@@ -12,6 +12,12 @@
   </p>
   <p>音乐能力由 <a href="https://github.com/sodahub-org/libresoda">libresoda</a> 提供；应用签名服务可对接
     <a href="https://github.com/sodahub-org/libmssdk">libmssdk</a>。</p>
+  <p>
+    <a href="https://linux.do/t/topic/2921819">
+      <img src="docs/img/linux-do.svg" width="22" alt="LINUX DO">
+      Linux.do 开源推广帖 · 问题反馈与交流
+    </a>
+  </p>
 </div>
 
 SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操作手感、稳定的本地播放体验、
