@@ -7,7 +7,8 @@
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg" alt="Rust 1.85+"></a>
     <a href="https://github.com/sodahub-org/gpui"><img src="https://img.shields.io/badge/UI-GPUI%200.2.2-8B5CF6.svg" alt="GPUI 0.2.2"></a>
     <a href="https://omarchy.org/"><img src="https://img.shields.io/badge/Linux%20%7C%20Omarchy-tested-success.svg" alt="Linux / Omarchy tested"></a>
-    <img src="https://img.shields.io/badge/macOS%20%7C%20Windows-in%20development-yellow.svg" alt="macOS / Windows in development">
+    <a href="https://github.com/sodahub-org/sodam/releases"><img src="https://img.shields.io/badge/macOS%20arm64%20%7C%20Apple%20Silicon-tested-success.svg" alt="macOS arm64 tested"></a>
+    <img src="https://img.shields.io/badge/Windows-in%20development-yellow.svg" alt="Windows in development">
   </p>
   <p>音乐能力由 <a href="https://github.com/sodahub-org/libresoda">libresoda</a> 提供；应用签名服务可对接
     <a href="https://github.com/sodahub-org/libmssdk">libmssdk</a>。</p>
@@ -42,7 +43,7 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 | 平台 | 状态 |
 | --- | --- |
 | Linux / Omarchy | 已实测 |
-| macOS | 开发中 |
+| macOS（Apple Silicon） | 已实测，提供 `.app` 下载 |
 | Windows | 开发中 |
 
 ## 界面预览
@@ -54,6 +55,16 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 | <a href="docs/img/Search.png"><img src="docs/img/Search.png" width="880" alt="SodaM 搜索页面"></a> | <a href="docs/img/Playlists.png"><img src="docs/img/Playlists.png" width="880" alt="SodaM 我的歌单页面"></a> |
 | **我喜欢的音乐** | **设置** |
 | <a href="docs/img/Liked.png"><img src="docs/img/Liked.png" width="880" alt="SodaM 我喜欢的音乐页面"></a> | <a href="docs/img/Settings.png"><img src="docs/img/Settings.png" width="880" alt="SodaM 设置页面"></a> |
+
+### macOS（Apple Silicon）
+
+| 听歌模式 | 推荐流 |
+| --- | --- |
+| <a href="docs/img/macos/Modes.png"><img src="docs/img/macos/Modes.png" width="880" alt="SodaM macOS 听歌模式页面"></a> | <a href="docs/img/macos/Discover.png"><img src="docs/img/macos/Discover.png" width="880" alt="SodaM macOS 播放页与歌词"></a> |
+| **搜索** | **我的歌单** |
+| <a href="docs/img/macos/Search.png"><img src="docs/img/macos/Search.png" width="880" alt="SodaM macOS 搜索页面"></a> | <a href="docs/img/macos/Playlists.png"><img src="docs/img/macos/Playlists.png" width="880" alt="SodaM macOS 我的歌单页面"></a> |
+| **我喜欢的音乐** | **设置** |
+| <a href="docs/img/macos/Liked.png"><img src="docs/img/macos/Liked.png" width="880" alt="SodaM macOS 我喜欢的音乐页面"></a> | <a href="docs/img/macos/Settings.png"><img src="docs/img/macos/Settings.png" width="880" alt="SodaM macOS 设置页面"></a> |
 
 ## 功能特性
 
@@ -94,9 +105,9 @@ SodaM 面向 Linux 桌面，重点做四件事：**接近官方客户端的操�
 
 - Dark / Light 双主题，首次启动跟随系统偏好
 - 中文 / English 界面语言，首次启动跟随系统语言
-- 系统托盘：播放控制、显示主窗口、真正退出
+- 系统托盘：播放控制、显示主窗口、真正退出（Linux 为 SNI 托盘，macOS 为菜单栏 NSStatusItem）
 - 关闭主窗口不退出进程，保留后台播放
-- 原生窗口与桌面入口，Arch Linux ARM64 包可直接安装
+- Linux 提供原生窗口、桌面入口与 Arch Linux ARM64 包；macOS 提供自绘标题栏的 `.app`
 
 ### 性能与稳定性
 
@@ -123,9 +134,13 @@ UI 规范见 [`docs/UI-SPEC.md`](docs/UI-SPEC.md)。
 ### 环境要求
 
 - Rust stable，最低 `1.85`
-- Linux Wayland 或 X11 运行时
+- Linux：Wayland 或 X11 运行时
+- macOS：Apple Silicon（M 系列），macOS 12+；构建需完整版 Xcode（Metal shader 编译，
+  仅装 Command Line Tools 会报 `xcrun: unable to find utility "metal"`）
 - Chromium / Chrome / Edge 等浏览器用于扫码登录签名页
-- `libresoda` 与 `libmssdk` 建议与 `sodam` 同级 clone
+- `libresoda` 与 `sodam` 同级 clone（可选）：本地联调时可用
+  `[patch."https://github.com/sodahub-org/libresoda"]` 指向 `../libresoda`，
+  改动 libresoda 即时生效，无需等新版本。
 
 ```text
 Projects/sodahub-org/
@@ -232,6 +247,60 @@ sodam
 也可以从桌面环境的应用菜单中启动 **SodaM**。首次启动会进入设置页，按提示扫码登录后即可使用。
 
 后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本的对应架构包，并再次执行 `sudo pacman -U` 即可。
+
+## macOS 下载安装（Apple Silicon）
+
+macOS 版已在 Apple Silicon（M 系列）真机实测，GitHub Release 提供 `.app` 压缩包，
+当前版本为 [`v0.1.1`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.1)。
+
+### 1. 下载并校验
+
+```bash
+mkdir -p /tmp/sodam-install
+cd /tmp/sodam-install
+
+version=0.1.1
+base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
+
+curl -fLO ${base_url}/SHA256SUMS
+curl -fLO ${base_url}/sodam-${version}-macos-aarch64.zip
+grep "sodam-${version}-macos-aarch64\.zip$" SHA256SUMS | shasum -a 256 -c -
+```
+
+校验输出必须包含 `OK`：
+
+```text
+sodam-0.1.1-macos-aarch64.zip: OK
+```
+
+### 2. 安装
+
+```bash
+unzip sodam-${version}-macos-aarch64.zip
+mv SodaM.app /Applications/
+```
+
+也可以在 Finder 里双击解压后，把 **SodaM.app** 拖进「应用程序」文件夹。
+
+### 3. 首次启动（绕过 Gatekeeper）
+
+当前发行包为 ad-hoc 签名、未经 Apple 公证，首次打开会被 Gatekeeper 拦截，
+任选一种方式放行：
+
+```bash
+# 方式一：去掉隔离属性（推荐）
+xattr -cr /Applications/SodaM.app
+open -a SodaM
+```
+
+或：双击 SodaM.app → 在弹窗中点「取消」→ 打开「系统设置 → 隐私与安全性」→
+点「仍要打开」。
+
+### 4. 启动
+
+从启动台或 Finder 打开 **SodaM**，首次启动会进入设置页，按提示扫码登录后即可使用。
+后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本，
+重复步骤 2 覆盖到 `/Applications` 即可（配置在 `~/.config/sodam/`，不会丢失）。
 
 ## 打包
 
