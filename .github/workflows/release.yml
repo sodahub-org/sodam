@@ -16,7 +16,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
-  cancel-in_progress: false
+  cancel-in-progress: false
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
