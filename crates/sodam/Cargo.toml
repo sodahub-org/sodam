@@ -17,5 +17,12 @@ anyhow.workspace = true
 sys-locale.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-ksni = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# StatusNotifier 托盘是 Linux 桌面协议，macOS 上没有 D-Bus session bus。
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"
+
+# macOS 原生 NSStatusItem 托盘（tauri 维护的 tray-icon）。
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = "0.25"

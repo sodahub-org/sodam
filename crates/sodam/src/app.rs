@@ -871,6 +871,8 @@ impl Render for Root {
             .flex()
             .flex_col()
             .size_full()
+            // macOS 隐藏了系统标题栏，顶部留出红绿灯的高度。
+            .when(cfg!(target_os = "macos"), |this| this.pt(px(28.0)))
             .bg(theme::ambient_background())
             .text_color(ui::theme::text())
             .child(

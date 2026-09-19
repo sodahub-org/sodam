@@ -22,6 +22,6 @@ sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 
-# 公开源码依赖；本地联调可用 `[patch."https://github.com/sodahub-org/libresoda"]`
-# 指向同级 clone，见 README「开发环境」。
-libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "7efd2ca2f05a945b77741638284bb9a0b4c74744" }
+# 公开源码依赖；本地联调可选：可用 `[patch."https://github.com/sodahub-org/libresoda"]`
+# 指向同级 clone，见 README「快速开始」。
+libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "677113b" }

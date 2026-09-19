@@ -1,6 +1,7 @@
 //! SodaM——GPUI 原生客户端入口。
 
 mod app;
+// 托盘：Linux 走 ksni/SNI，macOS 走 NSStatusItem，见 tray.rs。
 mod tray;
 mod ui;
 mod views;
@@ -21,6 +22,10 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
         titlebar: Some(TitlebarOptions {
             title: Some("SodaM".into()),
+            // macOS 隐藏系统标题栏，内容延伸到红绿灯下，由应用自绘顶部留白；
+            // Linux 走 compositor 窗口装饰，保持不动。
+            #[cfg(target_os = "macos")]
+            appears_transparent: true,
             ..Default::default()
         }),
         app_id: Some("SodaM".into()),
@@ -33,11 +38,13 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
+/// 托盘事件循环：把命令转发为应用动作，并周期同步播放状态到 `sync`。
+/// 双平台共用；平台差异只在 `sync` 闭包（见 tray.rs）。
 fn start_tray_service(
     rx: std::sync::mpsc::Receiver<tray::TrayCommand>,
-    tray: ksni::Handle<tray::SodaTray>,
     app: Entity<app::Root>,
     cx: &mut App,
+    mut sync: impl FnMut(tray::TrayState) + 'static,
 ) {
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
@@ -79,12 +86,11 @@ fn start_tray_service(
                                 .map(|track| track.artist.clone())
                                 .unwrap_or_default()
                         };
-                        let playing = snapshot.playing;
-                        tray.update(|tray| {
-                            tray.language = root.language;
-                            tray.title = title;
-                            tray.subtitle = subtitle;
-                            tray.playing = playing;
+                        sync(tray::TrayState {
+                            language: root.language,
+                            title,
+                            subtitle,
+                            playing: snapshot.playing,
                         });
                     });
                 });
@@ -94,6 +100,7 @@ fn start_tray_service(
     .detach();
 }
 
+/// 打开或激活主窗口；由托盘的 Show 命令调用。
 fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
@@ -110,19 +117,41 @@ fn main() {
         .with_assets(ui::icons::Assets)
         .with_quit_mode(gpui::QuitMode::Explicit)
         .run(|cx: &mut App| {
-            let (tray_tx, tray_rx) = std::sync::mpsc::channel();
-            let tray_service = ksni::TrayService::new(tray::SodaTray::new(
-                tray_tx,
-                crate::ui::i18n::Language::system_locale(),
-            ));
-            let tray_handle = tray_service.handle();
-            tray_service.spawn();
             #[allow(clippy::redundant_closure)]
             let app = cx.new(|cx| app::Root::new(cx));
             let options = main_window_options(cx);
             cx.open_window(options, |_window, _cx| app.clone())
                 .expect("打开主窗口失败");
-            start_tray_service(tray_rx, tray_handle, app.clone(), cx);
+
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+
+                // 平台各自的托盘创建 + 状态同步闭包。
+                #[cfg(target_os = "linux")]
+                let sync = {
+                    let tray_service = ksni::TrayService::new(tray::linux::SodaTray::new(
+                        tray_tx,
+                        crate::ui::i18n::Language::system_locale(),
+                    ));
+                    let tray_handle = tray_service.handle();
+                    tray_service.spawn();
+                    move |state: tray::TrayState| {
+                        let _ = tray_handle.update(|tray| {
+                            tray.language = state.language;
+                            tray.title = state.title;
+                            tray.subtitle = state.subtitle;
+                            tray.playing = state.playing;
+                        });
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                let sync =
+                    tray::create_status_item(tray_tx, crate::ui::i18n::Language::system_locale());
+
+                start_tray_service(tray_rx, app.clone(), cx, sync);
+            }
+
             cx.activate(true);
         });
 }
