@@ -137,7 +137,8 @@ fn main() {
                     let tray_handle = tray_service.handle();
                     tray_service.spawn();
                     move |state: tray::TrayState| {
-                        let _ = tray_handle.update(|tray| {
+                        // ksni 0.2 的 Handle::update 返回 ()，直接调用。
+                        tray_handle.update(|tray| {
                             tray.language = state.language;
                             tray.title = state.title;
                             tray.subtitle = state.subtitle;
