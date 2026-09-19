@@ -22,9 +22,9 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
         window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
         titlebar: Some(TitlebarOptions {
             title: Some("SodaM".into()),
-            // macOS 隐藏系统标题栏，内容延伸到红绿灯下，由应用自绘顶部留白；
-            // Linux 走 compositor 窗口装饰，保持不动。
-            #[cfg(target_os = "macos")]
+            // macOS 隐藏系统标题栏（红绿灯悬浮）；Windows 同样隐藏，
+            // 由 ui::titlebar 自绘拖拽区与最小化/最大化/关闭按钮。
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             appears_transparent: true,
             ..Default::default()
         }),
@@ -123,7 +123,7 @@ fn main() {
             cx.open_window(options, |_window, _cx| app.clone())
                 .expect("打开主窗口失败");
 
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
                 let (tray_tx, tray_rx) = std::sync::mpsc::channel();
 
@@ -146,7 +146,7 @@ fn main() {
                         });
                     }
                 };
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let sync =
                     tray::create_status_item(tray_tx, crate::ui::i18n::Language::system_locale());
 

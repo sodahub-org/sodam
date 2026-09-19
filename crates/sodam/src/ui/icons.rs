@@ -128,6 +128,8 @@ icon_set!(
     "chevron-right",
     "plus",
     "x",
+    "minus",
+    "square",
     "disc-3",
 );
 

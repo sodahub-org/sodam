@@ -23,6 +23,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.2"
 
-# macOS 原生 NSStatusItem 托盘（tauri 维护的 tray-icon）。
-[target.'cfg(target_os = "macos")'.dependencies]
+# macOS / Windows 共用 tray-icon：macOS 走 NSStatusItem，Windows 走 shell 通知区域。
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = "0.25"

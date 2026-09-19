@@ -1,8 +1,9 @@
-//! 系统托盘，双平台实现：
+//! 系统托盘，三平台实现：
 //! * Linux：StatusNotifierItem（KDE/freedesktop 协议，ksni）
 //! * macOS：原生 NSStatusItem（tray-icon）
+//! * Windows：shell 通知区域（tray-icon）
 //!
-//! 两边保持同一结构：菜单发送 [`TrayCommand`]，GPUI 实体轮询消费，
+//! 各平台保持同一结构：菜单发送 [`TrayCommand`]，GPUI 实体轮询消费，
 //! 播放状态通过 [`TrayState`] 回调同步回托盘。
 
 use std::sync::mpsc::Sender;
@@ -163,12 +164,13 @@ pub mod linux {
     }
 }
 
-// ---------------------------------------------------------------- macOS (NSStatusItem)
+// ------------------------------------------------- macOS / Windows (tray-icon)
 
-/// macOS 上创建菜单栏状态项，返回把 [`TrayState`] 同步进托盘的回调。
+/// macOS（NSStatusItem）/ Windows（通知区域）共用：创建托盘图标，
+/// 返回把 [`TrayState`] 同步进托盘的回调。
 /// 必须在主线程调用（GPUI `Application::run` 闭包内即主线程）。
 /// 菜单文案与 tooltip（当前曲目摘要）随每次同步更新，包括语言切换。
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn create_status_item(
     tx: Sender<TrayCommand>,
     language: Language,

@@ -871,8 +871,12 @@ impl Render for Root {
             .flex()
             .flex_col()
             .size_full()
-            // macOS 隐藏了系统标题栏，顶部留出红绿灯的高度。
+            // macOS 隐藏系统标题栏，顶部留出红绿灯的高度；
+            // Windows 隐藏系统标题栏后由应用自绘拖拽区与控制按钮。
             .when(cfg!(target_os = "macos"), |this| this.pt(px(28.0)))
+            .when(cfg!(target_os = "windows"), |this| {
+                this.child(ui::titlebar::render())
+            })
             .bg(theme::ambient_background())
             .text_color(ui::theme::text())
             .child(
