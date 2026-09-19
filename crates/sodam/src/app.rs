@@ -249,6 +249,8 @@ pub struct Root {
     /// 「我喜欢的音乐」的曲目 id 集合（列表里的爱心状态）。
     pub liked_ids: Arc<HashSet<String>>,
     liked_loading: bool,
+    /// 收藏 ids 拉取失败（网络等）：置位后等网络就绪信号自动重试。
+    pub liked_ids_failed: bool,
     pub loading_library: bool,
     pub loading_liked: bool,
     pub liked_loaded: bool,
@@ -453,6 +455,7 @@ impl Root {
             liked: Arc::new(Vec::new()),
             liked_ids: Arc::new(HashSet::new()),
             liked_loading: false,
+            liked_ids_failed: false,
             loading_library: false,
             loading_liked: false,
             liked_loaded: false,

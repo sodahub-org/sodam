@@ -385,6 +385,10 @@ impl Root {
                         }
                         root.account = Some(info.clone());
                         root.login = LoginState::LoggedIn(info.clone());
+                        // 账号请求成功说明网络就绪；若收藏 ids 此前拉取失败，自动重试。
+                        if root.liked_ids_failed {
+                            root.load_liked_ids(cx);
+                        }
                         root.set_status(
                             "已登录：{}（{}）",
                             &[
@@ -1154,6 +1158,7 @@ impl Root {
         self.playlists.clear();
         self.liked = Arc::new(Vec::new());
         self.liked_ids = Arc::new(HashSet::new());
+        self.liked_ids_failed = false;
         self.liked_loaded = false;
         self.open_playlist = None;
         self.track_menu = None;
@@ -1366,7 +1371,19 @@ impl Root {
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            sodam_core::library::liked_track_ids(&session)
+            // 启动时网络/接口可能未就绪：最多尝试 3 次（2s / 4s 退避），
+            // 否则一次瞬时失败会让整个会话的爱心状态全部落在「未收藏」。
+            let mut attempt = 0;
+            loop {
+                match sodam_core::library::liked_track_ids(&session) {
+                    Ok(ids) => return Ok(ids),
+                    Err(_err) if attempt < 2 => {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -1375,9 +1392,14 @@ impl Root {
                 match result {
                     Ok(ids) => {
                         root.liked_ids = Arc::new(ids);
+                        root.liked_ids_failed = false;
                         cx.notify();
                     }
-                    Err(_) => { /* 未登录/网络异常：保持空集合，不打扰用户 */ }
+                    Err(_) => {
+                        // 未登录/网络异常：保持空集合，不打扰用户；
+                        // 但置失败标记，等账号刷新成功（网络就绪信号）后自动重试。
+                        root.liked_ids_failed = true;
+                    }
                 }
             });
         })
@@ -1420,6 +1442,7 @@ impl Root {
 
         let settings = self.settings.clone();
         let work_id = id.clone();
+        let rollback_track = track.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             sodam_core::library::set_track_liked(&session, &work_id, liked)
@@ -1428,7 +1451,7 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 if let Err(err) = result {
-                    // 回滚
+                    // 回滚 ids
                     let mut ids = root.liked_ids.as_ref().clone();
                     if liked {
                         ids.remove(&id);
@@ -1436,6 +1459,16 @@ impl Root {
                         ids.insert(id.clone());
                     }
                     root.liked_ids = Arc::new(ids);
+                    // 同步回滚本地完整列表，避免 ids 与列表互相矛盾。
+                    if root.liked_loaded {
+                        let mut list = root.liked.as_ref().clone();
+                        if liked {
+                            list.retain(|item| item.id != id);
+                        } else if !list.iter().any(|item| item.id == id) {
+                            list.insert(0, rollback_track);
+                        }
+                        root.liked = Arc::new(list);
+                    }
                     root.localized("收藏失败：{err}", &[err.to_string()]);
                     cx.notify();
                 }
@@ -1471,6 +1504,12 @@ impl Root {
                 match result {
                     Ok(tracks) => {
                         root.liked_loaded = true;
+                        // 全量列表是收藏的权威快照：同步修复全局 ids，
+                        // 避免启动时 ids 拉取失败后爱心状态一直错。
+                        root.liked_ids = Arc::new(
+                            tracks.iter().map(|track| track.id.clone()).collect(),
+                        );
+                        root.liked_ids_failed = false;
                         root.liked_detail_list.reset(tracks.len() + 1);
                         root.set_status("我喜欢的音乐：{} 首", &[tracks.len().to_string()]);
                         // 只取头部封面（列表封面由「可见行」按需排队）
