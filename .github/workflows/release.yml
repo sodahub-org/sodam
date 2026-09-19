@@ -1,0 +1,104 @@
+name: Release Linux packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag, for example v0.1.1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+  cancel-in_progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+
+jobs:
+  linux-package:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git \
+            libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+
+      - name: Create pacman package
+        run: |
+          package=$(packaging/make-linux-package.sh '${{ matrix.arch }}')
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          test -s "$package"
+          test -s "$package.sha256"
+          mkdir -p release
+          mv "$package" "$package.sha256" release/
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-linux-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  github-release:
+    name: Publish GitHub Release
+    needs: linux-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Generate release checksums
+        run: |
+          cd release
+          rm -f SHA256SUMS
+          sha256sum *.pkg.tar.zst > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: SodaM ${{ env.RELEASE_TAG }}
+          body: |
+            Linux packages built by GitHub Actions.
+
+            - `x86_64` pacman package
+            - `aarch64` pacman package
+            - `SHA256SUMS`
+          files: |
+            release/*.pkg.tar.zst
+            release/SHA256SUMS
+          draft: false
+          prerelease: false

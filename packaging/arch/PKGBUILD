@@ -1,12 +1,13 @@
 # Maintainer: sodahub-org <https://github.com/sodahub-org/sodam>
 pkgname=sodam
-pkgver=0.1.0
-pkgrel=7
+pkgver=0.1.1
+pkgrel=1
 pkgdesc='Native Qishui Music client built with GPUI'
-arch=('aarch64')
+arch=('x86_64' 'aarch64')
 url='https://github.com/sodahub-org/sodam'
 license=('AGPL-3.0-or-later')
-depends=('alsa-lib' 'dbus' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxcb')
+depends=('alsa-lib' 'dbus' 'fontconfig' 'freetype2' 'hicolor-icon-theme' 'libxkbcommon' 'libxcb')
+makedepends=('cargo' 'git')
 options=('!emptydirs')
 source=()
 sha256sums=()

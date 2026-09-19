@@ -5587,7 +5587,7 @@ dependencies = [
 
 [[package]]
 name = "sodam"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "gpui",
@@ -5600,7 +5600,7 @@ dependencies = [
 
 [[package]]
 name = "sodam-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
