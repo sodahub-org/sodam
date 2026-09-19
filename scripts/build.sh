@@ -26,7 +26,8 @@ run() {
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=${SWAP_MAX}" -p "CPUQuota=${CPU_QUOTA}" \
             -- env CARGO_BUILD_JOBS="${JOBS}" "$@"
     else
-        ( ulimit -v 6291456; env CARGO_BUILD_JOBS="${JOBS}" "$@" )
+        # macOS 的 ulimit -v 不可用（Invalid argument），失败时退化为仅限并发数。
+        ( ulimit -v 6291456 2>/dev/null || true; env CARGO_BUILD_JOBS="${JOBS}" "$@" )
     fi
 }
 

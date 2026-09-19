@@ -20,7 +20,8 @@ run() {
             -- env CARGO_BUILD_JOBS="${JOBS}" "$@"
     else
         echo "提示：systemd-run 不可用，退化为 ulimit（约 6GB）" >&2
-        ( ulimit -v 6291456; env CARGO_BUILD_JOBS="${JOBS}" "$@" )
+        # macOS 的 ulimit -v 不可用（Invalid argument），失败时退化为仅限并发数。
+        ( ulimit -v 6291456 2>/dev/null || true; env CARGO_BUILD_JOBS="${JOBS}" "$@" )
     fi
 }
 
