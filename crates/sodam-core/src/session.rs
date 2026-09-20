@@ -125,6 +125,15 @@ fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     label
 }
 
+/// 下载是否被截断：只看「实际字节数是否少于服务端声明」。
+///
+/// 个别曲目的服务端 `size` 元数据会小于真实资产（例如声明 10,569,897 字节、
+/// 实际 CDN 返回 10,660,358 字节且 MP4 box 完整可播）。这类「实际更多」不是
+/// 截断，不应拒绝；真正的风险只有实际更少（连接提前断开的静默 EOF）。
+fn is_truncated_download(declared: i64, written: u64) -> bool {
+    declared > 0 && written < declared as u64
+}
+
 /// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
 pub struct Session {
     pumpkin: Soda,
@@ -293,7 +302,7 @@ impl Session {
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
         let path = dir.join(format!("{0}-{tag}.m4a", track.id));
-        // sidecar 记录「音质标签 + 期望字节数」，用于命中时的大小校验。
+        // sidecar 记录「音质标签 + 实际字节数」，用于命中时的大小校验。
         let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
         if let Some(cached) = self.cached_track(&track.id) {
             return Ok(cached);
@@ -321,12 +330,16 @@ impl Session {
                 anyhow::anyhow!("下载失败: {err}")
             })?;
 
-        // 完整性校验：服务端声明的字节数 vs 实际落盘字节数。
-        // 响应体被截断（连接提前断开时可能静默 EOF）在这里会被拒绝。
+        // 完整性校验：只拒绝「比服务端声明更少」的截断下载（静默 EOF 时可能发生）。
+        // 允许实际字节数更多：个别曲目的 play_info size 元数据会滞后于真实资产
+        //（实测存在声明 10,569,897 / 实际 10,660,358 的完整可播文件），等值校验会误杀。
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
-        if info.size > 0 && written as i64 != info.size {
+        if is_truncated_download(info.size, written) {
             let _ = std::fs::remove_file(&part);
-            anyhow::bail!("下载不完整（预期 {} 字节，实际 {written} 字节）", info.size);
+            anyhow::bail!(
+                "下载不完整（至少需要 {} 字节，实际 {written} 字节）",
+                info.size
+            );
         }
 
         let quality = describe_quality(&info);
@@ -536,5 +549,17 @@ mod tests {
         let session = Session::new(settings);
         assert!(session.has_cookie());
         assert_eq!(session.settings().quality, "lossless");
+    }
+
+    #[test]
+    fn truncation_check_rejects_only_short_downloads() {
+        // 服务端未声明大小：无从判定截断，放行
+        assert!(!is_truncated_download(0, 123));
+        // 正常：实际等于声明
+        assert!(!is_truncated_download(10_569_897, 10_569_897));
+        // 真实案例：play_info 声明的 size 滞后于 CDN 实际资产，文件完整可播
+        assert!(!is_truncated_download(10_569_897, 10_660_358));
+        // 截断：实际少于声明
+        assert!(is_truncated_download(10_569_897, 10_569_896));
     }
 }
