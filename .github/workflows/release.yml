@@ -139,6 +139,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 附注 tag 的消息就是本次发布的更新说明（changelog 写在 `git tag -a` 里）
+      - name: Checkout for tag message
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch tag object
+        run: git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --no-tags
+
+      - name: Read changelog from tag message
+        id: tagnotes
+        run: |
+          notes=$(git tag -l --format='%(contents)' "${RELEASE_TAG}")
+          if [ -z "$notes" ]; then
+            notes="（本次发布未附更新说明：请用附注 tag 携带 changelog）"
+          fi
+          {
+            echo 'notes<<RELEASE_NOTES_EOF'
+            printf '%s\n' "$notes"
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -157,6 +179,10 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: SodaM ${{ env.RELEASE_TAG }}
           body: |
+            ${{ steps.tagnotes.outputs.notes }}
+
+            ---
+
             Packages built by GitHub Actions.
 
             Linux (pacman):
