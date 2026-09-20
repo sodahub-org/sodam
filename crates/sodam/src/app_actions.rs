@@ -541,11 +541,10 @@ impl Root {
         cx.notify();
     }
 
-    /// 用系统默认应用打开配置文件（Linux 上是 xdg-open）。
+    /// 用系统默认应用打开配置文件（macOS `open` / Windows `start` / Linux `xdg-open`）。
     pub fn open_config_file(&mut self, cx: &mut Context<Self>) {
         let path = Settings::config_path();
-        let result = std::process::Command::new("xdg-open").arg(path).spawn();
-        self.status = match result {
+        self.status = match system_open(&path.display().to_string()) {
             Ok(_) => self.tr("已用系统默认应用打开配置文件").to_string(),
             Err(err) => self.localized("打开配置文件失败：{err}", &[err.to_string()]),
         };
@@ -555,8 +554,7 @@ impl Root {
     /// 用系统默认浏览器打开项目 GitHub 仓库。
     pub fn open_github_repository(&mut self, cx: &mut Context<Self>) {
         let url = env!("CARGO_PKG_REPOSITORY");
-        let result = std::process::Command::new("xdg-open").arg(url).spawn();
-        self.status = match result {
+        self.status = match system_open(url) {
             Ok(_) => self.tr("已在浏览器打开 GitHub 仓库").to_string(),
             Err(err) => self.localized("打开 GitHub 仓库失败：{err}", &[err.to_string()]),
         };
@@ -2002,6 +2000,22 @@ impl Root {
             }
         }
     }
+}
+
+/// 跨平台「用系统默认应用打开」（文件或 URL 均可）：
+/// macOS `open`、Windows `cmd /C start ""`（空标题防 URL 被当窗口名）、
+/// 其他 `xdg-open`。fire-and-forget：不等待打开结果，UI 动作不阻塞。
+fn system_open(target: &str) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    return std::process::Command::new("open").arg(target).spawn();
+    #[cfg(windows)]
+    return {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return std::process::Command::new("xdg-open").arg(target).spawn();
 }
 
 /// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
