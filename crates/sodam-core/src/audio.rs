@@ -326,7 +326,10 @@ pub fn cover_cache_dir() -> std::path::PathBuf {
         .join("covers")
 }
 
-/// 目录占用（字节数，文件数）。
+/// 目录占用：**递归**统计（字节数，文件数）。
+///
+/// 封面缩略图在 `covers/`，原图在 `covers/original/` 子目录 ——
+/// 只看顶层会把整个子目录漏掉（实测踩过：字节/张数都偏小）。
 fn dir_usage(dir: &std::path::Path) -> (u64, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (0, 0);
@@ -334,21 +337,45 @@ fn dir_usage(dir: &std::path::Path) -> (u64, usize) {
     let mut bytes = 0u64;
     let mut files = 0usize;
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() {
-                bytes += meta.len();
-                files += 1;
-            }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            bytes += meta.len();
+            files += 1;
+        } else if meta.is_dir() {
+            let (sub_bytes, sub_files) = dir_usage(&entry.path());
+            bytes += sub_bytes;
+            files += sub_files;
         }
     }
     (bytes, files)
 }
 
-/// 缓存统计：(音频字节, 音频文件数, 封面字节, 封面文件数)。
+/// 顶层目录里指定扩展名的文件数（用于「歌曲数」：只数 `.m4a`）。
+fn count_extension(dir: &std::path::Path, extension: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().map(|ext| ext == extension) == Some(true))
+        .count()
+}
+
+/// 缓存统计：(音频字节, 歌曲数, 封面字节, 封面张数)。
+///
+/// * 字节数含**全部**文件（`.m4a` / `.quality` 边车 / 下载中的 `.part` /
+///   封面原图子目录）；
+/// * 「歌曲数」只数 `.m4a`：边车和临时文件不是歌，全算会把数量翻倍（踩过）；
+/// * 「封面张数」数全部图片缓存文件（含原图）。
+///
+/// 注意：这是同步扫盘，别在渲染路径里每帧调 —— 调用方应后台执行并缓存结果。
 pub fn cache_stats() -> (u64, usize, u64, usize) {
-    let (audio_bytes, audio_files) = dir_usage(&cache_dir());
+    let (audio_bytes, _) = dir_usage(&cache_dir());
+    let songs = count_extension(&cache_dir(), "m4a");
     let (cover_bytes, cover_files) = dir_usage(&cover_cache_dir());
-    (audio_bytes, audio_files, cover_bytes, cover_files)
+    (audio_bytes, songs, cover_bytes, cover_files)
 }
 
 /// 清空缓存（音频 + 封面），返回删除的文件数。
@@ -389,5 +416,25 @@ mod tests {
         let snap = engine.snapshot();
         assert_eq!(snap.volume, 1.0);
         assert!(!snap.playing);
+    }
+
+    #[test]
+    fn dir_usage_and_count_extension_classify_files_correctly() {
+        let dir = std::env::temp_dir().join(format!("sodam-cache-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("original")).expect("mkdir");
+        std::fs::write(dir.join("a.m4a"), [0u8; 100]).expect("m4a");
+        std::fs::write(dir.join("a.quality"), b"lossless\t100").expect("sidecar");
+        std::fs::write(dir.join("b.part"), [0u8; 50]).expect("part");
+        std::fs::write(dir.join("original/full.img"), [0u8; 25]).expect("cover");
+
+        // 字节：递归含子目录，全部文件都算（100 + 12 + 50 + 25）
+        let (bytes, files) = dir_usage(&dir);
+        assert_eq!(bytes, 187, "应含子目录与边车/part");
+        assert_eq!(files, 4);
+        // 歌曲数：只数 .m4a（边车/part 不算歌）
+        assert_eq!(count_extension(&dir, "m4a"), 1);
+        assert_eq!(count_extension(&dir, "img"), 0, "只看顶层");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

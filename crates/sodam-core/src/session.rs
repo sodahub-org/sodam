@@ -11,6 +11,28 @@ use std::sync::Arc;
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
 
+/// 预取/播放两条路径可能**并发下载同一首**（预取进行中用户又手动点了它），
+/// 固定的 .part 名会让两个写者互相踩踏（remove + 交错写 + 错误的 rename 对象）。
+/// 用「进程号 + 进程内序号」保证每次下载写自己的临时文件。
+fn part_file_name(track_id: &str, tag: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{track_id}-{tag}-{}-{seq}.m4a.part", std::process::id())
+}
+
+#[cfg(test)]
+mod part_tests {
+    #[test]
+    fn part_names_are_unique_and_labeled() {
+        let first = super::part_file_name("123", "lossless");
+        let second = super::part_file_name("123", "lossless");
+        assert_ne!(first, second, "同一曲目两次下载的临时名必须不同");
+        assert!(first.starts_with("123-lossless-"), "{first}");
+        assert!(first.ends_with(".m4a.part"), "{first}");
+    }
+}
+
 fn hash_url(url: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in url.as_bytes() {
@@ -289,8 +311,8 @@ impl Session {
             ..Default::default()
         };
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
-        let part = dir.join(format!("{0}-{tag}.m4a.part", track.id));
-        let _ = std::fs::remove_file(&part);
+        // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
+        let part = dir.join(part_file_name(&track.id, &tag));
         let info = self
             .pumpkin
             .download_with_info(&song, &part)

@@ -754,9 +754,18 @@ fn queue_drawer_inner(root: &Root, cx: &mut Context<Root>, embedded: bool) -> im
                             })
                             .on_mouse_down(MouseButton::Right, {
                                 let entity = entity.clone();
+                                let track_id = track.id.clone();
                                 move |event: &MouseDownEvent, _window, cx: &mut gpui::App| {
                                     let position = event.position;
                                     entity.update(cx, |root, cx| {
+                                        // 正在播放的曲目不弹菜单：它不能从队列移除
+                                        // （还挂在引擎上），也不需要「下一首播放」自己。
+                                        // 除了当前下标，还要拦「引擎仍在播但下标已跳走」
+                                        // 的 pending 窗口（收尾瞬间切歌）。
+                                        let engine_id = root.engine.snapshot().track_id;
+                                        if playing || track_id == engine_id {
+                                            return;
+                                        }
                                         root.queue_menu = Some((index, position));
                                         cx.notify();
                                     });

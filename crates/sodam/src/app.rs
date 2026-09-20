@@ -306,8 +306,16 @@ pub struct Root {
     pub playback_error: Option<String>,
     /// 连续拉流失败次数（>=3 就停下，避免无限跳歌）。
     pub(crate) consecutive_failures: u32,
-    /// 正在预取的曲目 id（避免重复排队；预取结果只写缓存，不改 UI）。
-    pub(crate) prefetch_inflight: Option<String>,
+    /// 正在预取的曲目 id 集合（多首并行去重；预取结果只写缓存，不改 UI）。
+    pub(crate) prefetch_inflight: HashSet<String>,
+    /// 预取失败冷却表（曲目 id → 最近失败时刻）：巡检不能把永久失败的歌
+    /// （下架/地区受限）每 5 秒无限重试，60s 内不再排。
+    pub(crate) prefetch_failed: HashMap<String, std::time::Instant>,
+    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）补一次预取。
+    pub(crate) prefetch_patrol: u32,
+    /// 缓存统计快照（音频字节, 歌曲数, 封面字节, 封面张数）：
+    /// 后台扫盘后回填，设置页只读它（渲染路径不做同步 IO）。
+    pub(crate) cache_summary: (u64, usize, u64, usize),
     /// 正在加载（下载/解密）的曲目：非空时播放栏显示 loading，且进度条不可拖。
     pub pending_track: Option<TrackItem>,
     /// 已处理过的「播完」序号（配合引擎的 finished_seq 自动切歌）。
@@ -475,7 +483,10 @@ impl Root {
             volume_before_mute: 1.0,
             progress_track_bounds: Arc::new(Mutex::new(None)),
             volume_track_bounds: Arc::new(Mutex::new(None)),
-            prefetch_inflight: None,
+            prefetch_inflight: HashSet::new(),
+            prefetch_failed: HashMap::new(),
+            prefetch_patrol: 0,
+            cache_summary: (0, 0, 0, 0),
             pending_track: None,
             last_finished_seq: 0,
             progress_preview: None,

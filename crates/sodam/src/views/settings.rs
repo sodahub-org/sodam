@@ -482,9 +482,8 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .children(rows),
         )
         .child({
-            // 缓存：显示占用大小 + 一键清理
-            let (audio_bytes, audio_files, cover_bytes, cover_files) =
-                sodam_core::audio::cache_stats();
+            // 缓存：显示占用大小 + 一键清理（统计读后台快照，不在渲染路径扫盘）
+            let (audio_bytes, audio_files, cover_bytes, cover_files) = root.cache_summary;
             let total = audio_bytes + cover_bytes;
             div()
                 .flex()
@@ -541,6 +540,8 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             let removed = sodam_core::audio::clear_cache();
                             root.status =
                                 root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
+                            // 清理后立即刷新统计（后台扫盘）
+                            root.refresh_cache_stats(cx);
                             cx.notify();
                         }))
                         .child(root.tr("清除歌曲缓存")),

@@ -66,63 +66,100 @@ impl Root {
             .unwrap_or(self.search_input.len()..self.search_input.len())
     }
 
-    /// 预取队列下一首到本地缓存（只落盘，不动界面状态）。
+    /// 预取队列接下来几首到本地缓存（只落盘，不动界面状态）。
     ///
     /// 保持「拉完再播」的简单架构不变，但把等待时间提前吃掉：
-    /// 当前曲目一开播，就在后台把下一首下好；切歌时命中缓存直接播。
+    /// 当前曲目一开播，就在后台把接下来几首下好；切歌时命中缓存直接播。
+    ///
+    /// * 预取数量：`SODAM_PREFETCH_COUNT`（默认 3）；
+    /// * 并发上限：`SODAM_PREFETCH_CONCURRENCY`（默认 2，避免签名服务/网络压力）；
+    /// * 已缓存 / 正在预取 / 正在装载的曲目跳过，继续看更后面的。
+    ///
+    /// 触发点：装载成功、切音质、「下一首播放」，以及心跳每 ~5s 的巡检
+    /// （后者自动覆盖 append/remove 等队列变更，不必逐个调用点补）。
     pub(crate) fn spawn_prefetch(&mut self, cx: &mut Context<Self>) {
         let log = std::env::var("SODAM_PREFETCH_LOG").is_ok();
-        let Some(next) = self.queue.peek_next().cloned() else {
+        let ahead = prefetch_ahead_count();
+        let max_inflight = prefetch_concurrency().max(1);
+        let candidates: Vec<TrackItem> = self
+            .queue
+            .peek_ahead(ahead)
+            .iter()
+            .map(|track| (*track).clone())
+            .collect();
+        if candidates.is_empty() {
             if log {
-                eprintln!("[prefetch] 队列为空，跳过");
-            }
-            return;
-        };
-        // 已经在缓存里、或这一首正在预取/正在播放，就不用再排
-        if let Some(session) = &self.session {
-            if session.is_cached(&next.id) {
-                if log {
-                    eprintln!("[prefetch] 跳过（已缓存）：{}", next.title);
-                }
-                return;
-            }
-        }
-        if self.prefetch_inflight.as_deref() == Some(next.id.as_str())
-            || self
-                .pending_track
-                .as_ref()
-                .map(|track| track.id == next.id)
-                .unwrap_or(false)
-        {
-            if log {
-                eprintln!("[prefetch] 跳过（已在进行中）：{}", next.title);
+                eprintln!("[prefetch] 队列没有更前面的曲目，跳过");
             }
             return;
         }
-        if log {
-            eprintln!("[prefetch] 开始预取：{}", next.title);
-        }
-        self.prefetch_inflight = Some(next.id.clone());
-        let settings = self.settings.clone();
-        let track = next.clone();
-        let work_track = track.clone();
-        let result = cx
-            .background_spawn(async move { Session::new(settings).download_to_cache(&work_track) });
-        cx.spawn(async move |this, cx| {
-            let outcome = result.await;
-            if log {
-                match &outcome {
-                    Ok(cached) => {
-                        eprintln!("[prefetch] {} → {}", track.title, cached.quality)
+        for next in candidates {
+            if self.prefetch_inflight.len() >= max_inflight {
+                break;
+            }
+            // 已经在缓存里就不用再排（继续看更后面的：多首预取的意义）
+            if let Some(session) = &self.session {
+                if session.is_cached(&next.id) {
+                    if log {
+                        eprintln!("[prefetch] 跳过（已缓存）：{}", next.title);
                     }
-                    Err(err) => eprintln!("[prefetch] {} 失败: {err}", track.title),
+                    continue;
                 }
             }
-            let _ = this.update(cx, |root, _cx| {
-                root.prefetch_inflight = None;
+            // 正在预取 / 正在装载（播放下载中）的曲目不重复排
+            if self.prefetch_inflight.contains(&next.id)
+                || self
+                    .pending_track
+                    .as_ref()
+                    .map(|track| track.id == next.id)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            // 近期失败过的曲目进入冷却：巡检不能把永久失败的歌（下架/受限）
+            // 每 5 秒无限重试——那会持续打签名服务和网络
+            if self
+                .prefetch_failed
+                .get(&next.id)
+                .is_some_and(|failed_at| failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN)
+            {
+                continue;
+            }
+            if log {
+                eprintln!("[prefetch] 开始预取：{}", next.title);
+            }
+            self.prefetch_inflight.insert(next.id.clone());
+            let settings = self.settings.clone();
+            let track = next.clone();
+            let work_track = track.clone();
+            let result = cx.background_spawn(async move {
+                Session::new(settings).download_to_cache(&work_track)
             });
-        })
-        .detach();
+            cx.spawn(async move |this, cx| {
+                let outcome = result.await;
+                let succeeded = outcome.is_ok();
+                if log {
+                    match &outcome {
+                        Ok(cached) => {
+                            eprintln!("[prefetch] {} → {}", track.title, cached.quality)
+                        }
+                        Err(err) => eprintln!("[prefetch] {} 失败: {err}", track.title),
+                    }
+                }
+                let _ = this.update(cx, |root, _cx| {
+                    // 只删自己的：避免早先的完成回执误清后来排的曲目（单槽时代踩过）
+                    root.prefetch_inflight.remove(&track.id);
+                    // 成功清冷却；失败记时刻，冷却期内巡检不再重排
+                    if succeeded {
+                        root.prefetch_failed.remove(&track.id);
+                    } else {
+                        root.prefetch_failed
+                            .insert(track.id.clone(), std::time::Instant::now());
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// UI 心跳：播放中每 200ms 刷新一次（进度条需要持续重绘），
@@ -143,10 +180,21 @@ impl Root {
                 if snap.playing || root.pending_track.is_some() {
                     cx.notify();
                 }
-                // 播完自动下一首：按序号判断（循环同一首也不会漏切）
+                // 播完自动下一首：按序号判断（循环同一首也不会漏切）。
+                // 注意：正在装载下一首（pending）时「播完」属于旧曲目，
+                // 只消费事件不推进——否则会把 pending 的那首跳过去（收尾瞬间
+                // 手动切歌/插入队列时踩过）。
                 if snap.finished && snap.finished_seq != root.last_finished_seq {
                     root.last_finished_seq = snap.finished_seq;
-                    root.next_track(cx);
+                    if root.pending_track.is_none() {
+                        root.next_track(cx);
+                    }
+                }
+                // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
+                // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
+                root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
+                if root.prefetch_patrol % 25 == 0 {
+                    root.spawn_prefetch(cx);
                 }
                 root.load_more_recommendation(cx);
             });
@@ -161,9 +209,17 @@ impl Root {
             .scroll_to_item(row, gpui::ScrollStrategy::Center);
     }
 
-    /// 从队列移除某一首（右键菜单）。移除的是正在播放的那首时，
-    /// 只把它从队列拿掉，音频继续播当前这首。
+    /// 从队列移除某一首（右键菜单）。正在播放的那首不允许移除：
+    /// 它还挂在引擎上，移除后「队列当前项」与「实际在播」会分叉。
     pub fn remove_from_queue(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == self.queue.index() {
+            self.queue_menu = None;
+            self.status = self
+                .tr("正在播放的曲目不能从队列移除，可直接点「下一首」")
+                .to_string();
+            cx.notify();
+            return;
+        }
         if self.queue.remove(index).is_some() {
             self.queue_menu = None;
             self.sync_queue_cache();
@@ -1226,8 +1282,25 @@ impl Root {
             self.nav_history.remove(0);
         }
         self.nav = nav;
+        if matches!(nav, Nav::Settings) {
+            self.refresh_cache_stats(cx);
+        }
         self.on_nav_changed(cx);
         cx.notify();
+    }
+
+    /// 后台刷新缓存统计（同步扫盘不能进渲染路径：设置页每次重绘都扫
+    /// 目录会把 UI 卡出顿挫，预取/心跳的高频 notify 会放大这个问题）。
+    pub(crate) fn refresh_cache_stats(&mut self, cx: &mut Context<Self>) {
+        let work = cx.background_spawn(async { sodam_core::audio::cache_stats() });
+        cx.spawn(async move |this, cx| {
+            let stats = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.cache_summary = stats;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 通用返回：同页详情优先关闭，再按真实访问历史回退。
@@ -1895,7 +1968,8 @@ impl Root {
     }
 
     pub fn next_track(&mut self, cx: &mut Context<Self>) {
-        // 切歌时丢掉进度预览，避免「拖到一半换歌」把 seek 用到新歌上
+        // 切歌时丢掉进度预览，避免「拖到一半换歌」把 seek 用到新歌上。
+        // 队列当前项不会被移除（remove 拒绝当前项），所以直接推进即可。
         self.progress_preview = None;
         self.queue.advance();
         self.sync_queue_cache();
@@ -1928,4 +2002,26 @@ impl Root {
             }
         }
     }
+}
+
+/// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
+/// 持续打签名服务和网络）。
+const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 预取数量：环境变量 `SODAM_PREFETCH_COUNT`（默认 3，解析失败/为 0 用默认）。
+fn prefetch_ahead_count() -> usize {
+    std::env::var("SODAM_PREFETCH_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(3)
+}
+
+/// 预取并发上限：环境变量 `SODAM_PREFETCH_CONCURRENCY`（默认 2）。
+fn prefetch_concurrency() -> usize {
+    std::env::var("SODAM_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(2)
 }

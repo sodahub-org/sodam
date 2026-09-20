@@ -89,6 +89,9 @@ impl Language {
             "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
                 "Failed to open the verification window: {err}. Export a cookie from the official client instead."
             }
+            "正在播放的曲目不能从队列移除，可直接点「下一首」" => {
+                "The playing track can't be removed from the queue. Use Next instead."
+            }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "账号" => "Account",
             "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {}",
@@ -318,6 +321,9 @@ impl Language {
             }
             "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
                 "Failed to open the verification window: {err}. Export a cookie from the official client instead."
+            }
+            "正在播放的曲目不能从队列移除，可直接点「下一首」" => {
+                "The playing track can't be removed from the queue. Use Next instead."
             }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "非 VIP" => "Non-VIP",
