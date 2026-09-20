@@ -146,7 +146,7 @@ jobs:
           fetch-depth: 1
 
       - name: Fetch tag object
-        run: git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --no-tags
+        run: git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --no-tags
 
       - name: Read changelog from tag message
         id: tagnotes
