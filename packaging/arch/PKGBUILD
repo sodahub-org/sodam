@@ -1,6 +1,6 @@
 # Maintainer: sodahub-org <https://github.com/sodahub-org/sodam>
 pkgname=sodam
-pkgver=0.1.5
+pkgver=0.1.6
 pkgrel=1
 pkgdesc='Native Qishui Music client built with GPUI'
 arch=('x86_64' 'aarch64')
