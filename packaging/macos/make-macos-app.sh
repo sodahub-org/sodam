@@ -24,14 +24,17 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m755 target/release/sodam "$app/Contents/MacOS/sodam"
 
-# ---- icon: 256px PNG -> multi-size .icns ----
+# ---- icon: 1024px PNG -> multi-size .icns ----
+# src 已按 Apple 图标网格留白（1024 画布 / 824 图形，四周 100px 透明边距）。
+# 直接用满幅的 sodam-logo.png 会让 Dock 与启动台里的图标看起来比其它 App 大一圈。
+# 重新生成：把 sodam-logo.svg 以 824x824 居中渲染到 1024x1024 透明画布。
 iconset="$stage/SodaM.iconset"
 mkdir -p "$iconset"
-src=crates/sodam/assets/brand/sodam-logo.png
-for size in 16 32 128 256; do
+src=crates/sodam/assets/brand/sodam-icon-macos.png
+for size in 16 32 128 256 512; do
   sips -z "$size" "$size" "$src" --out "$iconset/icon_${size}x${size}.png" >/dev/null
 done
-for size in 16 32 128; do
+for size in 16 32 128 256 512; do
   double=$((size * 2))
   sips -z "$double" "$double" "$src" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
