@@ -10,7 +10,13 @@ use std::sync::mpsc::Sender;
 
 use crate::ui::i18n::Language;
 
+// Linux SNI 与 Windows 通知区域使用品牌彩色图标。
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const ICON_PNG: &[u8] = include_bytes!("../assets/brand/sodam-logo-tray.png");
+
+/// macOS 菜单栏模板图：纯黑 + 透明，由 NSStatusItem 按系统明暗主题自动反色。
+#[cfg(target_os = "macos")]
+const ICON_TEMPLATE_PNG: &[u8] = include_bytes!("../assets/brand/sodam-tray-template.png");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
@@ -198,7 +204,13 @@ pub fn create_status_item(
     .expect("构建 macOS 托盘菜单不应失败");
 
     let icon = {
-        let image = image::load_from_memory(ICON_PNG)
+        // macOS 状态栏遵循系统惯例使用单色模板图（浅色菜单栏黑色、深色菜单栏白色）；
+        // Windows 通知区域保留品牌彩色图标。
+        #[cfg(target_os = "macos")]
+        let icon_png: &[u8] = ICON_TEMPLATE_PNG;
+        #[cfg(not(target_os = "macos"))]
+        let icon_png: &[u8] = ICON_PNG;
+        let image = image::load_from_memory(icon_png)
             .expect("内置托盘图标应为有效 PNG")
             .to_rgba8();
         Icon::from_rgba(image.to_vec(), image.width(), image.height())
@@ -208,6 +220,7 @@ pub fn create_status_item(
     let tray = TrayIconBuilder::new()
         .with_id("sodam")
         .with_icon(icon)
+        .with_icon_as_template(cfg!(target_os = "macos"))
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(true)
         .with_tooltip("SodaM")
