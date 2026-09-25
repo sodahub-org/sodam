@@ -57,7 +57,7 @@ SodaM 面向 Linux / macOS / Windows 桌面，重点做四件事：**接近官�
 | 平台 | 状态 |
 | --- | --- |
 | Linux / Omarchy | 已实测 |
-| macOS（Apple Silicon） | 已实测，提供 `.app` 下载 |
+| macOS（Apple Silicon） | 已实测，提供 Homebrew Cask 与 `.app` 下载 |
 | Windows（x64） | 已实测，提供安装包 |
 
 ## 界面预览
@@ -267,10 +267,30 @@ sodam
 
 ## macOS 下载安装（Apple Silicon）
 
-macOS 版已在 Apple Silicon（M 系列）真机实测，GitHub Release 提供 `.app` 压缩包，
-当前版本为 [`v0.1.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.7)。
+macOS 版已在 Apple Silicon（M 系列）真机实测。当前版本为
+[`v0.1.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.1.7)，两种安装方式任选。
 
-### 1. 下载并校验
+### 方式一：Homebrew（推荐，预编译 `.app`）
+
+```bash
+brew install --cask sodahub-org/tap/sodam
+```
+
+升级：
+
+```bash
+brew update
+brew upgrade --cask sodam
+```
+
+Cask 来自官方 tap [sodahub-org/homebrew-tap](https://github.com/sodahub-org/homebrew-tap)，
+安装的就是 GitHub Release 里的 Apple Silicon（arm64）预编译包；Intel 机型会被
+Homebrew 按架构要求拦下。安装后如仍被 Gatekeeper 拦截，用下面手动安装第 3 步的
+`xattr` 命令放行即可。
+
+### 方式二：手动下载安装包
+
+#### 1. 下载并校验
 
 ```bash
 mkdir -p /tmp/sodam-install
@@ -290,7 +310,7 @@ grep "sodam-${version}-macos-aarch64\.zip$" SHA256SUMS | shasum -a 256 -c -
 sodam-0.1.7-macos-aarch64.zip: OK
 ```
 
-### 2. 安装
+#### 2. 安装
 
 ```bash
 unzip sodam-${version}-macos-aarch64.zip
@@ -299,13 +319,13 @@ mv SodaM.app /Applications/
 
 也可以在 Finder 里双击解压后，把 **SodaM.app** 拖进「应用程序」文件夹。
 
-### 3. 首次启动（绕过 Gatekeeper）
+#### 3. 首次启动（绕过 Gatekeeper）
 
 当前发行包为 ad-hoc 签名、未经 Apple 公证，首次打开会被 Gatekeeper 拦截，
 任选一种方式放行：
 
 ```bash
-# 方式一：去掉隔离属性（推荐）
+# 去掉隔离属性（推荐）
 xattr -cr /Applications/SodaM.app
 open -a SodaM
 ```
@@ -313,7 +333,7 @@ open -a SodaM
 或：双击 SodaM.app → 在弹窗中点「取消」→ 打开「系统设置 → 隐私与安全性」→
 点「仍要打开」。
 
-### 4. 启动
+#### 4. 启动
 
 从启动台或 Finder 打开 **SodaM**，首次启动会进入设置页，按提示扫码登录后即可使用。
 后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本，
