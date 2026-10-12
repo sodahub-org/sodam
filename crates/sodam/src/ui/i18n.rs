@@ -163,6 +163,7 @@ impl Language {
             }
             "快捷键已更新" => "Shortcut updated",
             "快捷键已恢复默认" => "Shortcut reset to default",
+            "未在播放" => "Nothing playing",
             "「{}」共 {} 条结果" => "{}: {} results",
             "读取音乐人失败：{err}" => "Failed to load artist: {err}",
             "加载更多音乐人歌曲失败：{err}" => "Failed to load more artist tracks: {err}",

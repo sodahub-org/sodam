@@ -34,17 +34,43 @@ pub struct TrayState {
     pub title: String,
     pub subtitle: String,
     pub playing: bool,
+    /// 当前是否有曲目（决定菜单里那行「正在播放」显示曲名还是「未在播放」）。
+    pub has_track: bool,
+    /// 本地缓存的封面文件，菜单里那行「正在播放」用它当图标。
+    pub cover_path: Option<std::path::PathBuf>,
 }
 
+/// 菜单里「正在播放」那行最多显示多少个字符（和 sonora 一样取 26）。
+const CAPTION_LIMIT: usize = 26;
+
+/// 菜单行里的封面边长（像素）。macOS 无论如何都按 18pt 画，Windows 按原尺寸画。
+const COVER: u32 = 32;
+
 impl TrayState {
-    /// 托盘标题/tooltip 的单行摘要；未播放时只显示应用名。
-    pub fn summary(&self) -> String {
-        if self.title == "SodaM" {
+    /// 菜单顶部那行「艺人 – 曲名」；没有曲目时给一句「未在播放」。
+    ///
+    /// macOS/Windows 用它当菜单首行与 tooltip，Linux 用它当 SNI 标题/tooltip。
+    pub fn caption(&self) -> String {
+        if !self.has_track {
+            return self.language.text("未在播放").to_string();
+        }
+        let full = if self.subtitle.trim().is_empty() {
             self.title.clone()
         } else {
-            format!("{} · {}", self.title, self.subtitle)
-        }
+            format!("{} – {}", self.subtitle, self.title)
+        };
+        clip(&full, CAPTION_LIMIT)
     }
+}
+
+/// 按字符截断，超出部分用省略号（多字节字符也安全）。
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(limit.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }
 
 // ---------------------------------------------------------------- Linux (SNI)
@@ -63,6 +89,10 @@ pub mod linux {
         pub(crate) title: String,
         pub(crate) subtitle: String,
         pub(crate) playing: bool,
+        pub(crate) has_track: bool,
+        cover_path: Option<std::path::PathBuf>,
+        /// 封面转好的 ARGB32，按源路径缓存（同步每 500ms 一次，不必反复解码）。
+        cover_cache: std::cell::RefCell<Option<(std::path::PathBuf, Vec<u8>)>>,
         icon_cache: OnceLock<Icon>,
     }
 
@@ -74,8 +104,49 @@ pub mod linux {
                 title: "SodaM".to_string(),
                 subtitle: language.text("就绪").to_string(),
                 playing: false,
+                has_track: false,
+                cover_path: None,
+                cover_cache: std::cell::RefCell::new(None),
                 icon_cache: OnceLock::new(),
             }
+        }
+
+        fn state(&self) -> TrayState {
+            TrayState {
+                language: self.language,
+                title: self.title.clone(),
+                subtitle: self.subtitle.clone(),
+                playing: self.playing,
+                has_track: self.has_track,
+                cover_path: self.cover_path.clone(),
+            }
+        }
+
+        /// 当前曲目封面的菜单图标（SNI 的 ARGB32）。拿不到就返回空，菜单行照常显示文字。
+        fn cover_argb(&self) -> Vec<u8> {
+            let state = self.state();
+            let Some(path) = state.cover_path.as_ref() else {
+                return Vec::new();
+            };
+            if let Some((cached, data)) = self.cover_cache.borrow().as_ref() {
+                if cached == path {
+                    return data.clone();
+                }
+            }
+            let data = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                .map(|image| {
+                    let image = image.thumbnail(COVER, COVER).to_rgba8();
+                    let mut argb = Vec::with_capacity(image.as_raw().len());
+                    for pixel in image.pixels() {
+                        argb.extend_from_slice(&[pixel[3], pixel[0], pixel[1], pixel[2]]);
+                    }
+                    argb
+                })
+                .unwrap_or_default();
+            *self.cover_cache.borrow_mut() = Some((path.clone(), data.clone()));
+            data
         }
 
         fn send(&self, command: TrayCommand) {
@@ -110,13 +181,7 @@ pub mod linux {
         }
 
         fn title(&self) -> String {
-            TrayState {
-                language: self.language,
-                title: self.title.clone(),
-                subtitle: self.subtitle.clone(),
-                playing: self.playing,
-            }
-            .summary()
+            self.state().caption()
         }
 
         fn icon_pixmap(&self) -> Vec<Icon> {
@@ -128,7 +193,19 @@ pub mod linux {
         }
 
         fn menu(&self) -> Vec<MenuItem<Self>> {
+            let caption = self.state().caption();
             vec![
+                // 当前播放信息：封面 + 「艺人 – 曲名」。有曲目时点它开主窗口，
+                // 没曲目时禁用（避免看起来能点却没反应）。
+                StandardItem {
+                    label: caption,
+                    icon_data: self.cover_argb(),
+                    enabled: self.has_track,
+                    activate: Box::new(|this: &mut Self| this.send(TrayCommand::Show)),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
                 StandardItem {
                     label: if self.playing {
                         self.language.text("暂停")
@@ -182,10 +259,12 @@ pub fn create_status_item(
     language: Language,
 ) -> impl FnMut(TrayState) + 'static {
     use tray_icon::menu::accelerator::Accelerator;
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
     let text = |key: &'static str| language.text(key).to_string();
+    // 顶部那行「封面 + 艺人 – 曲名」：不参与动作，点了就开主窗口。
+    let caption_item = IconMenuItem::with_id("caption", "SodaM", true, None, None::<Accelerator>);
     let toggle_item = MenuItem::with_id("toggle", text("播放"), true, None::<Accelerator>);
     let prev_item = MenuItem::with_id("prev", text("上一首"), true, None::<Accelerator>);
     let next_item = MenuItem::with_id("next", text("下一首"), true, None::<Accelerator>);
@@ -193,6 +272,8 @@ pub fn create_status_item(
     let quit_item = MenuItem::with_id("quit", text("退出"), true, None::<Accelerator>);
     let menu = Menu::new();
     menu.append_items(&[
+        &caption_item,
+        &PredefinedMenuItem::separator(),
         &toggle_item,
         &prev_item,
         &next_item,
@@ -229,18 +310,38 @@ pub fn create_status_item(
 
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let command = match event.id().as_ref() {
+            // 点了「正在播放」那行就把主窗口叫出来（没有曲目详情页可跳）。
+            "caption" | "show" => TrayCommand::Show,
             "toggle" => TrayCommand::Toggle,
             "prev" => TrayCommand::Previous,
             "next" => TrayCommand::Next,
-            "show" => TrayCommand::Show,
             "quit" => TrayCommand::Quit,
             _ => return,
         };
         let _ = tx.send(command);
     }));
 
+    // 封面每 500ms 会被同步一次，按源路径缓存解码结果。
+    let mut cover_cache: Option<(std::path::PathBuf, tray_icon::menu::Icon)> = None;
+
     move |state: TrayState| {
         let language = state.language;
+        let caption = state.caption();
+        caption_item.set_text(caption.clone());
+        caption_item.set_enabled(state.has_track);
+        let cover = state.cover_path.as_ref().and_then(|path| {
+            if cover_cache
+                .as_ref()
+                .is_some_and(|(cached, _)| cached == path)
+            {
+                return cover_cache.as_ref().map(|(_, icon)| icon.clone());
+            }
+            let icon = cover_icon(path)?;
+            cover_cache = Some((path.clone(), icon.clone()));
+            Some(icon)
+        });
+        caption_item.set_icon(cover);
+
         toggle_item.set_text(if state.playing {
             language.text("暂停")
         } else {
@@ -250,6 +351,22 @@ pub fn create_status_item(
         next_item.set_text(language.text("下一首"));
         show_item.set_text(language.text("显示主窗口"));
         quit_item.set_text(language.text("退出"));
-        let _ = tray.set_tooltip(Some(state.summary()));
+        // tooltip 跟菜单那行一致，悬停图标就能看到在放什么。
+        let _ = tray.set_tooltip(Some(caption));
     }
+}
+
+/// 读本地缓存的封面，缩到菜单行尺寸并转成菜单图标。
+///
+/// 注意类型：菜单项要的是 `tray_icon::menu::Icon`，和状态栏自己的 `tray_icon::Icon`
+/// 不是一个类型。失败返回 `None`：那一行只显示文字，不因为封面读不出来影响整个菜单。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cover_icon(path: &std::path::Path) -> Option<tray_icon::menu::Icon> {
+    let bytes = std::fs::read(path).ok()?;
+    let image = image::load_from_memory(&bytes)
+        .ok()?
+        .thumbnail(COVER, COVER)
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    tray_icon::menu::Icon::from_rgba(image.into_raw(), width, height).ok()
 }
