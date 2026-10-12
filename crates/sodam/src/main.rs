@@ -9,6 +9,8 @@ mod app;
 mod tray;
 mod ui;
 mod views;
+// 系统媒体控制（媒体键 / 桌面媒体挂件），见 media.rs。
+mod media;
 // 播放控制快捷键（可重绑），见 shortcuts.rs。
 mod shortcuts;
 // macOS 菜单栏与标准快捷键（⌘Q/⌘M/⌘W），见 menus.rs。
@@ -47,6 +49,24 @@ fn main_window_options(cx: &mut App) -> WindowOptions {
     }
 }
 
+/// Windows 上取窗口的原生 HWND（系统媒体控件挂在窗口上）；其它平台没有这个概念。
+#[cfg(target_os = "windows")]
+fn native_handle(window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // 必须显式写 trait 名：gpui 的 `Window` 自带一个同名的 `window_handle()`（返回
+    // `AnyWindowHandle`），方法语法会优先命中那个，拿不到原生句柄。
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
+    None
+}
+
 /// 托盘事件循环：把命令转发为应用动作，并周期同步播放状态到 `sync`。
 /// 双平台共用；平台差异只在 `sync` 闭包（见 tray.rs）。
 fn start_tray_service(
@@ -77,6 +97,23 @@ fn start_tray_service(
                 };
             }
 
+            // 系统媒体控件（媒体键 / 桌面挂件按钮）的请求 → 播放动作。
+            for command in cx.update(|cx| media::drain_commands(cx)) {
+                cx.update(|cx| {
+                    app.update(cx, |root, cx| {
+                        let playing = root.engine.snapshot().playing;
+                        match command {
+                            media::Command::Play if !playing => root.toggle_play(cx),
+                            media::Command::Pause if playing => root.toggle_play(cx),
+                            media::Command::Toggle => root.toggle_play(cx),
+                            media::Command::Next => root.next_track(cx),
+                            media::Command::Previous => root.prev_track(cx),
+                            _ => {}
+                        }
+                    })
+                });
+            }
+
             // 设置页重绑快捷键后置位，这里重新注册（清空 + 重建 keymap，见 shortcuts::apply）。
             let settings_changed = cx.update(|cx| {
                 app.update(cx, |root, _cx| {
@@ -92,30 +129,42 @@ fn start_tray_service(
 
             tick += 1;
             if tick % 5 == 0 {
-                cx.update(|cx| {
+                let now = cx.update(|cx| {
                     app.update(cx, |root, _cx| {
                         let snapshot = root.engine.snapshot();
+                        let track = root.queue.current();
                         let title = if snapshot.track_id.is_empty() {
                             "SodaM".to_string()
                         } else {
-                            snapshot.title
+                            snapshot.title.clone()
                         };
                         let subtitle = if snapshot.track_id.is_empty() {
                             root.tr("就绪").to_string()
                         } else {
-                            root.queue
-                                .current()
-                                .map(|track| track.artist.clone())
-                                .unwrap_or_default()
+                            track.map(|track| track.artist.clone()).unwrap_or_default()
                         };
                         sync(tray::TrayState {
                             language: root.language,
                             title,
                             subtitle,
                             playing: snapshot.playing,
+                            has_track: !snapshot.track_id.is_empty(),
+                            cover_path: track.and_then(|track| root.cover_of(&track.cover)),
                         });
-                    });
+                        // 顺手发布给系统媒体面板（内容没变时 publish 内部会跳过）。
+                        media::NowPlaying {
+                            track_id: snapshot.track_id.clone(),
+                            title: snapshot.title.clone(),
+                            artist: track.map(|t| t.artist.clone()).unwrap_or_default(),
+                            album: track.map(|t| t.album.clone()).unwrap_or_default(),
+                            cover_path: track.and_then(|t| root.cover_of(&t.cover)),
+                            duration_seconds: snapshot.duration_seconds,
+                            position_seconds: snapshot.position_seconds,
+                            playing: snapshot.playing,
+                        }
+                    })
                 });
+                cx.update(|cx| media::publish(cx, &now));
             }
         }
     })
@@ -151,8 +200,12 @@ fn main() {
             let settings = app.read(cx).settings.clone();
             shortcuts::install(cx, &settings, app.clone());
             let options = main_window_options(cx);
-            cx.open_window(options, |_window, _cx| app.clone())
-                .expect("打开主窗口失败");
+            cx.open_window(options, |window, cx| {
+                // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
+                media::attach(native_handle(window), cx);
+                app.clone()
+            })
+            .expect("打开主窗口失败");
 
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
