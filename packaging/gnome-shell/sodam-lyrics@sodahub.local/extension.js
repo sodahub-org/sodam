@@ -8,6 +8,8 @@
 //! 顶栏出现/消失，也不会遮挡窗口。只在 SodaM 运行时显示，点击文字区会唤起主窗口。
 
 import Clutter from 'gi://Clutter';
+import Cairo from 'gi://cairo';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
@@ -36,6 +38,7 @@ export default class SodamLyricsExtension extends Extension {
             barVisible: true,
         };
         this._sodaMRunning = false;
+        this._coverUrl = null;
         this._mpris = null;
         this._lyrics = null;
         this._mprisSignals = [];
@@ -240,6 +243,7 @@ export default class SodamLyricsExtension extends Extension {
 
     _onSodaMAbsent() {
         this._sodaMRunning = false;
+        this._coverUrl = null;
         this._indicator.hide();
         this._dropProxies();
     }
@@ -337,6 +341,38 @@ export default class SodamLyricsExtension extends Extension {
         this._render();
     }
 
+    /// St 的 border-radius 不裁剪子元素，所以先用 Cairo 生成一张圆角封面。
+    _roundedCover(artUrl) {
+        try {
+            const source = Gio.File.new_for_uri(artUrl).get_path();
+            if (!source)
+                return null;
+            const size = 64;
+            const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(source, size, size, true);
+            const tmpPng = GLib.build_filenamev([GLib.get_tmp_dir(), 'sodam-cover-src.png']);
+            pixbuf.savev(tmpPng, 'png', [], []);
+            const src = Cairo.ImageSurface.createFromPNG(tmpPng);
+            const surface = new Cairo.ImageSurface(Cairo.Format.ARGB32, size, size);
+            const cr = new Cairo.Context(surface);
+            const radius = 12;
+            cr.newSubPath();
+            cr.arc(radius, radius, radius, Math.PI, 1.5 * Math.PI);
+            cr.arc(size - radius, radius, radius, 1.5 * Math.PI, 2 * Math.PI);
+            cr.arc(size - radius, size - radius, radius, 0, 0.5 * Math.PI);
+            cr.arc(radius, size - radius, radius, 0.5 * Math.PI, Math.PI);
+            cr.closePath();
+            cr.clip();
+            cr.setSourceSurface(src, 0, 0);
+            cr.paint();
+            const out = GLib.build_filenamev([GLib.get_tmp_dir(), 'sodam-cover-rounded.png']);
+            surface.writeToPNG(out);
+            return out;
+        } catch (e) {
+            console.warn('[sodam-lyrics] cover rounding failed:', e);
+            return null;
+        }
+    }
+
     _render() {
         if (!this._indicator)
             return;
@@ -348,12 +384,13 @@ export default class SodamLyricsExtension extends Extension {
         this._lyricLabel.text = this._state.lyric ||
             (this._state.hasLyrics ? '' : '没有可用歌词');
 
-        if (this._state.artUrl) {
-            try {
-                const file = Gio.File.new_for_uri(this._state.artUrl);
-                this._cover.gicon = new Gio.FileIcon({file});
-            } catch (_e) {
-                this._cover.gicon = null;
+        if (this._state.artUrl && this._state.artUrl !== this._coverUrl) {
+            this._coverUrl = this._state.artUrl;
+            const rounded = this._roundedCover(this._state.artUrl);
+            if (rounded) {
+                this._cover.gicon = new Gio.FileIcon({
+                    file: Gio.File.new_for_path(rounded),
+                });
             }
         }
 

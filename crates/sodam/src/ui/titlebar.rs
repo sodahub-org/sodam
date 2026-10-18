@@ -122,16 +122,16 @@ fn lyrics_button(
                 .flex()
                 .items_center()
                 .justify_center()
-                .w(px(28.0))
-                .h(px(24.0))
-                .rounded(px(7.0))
-                .when(active, |this| this.bg(theme::accent()))
+                .w(px(22.0))
+                .h(px(18.0))
+                .rounded(px(4.0))
+                .when(active, |this| this.bg(theme::surface_hover()))
                 .child(
                     svg()
                         .path(icons::path("captions"))
                         .size(px(GLYPH_SIZE))
                         .text_color(if active {
-                            theme::accent_foreground()
+                            theme::text()
                         } else {
                             theme::text_muted()
                         }),
