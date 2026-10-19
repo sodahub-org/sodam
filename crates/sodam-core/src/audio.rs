@@ -370,19 +370,6 @@ fn audio_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let Some(command) = command else {
-            // 系统默认输出设备被切换（Windows 音响 → USB 耳机、macOS 换 AirPods…）：
-            // 已打开的流仍绑在旧设备上，不重建就得重启应用才生效。
-            if output.is_some() && device_watcher.poll(&mut probe) {
-                follow_default_output(
-                    &mut output,
-                    &mut player,
-                    &mut current_path,
-                    &mut watchdog,
-                    &state,
-                    &stream_error,
-                    &mut open_output,
-                );
-            }
             if let Some(current) = &player {
                 if watchdog.stalled(
                     current.get_pos().as_secs_f64(),
@@ -411,6 +398,22 @@ fn audio_thread(
                         snap.finished_seq = snap.finished_seq.wrapping_add(1);
                     }
                 }
+            }
+            // 设备切换放在「播完」判定**之后**：如果恰好在这个 tick 播完，
+            // 必须先上报 finished（UI 才会切下一首），否则重建输出会把空播放器
+            // 丢掉，finished 永远不触发，播放会卡在上一首的结尾。
+            // 系统默认输出设备被切换（Windows 音响 → USB 耳机、macOS 换 AirPods…）：
+            // 已打开的流仍绑在旧设备上，不重建就得重启应用才生效。
+            if output.is_some() && device_watcher.poll(&mut probe) {
+                follow_default_output(
+                    &mut output,
+                    &mut player,
+                    &mut current_path,
+                    &mut watchdog,
+                    &state,
+                    &stream_error,
+                    &mut open_output,
+                );
             }
             continue;
         };
