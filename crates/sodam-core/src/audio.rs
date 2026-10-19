@@ -4,6 +4,12 @@
 //! UI 侧只通过命令通道操作、通过 `Arc<Mutex<PlaybackSnapshot>>` 读状态。
 //!
 //! 没有可用音频设备时**不 panic**：把错误写进快照，界面照常能跑（用户可能没接耳机）。
+//!
+//! **跟随系统默认输出设备**：Windows(WASAPI)、macOS(CoreAudio) 下流在创建时就跟设备
+//! 绑死，切换默认设备（音响 → USB 耳机）对已开的流无效，必须重建；否则要重启应用才生效。
+//! 播放线程每 2 秒探测一次默认设备 ID，变化时换新输出并从原位置续播。
+//! Linux 的 cpal ALSA 后端恒返回 `default` 单一设备，且 PipeWire/WirePlumber 会把现有流
+//! 自动迁到新的默认节点，因此探测天然不触发 —— 行为与修复前一致。
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -100,13 +106,14 @@ impl PlaybackEngine {
     }
 
     pub fn with_volume(saved_volume: f32) -> Self {
-        Self::with_output(saved_volume, open_output)
+        Self::with_output(saved_volume, open_output, probe_default_output_id)
     }
 
-    // 单测注入故障输出，不触碰硬件/COM；正式运行始终使用上面的真实设备工厂。
+    // 单测注入故障输出与设备探测，不触碰硬件/COM；正式运行始终使用上面的真实实现。
     fn with_output(
         saved_volume: f32,
         open_output: impl FnMut(OutputErrors) -> OutputResult + Send + 'static,
+        probe: impl FnMut() -> Option<String> + Send + 'static,
     ) -> Self {
         let (tx, rx) = channel();
         // 显式环境覆盖仍优先（静音开发测试），无覆盖时恢复用户保存的值。
@@ -119,7 +126,7 @@ impl PlaybackEngine {
         let state = snapshot.clone();
         let spawned = std::thread::Builder::new()
             .name("sodam-audio".to_string())
-            .spawn(move || audio_thread(rx, state, open_output));
+            .spawn(move || audio_thread(rx, state, open_output, probe));
         if let Err(err) = spawned {
             if let Ok(mut snap) = snapshot.lock() {
                 snap.error = format!("音频线程启动失败：{err}");
@@ -272,10 +279,58 @@ impl OutputWatchdog {
     }
 }
 
+/// 探测系统默认输出设备的稳定 ID（`None` = 现在拿不到默认设备）。
+fn probe_default_output_id() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let host = rodio::cpal::default_host();
+    let device = host.default_output_device()?;
+    device.id().ok().map(|id| id.to_string())
+}
+
+/// 默认输出设备轮询节流：播放线程 100ms 一个 tick，20 个 tick ≈ 2 秒。
+const DEVICE_POLL_TICKS: u8 = 20;
+
+/// 默认输出设备变化检测。
+///
+/// 初次探测为空（启动时没有设备）不算切换，避免启动瞬间误重建。
+/// 探测失败（一瞬间拿不到默认设备）也不算切换，避免把正在播的歌打断。
+struct DeviceWatcher {
+    last: Option<String>,
+    ticks: u8,
+}
+
+impl DeviceWatcher {
+    fn new(initial: Option<String>) -> Self {
+        Self {
+            last: initial,
+            ticks: 0,
+        }
+    }
+
+    /// 每个 tick 调用一次；返回 `true` 表示默认设备确实换了。
+    fn poll(&mut self, probe: &mut impl FnMut() -> Option<String>) -> bool {
+        self.ticks = self.ticks.saturating_add(1);
+        if self.ticks < DEVICE_POLL_TICKS {
+            return false;
+        }
+        self.ticks = 0;
+        let Some(current) = probe() else {
+            return false;
+        };
+        let changed = match &self.last {
+            Some(previous) => *previous != current,
+            None => false,
+        };
+        self.last = Some(current);
+        changed
+    }
+}
+
 fn audio_thread(
     rx: Receiver<Command>,
     state: Arc<Mutex<PlaybackSnapshot>>,
     mut open_output: impl FnMut(OutputErrors) -> OutputResult,
+    mut probe: impl FnMut() -> Option<String>,
 ) {
     let stream_error = Arc::new(Mutex::new(None));
     // 失效的输出会在下一次装载时重新打开，不把启动时/休眠后的失败永久锁死。
@@ -288,6 +343,9 @@ fn audio_thread(
     };
 
     let mut player: Option<rodio::Player> = None;
+    // 重建输出时要从原位置续播，必须记住当前曲目的文件路径。
+    let mut current_path: Option<PathBuf> = None;
+    let mut device_watcher = DeviceWatcher::new(probe());
     let mut _current_lease = None;
     let mut watchdog = OutputWatchdog::new(std::time::Instant::now());
     // 当前曲目是否已经上报过「播完」；换曲时重置
@@ -299,6 +357,7 @@ fn audio_thread(
                 previous.stop();
             }
             _current_lease = None;
+            current_path = None;
             output = None;
             set_error(&state, error);
             finished_reported = true;
@@ -311,6 +370,19 @@ fn audio_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let Some(command) = command else {
+            // 系统默认输出设备被切换（Windows 音响 → USB 耳机、macOS 换 AirPods…）：
+            // 已打开的流仍绑在旧设备上，不重建就得重启应用才生效。
+            if output.is_some() && device_watcher.poll(&mut probe) {
+                follow_default_output(
+                    &mut output,
+                    &mut player,
+                    &mut current_path,
+                    &mut watchdog,
+                    &state,
+                    &stream_error,
+                    &mut open_output,
+                );
+            }
             if let Some(current) = &player {
                 if watchdog.stalled(
                     current.get_pos().as_secs_f64(),
@@ -321,6 +393,7 @@ fn audio_thread(
                         previous.stop();
                     }
                     _current_lease = None;
+                    current_path = None;
                     output = None;
                     set_error(&state, "音频输出长时间无响应，请重试播放".to_string());
                     finished_reported = true;
@@ -404,6 +477,7 @@ fn audio_thread(
                     finished_reported = false;
                 }
                 player = Some(new_player);
+                current_path = Some(path);
                 watchdog = OutputWatchdog::new(std::time::Instant::now());
                 _current_lease = Some(lease);
             }
@@ -436,6 +510,7 @@ fn audio_thread(
                     current.stop();
                 }
                 _current_lease = None;
+                current_path = None;
                 if let Ok(mut snap) = state.lock() {
                     snap.playing = false;
                     snap.finished = false;
@@ -467,6 +542,79 @@ fn audio_thread(
         if let Some(current) = &player {
             sync_progress(&state, current);
         }
+    }
+}
+
+/// 默认设备变化后把输出重建到新设备，并从原位置继续播放。
+///
+/// 打开新设备失败时**保留旧流**（例如目标设备刚好在枚举瞬间消失），
+/// 下一次轮询再试，避免一次瞬时失败把正在播的歌停掉。
+fn follow_default_output(
+    output: &mut Option<rodio::MixerDeviceSink>,
+    player: &mut Option<rodio::Player>,
+    current_path: &mut Option<PathBuf>,
+    watchdog: &mut OutputWatchdog,
+    state: &Arc<Mutex<PlaybackSnapshot>>,
+    stream_error: &Arc<Mutex<Option<String>>>,
+    open_output: &mut impl FnMut(OutputErrors) -> OutputResult,
+) {
+    // 先把续播信息取出来，再去动旧流。
+    let resume = player
+        .as_ref()
+        .filter(|current| !current.empty())
+        .map(|current| (current.get_pos(), current.is_paused()));
+    let volume = state.lock().map(|snap| snap.volume).unwrap_or(1.0);
+
+    let Ok(new_output) = open_output(stream_error.clone()) else {
+        return;
+    };
+    if let Some(previous) = player.take() {
+        previous.stop();
+    }
+    *output = Some(new_output);
+
+    let Some((position, paused)) = resume else {
+        // 没在播（已停止 / 已播完）：换好输出即可，下一次装载直接用新设备。
+        *current_path = None;
+        return;
+    };
+    let Some(path) = current_path.clone() else {
+        return;
+    };
+
+    let decoder = std::fs::File::open(&path)
+        .map_err(|err| err.to_string())
+        .and_then(|file| {
+            rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|err| err.to_string())
+        });
+    let decoder = match decoder {
+        Ok(decoder) => decoder,
+        Err(err) => {
+            set_error(state, format!("切换音频设备后重新打开失败：{err}"));
+            return;
+        }
+    };
+    let Some(device) = output.as_ref() else {
+        return;
+    };
+    let new_player = rodio::Player::connect_new(device.mixer());
+    new_player.set_volume(volume);
+    new_player.append(decoder);
+    if new_player.try_seek(position).is_err() {
+        // 定位失败就从头播，总比丢歌好。
+        let _ = new_player.try_seek(std::time::Duration::ZERO);
+    }
+    if paused {
+        new_player.pause();
+    } else {
+        new_player.play();
+    }
+    *player = Some(new_player);
+    *watchdog = OutputWatchdog::new(std::time::Instant::now());
+    if let Ok(mut snap) = state.lock() {
+        snap.position_seconds = position.as_secs_f64();
+        snap.playing = !paused;
+        snap.error.clear();
     }
 }
 
@@ -547,6 +695,74 @@ pub fn clear_cache() -> usize {
 mod tests {
     use super::*;
 
+    /// 跑满一个轮询周期，返回每个 tick 的 `poll` 结果。
+    fn advance(
+        watcher: &mut DeviceWatcher,
+        probe: &mut impl FnMut() -> Option<String>,
+    ) -> Vec<bool> {
+        (0..DEVICE_POLL_TICKS)
+            .map(|_| watcher.poll(probe))
+            .collect()
+    }
+
+    #[test]
+    fn device_watcher_reports_each_switch_exactly_once() {
+        let device = std::rc::Rc::new(std::cell::RefCell::new(Some("wasapi:speakers".to_string())));
+        let mut watcher = DeviceWatcher::new(device.borrow().clone());
+        let mut probe = || device.borrow().clone();
+
+        // 没换设备：一个周期内一次都不报。
+        assert!(advance(&mut watcher, &mut probe)
+            .iter()
+            .all(|changed| !changed));
+
+        // 切到 USB 耳机：只在真正探测的那一个 tick 报一次。
+        *device.borrow_mut() = Some("wasapi:usb-headset".to_string());
+        let ticks = advance(&mut watcher, &mut probe);
+        assert_eq!(ticks.iter().filter(|changed| **changed).count(), 1);
+        assert!(ticks.last().copied().unwrap_or(false));
+
+        // 之后不再重复报（否则会持续重建输出）。
+        assert!(advance(&mut watcher, &mut probe)
+            .iter()
+            .all(|changed| !changed));
+    }
+
+    #[test]
+    fn device_watcher_ignores_unknown_start_and_transient_failures() {
+        let device: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        // 启动时没有默认设备：首次探测到设备只做采纳，不算切换。
+        let mut watcher = DeviceWatcher::new(None);
+        let mut probe = || device.borrow().clone();
+        *device.borrow_mut() = Some("coreaudio:builtin".to_string());
+        assert!(advance(&mut watcher, &mut probe)
+            .iter()
+            .all(|changed| !changed));
+
+        // 探测失败（一瞬间拿不到默认设备）不能把正在播的歌打断。
+        *device.borrow_mut() = None;
+        assert!(advance(&mut watcher, &mut probe)
+            .iter()
+            .all(|changed| !changed));
+
+        // 设备回来且没变：不报切换。
+        *device.borrow_mut() = Some("coreaudio:builtin".to_string());
+        assert!(advance(&mut watcher, &mut probe)
+            .iter()
+            .all(|changed| !changed));
+
+        // 真正换成 AirPods 才报。
+        *device.borrow_mut() = Some("coreaudio:airpods".to_string());
+        assert_eq!(
+            advance(&mut watcher, &mut probe)
+                .iter()
+                .filter(|changed| **changed)
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn watchdog_reports_stalls_but_not_pauses_or_normal_progress() {
         let now = std::time::Instant::now();
@@ -576,10 +792,14 @@ mod tests {
         std::fs::write(&path, b"not an audio file").unwrap();
         let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_opens = opens.clone();
-        let engine = PlaybackEngine::with_output(0.0, move |_| {
-            worker_opens.fetch_add(1, Ordering::SeqCst);
-            Err(rodio::DeviceSinkError::NoDevice)
-        });
+        let engine = PlaybackEngine::with_output(
+            0.0,
+            move |_| {
+                worker_opens.fetch_add(1, Ordering::SeqCst);
+                Err(rodio::DeviceSinkError::NoDevice)
+            },
+            || None,
+        );
         for _ in 0..2 {
             let cached = CachedTrack {
                 path: path.clone(),
@@ -669,7 +889,8 @@ mod tests {
     #[test]
     fn engine_starts_without_audio_device_and_reports_state() {
         // 确定性模拟没有音频设备：不依赖 runner 恰好未安装声卡。
-        let engine = PlaybackEngine::with_output(1.0, |_| Err(rodio::DeviceSinkError::NoDevice));
+        let engine =
+            PlaybackEngine::with_output(1.0, |_| Err(rodio::DeviceSinkError::NoDevice), || None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while engine.snapshot().error.is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
