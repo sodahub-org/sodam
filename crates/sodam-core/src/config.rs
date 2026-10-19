@@ -32,6 +32,9 @@ pub struct Settings {
     pub theme: String,
     /// 界面语言：`zh` / `en`；空或 `auto` = 跟随系统语言。
     pub language: String,
+    /// Linux 下是否自绘窗口控制按钮：`auto`（默认，按桌面装饰能力）/ `always` / `never`。
+    /// Windows 与 macOS 由系统负责，此项不生效。
+    pub titlebar: String,
     /// 播放/暂停快捷键（gpui 的 keystroke 写法，如 `space`、`ctrl-left`）。
     /// 空串 = 用内置默认值 `DEFAULT_SHORTCUT_*`。
     pub shortcut_toggle: String,
@@ -81,6 +84,52 @@ pub const DEFAULT_SIGNER_TOKEN: &str = "b356ad402bc31ee9e5a99cfdbf41eaa39961a562
 const LEGACY_SIGNER_URL: &str = "http://222.186.10.201:8921/sign";
 const LEGACY_SIGNER_TOKEN: &str = "05f8089b8c5f60c63f2a6dcfe1028d28ee2725a504f3e59b";
 
+/// Linux 下自绘窗口控制按钮（标题栏）的策略。
+///
+/// 不同桌面对 xdg-decoration 的回答差别很大：
+/// * GNOME 等：协商成客户端装饰，告诉应用「你自己画」——必须自绘，否则没有按钮；
+/// * Hyprland / sway 等 wlroots 平铺桌面：协商成服务端装饰，但自己同样不画标题栏，
+///   这类桌面上窗口本来就由键盘/手势管理，通常不需要应用再画一套。
+///
+/// 所以默认 `Auto` 直接跟随协商结果，需要时可在设置里强制开或关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitlebarMode {
+    /// 按桌面协商结果决定（默认）。
+    #[default]
+    Auto,
+    /// 始终自绘。
+    Always,
+    /// 始终不自绘。
+    Never,
+}
+
+impl TitlebarMode {
+    pub fn from_key(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" | "on" | "show" => Self::Always,
+            "never" | "off" | "hide" => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// `client_decorated` 来自 gpui 的 `Decorations::Client`：桌面是否要求应用自绘。
+    pub fn draws_titlebar(self, client_decorated: bool) -> bool {
+        match self {
+            Self::Auto => client_decorated,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -97,6 +146,7 @@ impl Default for Settings {
             audio_cache_limit_mb: crate::cache::DEFAULT_AUDIO_LIMIT_MB,
             theme: String::new(),
             language: String::new(),
+            titlebar: String::new(),
             shortcut_toggle: String::new(),
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
@@ -359,6 +409,32 @@ mod tests {
         assert_eq!(loaded.signer_token, "my-own-token");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 窗口按钮策略：默认 auto，未知值也回退 auto，老配置缺字段不影响。
+    #[test]
+    fn titlebar_mode_parses_and_resolves() {
+        assert_eq!(TitlebarMode::default(), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key(""), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key("auto"), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key(" ALWAYS "), TitlebarMode::Always);
+        assert_eq!(TitlebarMode::from_key("never"), TitlebarMode::Never);
+        assert_eq!(TitlebarMode::from_key("nonsense"), TitlebarMode::Auto);
+
+        // auto 跟随桌面：GNOME 这类要求客户端自绘 → 画；Hyprland 这类 → 不画
+        assert!(TitlebarMode::Auto.draws_titlebar(true));
+        assert!(!TitlebarMode::Auto.draws_titlebar(false));
+        // 强制开关覆盖协商结果
+        assert!(TitlebarMode::Always.draws_titlebar(false));
+        assert!(!TitlebarMode::Never.draws_titlebar(true));
+
+        // 旧配置没有 titlebar 字段时按默认值读出来
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"theme":"dark","language":"zh"}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.titlebar, "");
+        assert_eq!(TitlebarMode::from_key(&loaded.titlebar), TitlebarMode::Auto);
     }
 
     /// 快捷键：默认值、空串回退、老配置缺字段也能读。

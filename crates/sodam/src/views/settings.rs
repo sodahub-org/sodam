@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::ui::i18n::Language;
+#[cfg(target_os = "linux")]
+use sodam_core::config::TitlebarMode;
 
 /// 字节 → 人类可读（KB / MB / GB）。
 fn human_bytes(bytes: u64) -> String {
@@ -167,6 +169,130 @@ fn account_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             )
         })
         .into_any_element()
+}
+
+/// Linux 专属：窗口控制按钮的显示策略。
+///
+/// 只有 Linux 需要这个开关：Windows 一定会去掉系统标题栏、macOS 用系统红绿灯，
+/// 其它平台直接返回空，不占布局。
+#[cfg(target_os = "linux")]
+fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyElement> {
+    let current = TitlebarMode::from_key(&root.settings.titlebar);
+    let rows: Vec<AnyElement> = [
+        (
+            TitlebarMode::Auto,
+            root.tr("自动（跟随桌面）"),
+            root.tr("由桌面是否要求客户端自绘决定：GNOME 等显示，Hyprland 等平铺桌面不显示"),
+        ),
+        (
+            TitlebarMode::Always,
+            root.tr("总是显示"),
+            root.tr("即使桌面自己不管窗口，也显示最小化 / 最大化 / 关闭按钮"),
+        ),
+        (
+            TitlebarMode::Never,
+            root.tr("不显示"),
+            root.tr("完全交给桌面管理窗口，不画任何按钮"),
+        ),
+    ]
+    .into_iter()
+    .map(|(mode, title, hint)| {
+        let chosen = mode == current;
+        div()
+            .id(gpui::ElementId::Name(
+                format!("titlebar-set-{}", mode.key()).into(),
+            ))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(theme::space::LG))
+            .px(px(theme::space::MD))
+            .py(px(theme::space::SM))
+            .rounded(px(theme::radius::ROW))
+            .cursor_pointer()
+            .when(chosen, |this| this.bg(theme::surface_selected()))
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.settings.titlebar = mode.key().to_string();
+                if let Err(err) = root.settings.save() {
+                    root.status =
+                        root.localized("窗口按钮已切换，但保存失败：{err}", &[err.to_string()]);
+                } else {
+                    root.status = match mode {
+                        TitlebarMode::Auto => root.tr("窗口按钮：自动（跟随桌面）").to_string(),
+                        TitlebarMode::Always => root.tr("窗口按钮：总是显示").to_string(),
+                        TitlebarMode::Never => root.tr("窗口按钮：不显示").to_string(),
+                    };
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(theme::Text::Body.size())
+                            .text_color(if chosen {
+                                theme::text()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::Text::Small.size())
+                            .text_color(theme::text_muted())
+                            .child(hint),
+                    ),
+            )
+            .when(chosen, |this| {
+                this.child(
+                    svg()
+                        .path(icons::path("check"))
+                        .size(px(theme::ICON))
+                        .text_color(theme::accent()),
+                )
+            })
+            .into_any_element()
+    })
+    .collect();
+
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::space::XS))
+            .child(
+                div()
+                    .text_size(theme::Text::Large.size())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child(root.tr("窗口")),
+            )
+            .child(
+                div()
+                    .text_size(theme::Text::Small.size())
+                    .text_color(theme::text_muted())
+                    .child(root.tr("Linux 下是否自绘最小化 / 最大化 / 关闭按钮")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::space::XS))
+                    .children(rows),
+            )
+            .into_any_element(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn window_controls_section(_root: &Root, _cx: &mut Context<Root>) -> Option<AnyElement> {
+    None
 }
 
 pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
@@ -468,6 +594,7 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .collect::<Vec<_>>(),
             ),
         )
+        .children(window_controls_section(root, cx))
         .child(
             div()
                 .flex()

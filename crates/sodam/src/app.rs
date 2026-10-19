@@ -890,11 +890,19 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Wayland 下 gpui 只能提供客户端装饰：系统不画标题栏，最小化/最大化/关闭
-        // 按钮必须应用自绘。X11 与 macOS 走服务端装饰，窗口管理器已经提供了标题栏，
-        // 再画一层会出现两套按钮。
-        let own_titlebar = cfg!(target_os = "windows")
-            || matches!(window.window_decorations(), Decorations::Client { .. });
+        // Windows 自绘标题栏（系统标题栏被 WM_NCCALCSIZE 去掉）；macOS 用系统红绿灯。
+        // Linux 交给设置项：默认 auto 跟随桌面协商结果 —— GNOME 这类要求客户端装饰的
+        // 桌面需要自绘，Hyprland/sway 这类平铺桌面协商成服务端装饰但不画标题栏，
+        // 用户也可以在设置里强制显示或隐藏。
+        let own_titlebar = if cfg!(target_os = "windows") {
+            true
+        } else if cfg!(target_os = "macos") {
+            false
+        } else {
+            sodam_core::config::TitlebarMode::from_key(&self.settings.titlebar).draws_titlebar(
+                matches!(window.window_decorations(), Decorations::Client { .. }),
+            )
+        };
         let titlebar_anchor = self.titlebar_anchor.clone();
         // 没有元素聚焦时把焦点收回根元素：gpui 的上下文栈取自聚焦节点的路径，
         // 空栈会让带谓词的快捷键绑定（播放三键）全部失效。

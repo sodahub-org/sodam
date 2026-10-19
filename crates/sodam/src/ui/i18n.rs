@@ -101,6 +101,28 @@ impl Language {
             "浅色" => "Light",
             "深色" => "Dark",
             "主题已切换，但保存失败：{err}" => "Theme switched, but saving failed: {err}",
+            "窗口" => "Window",
+            "Linux 下是否自绘最小化 / 最大化 / 关闭按钮" => {
+                "Whether SodaM draws its own minimize / maximize / close buttons on Linux"
+            }
+            "自动（跟随桌面）" => "Auto (follow desktop)",
+            "由桌面是否要求客户端自绘决定：GNOME 等显示，Hyprland 等平铺桌面不显示" => {
+                "Decided by whether the desktop asks apps to draw their own decorations: shown on GNOME, hidden on tiling desktops like Hyprland"
+            }
+            "总是显示" => "Always show",
+            "即使桌面自己不管窗口，也显示最小化 / 最大化 / 关闭按钮" => {
+                "Draw the buttons even when the desktop manages windows itself"
+            }
+            "不显示" => "Never show",
+            "完全交给桌面管理窗口，不画任何按钮" => {
+                "Leave window management entirely to the desktop"
+            }
+            "窗口按钮：自动（跟随桌面）" => "Window controls: auto (follow desktop)",
+            "窗口按钮：总是显示" => "Window controls: always shown",
+            "窗口按钮：不显示" => "Window controls: hidden",
+            "窗口按钮已切换，但保存失败：{err}" => {
+                "Window controls changed, but saving failed: {err}"
+            }
             "主题已恢复为跟随系统" => "Theme restored to system",
             "已切换为跟随系统，但保存失败：{err}" => "Switched to system theme, but saving failed: {err}",
             "已用系统默认应用打开配置文件" => "Opened config with the default app",
