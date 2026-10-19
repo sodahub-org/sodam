@@ -186,6 +186,9 @@ pub struct TrackMenu {
 /// 根视图状态。
 pub struct Root {
     pub nav: Nav,
+    /// 自绘标题栏拖拽区的按下锚点：按下只记录，移动超过阈值才交给合成器，
+    /// 否则合成器会抢走指针，双击最大化收不到第二次按下（见 ui::titlebar）。
+    pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
     pub lyrics_return_nav: Option<Nav>,
@@ -402,6 +405,7 @@ impl Root {
         let logged_in = !settings.cookie.trim().is_empty();
         let play_reporter = PlayReporter::new(settings.clone());
         let mut root = Self {
+            titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
             nav: if logged_in {
                 Nav::Lyrics
@@ -891,6 +895,7 @@ impl Render for Root {
         // 再画一层会出现两套按钮。
         let own_titlebar = cfg!(target_os = "windows")
             || matches!(window.window_decorations(), Decorations::Client { .. });
+        let titlebar_anchor = self.titlebar_anchor.clone();
         // 没有元素聚焦时把焦点收回根元素：gpui 的上下文栈取自聚焦节点的路径，
         // 空栈会让带谓词的快捷键绑定（播放三键）全部失效。
         if window.focused(cx).is_none() {
@@ -985,7 +990,7 @@ impl Render for Root {
             // 标题栏覆盖在各面板背景之上；不再单独占一行而截断侧栏底色。
             // 放在普通内容之后、弹层之前，控制按钮可点击，弹层仍能覆盖标题栏。
             .when(own_titlebar, |this| {
-                this.child(ui::titlebar::render(window))
+                this.child(ui::titlebar::render(window, &titlebar_anchor))
             })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
