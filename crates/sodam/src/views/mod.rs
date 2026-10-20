@@ -780,15 +780,8 @@ pub(crate) fn back_button(cx: &mut Context<Root>) -> AnyElement {
 fn subtitle_for(root: &Root) -> String {
     let logged_in = !root.settings.cookie.trim().is_empty();
     match root.nav {
-        Nav::Search => {
-            if root.searching {
-                root.tr("正在搜索…").to_string()
-            } else if root.results.is_empty() {
-                root.tr("回车搜索歌曲、歌手或专辑").to_string()
-            } else {
-                root.localized("{} 条结果", &[root.results.len().to_string()])
-            }
-        }
+        // 搜索页有自己的标题，不走 page_header，因此没有副标题
+        Nav::Search => String::new(),
         Nav::Liked => {
             if !logged_in {
                 root.tr("未登录：先在「登录」页扫码").to_string()
@@ -819,19 +812,23 @@ fn subtitle_for(root: &Root) -> String {
     }
 }
 
+/// 页面标题。
+fn page_title(title: &str) -> AnyElement {
+    div()
+        .text_size(theme::Text::Title.size())
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(theme::text())
+        .child(title.to_string())
+        .into_any_element()
+}
+
 /// 页面标题 + 副标题。
 fn page_header(title: &str, subtitle: &str) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(theme::space::XS))
-        .child(
-            div()
-                .text_size(theme::Text::Title.size())
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme::text())
-                .child(title.to_string()),
-        )
+        .child(page_title(title))
         .child(
             div()
                 .text_size(theme::Text::Small.size())

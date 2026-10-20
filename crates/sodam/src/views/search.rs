@@ -7,8 +7,7 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
     let text = if root.search_input.is_empty() {
-        root.tr("搜索歌曲 / 歌手（点这里后输入，回车搜索）")
-            .to_string()
+        root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
     } else {
         root.search_input.clone()
     };
@@ -671,7 +670,7 @@ pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) 
         .gap(px(theme::space::MD))
         .child(search_box(root, window, cx))
         .child(if query.is_empty() {
-            page_header(root.tr("搜索"), root.tr("回车搜索歌曲、音乐人、专辑或歌单"))
+            page_title(root.tr("搜索"))
         } else {
             div()
                 .flex()
