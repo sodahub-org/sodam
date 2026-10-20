@@ -75,7 +75,8 @@ fn columns_for(width: f32) -> Columns {
     let base = COL_INDEX + COL_LIKE + theme::size::ROW_ART;
     let candidate = |artist: bool, album: bool, time: bool| -> Option<f32> {
         let mut fixed = base;
-        let mut count = 3.0;
+        // 4 个固定子项（#、爱心、封面、标题），间距数 = 子项数 - 1
+        let mut count = 4.0;
         if artist {
             fixed += COL_ARTIST;
             count += 1.0;
@@ -1170,4 +1171,35 @@ pub fn render(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                 .gap(px(theme::space::LG))
                 .child(body),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表头与数据行共用的列宽必须装得进内容区，否则行右侧内边距会被吃掉。
+    #[test]
+    fn columns_fit_content_width() {
+        // 400 起：更窄时退化到 COL_TITLE_MIN，允许溢出。
+        for width in [400.0_f32, 640.0, 900.0, 1200.0] {
+            let cols = columns_for(width);
+            let mut total =
+                ROW_PAD * 2.0 + COL_INDEX + COL_LIKE + theme::size::ROW_ART + cols.title;
+            let mut items = 4.0;
+            if cols.artist {
+                total += COL_ARTIST;
+                items += 1.0;
+            }
+            if cols.album {
+                total += COL_ALBUM;
+                items += 1.0;
+            }
+            if cols.time {
+                total += COL_TIME;
+                items += 1.0;
+            }
+            total += COL_GAP * (items - 1.0);
+            assert!(total <= width + 0.01, "width={width} total={total}");
+        }
+    }
 }
