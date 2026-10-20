@@ -500,7 +500,10 @@ pub(crate) fn scrolling_detail_page(
                 .flex_row()
                 .items_start()
                 .gap(px(theme::space::XL))
-                .p(px(theme::space::SM))
+                // 左侧与曲目行的内容起点对齐（页面 24 + 行内 12）；底部留白避免首行贴住封面
+                .px(px(ROW_PAD))
+                .py(px(theme::space::SM))
+                .pb(px(theme::space::LG))
                 .child(cover(
                     cover_path.clone(),
                     theme::size::CARD_COVER,
