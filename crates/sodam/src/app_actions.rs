@@ -722,24 +722,14 @@ impl Root {
         cx.notify();
     }
 
-    /// 用系统默认应用打开配置文件（macOS `open` / Windows `start` / Linux `xdg-open`）。
+    /// 用系统默认应用打开配置文件。
     pub fn open_config_file(&mut self, cx: &mut Context<Self>) {
-        let path = Settings::config_path();
-        self.status = match system_open(&path.display().to_string()) {
-            Ok(_) => self.tr("已用系统默认应用打开配置文件").to_string(),
-            Err(err) => self.localized("打开配置文件失败：{err}", &[err.to_string()]),
-        };
-        cx.notify();
+        apply_external_open(cx, config_open_target());
     }
 
     /// 用系统默认浏览器打开项目 GitHub 仓库。
     pub fn open_github_repository(&mut self, cx: &mut Context<Self>) {
-        let url = env!("CARGO_PKG_REPOSITORY");
-        self.status = match system_open(url) {
-            Ok(_) => self.tr("已在浏览器打开 GitHub 仓库").to_string(),
-            Err(err) => self.localized("打开 GitHub 仓库失败：{err}", &[err.to_string()]),
-        };
-        cx.notify();
+        apply_external_open(cx, repository_open_target());
     }
 
     /// 打开歌词播放页，并按需加载当前（或正在装载）歌曲的歌词。
@@ -2208,20 +2198,41 @@ impl Root {
     }
 }
 
-/// 跨平台「用系统默认应用打开」（文件或 URL 均可）：
-/// macOS `open`、Windows `cmd /C start ""`（空标题防 URL 被当窗口名）、
-/// 其他 `xdg-open`。fire-and-forget：不等待打开结果，UI 动作不阻塞。
-fn system_open(target: &str) -> std::io::Result<std::process::Child> {
-    #[cfg(target_os = "macos")]
-    return std::process::Command::new("open").arg(target).spawn();
-    #[cfg(windows)]
-    return {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", target])
-            .spawn()
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    return std::process::Command::new("xdg-open").arg(target).spawn();
+/// 外部打开的两种语义，不可互换。
+#[derive(Debug)]
+pub(crate) enum ExternalOpen {
+    /// 交给系统默认浏览器/协议处理程序的 URL。
+    Url(&'static str),
+    /// 交给系统默认应用的本地文件；Linux 下裸路径进 `open_url` 会因 URI 解析失败而静默无操作。
+    File(PathBuf),
+}
+
+fn config_open_target() -> ExternalOpen {
+    ExternalOpen::File(Settings::config_path())
+}
+
+fn repository_open_target() -> ExternalOpen {
+    ExternalOpen::Url(env!("CARGO_PKG_REPOSITORY"))
+}
+
+/// gpui 的入口返回 `()` 且失败只写日志，所以这里既没有错误分支，也不写状态文案。
+fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
+    match target {
+        ExternalOpen::Url(url) => cx.open_url(url),
+        ExternalOpen::File(path) => cx.open_with_system(&path),
+    }
+}
+
+#[cfg(test)]
+mod external_open_tests {
+    use super::*;
+
+    /// 守住院落里最容易犯的回归：把配置文件当 URL 交给 `open_url`。
+    #[test]
+    fn config_entry_uses_file_semantics_and_repo_entry_uses_url() {
+        assert!(matches!(config_open_target(), ExternalOpen::File(_)));
+        assert!(matches!(repository_open_target(), ExternalOpen::Url(_)));
+    }
 }
 
 /// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
