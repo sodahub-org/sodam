@@ -97,12 +97,13 @@ pub fn install(cx: &mut App, settings: &Settings, root: Entity<Root>) {
 /// 重新应用全部绑定（设置页改完快捷键后调用）。
 ///
 /// 整表重建而不是增量添加：gpui 的 keymap 是累加的，只加新绑定的话老键位会继续生效。
-/// 清空是安全的 —— 应用自己注册的绑定只有这里和 `menus`（macOS 的 ⌘Q/⌘M/⌘W），
-/// gpui 的 keymap 初始就是空的，sodam 的文本输入自己处理按键，不依赖 keymap。
+/// 也正因为 `clear_key_bindings` 是整表擦除（gpui 没有按作用域清除的 API），
+/// 搜索框的编辑键位必须在这里一起重发，否则用户重绑一次播放快捷键就把它抹掉了。
 pub fn apply(cx: &mut App, settings: &Settings) {
     cx.clear_key_bindings();
     #[cfg(target_os = "macos")]
     cx.bind_keys(crate::menus::window_bindings());
+    cx.bind_keys(crate::app_text::bindings());
     cx.bind_keys(bindings(settings));
 }
 

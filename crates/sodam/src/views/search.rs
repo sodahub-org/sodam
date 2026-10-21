@@ -1,17 +1,17 @@
 //! 官方风格搜索结果页，以及音乐人 / 专辑详情页。
 
 use super::*;
-/// 搜索框：点击获取焦点，回车触发搜索，Esc 清空。
+/// 搜索框：点击定位插入点，按键走 keymap + action（见 `app_text`），Esc 清空。
 fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
     let focused = root.search_focus.is_focused(window);
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
-    let text = if root.search_input.is_empty() {
+    let text = if root.search_field.is_empty() {
         root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
     } else {
-        root.search_input.clone()
+        root.search_field.text().to_string()
     };
-    let color = if root.search_input.is_empty() {
+    let color = if root.search_field.is_empty() {
         theme::text_muted()
     } else {
         theme::text()
@@ -43,56 +43,24 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
             cx.listener(|root, event: &MouseDownEvent, window, cx| {
                 window.focus(&root.search_focus, cx);
                 // 点哪儿就把插入点放哪儿（之前只聚焦，光标恒在末尾）。
-                let cursor = root.search_cursor_for_x(event.position.x, window);
-                root.search_set_cursor(cursor);
+                let caret = root.search_cursor_for_x(event.position.x, window);
+                root.search_field.set_caret(caret);
                 cx.notify();
             }),
         )
-        .on_key_down(cx.listener(|root, event: &KeyDownEvent, _window, cx| {
-            let key = event.keystroke.key.as_str();
-            match key {
-                "enter" => root.run_search(cx),
-                // 编辑键都要落在真实的插入点上：之前 backspace 只会 pop 末尾、
-                // 左右方向键完全没处理，所以光标永远停在最后。
-                "backspace" => {
-                    if root.search_backspace() {
-                        cx.notify();
-                    }
-                }
-                "delete" => {
-                    if root.search_delete_forward() {
-                        cx.notify();
-                    }
-                }
-                "left" => {
-                    if root.search_move_cursor(false) {
-                        cx.notify();
-                    }
-                }
-                "right" => {
-                    if root.search_move_cursor(true) {
-                        cx.notify();
-                    }
-                }
-                "home" => {
-                    root.search_set_cursor(0);
-                    cx.notify();
-                }
-                "end" => {
-                    let end = root.search_input.len();
-                    root.search_set_cursor(end);
-                    cx.notify();
-                }
-                "escape" => {
-                    root.search_input.clear();
-                    root.search_set_cursor(0);
-                    cx.notify();
-                }
-                // 可打印字符（含 Fcitx 上屏）交给 EntityInputHandler；
-                // 这里手动追加会和 IME 通道重复插入。
-                _ => {}
-            }
-        }))
+        // 编辑键不再在 on_key_down 里逐个匹配字符串：gpui 的 keymap 匹配修饰键是精确的，
+        // 绑定表集中在 app_text::bindings()，一处读得全（可输入字符仍走 EntityInputHandler）。
+        .on_action(cx.listener(Root::text_backspace))
+        .on_action(cx.listener(Root::text_delete))
+        .on_action(cx.listener(Root::text_delete_word_backward))
+        .on_action(cx.listener(Root::text_left))
+        .on_action(cx.listener(Root::text_right))
+        .on_action(cx.listener(Root::text_word_left))
+        .on_action(cx.listener(Root::text_word_right))
+        .on_action(cx.listener(Root::text_home))
+        .on_action(cx.listener(Root::text_end))
+        .on_action(cx.listener(Root::text_submit))
+        .on_action(cx.listener(Root::text_cancel))
         .child(
             // 文本 + 光标放在同一个 relative 盒里：光标是一个真实的绝对定位元素，
             // `left` 直接用 ShapedLine 的 `x_for_index(cursor)` 算出来，
@@ -767,7 +735,7 @@ pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) 
     }
     let query = root.search_keyword.trim().to_string();
     let show_history = root.settings.search_history_is_enabled()
-        && root.search_input.trim().is_empty()
+        && root.search_field.text().trim().is_empty()
         && root.search_focus.is_focused(window)
         && !root.searching
         && !root.settings.search_history.is_empty();

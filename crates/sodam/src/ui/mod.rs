@@ -7,5 +7,6 @@ pub mod icons;
 pub mod player_bar;
 pub mod sidebar;
 pub mod spinner;
+pub mod text_field;
 pub mod theme;
 pub mod titlebar;

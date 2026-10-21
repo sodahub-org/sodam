@@ -26,8 +26,9 @@ crates/sodam/            GPUI 应用
   app.rs                 Root 状态、输入法、渲染入口
   app_actions.rs         播放、队列、收藏、歌单、推荐、封面、设置动作
   app_search.rs          搜索、艺人页、专辑页动作
+  app_text.rs            搜索框编辑键的 actions、键位绑定与处理器
   tray.rs                StatusNotifier 托盘
-  ui/                    theme、sidebar、player_bar、artwork、icons、i18n
+  ui/                    theme、sidebar、player_bar、artwork、icons、i18n、text_field
   views/                 Discover、Scenes、Search、Artist、Album、Library、Lyrics、Settings
 docs/ARCHITECTURE.md     架构与线程模型
 docs/ROADMAP.md          当前状态与剩余工作

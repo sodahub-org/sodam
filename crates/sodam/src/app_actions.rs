@@ -16,141 +16,9 @@ use std::sync::Arc;
 use super::{status_label, LoginState, Nav, QueueOrigin, Root, ROW_BATCH};
 use sodam_core::queue::Queue;
 
-/// 把插入点夹到合法位置：不超过末尾，也不落在多字节字符中间。
-pub(crate) fn clamp_cursor(text: &str, cursor: usize) -> usize {
-    let mut cursor = cursor.min(text.len());
-    while cursor > 0 && !text.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    cursor
-}
-
-/// 插入点前进/后退一个字符后的位置（按 UTF-8 边界，不会切坏中文）。
-pub(crate) fn cursor_step(text: &str, cursor: usize, forward: bool) -> usize {
-    let cursor = clamp_cursor(text, cursor);
-    if forward {
-        text[cursor..]
-            .chars()
-            .next()
-            .map(|ch| cursor + ch.len_utf8())
-            .unwrap_or(cursor)
-    } else {
-        text[..cursor]
-            .char_indices()
-            .last()
-            .map(|(index, _)| index)
-            .unwrap_or(0)
-    }
-}
-
-/// 删除插入点前的一个字符；返回删除后的插入点（没有可删的返回 `None`）。
-pub(crate) fn delete_before_cursor(text: &mut String, cursor: usize) -> Option<usize> {
-    let cursor = clamp_cursor(text, cursor);
-    let start = cursor_step(text, cursor, false);
-    if start == cursor {
-        return None;
-    }
-    text.replace_range(start..cursor, "");
-    Some(start)
-}
-
-/// 删除插入点后的一个字符；返回删除后的插入点（没有可删的返回 `None`）。
-pub(crate) fn delete_after_cursor(text: &mut String, cursor: usize) -> Option<usize> {
-    let cursor = clamp_cursor(text, cursor);
-    let end = cursor_step(text, cursor, true);
-    if end == cursor {
-        return None;
-    }
-    text.replace_range(cursor..end, "");
-    Some(cursor)
-}
-
 impl Root {
     pub(crate) fn search_input_focused(&self, window: &Window) -> bool {
         self.search_focus.is_focused(window)
-    }
-
-    pub(crate) fn search_utf16_to_byte_offset(&self, offset: usize) -> usize {
-        let mut units = 0;
-        for (byte_offset, character) in self.search_input.char_indices() {
-            if units >= offset {
-                return byte_offset;
-            }
-            units += character.len_utf16();
-        }
-        self.search_input.len()
-    }
-
-    pub(crate) fn search_byte_to_utf16_offset(&self, offset: usize) -> usize {
-        self.search_input
-            .char_indices()
-            .take_while(|(byte_offset, _)| *byte_offset < offset)
-            .map(|(_, character)| character.len_utf16())
-            .sum()
-    }
-
-    pub(crate) fn search_byte_range_from_utf16(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> std::ops::Range<usize> {
-        let start = self.search_utf16_to_byte_offset(range.start);
-        let end = self.search_utf16_to_byte_offset(range.end);
-        start.min(end)..start.max(end)
-    }
-
-    pub(crate) fn search_utf16_range_from_byte(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> std::ops::Range<usize> {
-        self.search_byte_to_utf16_offset(range.start)..self.search_byte_to_utf16_offset(range.end)
-    }
-
-    pub(crate) fn search_replacement_range(
-        &self,
-        range_utf16: Option<std::ops::Range<usize>>,
-    ) -> std::ops::Range<usize> {
-        range_utf16
-            .map(|range| self.search_byte_range_from_utf16(range))
-            .or_else(|| self.search_marked_range.clone())
-            .unwrap_or(self.search_input.len()..self.search_input.len())
-    }
-
-    /// 把插入点设到指定字节位置（自动夹到字符边界）。
-    pub(crate) fn search_set_cursor(&mut self, cursor: usize) {
-        self.search_cursor = clamp_cursor(&self.search_input, cursor);
-    }
-
-    /// 插入点前进/后退一个字符；返回是否真的移动了。
-    pub(crate) fn search_move_cursor(&mut self, forward: bool) -> bool {
-        let next = cursor_step(&self.search_input, self.search_cursor, forward);
-        let moved = next != self.search_cursor;
-        self.search_cursor = next;
-        self.search_marked_range = None;
-        moved
-    }
-
-    /// 退格：删插入点前一个字符。返回是否有改动。
-    pub(crate) fn search_backspace(&mut self) -> bool {
-        match delete_before_cursor(&mut self.search_input, self.search_cursor) {
-            Some(cursor) => {
-                self.search_cursor = cursor;
-                self.search_marked_range = None;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Delete：删插入点后一个字符。返回是否有改动。
-    pub(crate) fn search_delete_forward(&mut self) -> bool {
-        match delete_after_cursor(&mut self.search_input, self.search_cursor) {
-            Some(cursor) => {
-                self.search_cursor = cursor;
-                self.search_marked_range = None;
-                true
-            }
-            None => false,
-        }
     }
 
     /// 预取队列接下来几首到本地缓存（只落盘，不动界面状态）。
@@ -2223,18 +2091,6 @@ fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
     }
 }
 
-#[cfg(test)]
-mod external_open_tests {
-    use super::*;
-
-    /// 守住院落里最容易犯的回归：把配置文件当 URL 交给 `open_url`。
-    #[test]
-    fn config_entry_uses_file_semantics_and_repo_entry_uses_url() {
-        assert!(matches!(config_open_target(), ExternalOpen::File(_)));
-        assert!(matches!(repository_open_target(), ExternalOpen::Url(_)));
-    }
-}
-
 /// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
 /// 持续打签名服务和网络）。
 const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2258,44 +2114,13 @@ fn prefetch_concurrency() -> usize {
 }
 
 #[cfg(test)]
-mod cursor_tests {
+mod external_open_tests {
     use super::*;
 
+    /// 守住院落里最容易犯的回归：把配置文件当 URL 交给 `open_url`。
     #[test]
-    fn cursor_steps_over_utf8_boundaries() {
-        let text = "ab中文";
-        assert_eq!(cursor_step(text, 0, true), 1);
-        assert_eq!(cursor_step(text, 1, true), 2);
-        assert_eq!(cursor_step(text, 2, true), 5, "中 占 3 字节");
-        assert_eq!(cursor_step(text, 5, false), 2);
-        assert_eq!(cursor_step(text, 0, false), 0, "开头再往左不动");
-        assert_eq!(
-            cursor_step(text, text.len(), true),
-            text.len(),
-            "末尾再往右不动"
-        );
-    }
-
-    #[test]
-    fn cursor_is_clamped_into_char_boundaries() {
-        let text = "ab中";
-        assert_eq!(clamp_cursor(text, 3), 2, "3 落在「中」中间，回退到字符边界");
-        assert_eq!(clamp_cursor(text, 99), text.len());
-        assert_eq!(clamp_cursor(text, 0), 0);
-    }
-
-    #[test]
-    fn delete_respects_the_cursor_position() {
-        let mut text = "ab中cd".to_string();
-        // 插入点在 5（「中」之后的字节位置），退格删掉「中」（2..5）
-        assert_eq!(delete_before_cursor(&mut text, 5), Some(2));
-        assert_eq!(text, "abcd");
-        // 删插入点后的字符
-        assert_eq!(delete_after_cursor(&mut text, 1), Some(1));
-        assert_eq!(text, "acd");
-        // 开头退格 / 末尾删除都是空操作
-        assert_eq!(delete_before_cursor(&mut text, 0), None);
-        let len = text.len();
-        assert_eq!(delete_after_cursor(&mut text, len), None);
+    fn config_entry_uses_file_semantics_and_repo_entry_uses_url() {
+        assert!(matches!(config_open_target(), ExternalOpen::File(_)));
+        assert!(matches!(repository_open_target(), ExternalOpen::Url(_)));
     }
 }

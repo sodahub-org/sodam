@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+// 搜索框按键分发（动作 + 键位绑定），见 app_text.rs。
+mod app_text;
 // 托盘：Linux 走 ksni/SNI，macOS 走 NSStatusItem，见 tray.rs。
 mod tray;
 mod ui;

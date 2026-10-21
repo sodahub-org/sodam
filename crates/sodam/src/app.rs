@@ -88,6 +88,7 @@ pub(crate) fn status_label(status: LoginStatus, language: Language) -> &'static 
 
 use crate::ui;
 use crate::ui::i18n::{scene_mode_text, Language};
+use crate::ui::text_field::TextField;
 use crate::ui::theme::{self, ThemeKind};
 use crate::views;
 
@@ -221,9 +222,7 @@ pub struct Root {
     pub lyrics_scroll: gpui::UniformListScrollHandle,
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
-    pub search_input: String,
-    /// 搜索框插入点（字节下标，永远落在字符边界上）。
-    pub search_cursor: usize,
+    pub search_field: TextField,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub search_focus: FocusHandle,
@@ -315,8 +314,6 @@ pub struct Root {
     pub queue_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// 搜索/歌单/我喜欢等歌曲行右键菜单。
     pub track_menu: Option<TrackMenu>,
-    /// Fcitx/IBus 等 IME 的搜索框预编辑范围（UTF-8 byte range）。
-    pub(crate) search_marked_range: Option<std::ops::Range<usize>>,
     /// 播放请求序号：每次 start_track +1。
     ///
     /// 作用：加载是异步的（下载 + 解密），如果用户在 A 加载途中换了 B，
@@ -430,7 +427,6 @@ impl Root {
             login_modal_open: false,
             queue_menu: None,
             track_menu: None,
-            search_marked_range: None,
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,
@@ -451,8 +447,7 @@ impl Root {
             lyrics_active: None,
             lyrics_scroll: gpui::UniformListScrollHandle::new(),
             lyrics_request_seq: 0,
-            search_input: String::new(),
-            search_cursor: 0,
+            search_field: TextField::default(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             search_focus: cx.focus_handle(),
             workspace_focus: cx.focus_handle(),
@@ -561,7 +556,7 @@ impl Root {
         // 开发/验证便利：`SODAM_QUERY="周杰伦" cargo run -p sodam` 启动即搜索一次
         if let Ok(query) = std::env::var("SODAM_QUERY") {
             if !query.trim().is_empty() {
-                root.search_input = query;
+                root.search_field.set_text(query);
                 root.nav = Nav::Search;
                 root.run_search(cx);
             }
@@ -731,12 +726,12 @@ impl Root {
     /// 光标位置和点击定位都用**同一条** ShapedLine 量，避免"自己估宽度"和
     /// 实际渲染不一致导致的光标错位（sonora 的 Input 也是这么做的）。
     fn search_shaped_line(&self, window: &Window) -> Option<gpui::ShapedLine> {
-        if self.search_input.is_empty() {
+        if self.search_field.is_empty() {
             return None;
         }
         let style = window.text_style();
         let run = gpui::TextRun {
-            len: self.search_input.len(),
+            len: self.search_field.len(),
             font: style.font(),
             color: style.color,
             background_color: None,
@@ -744,7 +739,7 @@ impl Root {
             strikethrough: None,
         };
         Some(window.text_system().shape_line(
-            self.search_input.clone().into(),
+            self.search_field.text().into(),
             style.font_size.to_pixels(window.rem_size()),
             &[run],
             None,
@@ -766,19 +761,21 @@ impl Root {
         if local <= gpui::px(0.0) {
             return 0;
         }
-        line.closest_index_for_x(local).min(self.search_input.len())
+        line.closest_index_for_x(local).min(self.search_field.len())
     }
 
     /// 插入点在输入框内的横向偏移。
     pub(crate) fn search_caret_x(&self, window: &Window) -> gpui::Pixels {
-        let cursor = actions::clamp_cursor(&self.search_input, self.search_cursor);
+        let caret = self.search_field.caret();
         match self.search_shaped_line(window) {
-            Some(line) => line.x_for_index(cursor),
+            Some(line) => line.x_for_index(caret),
             None => gpui::px(0.0),
         }
     }
 }
 
+/// gpui 的输入协议桥：把平台的 UTF-16 区间换算交给 [`TextField`]，
+/// 这里只留「平台说了什么」→「状态怎么变」这一层，外加焦点门禁。
 impl EntityInputHandler for Root {
     fn text_for_range(
         &mut self,
@@ -790,9 +787,9 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return None;
         }
-        let range = self.search_byte_range_from_utf16(range_utf16);
-        actual_range.replace(self.search_utf16_range_from_byte(range.clone()));
-        Some(self.search_input[range].to_string())
+        let range = self.search_field.byte_range_from_utf16(range_utf16);
+        actual_range.replace(self.search_field.utf16_range_from_byte(range.clone()));
+        Some(self.search_field.slice(range))
     }
 
     fn selected_text_range(
@@ -804,12 +801,11 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return None;
         }
-        // 有 IME 组合时返回组合区间，否则是插入点的折叠选区。
-        // 之前恒返回「末尾..末尾」，光标只能停在最后，方向键也就没有可动的余地。
-        let cursor = actions::clamp_cursor(&self.search_input, self.search_cursor);
-        let range = self.search_marked_range.clone().unwrap_or(cursor..cursor);
+        // 有 IME 组合时上报组合区间，否则是插入点的折叠区间。
         Some(UTF16Selection {
-            range: self.search_utf16_range_from_byte(range),
+            range: self
+                .search_field
+                .utf16_range_from_byte(self.search_field.selection_range()),
             reversed: false,
         })
     }
@@ -822,13 +818,13 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return None;
         }
-        self.search_marked_range
-            .as_ref()
-            .map(|range| self.search_utf16_range_from_byte(range.clone()))
+        self.search_field
+            .marked()
+            .map(|range| self.search_field.utf16_range_from_byte(range))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_marked_range.take().is_some() {
+        if self.search_field.clear_marked() {
             cx.notify();
         }
     }
@@ -843,11 +839,8 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return;
         }
-        let range = self.search_replacement_range(range_utf16);
-        let start = range.start;
-        self.search_input.replace_range(range, text);
-        self.search_cursor = start + text.len();
-        self.search_marked_range = None;
+        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        self.search_field.replace(range, text);
         cx.notify();
     }
 
@@ -862,12 +855,8 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return;
         }
-        let range = self.search_replacement_range(range_utf16);
-        let start = range.start;
-        self.search_input.replace_range(range, new_text);
-        let end = start + new_text.len();
-        self.search_cursor = end;
-        self.search_marked_range = Some(start..end);
+        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        self.search_field.replace_and_mark(range, new_text);
         cx.notify();
     }
 
@@ -892,7 +881,7 @@ impl EntityInputHandler for Root {
         }
         // 语义是 UTF-16 偏移：按点击位置算出字节下标后再换算。
         let byte = self.search_cursor_for_x(point.x, window);
-        Some(self.search_byte_to_utf16_offset(byte))
+        Some(self.search_field.byte_to_utf16(byte))
     }
 
     fn set_selected_text_range(
@@ -904,9 +893,8 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return;
         }
-        let byte = self.search_byte_range_from_utf16(range_utf16);
-        self.search_cursor = byte.start;
-        self.search_marked_range = None;
+        let range = self.search_field.byte_range_from_utf16(range_utf16);
+        self.search_field.set_caret(range.start);
         cx.notify();
     }
 
@@ -914,7 +902,7 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return None;
         }
-        Some(self.search_input.chars().map(char::len_utf16).sum())
+        Some(self.search_field.utf16_len())
     }
 
     fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {

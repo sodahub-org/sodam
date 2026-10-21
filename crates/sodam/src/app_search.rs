@@ -12,8 +12,8 @@ use super::{Nav, Root};
 
 impl Root {
     pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
-        self.search_input = query;
-        self.search_set_cursor(self.search_input.len());
+        self.search_field.set_text(query);
+        self.search_field.set_caret(self.search_field.len());
         self.run_search(cx);
     }
 
@@ -48,7 +48,7 @@ impl Root {
 
     /// 触发搜索：网络调用放在 GPUI 的后台执行器上，结果回灌后 `notify` 重绘。
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
-        let keyword = self.search_input.trim().to_string();
+        let keyword = self.search_field.text().trim().to_string();
         if keyword.is_empty() {
             self.set_status("先输入关键词再回车", &[]);
             cx.notify();
@@ -133,7 +133,7 @@ impl Root {
             return;
         }
         self.search_tab = tab;
-        if self.search_input.trim().is_empty() {
+        if self.search_field.text().trim().is_empty() {
             cx.notify();
         } else {
             self.run_search(cx);

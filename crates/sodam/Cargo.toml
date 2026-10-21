@@ -18,6 +18,7 @@ sys-locale.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+unicode-segmentation = "1.13.3"
 
 # StatusNotifier 托盘是 Linux 桌面协议，macOS 上没有 D-Bus session bus。
 [target.'cfg(target_os = "linux")'.dependencies]
