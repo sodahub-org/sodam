@@ -183,6 +183,15 @@ impl Language {
             }
             "快捷键已更新" => "Shortcut updated",
             "快捷键已恢复默认" => "Shortcut reset to default",
+            "徽标键由系统占用，请换个组合键" => {
+                "The Windows/Super key belongs to the system — pick another combination"
+            }
+            "这个键无法作为快捷键，请换个组合键" => {
+                "This key can't be used as a shortcut — pick another combination"
+            }
+            "这一行的按键无法解析，未生效" => {
+                "This row's key can't be parsed, so it is not bound"
+            }
             "未在播放" => "Nothing playing",
             "「{}」共 {} 条结果" => "{}: {} results",
             "读取音乐人失败：{err}" => "Failed to load artist: {err}",

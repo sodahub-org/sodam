@@ -1380,6 +1380,10 @@ impl Root {
     ///
     /// 未登录时其他页面一律进不去（登录入口在设置 → 账户）。
     pub fn on_nav_changed(&mut self, cx: &mut Context<Self>) {
+        // 离开设置页时录制态不会自己结束：卡片不在树上时收不到键，但回到设置页那一行
+        // 还显示着「按下新的组合键…」，用户随手按一个键就被写进配置。
+        self.shortcut_capture = None;
+        self.shortcut_note = None;
         if !self.settings.cookie.trim().is_empty() {
             match self.nav {
                 Nav::Home => self.start_recommendation(true, cx),

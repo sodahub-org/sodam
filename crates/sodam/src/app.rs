@@ -236,6 +236,10 @@ pub struct Root {
     pub shortcut_focus: FocusHandle,
     /// 正在录制的动作（None = 没在录制）。
     pub shortcut_capture: Option<crate::shortcuts::Slot>,
+    /// 录制时的行内提示（徽标键被拒、按键无法绑定）：下一次按键、取消或离开设置页都会清掉。
+    ///
+    /// 不走 `status` —— 那个字段现在没有任何地方渲染（见 #40），提示必须长在出问题的行上。
+    pub shortcut_note: Option<&'static str>,
     /// 快捷键配置有改动，需要重新注册 keymap（由 main 的托盘循环统一应用）。
     pub shortcuts_dirty: bool,
     /// 搜索结果与加载状态。
@@ -453,6 +457,7 @@ impl Root {
             workspace_focus: cx.focus_handle(),
             shortcut_focus: cx.focus_handle(),
             shortcut_capture: None,
+            shortcut_note: None,
             shortcuts_dirty: false,
             results: Arc::new(Vec::new()),
             search_results: SearchResults::default(),

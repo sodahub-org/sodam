@@ -6,23 +6,100 @@
 use super::*;
 use crate::shortcuts::{self, Slot};
 
-/// 把 gpui 的 keystroke 写法（`ctrl-left`）显示成人看的样子（`Ctrl+←`）。
+/// 存储串 → 给人看的按键形式。
+///
+/// 存储与显示是两套东西，这是刻意的：存储串要喂给 `Keystroke::parse`
+/// （见 `shortcuts::canonical_keystroke`），显示形式按平台走 —— macOS 用 Apple 顺序的
+/// 符号 `⌃⌥⇧⌘` + 键名且不带 `+`，其他平台用 `Ctrl+Alt+Shift+K`。
 fn display_keystroke(raw: &str) -> String {
-    raw.split('-')
-        .map(|part| match part {
-            "cmd" => "⌘",
-            "ctrl" => "Ctrl",
-            "alt" => "⌥",
-            "shift" => "Shift",
-            "left" => "←",
-            "right" => "→",
-            "up" => "↑",
-            "down" => "↓",
-            "space" => "Space",
-            other => other,
-        })
-        .collect::<Vec<_>>()
-        .join("+")
+    let mut control = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut platform = false;
+    let mut function = false;
+    let mut key = raw.trim();
+    for part in raw.split('-') {
+        match part {
+            "ctrl" | "control" => control = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "fn" | "function" => function = true,
+            // secondary 在 macOS 解析成 ⌘、其他平台解析成 Ctrl：显示跟着解析走。
+            "secondary" => {
+                if cfg!(target_os = "macos") {
+                    platform = true;
+                } else {
+                    control = true;
+                }
+            }
+            "cmd" | "command" | "super" | "win" => platform = true,
+            "" => {}
+            other => key = other,
+        }
+    }
+    let key = display_key_name(key);
+    if cfg!(target_os = "macos") {
+        let mut out = String::new();
+        if function {
+            out.push_str("fn ");
+        }
+        if control {
+            out.push('⌃');
+        }
+        if alt {
+            out.push('⌥');
+        }
+        if shift {
+            out.push('⇧');
+        }
+        if platform {
+            out.push('⌘');
+        }
+        out.push_str(&key);
+        out
+    } else {
+        let mut parts: Vec<&str> = Vec::with_capacity(5);
+        if function {
+            parts.push("Fn");
+        }
+        if control {
+            parts.push("Ctrl");
+        }
+        if alt {
+            parts.push("Alt");
+        }
+        if shift {
+            parts.push("Shift");
+        }
+        if platform {
+            parts.push("Win");
+        }
+        parts.push(&key);
+        parts.join("+")
+    }
+}
+
+/// 键名的人话形式。单字符键按惯例显示大写，但存储串里仍是小写（大写会被 parse 读成 shift）。
+fn display_key_name(key: &str) -> String {
+    let named = match key {
+        "left" => Some("←"),
+        "right" => Some("→"),
+        "up" => Some("↑"),
+        "down" => Some("↓"),
+        "space" => Some("Space"),
+        "escape" => Some("Esc"),
+        "backspace" => Some("Backspace"),
+        "delete" => Some("Del"),
+        "enter" => Some("Enter"),
+        "pageup" => Some("PgUp"),
+        "pagedown" => Some("PgDn"),
+        _ => None,
+    };
+    match named {
+        Some(name) => name.to_string(),
+        None if key.chars().count() == 1 => key.to_uppercase(),
+        None => key.to_string(),
+    }
 }
 
 fn slot_label(root: &Root, slot: Slot) -> &'static str {
@@ -36,12 +113,22 @@ fn slot_label(root: &Root, slot: Slot) -> &'static str {
 /// 一行：动作名 + 当前按键 + 操作按钮。
 fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
     let capturing = root.shortcut_capture == Some(slot);
+    let stored = shortcuts::keystroke_of(&root.settings, slot);
     let current = if capturing {
         root.tr("按下新的组合键…（Esc 取消）").to_string()
     } else {
-        display_keystroke(shortcuts::keystroke_of(&root.settings, slot))
+        display_keystroke(stored)
     };
     let customized = shortcuts::is_customized(&root.settings, slot);
+    // 提示长在出问题的这一行上（`status` 现在没有任何渲染出口，见 #40）：录制期的拒绝原因，
+    // 以及配置里已有的坏值（手改 config.json、或旧版本存下的符号形式）——后者不绑也不崩。
+    let note = match (capturing, root.shortcut_note) {
+        (true, Some(note)) => Some(root.tr(note)),
+        (false, _) if !shortcuts::is_bindable_source(stored) => {
+            Some(root.tr("这一行的按键无法解析，未生效"))
+        }
+        _ => None,
+    };
 
     // 三行必须各有各的 id：gpui 的 `Div::id` 直接把传入值当 ElementId，不混父路径也不报错，
     // 共用字面量的话只有第一行拿到可交互节点，后两行的 on_click 永远不触发（见 #35）。
@@ -104,17 +191,29 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                 .child(
                     div()
                         .min_w(px(96.0))
-                        .text_size(theme::Text::Small.size())
-                        .text_color(if capturing {
-                            theme::accent()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .child(current),
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(if capturing {
+                                    theme::accent()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(current),
+                        )
+                        .children(note.map(|note| {
+                            div()
+                                .text_size(theme::Text::Tiny.size())
+                                .text_color(theme::accent())
+                                .child(note)
+                        })),
                 )
                 .child(
                     action_button(button_id, button_label, is_primary).on_click(cx.listener(
                         move |root, _event: &ClickEvent, window, cx| {
+                            root.shortcut_note = None;
                             if capturing {
                                 root.shortcut_capture = None;
                             } else {
@@ -198,6 +297,7 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         return;
                     };
                     let keystroke = event.keystroke.clone();
+                    root.shortcut_note = None;
                     // Esc 取消；按住纯修饰键不会走到这里。
                     if keystroke.key == "escape" && keystroke.modifiers.number_of_modifiers() == 0 {
                         root.shortcut_capture = None;
@@ -205,8 +305,24 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         cx.notify();
                         return;
                     }
-                    let text = keystroke.to_string();
-                    shortcuts::set_keystroke(&mut root.settings, slot, text);
+                    if keystroke.modifiers.platform && !cfg!(target_os = "macos") {
+                        // Windows / Linux 的徽标键归系统（Win+← 是贴边快捷键、Win+↑ 是最小化），
+                        // 应用拿不到干净的按键事件，绑上去只会是个永不触发的死键，所以直接拒。
+                        root.shortcut_note = Some("徽标键由系统占用，请换个组合键");
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 存规范串，不存 Display 形式：旧版存 `ctrl-A` / `⌘←` 这类显示串，
+                    // parse 回来是另一个键（甚至是个不存在的键名），绑上就是死键（#39）。
+                    let stored = shortcuts::canonical_keystroke(&keystroke);
+                    if !shortcuts::is_bindable_source(&stored) {
+                        root.shortcut_note = Some("这个键无法作为快捷键，请换个组合键");
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    shortcuts::set_keystroke(&mut root.settings, slot, stored);
                     root.shortcut_capture = None;
                     root.shortcuts_dirty = true;
                     root.status = if root.language.is_zh() {
@@ -231,4 +347,53 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .children(rows),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// `secondary` 必须按平台显示成该平台的主修饰键，不能写成符号糊过去。
+    #[test]
+    fn secondary_shows_as_the_platform_primary_modifier() {
+        let shown = display_keystroke("secondary-left");
+        if cfg!(target_os = "macos") {
+            assert_eq!(shown, "⌘←");
+        } else {
+            assert_eq!(shown, "Ctrl+←");
+        }
+    }
+
+    /// 修饰键顺序、键名的人话形式，按平台分两套。
+    #[test]
+    fn modifier_order_and_key_names() {
+        let combo = display_keystroke("ctrl-shift-a");
+        if cfg!(target_os = "macos") {
+            assert_eq!(combo, "⌃⇧A");
+        } else {
+            assert_eq!(combo, "Ctrl+Shift+A");
+        }
+        assert_eq!(display_keystroke("space"), "Space");
+        assert_eq!(display_keystroke("escape"), "Esc");
+        assert_eq!(display_keystroke("pageup"), "PgUp");
+        let win = display_keystroke("win-left");
+        if cfg!(target_os = "macos") {
+            assert!(win.contains('⌘'), "macOS 上没有徽标键，按 ⌘ 显示：{win}");
+        } else {
+            assert!(
+                win.contains("Win"),
+                "Windows / Linux 要看得出是徽标键：{win}"
+            );
+        }
+    }
+
+    /// 旧版存下来的符号形式不绑，界面也不能装成能用：行的判定就靠这个谓词。
+    #[test]
+    fn legacy_symbol_forms_are_reported_as_unusable() {
+        assert!(!shortcuts::is_bindable_source("⌘←"));
+        assert!(!shortcuts::is_bindable_source("^←"));
+        assert!(!shortcuts::is_bindable_source("⊞k"));
+        assert!(shortcuts::is_bindable_source("secondary-left"));
+        assert!(shortcuts::is_bindable_source("ctrl-a"));
+    }
 }
