@@ -77,6 +77,98 @@ fn effective_shortcut<'a>(value: &'a str, default: &'a str) -> &'a str {
     }
 }
 
+/// 把旧版本录制时写下的**显示形式**改回可解析的规范存储串。
+///
+/// 只认三类无歧义的本应用产物，其余一律返回 `None`（保持原样）：
+/// * 符号修饰键：`^`→`ctrl`、`⌥`→`alt`、`⇧`→`shift`、`⌘`/`⊞`/`❖`→本平台主修饰键；
+/// * 符号键名：`←↑→↓`→`left/right/up/down`；
+/// * 被大写化的单字符键：`ctrl-A`→`ctrl-a`（旧 Display 把 `Ctrl+K` 写成大写，
+///   而 parse 把大写读成「带 shift」，所以小写化是还原用户本意）。
+///
+/// 已经是合法 ASCII 写法的（`ctrl-left`、`cmd-left`、`secondary-a`）**一概不改**：
+/// 改写用户自己写进配置文件的值，会让他找不到原来写的是什么。认不出的值留给设置页
+/// 标成「未生效」，不在这里猜。
+fn normalize_legacy_keystroke(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let looks_like_our_output = !value.is_ascii()
+        || value.split('-').any(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase()) && chars.next().is_none()
+        });
+    if !looks_like_our_output {
+        return None;
+    }
+
+    let mut function = false;
+    let mut control = false;
+    let mut alt = false;
+    let mut platform = false;
+    let mut shift = false;
+    let mut key = String::new();
+    for component in value.split('-') {
+        match component {
+            "" => {}
+            "ctrl" | "control" => control = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "fn" | "function" => function = true,
+            "secondary" | "cmd" | "command" | "super" | "win" => platform = true,
+            "left" | "right" | "up" | "down" => key = component.to_string(),
+            other => {
+                for ch in other.chars() {
+                    match ch {
+                        '^' => control = true,
+                        '⌥' => alt = true,
+                        '⇧' => shift = true,
+                        '⌘' | '⊞' | '❖' => platform = true,
+                        '←' => key = "left".into(),
+                        '→' => key = "right".into(),
+                        '↑' => key = "up".into(),
+                        '↓' => key = "down".into(),
+                        ch if ch.is_ascii_uppercase() => key.push(ch.to_ascii_lowercase()),
+                        ch if ch.is_ascii() => key.push(ch),
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    if key.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::with_capacity(6);
+    if function {
+        parts.push("fn");
+    }
+    if control {
+        parts.push("ctrl");
+    }
+    if alt {
+        parts.push("alt");
+    }
+    if platform {
+        // 与 gpui `Keystroke::unparse` 的写法一致，免得同一个修饰键在配置里有两种拼法
+        // （`secondary` 在非 macOS 上会被 parse 成 ctrl，绝不能拿来表示徽标键）。
+        parts.push(if cfg!(target_os = "macos") {
+            "cmd"
+        } else if cfg!(target_os = "windows") {
+            "win"
+        } else {
+            "super"
+        });
+    }
+    if shift {
+        parts.push("shift");
+    }
+    parts.push(key.as_str());
+    let normalized = parts.join("-");
+    (normalized != value).then_some(normalized)
+}
+
 /// 项目自建的签名服务（sodahub-org 部署）：开箱即用，可在设置里改成别的实例。
 pub const DEFAULT_SIGNER_URL: &str = "http://103.236.75.83:8899/sign";
 /// 上面那台服务的 token（等同取流能力，别外传；换服务时在设置里替换）。
@@ -194,20 +286,37 @@ impl Settings {
         settings
     }
 
-    /// 把老版本的默认端点迁到当前默认值。
+    /// 把老配置里已经失效的写法改到当前形式：内置签名端点、快捷键的显示形式。
     ///
-    /// 只认「等于旧默认值」这一种情况，用户填过别的地址就原样保留；
+    /// 端点只认「等于旧默认值」这一种情况，用户填过别的地址就原样保留；
     /// token 同理，避免覆盖用户自己给别的实例配的 token。
-    /// 返回是否发生了改动。
+    /// 返回是否发生了改动（改动后由 `load_from` 回存）。
     fn migrated(mut self) -> (Self, bool) {
-        if self.signer_url.trim() != LEGACY_SIGNER_URL {
-            return (self, false);
+        let mut changed = false;
+
+        if self.signer_url.trim() == LEGACY_SIGNER_URL {
+            self.signer_url = DEFAULT_SIGNER_URL.to_string();
+            if self.signer_token.trim() == LEGACY_SIGNER_TOKEN {
+                self.signer_token = DEFAULT_SIGNER_TOKEN.to_string();
+            }
+            changed = true;
         }
-        self.signer_url = DEFAULT_SIGNER_URL.to_string();
-        if self.signer_token.trim() == LEGACY_SIGNER_TOKEN {
-            self.signer_token = DEFAULT_SIGNER_TOKEN.to_string();
+
+        // 旧版本把按键的**显示形式**写进了配置（`⌘←`、`^←`、`ctrl-A`），这些串 parse 不回
+        // 原本那个键，绑上就是永不触发的死键（#39）。这里只改写「认得出是本应用产物」的值；
+        // 认不出的保持原样，交给设置页标成未生效。
+        for field in [
+            &mut self.shortcut_toggle,
+            &mut self.shortcut_previous,
+            &mut self.shortcut_next,
+        ] {
+            if let Some(normalized) = normalize_legacy_keystroke(field) {
+                *field = normalized;
+                changed = true;
+            }
         }
-        (self, true)
+
+        (self, changed)
     }
 
     /// 写配置（自动建目录）。
@@ -569,5 +678,67 @@ mod tests {
         let parsed: Settings = serde_json::from_str(r#"{"cookie":"x"}"#).expect("老配置应能解析");
         assert_eq!(parsed.shortcut_next(), DEFAULT_SHORTCUT_NEXT);
         assert!(parsed.shortcut_toggle.is_empty());
+    }
+
+    /// gpui `unparse` 在本机给主修饰键用的拼法（macOS = cmd，Windows = win，其余 = super）。
+    fn platform_key() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd"
+        } else if cfg!(target_os = "windows") {
+            "win"
+        } else {
+            "super"
+        }
+    }
+
+    /// 旧 Display 写下来的符号形式被认出来并改写成规范串；合法写法与认不出的值一概不动。
+    #[test]
+    fn legacy_display_forms_migrate_and_legal_values_stay() {
+        let expected = format!("{}-left", platform_key());
+        assert_eq!(
+            normalize_legacy_keystroke("⌘←").as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            normalize_legacy_keystroke("^←").as_deref(),
+            Some("ctrl-left"),
+            "macOS 的 control 曾被写成不带连字符的 ^"
+        );
+        assert_eq!(
+            normalize_legacy_keystroke("ctrl-A").as_deref(),
+            Some("ctrl-a"),
+            "大写单字符是旧 Display 的产物，本意是 Ctrl+A"
+        );
+        let expected = format!("{}-shift-i", platform_key());
+        assert_eq!(
+            normalize_legacy_keystroke("⇧⌘I").as_deref(),
+            Some(expected.as_str())
+        );
+
+        // 已经是合法写法：不改，用户在配置文件里看到的仍是他写的东西。
+        assert_eq!(normalize_legacy_keystroke("ctrl-left"), None);
+        assert_eq!(normalize_legacy_keystroke("cmd-left"), None);
+        assert_eq!(normalize_legacy_keystroke(""), None);
+        // 认不出的符号不猜。
+        assert_eq!(normalize_legacy_keystroke("☃"), None);
+    }
+
+    /// 启动读到旧格式：改写并回存，用户下次打开配置文件看到的就是真正生效的值。
+    #[test]
+    fn load_from_migrates_legacy_shortcut_in_place() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"cookie":"x","shortcut_previous":"⌘←"}"#).expect("写入临时配置");
+        let expected = format!("{}-left", platform_key());
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.shortcut_previous, expected);
+        assert_eq!(loaded.cookie, "x", "迁移不该动别的字段");
+
+        let reread = std::fs::read_to_string(&path).expect("迁移后应回存");
+        assert!(
+            reread.contains(expected.as_str()),
+            "配置文件里应已是规范串：{reread}"
+        );
     }
 }
