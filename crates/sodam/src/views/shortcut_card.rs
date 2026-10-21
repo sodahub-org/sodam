@@ -43,7 +43,15 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
     };
     let customized = shortcuts::is_customized(&root.settings, slot);
 
-    let action_button = |id: &'static str, label: &'static str, primary: bool| {
+    // 三行必须各有各的 id：gpui 的 `Div::id` 直接把传入值当 ElementId，不混父路径也不报错，
+    // 共用字面量的话只有第一行拿到可交互节点，后两行的 on_click 永远不触发（见 #35）。
+    let slot_key = match slot {
+        Slot::Toggle => "toggle",
+        Slot::Previous => "previous",
+        Slot::Next => "next",
+    };
+
+    let action_button = |id: String, label: &'static str, primary: bool| {
         div()
             .id(id)
             .flex()
@@ -64,9 +72,13 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
     };
 
     let (button_id, button_label, is_primary) = if capturing {
-        ("shortcut-cancel", root.tr("取消"), false)
+        (
+            format!("shortcut-cancel-{slot_key}"),
+            root.tr("取消"),
+            false,
+        )
     } else {
-        ("shortcut-start", root.tr("重绑"), true)
+        (format!("shortcut-start-{slot_key}"), root.tr("重绑"), true)
     };
 
     div()
@@ -115,8 +127,13 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                 )
                 .when(customized && !capturing, |this| {
                     this.child(
-                        action_button("shortcut-reset", root.tr("恢复默认"), false).on_click(
-                            cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                        action_button(
+                            format!("shortcut-reset-{slot_key}"),
+                            root.tr("恢复默认"),
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |root, _event: &ClickEvent, _window, cx| {
                                 shortcuts::set_keystroke(&mut root.settings, slot, String::new());
                                 root.shortcuts_dirty = true;
                                 root.status = if root.language.is_zh() {
@@ -126,8 +143,8 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                                 };
                                 let _ = root.settings.save();
                                 cx.notify();
-                            }),
-                        ),
+                            },
+                        )),
                     )
                 }),
         )
