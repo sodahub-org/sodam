@@ -1,8 +1,8 @@
-//! 自绘输入框的纯状态层：文本、插入点、IME 组合区间、词边界。
+//! 自绘输入框的纯状态层：文本、选区、IME 组合区间、词边界、横向偏移、撤销 / 重做栈。
 //!
 //! 这里刻意不出现 gpui 类型，也不读时钟、不碰剪贴板：整套状态能脱离窗口构造并单测，
-//! 渲染与按键分发留在 `app_text` 与 `views::search`。选区、滚动偏移、撤销栈之后
-//! 继续加在这个结构上，为的就是保住这条可测边界。
+//! 渲染与按键分发留在 `app_text` 与 `views::search`。所以撤销那 500ms 的合并窗口不自己
+//! 取时间，而是由调用方把算好的毫秒传进 [`TextField::end_edit`]。
 
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -192,6 +192,66 @@ fn normalized_range(text: &str, range: Range<usize>) -> Range<usize> {
     start..end.max(start)
 }
 
+/// 撤销/重做记录的时间戳单位：毫秒，由调用方（`Root` 自带的单调时钟）换算好传进来。
+///
+/// 状态层不读时钟是硬约定 —— 读了就没法写确定性的单测，合并窗口也就无法验证。
+pub type Milliseconds = u64;
+
+/// 相邻的同向插删在多久之内并成一条记录。
+const COALESCE_WINDOW_MS: Milliseconds = 500;
+
+/// 撤销栈长度上限：搜索框的串不会长，128 条已经足够回到很久以前，又能兜住内存。
+const MAX_UNDO_ENTRIES: usize = 128;
+
+/// 一条记录归类成哪种编辑，决定它能不能与相邻记录合并。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// 纯插入（打字，含打字替换掉选区的那一下）。可与同向的相邻记录按时间合并。
+    Typing,
+    /// 无选区时的退格。
+    DeleteBackward,
+    /// 无选区时的向前删。
+    DeleteForward,
+    /// 一次不可分割的结构变化：粘贴、剪切、清空、删掉整段选区。
+    Structural,
+    /// 一次输入法上屏：从第一个预编辑片段到最终提交，整体算一条。
+    Composition,
+}
+
+impl EditKind {
+    /// 只有连续同向的插删才按时间合并；结构变化和上屏各自独立成条。
+    fn coalescible_by_time(self) -> bool {
+        matches!(
+            self,
+            Self::Typing | Self::DeleteBackward | Self::DeleteForward
+        )
+    }
+}
+
+/// 撤销/重做要恢复的完整状态：文本 + 选区两端 + 方向。
+///
+/// 不含 `scroll_x`：滚动位置是视口属性，恢复它会让「撤销一下」顺带把画面甩走。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    text: String,
+    anchor: usize,
+    cursor: usize,
+    reversed: bool,
+}
+
+/// 一条可撤销记录：编辑前后的两端状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Command {
+    before: Snapshot,
+    after: Snapshot,
+    kind: EditKind,
+    /// 这条记录落笔的时刻，用于时间合并窗口。
+    at: Milliseconds,
+    /// 这条记录还停在没结束的输入法组合里（`after` 状态带着预编辑区间）。
+    /// 为真时下一条上屏编辑继续并入，直到组合结束。
+    open: bool,
+}
+
 /// 单行输入框的状态。下标一律是 UTF-8 字节位置，且永远落在字符边界上。
 ///
 /// 选区用「锚点 + 活动端」表示，而不是 `Option<Range>`：Shift 扩选和鼠标拖拽都要固定一端、
@@ -212,6 +272,14 @@ pub struct TextField {
     /// Fcitx/IBus 等 IME 的预编辑区间。
     marked: Option<Range<usize>>,
     scroll_x: f32,
+    /// 撤销栈，栈顶是最近一条。
+    undo: Vec<Command>,
+    /// 重做栈，栈顶是最近被撤销的一条。任何新编辑都会清空它。
+    redo: Vec<Command>,
+    /// `begin_edit` 记下的「这一下之前」，`end_edit` 用它收尾；没在编辑中时为 `None`。
+    pending: Option<Snapshot>,
+    /// 本次编辑期间文本有没有真的变、变成了哪一类。只有改到文本的方法会写它。
+    last_edit: Option<EditKind>,
 }
 
 impl TextField {
@@ -278,6 +346,9 @@ impl TextField {
         self.reversed = false;
         self.marked = None;
         self.scroll_x = 0.0;
+        if changed {
+            self.last_edit = Some(EditKind::Structural);
+        }
         changed
     }
 
@@ -289,10 +360,14 @@ impl TextField {
     pub fn set_caret(&mut self, caret: usize) -> bool {
         let next = clamp_cursor(&self.text, caret);
         let changed = next != self.cursor || self.has_selection();
+        let was_marked = self.marked.is_some();
         self.cursor = next;
         self.anchor = next;
         self.reversed = false;
         self.marked = None;
+        if was_marked {
+            self.close_composition();
+        }
         changed
     }
 
@@ -429,7 +504,12 @@ impl TextField {
             })
             .collect::<String>();
         let trimmed = normalized.trim();
-        self.replace(None, trimmed)
+        let changed = self.replace(None, trimmed);
+        if changed {
+            // 一次粘贴就是一条记录：`replace` 按插入归类，会让它跟相邻的打字合并掉。
+            self.last_edit = Some(EditKind::Structural);
+        }
+        changed
     }
 
     /// 把滚动量设到 `desired`，并夹在 `[0, max]` 内（`max` 由视图层用文本宽度算）。
@@ -466,12 +546,24 @@ impl TextField {
     /// 否则删掉活动端与目标位置之间的一段。
     pub fn delete(&mut self, direction: Direction, unit: Unit) -> bool {
         if self.has_selection() {
+            // 删掉整段选区是一次结构变化，不能跟相邻的同向单字删除合并。
             let range = self.selection();
-            return self.apply_removal(range);
+            let changed = self.apply_removal(range);
+            if changed {
+                self.last_edit = Some(EditKind::Structural);
+            }
+            return changed;
         }
         let from = self.offset_in_direction(direction, unit);
         let range = normalized_range(&self.text, self.cursor..from);
-        self.apply_removal(range)
+        let changed = self.apply_removal(range);
+        if changed {
+            self.last_edit = Some(match direction {
+                Direction::Backward => EditKind::DeleteBackward,
+                Direction::Forward => EditKind::DeleteForward,
+            });
+        }
+        changed
     }
 
     /// 删除区间并把两端收口到删除起点；空区间返回 `false`（不需要重绘）。
@@ -493,6 +585,15 @@ impl TextField {
     /// Windows 的可输入字符走 WM_CHAR，带的是 `None`，兜底成末尾会让「点到中间再打字」
     /// 变成追加到尾部；而选了整段再打字必须替换掉整段，所以选区排在这里。
     pub fn replace(&mut self, range: Option<Range<usize>>, text: &str) -> bool {
+        // 归类必须在看不到改坏之后的状态之前做：带着组合区间的替换属于「一次上屏」，
+        // 插了内容的算打字，只删不插的（平台直接给的删除）算结构变化。
+        let kind = if self.marked.is_some() {
+            EditKind::Composition
+        } else if text.is_empty() {
+            EditKind::Structural
+        } else {
+            EditKind::Typing
+        };
         let range = normalized_range(
             &self.text,
             range
@@ -507,6 +608,9 @@ impl TextField {
         self.anchor = self.cursor;
         self.reversed = false;
         self.marked = None;
+        if changed {
+            self.last_edit = Some(kind);
+        }
         changed
     }
 
@@ -516,12 +620,129 @@ impl TextField {
         let end = self.cursor;
         let start = end.saturating_sub(text.len());
         self.marked = (end > start).then_some(start..end);
+        if changed {
+            // 第一个预编辑片段之前没有组合区间，`replace` 会把它误判成打字，这里统一收回。
+            self.last_edit = Some(EditKind::Composition);
+        }
         changed
     }
 
     /// 结束组合（`unmark_text`），返回是否本来就在组合中。
     pub fn clear_marked(&mut self) -> bool {
-        self.marked.take().is_some()
+        let was_marked = self.marked.take().is_some();
+        if was_marked {
+            self.close_composition();
+        }
+        was_marked
+    }
+
+    /// 给栈顶那条记录收口：组合区间被清掉（Esc 撤候选、点击别处）之后，下一次上屏必须
+    /// 新开一条记录，否则两次不相干的下屏会被并成一条。
+    fn close_composition(&mut self) {
+        if let Some(top) = self.undo.last_mut() {
+            top.open = false;
+        }
+    }
+
+    /// 开始一次编辑事务：把「这一下之前」的完整状态扣下来。
+    ///
+    /// 由调用方（`app_text` 的按键处理器与 `Root` 的 `EntityInputHandler`）在改动文本之前
+    /// 调用，改完紧跟 `end_edit`。只动光标不动文本的事务会在 `end_edit` 里被整条丢弃。
+    pub fn begin_edit(&mut self) {
+        self.last_edit = None;
+        self.pending = Some(self.snapshot());
+    }
+
+    /// 收尾一次编辑事务：文本真变了才入栈，并按 [`EditKind`] 的规则决定并入栈顶还是新开一条。
+    pub fn end_edit(&mut self, now: Milliseconds) {
+        let before = self.pending.take();
+        let kind = self.last_edit.take();
+        let (Some(before), Some(kind)) = (before, kind) else {
+            return;
+        };
+        let after = self.snapshot();
+        let open = self.marked.is_some();
+        let merge = self
+            .undo
+            .last()
+            .is_some_and(|top| Self::mergeable(top, &before, kind, now));
+        if merge {
+            // 合并只把栈顶的 `after` 往前推：`before` 保持组内最早那一次的起点，
+            // 于是一次撤销能退回到「连打五个字」之前，而不是只退一个字。
+            let index = self.undo.len() - 1;
+            self.undo[index].after = after;
+            self.undo[index].at = now;
+            self.undo[index].open = open;
+            return;
+        }
+        self.undo.push(Command {
+            before,
+            after,
+            kind,
+            at: now,
+            open,
+        });
+        if self.undo.len() > MAX_UNDO_ENTRIES {
+            let excess = self.undo.len() - MAX_UNDO_ENTRIES;
+            self.undo = self.undo.split_off(excess);
+        }
+        // 历史一旦分叉，重做链就断了 —— 与所有编辑器一致。
+        self.redo.clear();
+    }
+
+    /// 撤销一条记录，把它的「之前」整个装回来（文本、两端、方向一起）。
+    pub fn undo(&mut self) -> bool {
+        let Some(command) = self.undo.pop() else {
+            return false;
+        };
+        self.restore(&command.before);
+        self.redo.push(command);
+        true
+    }
+
+    /// 重做一条刚被撤销的记录。
+    pub fn redo(&mut self) -> bool {
+        let Some(command) = self.redo.pop() else {
+            return false;
+        };
+        self.restore(&command.after);
+        self.undo.push(command);
+        true
+    }
+
+    /// 这条记录能不能并入栈顶：必须首尾相接（中间插了别的改动就不算连续），
+    /// 再看类别与时间窗口。
+    fn mergeable(top: &Command, before: &Snapshot, kind: EditKind, now: Milliseconds) -> bool {
+        if top.after != *before || top.kind != kind {
+            return false;
+        }
+        match kind {
+            // 一次上屏从第一个预编辑片段到最终提交始终是一条，不看时间——拼音打得多慢都不该断。
+            EditKind::Composition => top.open,
+            other => {
+                other.coalescible_by_time()
+                    && !top.open
+                    && now.saturating_sub(top.at) <= COALESCE_WINDOW_MS
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.text.clone(),
+            anchor: self.anchor,
+            cursor: self.cursor,
+            reversed: self.reversed,
+        }
+    }
+
+    /// 装回一个快照。快照取自文本一致的状态，夹一下只是防御性收尾。
+    fn restore(&mut self, state: &Snapshot) {
+        self.text = state.text.clone();
+        self.anchor = clamp_cursor(&self.text, state.anchor);
+        self.cursor = clamp_cursor(&self.text, state.cursor);
+        self.reversed = state.reversed;
+        self.marked = None;
     }
 
     pub fn utf16_len(&self) -> usize {
@@ -961,5 +1182,191 @@ mod tests {
         field.set_scroll_x(30.0, 100.0);
         field.set_text("abc");
         assert_eq!(field.scroll_x(), 0.0, "整体换词之后旧偏移没有意义");
+    }
+
+    /// 在 `at` 毫秒时走一次完整事务（开 → 改 → 收尾），与 `app_text::edit_text` 同一条路径。
+    fn edit_at(
+        field: &mut TextField,
+        at: Milliseconds,
+        edit: impl FnOnce(&mut TextField) -> bool,
+    ) -> bool {
+        field.begin_edit();
+        let changed = edit(field);
+        field.end_edit(at);
+        changed
+    }
+
+    #[test]
+    fn history_is_empty_and_both_directions_are_no_ops() {
+        let mut field = field_with("abc");
+        assert!(!field.undo());
+        assert!(!field.redo());
+        assert_eq!(field.text(), "abc");
+    }
+
+    #[test]
+    fn caret_moves_never_enter_history() {
+        let mut field = field_with("hello world");
+        // 方向键、Shift 扩选、全选都只动两端，不动文本：一次撤销都不该留下。
+        edit_at(&mut field, 0, |field| {
+            field.move_caret(Direction::Backward, Unit::Char)
+        });
+        edit_at(&mut field, 10, |field| {
+            field.extend_selection(Direction::Forward, Unit::Word)
+        });
+        edit_at(&mut field, 20, |field| field.select_all());
+        edit_at(&mut field, 30, |field| field.collapse_selection());
+        assert!(!field.undo(), "纯光标移动不该进撤销栈");
+        assert_eq!(field.text(), "hello world");
+    }
+
+    #[test]
+    fn typing_inside_the_window_merges_into_one_record() {
+        let mut field = TextField::default();
+        for (index, ch) in "abc".chars().enumerate() {
+            let text = ch.to_string();
+            edit_at(&mut field, index as u64 * 100, |field| {
+                field.replace(None, &text)
+            });
+        }
+        assert!(field.undo());
+        assert_eq!(field.text(), "", "一次撤销要退回连打三个字之前");
+        assert!(!field.undo(), "三个字合并成了一条记录");
+    }
+
+    #[test]
+    fn typing_after_the_window_opens_a_new_record() {
+        let mut field = TextField::default();
+        edit_at(&mut field, 0, |field| field.replace(None, "a"));
+        edit_at(&mut field, 600, |field| field.replace(None, "b"));
+        assert!(field.undo());
+        assert_eq!(field.text(), "a", "超过 500ms 就不算同一次连打");
+        assert!(field.undo());
+        assert_eq!(field.text(), "");
+    }
+
+    #[test]
+    fn opposite_directions_do_not_merge() {
+        let mut field = TextField::default();
+        edit_at(&mut field, 0, |field| field.replace(None, "ab"));
+        edit_at(&mut field, 10, |field| {
+            field.delete(Direction::Backward, Unit::Char)
+        });
+        // 打字与退格是两种 kind，撤销应当一步步退回去。
+        assert!(field.undo());
+        assert_eq!(field.text(), "ab");
+        assert!(field.undo());
+        assert_eq!(field.text(), "");
+    }
+
+    #[test]
+    fn paste_and_selection_delete_are_their_own_records() {
+        let mut field = TextField::default();
+        edit_at(&mut field, 0, |field| field.paste("hello"));
+        edit_at(&mut field, 10, |field| field.replace(None, "!"));
+        assert!(field.undo());
+        assert_eq!(field.text(), "hello", "一次粘贴独立成条，不被后续打字吃掉");
+        edit_at(&mut field, 20, |field| field.select_all());
+        edit_at(&mut field, 30, |field| {
+            field.delete(Direction::Backward, Unit::Char)
+        });
+        assert_eq!(field.text(), "");
+        assert!(field.undo());
+        assert_eq!(field.text(), "hello");
+        assert_eq!(
+            field.selection(),
+            0..5,
+            "撤销要连同当时的选区一起恢复，而不只还原文本"
+        );
+    }
+
+    #[test]
+    fn one_ime_composition_is_one_record_even_when_it_is_slow() {
+        let mut field = field_with("前");
+        // 预编辑（带组合区间）到最终上屏之间可能很久，仍然只算一次上屏。
+        edit_at(&mut field, 0, |field| field.replace_and_mark(None, "zhong"));
+        assert_eq!(field.text(), "前zhong");
+        edit_at(&mut field, 5_000, |field| field.replace(None, "中"));
+        assert_eq!(field.text(), "前中");
+        assert!(field.undo());
+        assert_eq!(field.text(), "前", "一次撤销退到组合开始之前");
+        assert!(!field.undo());
+    }
+
+    #[test]
+    fn two_back_to_back_compositions_stay_separate() {
+        let mut field = TextField::default();
+        edit_at(&mut field, 0, |field| field.replace_and_mark(None, "a"));
+        edit_at(&mut field, 10, |field| field.replace(None, "阿"));
+        edit_at(&mut field, 20, |field| field.replace_and_mark(None, "b"));
+        edit_at(&mut field, 30, |field| field.replace(None, "吧"));
+        assert!(field.undo());
+        assert_eq!(field.text(), "阿", "上一次上屏已经收口，不该并进下一条");
+        assert!(field.undo());
+        assert_eq!(field.text(), "");
+    }
+
+    #[test]
+    fn esc_clear_can_be_undone() {
+        let mut field = field_with("周杰伦");
+        edit_at(&mut field, 0, |field| field.clear());
+        assert!(field.is_empty());
+        assert!(field.undo());
+        assert_eq!(field.text(), "周杰伦");
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_drops_the_redo_branch() {
+        let mut field = TextField::default();
+        edit_at(&mut field, 0, |field| field.replace(None, "a"));
+        edit_at(&mut field, 600, |field| field.replace(None, "b"));
+        assert!(field.undo());
+        assert_eq!(field.text(), "a");
+        edit_at(&mut field, 700, |field| field.replace(None, "c"));
+        assert_eq!(field.text(), "ac");
+        assert!(!field.redo(), "历史分叉之后重做链必须断开");
+    }
+
+    #[test]
+    fn redo_replays_what_undo_undid() {
+        let mut field = field_with("ab");
+        edit_at(&mut field, 0, |field| {
+            field.delete(Direction::Backward, Unit::Char)
+        });
+        assert_eq!(field.text(), "a");
+        assert!(field.undo());
+        assert_eq!(field.text(), "ab");
+        assert!(field.redo());
+        assert_eq!(field.text(), "a");
+        assert_eq!(field.caret(), 1);
+        assert!(!field.redo());
+    }
+
+    #[test]
+    fn history_is_capped_at_the_documented_size() {
+        let mut field = TextField::default();
+        // 每条间隔 1000ms，保证互不合并：130 条只留 128 条，最老的被丢掉。
+        for index in 0..130_u64 {
+            edit_at(&mut field, index * 1_000, |field| field.replace(None, "x"));
+        }
+        assert_eq!(field.text(), "x".repeat(130));
+        for _ in 0..128 {
+            assert!(field.undo());
+        }
+        assert!(!field.undo(), "上限之外的那两条不该还能撤销");
+        assert_eq!(field.text(), "xx");
+    }
+
+    #[test]
+    fn cancelling_a_composition_closes_the_group() {
+        let mut field = field_with("前");
+        edit_at(&mut field, 0, |field| field.replace_and_mark(None, "zhong"));
+        // Esc 撤掉候选：只清组合区间，不动文本，但正在打开的那条上屏记录必须收口。
+        assert!(field.clear_marked());
+        edit_at(&mut field, 10, |field| field.replace_and_mark(None, "ni"));
+        assert!(field.undo());
+        assert_eq!(field.text(), "前zhong", "两次不相干的下屏不能并成一条");
+        assert!(field.undo());
+        assert_eq!(field.text(), "前");
     }
 }

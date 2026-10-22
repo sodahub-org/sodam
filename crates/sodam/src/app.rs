@@ -234,6 +234,8 @@ pub struct Root {
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
     pub(crate) search_drag_by_word: bool,
+    /// 撤销合并窗口的单调时钟起点（见 [`Root::search_edit_time`]）。
+    search_edit_epoch: std::time::Instant,
     pub search_focus: FocusHandle,
     /// 「按下 Ctrl+F，等搜索框进树之后把焦点给它」的待办标记。
     ///
@@ -471,6 +473,7 @@ impl Root {
             lyrics_request_seq: 0,
             search_field: TextField::default(),
             search_drag_by_word: false,
+            search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             search_focus: cx.focus_handle(),
             search_focus_pending: false,
@@ -819,6 +822,14 @@ impl Root {
         gpui::px(self.search_field.scroll_x())
     }
 
+    /// 撤销合并用的时间戳（毫秒，自 `Root` 构造起算）。
+    ///
+    /// `TextField` 刻意不读时钟：读了就写不出确定性的单测，500ms 合并窗口也没法验证。
+    /// 所以时钟留在这里，状态层只接收算好的数。
+    pub(crate) fn search_edit_time(&self) -> crate::ui::text_field::Milliseconds {
+        self.search_edit_epoch.elapsed().as_millis() as u64
+    }
+
     /// 插入点在输入框内的横向偏移：**已扣掉滚动量**，可以直接当元素的 `left`。
     pub(crate) fn search_caret_x(&self, window: &Window) -> gpui::Pixels {
         let caret = self.search_field.caret();
@@ -983,7 +994,10 @@ impl EntityInputHandler for Root {
             return;
         }
         let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        let now = self.search_edit_time();
+        self.search_field.begin_edit();
         self.search_field.replace(range, text);
+        self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
         cx.notify();
     }
@@ -1000,7 +1014,10 @@ impl EntityInputHandler for Root {
             return;
         }
         let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        let now = self.search_edit_time();
+        self.search_field.begin_edit();
         self.search_field.replace_and_mark(range, new_text);
+        self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
         cx.notify();
     }

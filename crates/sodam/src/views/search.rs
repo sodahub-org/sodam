@@ -122,6 +122,8 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .on_action(cx.listener(Root::text_copy))
         .on_action(cx.listener(Root::text_cut))
         .on_action(cx.listener(Root::text_paste))
+        .on_action(cx.listener(Root::text_undo))
+        .on_action(cx.listener(Root::text_redo))
         .on_action(cx.listener(Root::text_submit))
         .on_action(cx.listener(Root::text_cancel))
         .child(

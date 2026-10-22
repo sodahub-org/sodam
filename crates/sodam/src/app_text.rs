@@ -40,6 +40,8 @@ actions!(
         Copy,
         Cut,
         Paste,
+        Undo,
+        Redo,
         Submit,
         Cancel,
         FocusSearch
@@ -71,6 +73,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-c", Copy, ctx),
         KeyBinding::new("secondary-x", Cut, ctx),
         KeyBinding::new("secondary-v", Paste, ctx),
+        KeyBinding::new("secondary-z", Undo, ctx),
+        KeyBinding::new("secondary-shift-z", Redo, ctx),
     ];
     if cfg!(target_os = "macos") {
         // macOS 的惯例：`⌥←/→` 按词移动，`⌘←/→` 是行首/行尾（与 shortcuts.rs 顶部注释里
@@ -93,6 +97,8 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-backspace", DeleteWordBackward, ctx),
             KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
             KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+            // Windows/Linux 的第二个重做键（`Ctrl+Y`）；macOS 只有 `⌘⇧Z`。
+            KeyBinding::new("ctrl-y", Redo, ctx),
         ]);
     }
     bindings
@@ -111,14 +117,37 @@ pub fn focus_bindings() -> Vec<KeyBinding> {
 }
 
 impl Root {
-    /// 改一处文本状态：真有变化才把活动端拉进可视区并重绘。
+    /// 改一处文本状态：先开撤销事务，真有变化才通知重绘。
+    ///
+    /// 事务的边界就放在这个唯一的收口处：`begin_edit` 记下改动之前的完整状态，`end_edit`
+    /// 按类别决定并入上一条还是新开一条。只动光标不动文本的按键（方向键、Shift 扩选）
+    /// 会被 `end_edit` 整条丢弃，不会污染撤销历史。
     fn edit_text(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut TextField) -> bool,
     ) {
-        if edit(&mut self.search_field) {
+        let now = self.search_edit_time();
+        self.search_field.begin_edit();
+        let changed = edit(&mut self.search_field);
+        self.search_field.end_edit(now);
+        if changed {
+            self.search_fit_caret_in_view(window);
+            cx.notify();
+        }
+    }
+
+    /// 撤销与重做不走 `edit_text`：要恢复哪一份快照由状态层自己决定，不需要再开事务。
+    pub(crate) fn text_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_field.undo() {
+            self.search_fit_caret_in_view(window);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn text_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_field.redo() {
             self.search_fit_caret_in_view(window);
             cx.notify();
         }
