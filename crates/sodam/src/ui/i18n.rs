@@ -183,6 +183,7 @@ impl Language {
             }
             "快捷键已更新" => "Shortcut updated",
             "快捷键已恢复默认" => "Shortcut reset to default",
+            "聚焦搜索框" => "Focus the search box",
             "徽标键由系统占用，请换个组合键" => {
                 "The Windows/Super key belongs to the system — pick another combination"
             }

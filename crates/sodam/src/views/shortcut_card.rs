@@ -329,6 +329,14 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             shortcuts::ShortcutConflict::MacosMenu => {
                                 root.localized("该组合键由 macOS 菜单保留，不能绑定", &[])
                             }
+                            shortcuts::ShortcutConflict::Fixed(feature) => {
+                                let label = root.tr(feature).to_string();
+                                if root.language.is_zh() {
+                                    root.localized("该组合键已用于「{}」，不能绑定", &[label])
+                                } else {
+                                    format!("Shortcut is already used by \"{label}\"")
+                                }
+                            }
                         };
                         root.status = message.clone();
                         root.open_message(crate::ui::message::MessageKind::Warning, message);

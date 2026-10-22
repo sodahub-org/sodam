@@ -27,8 +27,17 @@ pub const CAPTURING_CONTEXT: &str = "capturing";
 /// 时根本匹配不上。根元素挂上基础上下文后，栈至少有一层。
 pub const BASE_CONTEXT: &str = "workspace";
 
-/// 播放动作的生效条件。
-const PLAYBACK_CONTEXT: &str = "workspace && !input && !capturing";
+/// 播放动作与「聚焦搜索框」共同的生效条件。
+///
+/// 名字不叫播放专用：`app_text::focus_bindings()` 也用它 —— 那是个全局键，
+/// 同样不该在打字或录制快捷键时冒出来。
+pub(crate) const GLOBAL_CONTEXT: &str = "workspace && !input && !capturing";
+
+/// 「聚焦搜索框」的绑定串（见 `app_text::focus_bindings`）。
+///
+/// 固定功能，不可重绑。`secondary-` 由 gpui 按平台解释成 macOS 的 ⌘ / 其他平台的 Ctrl，
+/// 所以要拦哪个键得先把它规范成具体写法，见下面的 `reserved_feature`。
+pub const FOCUS_SEARCH_SOURCE: &str = "secondary-f";
 
 /// 三个可重绑的播放动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +58,8 @@ pub enum ShortcutConflict {
     Playback(Slot),
     /// macOS 菜单保留键。
     MacosMenu,
+    /// 已被应用内固定功能占用（携带该功能名的中文 key）。
+    Fixed(&'static str),
 }
 
 /// 读取某个动作当前生效的按键（gpui keystroke 写法）。
@@ -116,6 +127,18 @@ pub fn is_bindable_source(source: &str) -> bool {
             .all(|part| Keystroke::parse(part).is_ok())
 }
 
+/// 候选键是否已被应用内某个**固定功能**占用；返回该功能名的中文 key。
+///
+/// 规范串用 `parse` + `unparse` 现算，不手写 `"cmd-f"` / `"ctrl-f"`：手写就等于自己
+/// 再排一遍平台规则，正是 #42 之前那类「只在某个平台生效」的坑。录制界面存的也是
+/// `canonical_keystroke` 的产物，两边同一套归一化才比得准。
+fn reserved_feature(candidate: &str) -> Option<&'static str> {
+    Keystroke::parse(FOCUS_SEARCH_SOURCE)
+        .ok()
+        .filter(|keystroke| canonical_keystroke(keystroke).eq_ignore_ascii_case(candidate))
+        .map(|_| "聚焦搜索框")
+}
+
 /// 检查候选组合键能否绑定到 `slot`。
 ///
 /// 比较的是生效值而不是配置原文：空串代表内置默认，手改配置造成的重复
@@ -133,6 +156,10 @@ pub fn shortcut_conflict(
         )
     {
         return Some(ShortcutConflict::MacosMenu);
+    }
+    // 固定功能先判：两种原因同时命中时，「已被聚焦搜索框占用」才是能照着换键的那句。
+    if let Some(feature) = reserved_feature(candidate) {
+        return Some(ShortcutConflict::Fixed(feature));
     }
 
     Slot::ALL
@@ -176,6 +203,7 @@ pub fn apply(cx: &mut App, settings: &Settings) {
     #[cfg(target_os = "macos")]
     cx.bind_keys(crate::menus::window_bindings());
     cx.bind_keys(crate::app_text::bindings());
+    cx.bind_keys(crate::app_text::focus_bindings());
     cx.bind_keys(bindings(settings));
 }
 
@@ -195,11 +223,7 @@ fn push_binding<A: Action>(bindings: &mut Vec<KeyBinding>, source: &str, action:
     if !is_bindable_source(source) {
         return;
     }
-    bindings.push(KeyBinding::new(
-        source.trim(),
-        action,
-        Some(PLAYBACK_CONTEXT),
-    ));
+    bindings.push(KeyBinding::new(source.trim(), action, Some(GLOBAL_CONTEXT)));
 }
 
 #[cfg(test)]
@@ -343,5 +367,24 @@ mod tests {
                 Some(ShortcutConflict::MacosMenu)
             );
         }
+    }
+
+    #[test]
+    fn fixed_feature_shortcuts_are_reserved() {
+        // 与录制界面同一条归一化路径（parse + unparse）：手写 "ctrl-f" 在 macOS 上就验错了键。
+        let reserved = canonical_keystroke(&Keystroke::parse(FOCUS_SEARCH_SOURCE).unwrap());
+        let upper = reserved.to_uppercase();
+        let padded = format!("  {reserved} ");
+        let settings = Settings::default();
+        for candidate in [reserved.as_str(), upper.as_str(), padded.as_str()] {
+            assert_eq!(
+                shortcut_conflict(&settings, Slot::Toggle, candidate),
+                Some(ShortcutConflict::Fixed("聚焦搜索框")),
+                "{candidate} 该被固定功能挡住"
+            );
+        }
+        // 修饰键匹配是精确的：加一个 Shift 就没人占用，照常可绑。
+        let shifted = format!("shift-{reserved}");
+        assert_eq!(shortcut_conflict(&settings, Slot::Toggle, &shifted), None);
     }
 }

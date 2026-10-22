@@ -233,6 +233,10 @@ pub struct Root {
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub search_focus: FocusHandle,
+    /// 「按下 Ctrl+F，等搜索框进树之后把焦点给它」的待办标记。
+    ///
+    /// 只在 `app_text::Root::focus_search` 里置位，在 `Root::render` 开头消费。
+    pub(crate) search_focus_pending: bool,
     /// 窗口根元素的焦点。
     ///
     /// 必须有：gpui 的上下文栈取自「聚焦节点到根的路径」，没有聚焦元素时栈是空的，
@@ -466,6 +470,7 @@ impl Root {
             search_field: TextField::default(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             search_focus: cx.focus_handle(),
+            search_focus_pending: false,
             workspace_focus: cx.focus_handle(),
             shortcut_focus: cx.focus_handle(),
             shortcut_capture: None,
@@ -1002,6 +1007,12 @@ impl Render for Root {
         if window.focused(cx).is_none() {
             window.focus(&self.workspace_focus, cx);
         }
+        // Ctrl+F 的焦点不在动作里落：从别的页过来时搜索框要到这一帧的渲染才进 dispatch
+        // tree，早一帧 focus 拿不到 `input` 上下文。这里与上面收回根焦点是同一处时机。
+        if self.search_focus_pending {
+            self.search_focus_pending = false;
+            window.focus(&self.search_focus, cx);
+        }
         // 开发期帧耗时探针（`SODAM_FRAME_LOG=1`）：渲染超过 16ms 就打一行。
         // 排查「UI 卡死」先看这里，而不是靠感觉。
         let frame_started = std::time::Instant::now();
@@ -1064,6 +1075,8 @@ impl Render for Root {
             // 根元素持焦点 + 挂基础上下文：带谓词的快捷键绑定要有非空上下文栈才生效。
             .track_focus(&self.workspace_focus)
             .key_context(crate::shortcuts::BASE_CONTEXT)
+            // 焦点在窗口内的任何地方都能命中：根元素是全部聚焦节点的共同祖先。
+            .on_action(cx.listener(Root::focus_search))
             .bg(theme::ambient_background())
             .text_color(ui::theme::text())
             .child(
