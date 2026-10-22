@@ -1,20 +1,38 @@
 //! 官方风格搜索结果页，以及音乐人 / 专辑详情页。
 
 use super::*;
-/// 搜索框：点击定位插入点，按键走 keymap + action（见 `app_text`），Esc 清空。
+use gpui::{MouseMoveEvent, MouseUpEvent};
+/// 搜索框：单击定位、拖拽扩选、双击选词、三击全选；按键走 keymap + action（见 `app_text`）。
 fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
     let focused = root.search_focus.is_focused(window);
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
-    let text = if root.search_field.is_empty() {
+    let empty = root.search_field.is_empty();
+    // 空框用正常布局画占位文案（天然居中）；有内容时真实文本交给下面的 canvas 直接
+    // `line.paint`，因为只有这样才能跟着 `scroll_x` 走，而且它和光标、选区用的是
+    // 同一条 ShapedLine —— 三者不会互相错位。
+    let flow_text = if empty {
         root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
     } else {
-        root.search_field.text().to_string()
+        String::new()
     };
-    let color = if root.search_field.is_empty() {
+    let color = if empty {
         theme::text_muted()
     } else {
         theme::text()
+    };
+    let line = root.search_shaped_line_with(window, theme::text());
+    let scroll = root.search_scroll_x();
+    // 统一成「相对文本区左边缘」的坐标，canvas 里再加回 bounds.origin.x。
+    let selection = root
+        .search_selection_edges(window)
+        .map(|(start, end)| (start - scroll, end - scroll));
+    let caret_x = root.search_caret_x(window);
+    // 选区色取主题强调色加透明度；失焦时不消失，只是淡下来（与浏览器/Chromium 一致：
+    // 非活跃选区是「同色 + fading」，不是没有）。
+    let selection_color = gpui::Rgba {
+        a: if focused { 0.30 } else { 0.15 },
+        ..theme::accent()
     };
 
     div()
@@ -42,13 +60,48 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
             MouseButton::Left,
             cx.listener(|root, event: &MouseDownEvent, window, cx| {
                 window.focus(&root.search_focus, cx);
-                // 点哪儿就把插入点放哪儿（之前只聚焦，光标恒在末尾）。
-                let caret = root.search_cursor_for_x(event.position.x, window);
-                root.search_field.set_caret(caret);
-                cx.notify();
+                // 单击定位插入点、双击选词、三击全选（Chromium 的单行框三击就是全选）。
+                let changed =
+                    root.search_pointer_down(event.position.x, event.click_count, window);
+                if changed {
+                    cx.notify();
+                }
             }),
         )
-        // 编辑键不再在 on_key_down 里逐个匹配字符串：gpui 的 keymap 匹配修饰键是精确的，
+        .on_mouse_move(
+            cx.listener(|root, event: &MouseMoveEvent, window, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                let mut changed = root.search_pointer_drag(event.position.x, window);
+                // 拖到边缘内侧 16px 就横滚，滚完必须再算一次端点：指针没动，但字动了。
+                if let Some(bounds) = root.search_bounds.get() {
+                    let width = bounds.size.width;
+                    let left_edge = bounds.origin.x + px(16.0);
+                    let right_edge = bounds.origin.x + width - px(16.0);
+                    let scrolled = if event.position.x < left_edge {
+                        root.search_scroll_by(-px(12.0), window, width)
+                    } else if event.position.x > right_edge {
+                        root.search_scroll_by(px(12.0), window, width)
+                    } else {
+                        false
+                    };
+                    if scrolled {
+                        changed |= root.search_pointer_drag(event.position.x, window);
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|root, _event: &MouseUpEvent, _window, _cx| {
+                root.search_pointer_up();
+            }),
+        )
+        // 编辑键不在 on_key_down 里逐个匹配字符串：gpui 的 keymap 匹配修饰键是精确的，
         // 绑定表集中在 app_text::bindings()，一处读得全（可输入字符仍走 EntityInputHandler）。
         .on_action(cx.listener(Root::text_backspace))
         .on_action(cx.listener(Root::text_delete))
@@ -57,44 +110,79 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .on_action(cx.listener(Root::text_right))
         .on_action(cx.listener(Root::text_word_left))
         .on_action(cx.listener(Root::text_word_right))
+        .on_action(cx.listener(Root::text_select_left))
+        .on_action(cx.listener(Root::text_select_right))
+        .on_action(cx.listener(Root::text_select_word_left))
+        .on_action(cx.listener(Root::text_select_word_right))
         .on_action(cx.listener(Root::text_home))
         .on_action(cx.listener(Root::text_end))
+        .on_action(cx.listener(Root::text_select_home))
+        .on_action(cx.listener(Root::text_select_end))
+        .on_action(cx.listener(Root::text_select_all))
+        .on_action(cx.listener(Root::text_copy))
+        .on_action(cx.listener(Root::text_cut))
+        .on_action(cx.listener(Root::text_paste))
         .on_action(cx.listener(Root::text_submit))
         .on_action(cx.listener(Root::text_cancel))
         .child(
-            // 文本 + 光标放在同一个 relative 盒里：光标是一个真实的绝对定位元素，
-            // `left` 直接用 ShapedLine 的 `x_for_index(cursor)` 算出来，
-            // 和文本用的是同一条排版结果，不会错位。
+            // 26 = 占位文案的行盒高度，也是原来那条 4 + 18 + 4 的光标几何所暗示的高度；
+            // 显式定高之后，真实文本改由 canvas 绘制，盒子才不会塌成 0。
             div()
                 .id("search-text")
                 .relative()
+                .flex()
+                .items_center()
                 .flex_1()
                 .min_w(px(0.0))
+                .h(px(26.0))
                 .overflow_hidden()
-                .child(text)
-                .when(focused, |this| {
-                    let caret_x = root.search_caret_x(window);
-                    this.child(
-                        div()
-                            .absolute()
-                            .left(caret_x)
-                            .top(px(4.0))
-                            .w(px(2.0))
-                            .h(px(18.0))
-                            .bg(theme::accent()),
-                    )
-                })
+                .child(flow_text)
                 .child(
                     canvas(
                         {
                             let bounds_cell = root.search_bounds.clone();
                             move |bounds, _window, _cx| {
-                                // 记下文本区位置：鼠标点击要用它把 x 换算成字符下标。
+                                // 记下文本区位置：鼠标点击与拖拽都要用它把 x 换算成字符下标。
                                 bounds_cell.set(Some(bounds));
                                 bounds
                             }
                         },
                         move |bounds, _state, window, cx| {
+                            let line_height = window.line_height();
+                            // 在盒子里竖向居中，跟 flow 布局的占位文案同一套算法。
+                            let top = bounds.origin.y
+                                + px((f32::from(bounds.size.height) - f32::from(line_height)) / 2.0);
+                            // 先画选区，再画字，最后画光标：顺序即层级。
+                            if let Some((start, end)) = selection {
+                                let quad = gpui::fill(
+                                    gpui::Bounds::from_corners(
+                                        gpui::point(bounds.origin.x + start, bounds.origin.y),
+                                        gpui::point(bounds.origin.x + end, bounds.origin.y + bounds.size.height),
+                                    ),
+                                    selection_color,
+                                );
+                                window.paint_quad(quad);
+                            }
+                            if let Some(line) = &line {
+                                let _ = line.paint(
+                                    gpui::point(bounds.origin.x - scroll, top),
+                                    line_height,
+                                    gpui::TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            if focused {
+                                let caret = gpui::fill(
+                                    gpui::Bounds::new(
+                                        gpui::point(bounds.origin.x + caret_x, top),
+                                        gpui::size(crate::app::CARET_WIDTH, line_height),
+                                    ),
+                                    theme::accent(),
+                                );
+                                window.paint_quad(caret);
+                            }
                             window.handle_input(
                                 &input_focus,
                                 gpui::ElementInputHandler::new(bounds, input_entity.clone()),

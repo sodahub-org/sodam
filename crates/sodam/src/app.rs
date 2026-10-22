@@ -232,6 +232,8 @@ pub struct Root {
     pub search_field: TextField,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
+    pub(crate) search_drag_by_word: bool,
     pub search_focus: FocusHandle,
     /// 窗口根元素的焦点。
     ///
@@ -464,6 +466,7 @@ impl Root {
             lyrics_scroll: gpui::UniformListScrollHandle::new(),
             lyrics_request_seq: 0,
             search_field: TextField::default(),
+            search_drag_by_word: false,
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             search_focus: cx.focus_handle(),
             workspace_focus: cx.focus_handle(),
@@ -737,12 +740,27 @@ impl Root {
     }
 }
 
+/// 搜索框光标的宽度。绘制（`views::search_box`）与滚动判定（`search_fit_caret`、
+/// `search_max_scroll`）必须共用这一个值：只按 0 宽度算滚动的话，滚到最右时光标正好
+/// 压在 canvas 的裁剪线上，整个被裁掉，看起来就是「末尾没有光标」。
+pub(crate) const CARET_WIDTH: gpui::Pixels = gpui::px(2.0);
+
 impl Root {
     /// 按当前 text style 把搜索框内容 shape 成一行。
     ///
     /// 光标位置和点击定位都用**同一条** ShapedLine 量，避免"自己估宽度"和
     /// 实际渲染不一致导致的光标错位（sonora 的 Input 也是这么做的）。
     fn search_shaped_line(&self, window: &Window) -> Option<gpui::ShapedLine> {
+        self.search_shaped_line_with(window, theme::text())
+    }
+
+    /// 同上，但文字色由调用方给：视图现在要自己 `line.paint` 真实文本（好跟着横向滚动走），
+    /// 颜色必须跟 `theme::text()` 一致，不能退回窗口默认色。
+    pub(crate) fn search_shaped_line_with(
+        &self,
+        window: &Window,
+        color: gpui::Rgba,
+    ) -> Option<gpui::ShapedLine> {
         if self.search_field.is_empty() {
             return None;
         }
@@ -750,7 +768,7 @@ impl Root {
         let run = gpui::TextRun {
             len: self.search_field.len(),
             font: style.font(),
-            color: style.color,
+            color: gpui::Hsla::from(color),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -763,7 +781,10 @@ impl Root {
         ))
     }
 
-    /// 鼠标点击的窗口内 x → 最近的字符边界（字节下标）。
+    /// 鼠标点击/拖拽位置的窗口内 x → 最近的字符边界（字节下标）。
+    ///
+    /// 文本是按 `-scroll_x` 绘制的，所以命中测试要先把滚走的那段加回来，否则滚过之后
+    /// 点哪儿都会偏。
     pub(crate) fn search_cursor_for_x(&self, x: gpui::Pixels, window: &Window) -> usize {
         let Some(line) = self.search_shaped_line(window) else {
             return 0;
@@ -774,20 +795,119 @@ impl Root {
             .get()
             .map(|bounds| bounds.origin.x)
             .unwrap_or_else(|| gpui::px(0.0));
-        let local = x - origin;
+        let local = x - origin + self.search_scroll_x();
         if local <= gpui::px(0.0) {
             return 0;
         }
         line.closest_index_for_x(local).min(self.search_field.len())
     }
 
-    /// 插入点在输入框内的横向偏移。
-    pub(crate) fn search_caret_x(&self, window: &Window) -> gpui::Pixels {
-        let caret = self.search_field.caret();
+    /// 文本坐标系（未计滚动）下某个字节下标的横向位置。
+    fn search_text_x(&self, index: usize, window: &Window) -> gpui::Pixels {
         match self.search_shaped_line(window) {
-            Some(line) => line.x_for_index(caret),
+            Some(line) => line.x_for_index(index),
             None => gpui::px(0.0),
         }
+    }
+
+    pub(crate) fn search_scroll_x(&self) -> gpui::Pixels {
+        gpui::px(self.search_field.scroll_x())
+    }
+
+    /// 插入点在输入框内的横向偏移：**已扣掉滚动量**，可以直接当元素的 `left`。
+    pub(crate) fn search_caret_x(&self, window: &Window) -> gpui::Pixels {
+        let caret = self.search_field.caret();
+        self.search_text_x(caret, window) - self.search_scroll_x()
+    }
+
+    /// 选区左右两条边（文本坐标系）。无选区时 `None`。
+    ///
+    /// 单行框的选区必然落在同一行上，所以两端就够，不用像多行编辑器那样逐行切矩形。
+    pub(crate) fn search_selection_edges(
+        &self,
+        window: &Window,
+    ) -> Option<(gpui::Pixels, gpui::Pixels)> {
+        if !self.search_field.has_selection() {
+            return None;
+        }
+        let range = self.search_field.selection();
+        Some((
+            self.search_text_x(range.start, window),
+            self.search_text_x(range.end, window),
+        ))
+    }
+
+    /// 文本能横向滚动的最大距离；文本比视口窄时为 0。
+    ///
+    /// 多留出 `CARET_WIDTH`：插入点在最后一段文字之后时它本身就落在文本宽度上，
+    /// 不留这 2px 就永远滚不进视区。
+    pub(crate) fn search_max_scroll(&self, window: &Window, width: gpui::Pixels) -> gpui::Pixels {
+        let text_width = self
+            .search_shaped_line(window)
+            .map(|line| line.width())
+            .unwrap_or_else(|| gpui::px(0.0));
+        (text_width + CARET_WIDTH - width).max(gpui::px(0.0))
+    }
+
+    /// 把活动端拉进可视区，只滚到刚好露出（不居中）。返回是否滚了。
+    pub(crate) fn search_fit_caret(&mut self, window: &Window, width: gpui::Pixels) -> bool {
+        let caret_x = f32::from(self.search_text_x(self.search_field.caret(), window));
+        let max = f32::from(self.search_max_scroll(window, width));
+        self.search_field
+            .ensure_visible(caret_x, f32::from(CARET_WIDTH), f32::from(width), max)
+    }
+
+    /// 同上，但宽度取上次绘制记下的文本区宽度（按键路径拿不到布局，只能这样）。
+    pub(crate) fn search_fit_caret_in_view(&mut self, window: &Window) {
+        let Some(bounds) = self.search_bounds.get() else {
+            return;
+        };
+        self.search_fit_caret(window, bounds.size.width);
+    }
+
+    /// 鼠标按下：单击定位、双击选词、三击全选（Chromium 的单行框三击就是 SelectAll）。
+    /// 同时记下这次的拖拽粒度，供随后的拖拽沿用。
+    pub(crate) fn search_pointer_down(
+        &mut self,
+        x: gpui::Pixels,
+        click_count: usize,
+        window: &Window,
+    ) -> bool {
+        let index = self.search_cursor_for_x(x, window);
+        self.search_drag_by_word = click_count >= 2;
+        match click_count {
+            0 | 1 => self.search_field.set_caret(index),
+            2 => self.search_field.select_word_at(index),
+            _ => self.search_field.select_all(),
+        }
+    }
+
+    /// 拖拽扩选：双击起步的拖拽按整词扩（Chromium 会记住 `double_click_word_`，
+    /// 否则双击后一拖就退化成字符级），普通拖拽逐字符。
+    pub(crate) fn search_pointer_drag(&mut self, x: gpui::Pixels, window: &Window) -> bool {
+        let index = self.search_cursor_for_x(x, window);
+        if self.search_drag_by_word {
+            self.search_field.select_words_through(index)
+        } else {
+            self.search_field.select_through(index)
+        }
+    }
+
+    /// 松开鼠标：结束按词拖拽，下一次按下重新判定。
+    pub(crate) fn search_pointer_up(&mut self) {
+        self.search_drag_by_word = false;
+    }
+
+    /// 拖拽选区时按 `delta` 横滚，夹在 `[0, max]` 内。返回是否滚了。
+    pub(crate) fn search_scroll_by(
+        &mut self,
+        delta: gpui::Pixels,
+        window: &Window,
+        width: gpui::Pixels,
+    ) -> bool {
+        let max = f32::from(self.search_max_scroll(window, width));
+        let desired = self.search_field.scroll_x() + f32::from(delta);
+        self.search_field.set_scroll_x(desired, max)
     }
 }
 
@@ -818,12 +938,13 @@ impl EntityInputHandler for Root {
         if !self.search_input_focused(window) {
             return None;
         }
-        // 有 IME 组合时上报组合区间，否则是插入点的折叠区间。
+        // 组合中上报组合区间，否则上报选区（无选区时是活动端的折叠区间）。
+        // `reversed` 要照实给：方向决定 Shift 继续扩选时往哪边长，macOS 的候选窗也读它。
         Some(UTF16Selection {
             range: self
                 .search_field
                 .utf16_range_from_byte(self.search_field.selection_range()),
-            reversed: false,
+            reversed: self.search_field.is_reversed(),
         })
     }
 
@@ -858,6 +979,7 @@ impl EntityInputHandler for Root {
         }
         let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
         self.search_field.replace(range, text);
+        self.search_fit_caret_in_view(window);
         cx.notify();
     }
 
@@ -874,17 +996,31 @@ impl EntityInputHandler for Root {
         }
         let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
         self.search_field.replace_and_mark(range, new_text);
+        self.search_fit_caret_in_view(window);
         cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: std::ops::Range<usize>,
+        range_utf16: std::ops::Range<usize>,
         element_bounds: gpui::Bounds<gpui::Pixels>,
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
-        self.search_input_focused(window).then_some(element_bounds)
+        if !self.search_input_focused(window) {
+            return None;
+        }
+        // 候选窗要贴在真正在编辑的那一段下面：整框宽度当锚点会让候选窗一直停在框的左下，
+        // 滚过长文本之后更是完全对不上。这里与 `search_cursor_for_x` 共用同一条排版结果。
+        let range = self.search_field.byte_range_from_utf16(range_utf16);
+        let left = self.search_text_x(range.start, window) - self.search_scroll_x();
+        let right = self.search_text_x(range.end, window) - self.search_scroll_x();
+        let bounds = self.search_bounds.get().unwrap_or(element_bounds);
+        let width = gpui::px(1.0).max(right - left);
+        Some(gpui::Bounds {
+            origin: gpui::point(bounds.origin.x + left, bounds.origin.y),
+            size: gpui::size(width, bounds.size.height.max(gpui::px(1.0))),
+        })
     }
 
     fn character_index_for_point(
@@ -911,7 +1047,10 @@ impl EntityInputHandler for Root {
             return;
         }
         let range = self.search_field.byte_range_from_utf16(range_utf16);
-        self.search_field.set_caret(range.start);
+        // 平台交回的是整段区间，此前只取 `start` 会把选区丢掉；这里按真选区收下，
+        // 活动端落在区间末尾（方向由两端的大小关系决定）。
+        self.search_field.set_position(range.end, range.start);
+        self.search_fit_caret_in_view(window);
         cx.notify();
     }
 
