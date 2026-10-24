@@ -183,11 +183,15 @@ impl Root {
                 // 注意：正在装载下一首（pending）时「播完」属于旧曲目，
                 // 只消费事件不推进——否则会把 pending 的那首跳过去（收尾瞬间
                 // 手动切歌/插入队列时踩过）。
-                if snap.finished && snap.finished_seq != root.last_finished_seq {
-                    root.last_finished_seq = snap.finished_seq;
-                    if root.pending_track.is_none() {
-                        root.next_track(cx);
-                    }
+                // seek 之前积压的完成事件不能把当前曲目推进到下一首。
+                let current = finished_event_is_current(
+                    snap.finished_seq,
+                    snap.seek_seq,
+                    &mut root.last_finished_seq,
+                    &mut root.last_seek_seq,
+                );
+                if snap.finished && current && root.pending_track.is_none() {
+                    root.next_track(cx);
                 }
                 // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
@@ -2198,6 +2202,18 @@ fn prefetch_ahead_count() -> usize {
         .unwrap_or(3)
 }
 
+/// seek 之前产生的完成事件已经失效；UI 只消费序号并跳过该事件。
+fn finished_event_is_current(
+    finished_seq: u64,
+    seek_seq: u64,
+    last_finished_seq: &mut u64,
+    last_seek_seq: &mut u64,
+) -> bool {
+    let stale_finished = seek_seq != *last_seek_seq;
+    *last_seek_seq = seek_seq;
+    finished_seq != *last_finished_seq && !stale_finished
+}
+
 /// 预取并发上限：环境变量 `SODAM_PREFETCH_CONCURRENCY`（默认 2）。
 fn prefetch_concurrency() -> usize {
     std::env::var("SODAM_PREFETCH_CONCURRENCY")
@@ -2216,5 +2232,42 @@ mod external_open_tests {
     fn config_entry_uses_file_semantics_and_repo_entry_uses_url() {
         assert!(matches!(config_open_target(), ExternalOpen::File(_)));
         assert!(matches!(repository_open_target(), ExternalOpen::Url(_)));
+    }
+
+    #[test]
+    fn seek_invalidates_finished_event_from_before_the_seek() {
+        let mut last_finished = 0;
+        let mut last_seek = 0;
+        assert!(finished_event_is_current(
+            1,
+            0,
+            &mut last_finished,
+            &mut last_seek
+        ));
+        last_finished = 1;
+        assert!(!finished_event_is_current(
+            2,
+            1,
+            &mut last_finished,
+            &mut last_seek
+        ));
+        assert!(finished_event_is_current(
+            3,
+            1,
+            &mut last_finished,
+            &mut last_seek
+        ));
+    }
+
+    #[test]
+    fn first_real_completion_after_startup_still_advances() {
+        let mut last_finished = 7;
+        let mut last_seek = 3;
+        assert!(finished_event_is_current(
+            8,
+            3,
+            &mut last_finished,
+            &mut last_seek
+        ));
     }
 }

@@ -360,8 +360,9 @@ pub struct Root {
     pub(crate) pending_engine_load: Option<u64>,
     /// 正在加载（下载/解密）的曲目：非空时播放栏显示 loading，且进度条不可拖。
     pub pending_track: Option<TrackItem>,
-    /// 已处理过的「播完」序号（配合引擎的 finished_seq 自动切歌）。
+    /// 已处理过的完成事件（曲目结束序号 + 跳转序号）。
     pub(crate) last_finished_seq: u64,
+    pub(crate) last_seek_seq: u64,
     /// 拖动进度条时的预览位置（0.0~1.0）：拖动中只改它，松手才真跳。
     pub progress_preview: Option<f32>,
     /// 歌词页大封面：切曲后的 `(track_id, 开始时刻)`；管「至少 200ms 加载态」的门。
@@ -426,6 +427,7 @@ impl Root {
             }
         };
         let queue = Queue::new(Vec::<TrackItem>::new());
+        let engine_progress = engine.snapshot();
 
         let logged_in = !settings.cookie.trim().is_empty();
         let play_reporter = PlayReporter::new(settings.clone());
@@ -560,7 +562,8 @@ impl Root {
             cache_clearing: false,
             pending_engine_load: None,
             pending_track: None,
-            last_finished_seq: 0,
+            last_finished_seq: engine_progress.finished_seq,
+            last_seek_seq: engine_progress.seek_seq,
             progress_preview: None,
             lyrics_cover_gate: None,
             queue_cache: (0, Arc::new(Vec::new())),

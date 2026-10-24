@@ -37,6 +37,8 @@ pub struct PlaybackSnapshot {
     /// 播完序号：每播完一次 +1。UI 用它做「处理过了吗」的判断 ——
     /// 之前用 track_id 比较，遇到循环同一首或 id 重复就会漏切。
     pub finished_seq: u64,
+    /// 跳转序号：每次 seek 请求 +1。UI 用它丢弃 seek 之前积压的完成事件。
+    pub seek_seq: u64,
     /// 最近处理完的装载请求（成功/失败都会更新），UI 不再只用 track_id 判断完成。
     pub load_seq: u64,
 }
@@ -198,7 +200,9 @@ impl PlaybackEngine {
 
     /// 跳转到指定秒数（越界会被引擎裁剪到 [0, 时长]）。
     pub fn seek(&self, seconds: f64) {
-        self.send(Command::Seek(seconds.max(0.0)));
+        if seconds.is_finite() {
+            self.send(Command::Seek(seconds.max(0.0)));
+        }
     }
 }
 
@@ -521,14 +525,26 @@ fn audio_thread(
                 }
             }
             Command::Seek(seconds) => {
+                // seek 代表用户明确要求继续/从头播放当前曲目；此前的完成事件失效。
+                finished_reported = false;
+                if let Ok(mut snap) = state.lock() {
+                    snap.seek_seq = snap.seek_seq.wrapping_add(1);
+                    snap.finished = false;
+                    snap.position_seconds = seconds;
+                }
                 if let Some(current) = &player {
-                    if current
-                        .try_seek(std::time::Duration::from_secs_f64(seconds))
-                        .is_ok()
-                    {
-                        // 跳转后进度要立刻反映出来（避免界面回跳）
-                        if let Ok(mut snap) = state.lock() {
-                            snap.position_seconds = seconds;
+                    match current.try_seek(std::time::Duration::from_secs_f64(seconds)) {
+                        Ok(()) if current.empty() => {
+                            // rodio 对已结束的 source 会返回 Ok 但不真正移动。
+                            set_error(&state, "音频源已结束，无法跳转".to_string());
+                        }
+                        Ok(()) => {
+                            if let Ok(mut snap) = state.lock() {
+                                snap.position_seconds = seconds;
+                            }
+                        }
+                        Err(err) => {
+                            set_error(&state, format!("跳转失败：{err}"));
                         }
                     }
                 }
