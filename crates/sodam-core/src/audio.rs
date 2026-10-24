@@ -39,6 +39,9 @@ pub struct PlaybackSnapshot {
     pub finished_seq: u64,
     /// 跳转序号：每次 seek 请求 +1。UI 用它丢弃 seek 之前积压的完成事件。
     pub seek_seq: u64,
+    /// seek 请求已被登记、但音频线程还没处理完。此窗口内不能上报播完，
+    /// 否则会消费一个完成后又自动切到下一首。
+    pub(crate) seek_pending: bool,
     /// 最近处理完的装载请求（成功/失败都会更新），UI 不再只用 track_id 判断完成。
     pub load_seq: u64,
 }
@@ -86,7 +89,10 @@ enum Command {
     Stop,
     SetVolume(f32),
     /// 跳转到指定秒数
-    Seek(f64),
+    Seek {
+        seconds: f64,
+        track_id: String,
+    },
 }
 
 /// 播放引擎句柄（可以在任意线程调用，内部只有发命令与读快照）。
@@ -200,9 +206,25 @@ impl PlaybackEngine {
 
     /// 跳转到指定秒数（越界会被引擎裁剪到 [0, 时长]）。
     pub fn seek(&self, seconds: f64) {
-        if seconds.is_finite() {
-            self.send(Command::Seek(seconds.max(0.0)));
+        if !seconds.is_finite() {
+            return;
         }
+        // 在发命令前同步失效完成事件。音频线程最多要等 100ms 才取到命令，
+        // UI 心跳可能先看到旧曲目的 finished=true，因此不能只在音频线程里清。
+        let track_id = match self.snapshot.lock() {
+            Ok(mut snap) if !snap.track_id.is_empty() => {
+                snap.seek_seq = snap.seek_seq.wrapping_add(1);
+                snap.seek_pending = true;
+                snap.finished = false;
+                snap.position_seconds = seconds.max(0.0);
+                snap.track_id.clone()
+            }
+            _ => return,
+        };
+        self.send(Command::Seek {
+            seconds: seconds.max(0.0),
+            track_id,
+        });
     }
 }
 
@@ -249,6 +271,59 @@ fn sync_progress(state: &Arc<Mutex<PlaybackSnapshot>>, player: &rodio::Player) {
         snap.position_seconds = position;
         snap.playing = playing;
     }
+}
+
+fn should_report_completion(empty: bool, finished_reported: bool, seek_pending: bool) -> bool {
+    empty && !finished_reported && !seek_pending
+}
+
+fn mark_seek_succeeded(state: &Arc<Mutex<PlaybackSnapshot>>, seconds: f64, playing: bool) {
+    if let Ok(mut snap) = state.lock() {
+        snap.seek_pending = false;
+        snap.finished = false;
+        snap.error.clear();
+        snap.position_seconds = seconds;
+        snap.playing = playing;
+    }
+}
+
+fn mark_seek_failed(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
+    if let Ok(mut snap) = state.lock() {
+        snap.seek_pending = false;
+        snap.finished = false;
+        snap.error = message;
+        snap.playing = false;
+    }
+}
+
+/// 从缓存文件重新建立播放器，并恢复到指定位置。
+///
+/// 已播完的 rodio source 是不可逆的：`try_seek()` 会返回 `Ok` 但不会移动。
+/// 所以 seek 失败/源已结束时必须重新打开解码器，不能继续复用旧 `Player`。
+fn rebuild_player_at(
+    mixer: &rodio::mixer::Mixer,
+    path: &std::path::Path,
+    position: std::time::Duration,
+    volume: f32,
+    paused: bool,
+) -> Result<rodio::Player, String> {
+    let file = std::fs::File::open(path).map_err(|err| format!("重新打开音频文件失败：{err}"))?;
+    // 使用 TryFrom<File>，让 rodio 知道 byte length，后退 seek 才可靠。
+    let decoder =
+        rodio::Decoder::try_from(file).map_err(|err| format!("重新解码音频失败：{err}"))?;
+    let (player, source) = rodio::Player::new();
+    player.set_volume(volume);
+    player.append(decoder);
+    // 先暂停再挂到 mixer，避免 seek 完成前往旧起点漏出几毫秒声音。
+    player.pause();
+    mixer.add(source);
+    if position > std::time::Duration::ZERO && player.try_seek(position).is_err() {
+        return Err("音频源不支持后退/跳转".to_string());
+    }
+    if !paused {
+        player.play();
+    }
+    Ok(player)
 }
 
 fn open_output(errors: OutputErrors) -> OutputResult {
@@ -394,7 +469,8 @@ fn audio_thread(
                 // 播完：置 finished，UI 会据此自动切下一首
                 // 注意：sync_progress 会把 playing 置 false，所以这里不能用 playing 判断，
                 // 必须用本地的 finished_reported 标志（否则自动下一首永远不触发）。
-                if current.empty() && !finished_reported {
+                let seek_pending = state.lock().map(|snap| snap.seek_pending).unwrap_or(false);
+                if should_report_completion(current.empty(), finished_reported, seek_pending) {
                     finished_reported = true;
                     if let Ok(mut snap) = state.lock() {
                         snap.playing = false;
@@ -452,7 +528,7 @@ fn audio_thread(
                         continue;
                     }
                 };
-                let decoder = match rodio::Decoder::new(std::io::BufReader::new(file)) {
+                let decoder = match rodio::Decoder::try_from(file) {
                     Ok(decoder) => decoder,
                     Err(err) => {
                         // 无效缓存不能永久冒充命中；下一次播放重新下载，而不是反复解码坏文件。
@@ -481,6 +557,7 @@ fn audio_thread(
                     snap.quality = quality.clone();
                     snap.error.clear();
                     snap.finished = false;
+                    snap.seek_pending = false;
                     finished_reported = false;
                 }
                 player = Some(new_player);
@@ -521,31 +598,69 @@ fn audio_thread(
                 if let Ok(mut snap) = state.lock() {
                     snap.playing = false;
                     snap.finished = false;
+                    snap.seek_pending = false;
                     snap.position_seconds = 0.0;
                 }
             }
-            Command::Seek(seconds) => {
-                // seek 代表用户明确要求继续/从头播放当前曲目；此前的完成事件失效。
-                finished_reported = false;
-                if let Ok(mut snap) = state.lock() {
-                    snap.seek_seq = snap.seek_seq.wrapping_add(1);
-                    snap.finished = false;
-                    snap.position_seconds = seconds;
+            Command::Seek { seconds, track_id } => {
+                let current_track = state
+                    .lock()
+                    .map(|snap| snap.track_id.clone())
+                    .unwrap_or_default();
+                // 排队期间已切到别的曲目：这次 seek 已经过期。
+                if current_track != track_id {
+                    continue;
                 }
-                if let Some(current) = &player {
-                    match current.try_seek(std::time::Duration::from_secs_f64(seconds)) {
-                        Ok(()) if current.empty() => {
-                            // rodio 对已结束的 source 会返回 Ok 但不真正移动。
-                            set_error(&state, "音频源已结束，无法跳转".to_string());
-                        }
-                        Ok(()) => {
-                            if let Ok(mut snap) = state.lock() {
-                                snap.position_seconds = seconds;
-                            }
-                        }
+
+                let target = std::time::Duration::from_secs_f64(seconds);
+                let volume = state.lock().map(|snap| snap.volume).unwrap_or(1.0);
+                let paused = player.as_ref().is_some_and(rodio::Player::is_paused);
+                let in_place = player
+                    .as_ref()
+                    .filter(|current| !current.empty())
+                    .is_some_and(|current| current.try_seek(target).is_ok() && !current.empty());
+                if in_place {
+                    mark_seek_succeeded(&state, seconds, !paused);
+                    finished_reported = false;
+                    watchdog = OutputWatchdog::new(std::time::Instant::now());
+                    continue;
+                }
+
+                if let Some(previous) = player.take() {
+                    previous.stop();
+                }
+                if output.is_none() {
+                    match open_output(stream_error.clone()) {
+                        Ok(device) => output = Some(device),
                         Err(err) => {
-                            set_error(&state, format!("跳转失败：{err}"));
+                            finished_reported = true;
+                            mark_seek_failed(&state, format!("音频设备不可用：{err}"));
+                            continue;
                         }
+                    }
+                }
+                let Some(path) = current_path.clone() else {
+                    finished_reported = true;
+                    mark_seek_failed(&state, "当前曲目没有可重新打开的缓存".to_string());
+                    continue;
+                };
+                let Some(device) = output.as_ref() else {
+                    finished_reported = true;
+                    mark_seek_failed(&state, "音频设备不可用".to_string());
+                    continue;
+                };
+                match rebuild_player_at(device.mixer(), &path, target, volume, paused) {
+                    Ok(rebuilt) => {
+                        player = Some(rebuilt);
+                        watchdog = OutputWatchdog::new(std::time::Instant::now());
+                        mark_seek_succeeded(&state, seconds, !paused);
+                        finished_reported = false;
+                    }
+                    Err(err) => {
+                        // 绝不能把空 player 留在“尚未上报完成”的状态：
+                        // 下一个 tick 会重新上报 finished，UI 仍会自动下一首。
+                        finished_reported = true;
+                        mark_seek_failed(&state, err);
                     }
                 }
             }
@@ -601,33 +716,16 @@ fn follow_default_output(
         return;
     };
 
-    let decoder = std::fs::File::open(&path)
-        .map_err(|err| err.to_string())
-        .and_then(|file| {
-            rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|err| err.to_string())
-        });
-    let decoder = match decoder {
-        Ok(decoder) => decoder,
+    let Some(device) = output.as_ref() else {
+        return;
+    };
+    let new_player = match rebuild_player_at(device.mixer(), &path, position, volume, paused) {
+        Ok(player) => player,
         Err(err) => {
             set_error(state, format!("切换音频设备后重新打开失败：{err}"));
             return;
         }
     };
-    let Some(device) = output.as_ref() else {
-        return;
-    };
-    let new_player = rodio::Player::connect_new(device.mixer());
-    new_player.set_volume(volume);
-    new_player.append(decoder);
-    if new_player.try_seek(position).is_err() {
-        // 定位失败就从头播，总比丢歌好。
-        let _ = new_player.try_seek(std::time::Duration::ZERO);
-    }
-    if paused {
-        new_player.pause();
-    } else {
-        new_player.play();
-    }
     *player = Some(new_player);
     *watchdog = OutputWatchdog::new(std::time::Instant::now());
     if let Ok(mut snap) = state.lock() {
@@ -722,6 +820,84 @@ mod tests {
         (0..DEVICE_POLL_TICKS)
             .map(|_| watcher.poll(probe))
             .collect()
+    }
+
+    #[test]
+    fn pending_seek_suppresses_completion_until_it_finishes() {
+        // 音频线程还没取到 Seek 时，旧的空 Player 不能再次上报完成；
+        // 否则 UI 会消费新事件并自动下一首，正是 issue #50 的复现路径。
+        assert!(!should_report_completion(true, false, true));
+        assert!(should_report_completion(true, false, false));
+        assert!(!should_report_completion(true, true, false));
+        assert!(!should_report_completion(false, false, false));
+    }
+
+    #[test]
+    fn seek_immediately_invalidates_finished_before_audio_thread_runs() {
+        let (tx, rx) = channel();
+        let engine = PlaybackEngine {
+            tx,
+            snapshot: Arc::new(Mutex::new(PlaybackSnapshot {
+                track_id: "track".into(),
+                finished: true,
+                finished_seq: 4,
+                position_seconds: 120.0,
+                ..Default::default()
+            })),
+            next_load: AtomicU64::new(1),
+        };
+
+        engine.seek(10.0);
+
+        let snap = engine.snapshot();
+        assert!(!snap.finished);
+        assert!(snap.seek_pending);
+        assert_eq!(snap.seek_seq, 1);
+        assert_eq!(snap.position_seconds, 10.0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::Seek {
+                seconds: 10.0,
+                ref track_id,
+            }) if track_id == "track"
+        ));
+    }
+
+    #[test]
+    fn seek_completion_updates_snapshot_without_replaying_finished_event() {
+        let state = Arc::new(Mutex::new(PlaybackSnapshot {
+            track_id: "track".into(),
+            error: "old".into(),
+            finished: true,
+            seek_pending: true,
+            ..Default::default()
+        }));
+
+        mark_seek_succeeded(&state, 42.0, true);
+
+        let snap = state.lock().unwrap();
+        assert!(!snap.seek_pending);
+        assert!(!snap.finished);
+        assert!(snap.error.is_empty());
+        assert!(snap.playing);
+        assert_eq!(snap.position_seconds, 42.0);
+    }
+
+    #[test]
+    fn failed_seek_does_not_leave_a_completion_to_be_reported_again() {
+        let state = Arc::new(Mutex::new(PlaybackSnapshot {
+            seek_pending: true,
+            playing: true,
+            ..Default::default()
+        }));
+
+        mark_seek_failed(&state, "cannot rebuild".into());
+
+        let snap = state.lock().unwrap();
+        assert!(!snap.seek_pending);
+        assert!(!snap.finished);
+        assert!(!snap.playing);
+        assert_eq!(snap.error, "cannot rebuild");
     }
 
     #[test]
