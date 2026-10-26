@@ -234,7 +234,16 @@ pub struct Root {
     pub loading_lyrics: bool,
     pub lyrics_error: Option<String>,
     pub lyrics_active: Option<usize>,
-    pub lyrics_scroll: gpui::UniformListScrollHandle,
+    /// 歌词区自己管滚动（外层是普通滚动容器，不是虚拟列表），
+    /// 这样长句折行后行高不一致也能正确定位。
+    pub lyrics_scroll: gpui::ScrollHandle,
+    /// 用户手动滚过歌词后，暂停自动跟随到这个时刻。
+    ///
+    /// 官方客户端是「滚轮后 5 秒内不跟着进度跳」，这里沿用同一策略，
+    /// 否则用户往回翻歌词会被立刻拽回当前句。
+    pub lyrics_user_scroll_until: Option<std::time::Instant>,
+    /// 等待下一帧补做的歌词对齐（布局未就绪时记下目标句）。
+    pub(crate) pending_lyrics_scroll: Option<usize>,
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
     pub search_field: TextField,
@@ -502,7 +511,9 @@ impl Root {
             loading_lyrics: false,
             lyrics_error: None,
             lyrics_active: None,
-            lyrics_scroll: gpui::UniformListScrollHandle::new(),
+            lyrics_scroll: gpui::ScrollHandle::new(),
+            lyrics_user_scroll_until: None,
+            pending_lyrics_scroll: None,
             lyrics_request_seq: 0,
             search_field: TextField::default(),
             search_drag_by_word: false,
@@ -1311,6 +1322,8 @@ impl Render for Root {
             );
         }
         theme::set_ambient_rgb(ambient_color);
+        // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
+        self.flush_pending_lyrics_scroll();
         if self.nav == Nav::Lyrics {
             let position = self.engine.snapshot().position_seconds;
             let active = self
@@ -1319,9 +1332,14 @@ impl Render for Root {
                 .rposition(|line| position + 0.25 >= line.start_seconds)
                 .or_else(|| (!self.lyrics.is_empty()).then_some(0));
             self.lyrics_active = active;
+            // 用户刚手动滚过就让位，别把视图拽回去（官方同样是滚轮后 5 秒内不跟随）。
+            let user_scrolling = self
+                .lyrics_user_scroll_until
+                .is_some_and(|until| std::time::Instant::now() < until);
             if let Some(index) = active {
-                self.lyrics_scroll
-                    .scroll_to_item_strict(index, gpui::ScrollStrategy::Center);
+                if !user_scrolling {
+                    self.scroll_lyrics_to(index);
+                }
             }
             // 切曲后强制大封面显示至少 200ms 的加载态（即便图已在缓存里）。
             if let Some(track) = self.queue.current() {

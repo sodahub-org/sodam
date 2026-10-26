@@ -301,6 +301,33 @@ impl Root {
         }
         let target = snapshot.duration_seconds * fraction.clamp(0.0, 1.0) as f64;
         self.engine.seek(target);
+        // 拖动进度后立刻把歌词对齐到新位置，不等下一帧的进度回调。
+        self.align_lyrics_to_position(target);
+    }
+
+    /// 把歌词对齐到指定播放位置。
+    ///
+    /// 切歌与拖动进度都走这里：立刻算出当前句并滚动过去，
+    /// 布局未就绪时由 `pending_lyrics_scroll` 在下一帧补做。
+    pub(crate) fn align_lyrics_to_position(&mut self, position_seconds: f64) {
+        if self.lyrics.is_empty() {
+            return;
+        }
+        let active = self
+            .lyrics
+            .iter()
+            .rposition(|line| position_seconds + 0.25 >= line.start_seconds)
+            .or(Some(0));
+        self.lyrics_active = active;
+        // 用户在手动浏览时不抢滚动位置：只有自动跟随才动。
+        let user_scrolling = self
+            .lyrics_user_scroll_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if !user_scrolling {
+            if let Some(index) = active {
+                self.scroll_lyrics_to(index);
+            }
+        }
     }
 
     /// 设置音量（0.0~1.0）。
@@ -825,6 +852,10 @@ impl Root {
                     Ok(raw) => {
                         root.lyrics = Arc::new(raw);
                         root.lyrics_active = None;
+                        // 新歌词到位后立刻对齐到当前播放位置，不等下一帧进度回调；
+                        // 布局还没就绪时由 pending 标记在下一帧补做。
+                        let position = root.engine.snapshot().position_seconds;
+                        root.align_lyrics_to_position(position);
                         if root.lyrics.is_empty() {
                             let message = root.localized(
                                 "「{}」没有可用歌词",
@@ -1167,6 +1198,45 @@ impl Root {
         self.lyrics_error = None;
         self.loading_lyrics = false;
         self.playback_error = None;
+    }
+
+    /// 把歌词列表滚到第 `index` 句。
+    ///
+    /// 沿用之前的定位：当前句顶部落在视口顶部往下 80px 处（`offsetTop - 80`），
+    /// 不做垂直居中。列表顶部留了半屏空白，所以首句也能停在这个位置。
+    ///
+    /// 布局还没就绪时（切歌、拖动进度后的第一帧）记下目标句，由下一帧的
+    /// `flush_pending_lyrics_scroll` 补上，避免歌词停在上一首的位置。
+    pub(crate) fn scroll_lyrics_to(&mut self, index: usize) {
+        const LYRIC_TOP_INSET: f32 = 80.0;
+        let Some(bounds) = self.lyrics_scroll.bounds_for_item(index) else {
+            self.pending_lyrics_scroll = Some(index);
+            return;
+        };
+        self.pending_lyrics_scroll = None;
+        let viewport_top = self.lyrics_scroll.bounds().top();
+        // 目标：让该句顶部落在视口顶部 + 80。
+        // offset 为负表示内容上移，所以直接取「该句顶部 - 视口顶 - 80」的相反数。
+        let distance = bounds.top() - viewport_top - gpui::px(LYRIC_TOP_INSET);
+        let mut offset = self.lyrics_scroll.offset();
+        offset.y = -distance;
+        self.lyrics_scroll.set_offset(offset);
+    }
+
+    /// 补做上一帧没能完成的歌词对齐。
+    ///
+    /// 切歌或拖动进度后，歌词可能还没完成布局，`bounds_for_item` 返回 `None`；
+    /// 这里在渲染路径上重试一次，保证新歌词一出现就停在当前句。
+    /// 不在歌词页时直接丢弃，避免每帧空转，也避免回到歌词页时跳到过期位置。
+    pub(crate) fn flush_pending_lyrics_scroll(&mut self) {
+        let Some(index) = self.pending_lyrics_scroll else {
+            return;
+        };
+        if self.nav != crate::app::Nav::Lyrics || self.lyrics.is_empty() {
+            self.pending_lyrics_scroll = None;
+            return;
+        }
+        self.scroll_lyrics_to(index);
     }
 
     pub(crate) fn ensure_playback_assets(&mut self, track: TrackItem, cx: &mut Context<Self>) {

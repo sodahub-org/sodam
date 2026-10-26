@@ -2,6 +2,25 @@
 
 use super::scenes::retry_button;
 use super::*;
+
+/// 歌词排版沿用 SodaM 原本的样式：字号 `Text::Large`、行高 32、每句间距 32。
+/// 不采用官方客户端的 24px/34 字号行高——那套在 SodaM 里显得过大。
+const LYRIC_LINE_HEIGHT: f32 = 32.0;
+/// 相邻两句之间的间距（单句文本 32 + 间距 32 = 原来每行 64 的效果）。
+const LYRIC_ROW_GAP: f32 = 32.0;
+
+/// 歌词区没有内容时（加载中 / 出错 / 无歌词）的占位：铺满右侧栏并垂直居中。
+fn centered_state(content: AnyElement) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .size_full()
+        .child(content)
+        .into_any_element()
+}
+
 /// 歌词播放页：左封面，右滚动歌词，当前行跟随播放进度。
 pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
     if root.switching_queue.is_some() {
@@ -13,7 +32,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .into_any_element();
     }
 
-    let snapshot = root.engine.snapshot();
     let Some(track) = root
         .pending_track
         .clone()
@@ -30,45 +48,56 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     let liked = root.liked_ids.contains(&track.id);
     let active = root.lyrics_active;
     let lines = root.lyrics.clone();
+    // 歌词区高度：滚到中间要给首尾句留出半个视口的空白，所以先算出来。
+    let lyrics_viewport_height =
+        (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
+    let lyric_padding = lyrics_viewport_height / 2.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
         Some(
-            uniform_list(
-                "lyrics-list",
-                root.lyrics.len(),
-                move |range, _window, _cx| {
-                    range
-                        .map(|index| {
-                            let Some(line) = lines.get(index) else {
-                                return div().h(px(64.0)).into_any_element();
-                            };
-                            let is_active = active == Some(index);
-                            let color = if is_active {
-                                theme::accent()
-                            } else {
-                                theme::text_muted()
-                            };
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .h(px(64.0))
-                                .text_size(theme::Text::Large.size())
-                                .line_height(px(32.0))
-                                .text_color(color)
-                                .when(is_active, |this| this.font_weight(gpui::FontWeight::BOLD))
-                                .child(line.text.clone())
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                },
-            )
-            .flex_1()
-            .min_h(px(0.0))
-            .track_scroll(&root.lyrics_scroll)
-            .into_any_element(),
+            div()
+                .id("lyrics-scroll")
+                // 整块歌词自己滚动。这里不用虚拟列表：长句折行后每句高度都不一样，
+                // 等高列表会把折出来的第二行裁掉（#56）。
+                .flex()
+                .flex_col()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .pt(px(lyric_padding))
+                .pb(px(lyric_padding))
+                .overflow_y_scroll()
+                .track_scroll(&root.lyrics_scroll)
+                // 用户滚动时暂停自动跟随 5 秒（官方行为），否则往回翻会被拽回当前句。
+                .on_scroll_wheel(cx.listener(|root, _event, _window, cx| {
+                    root.lyrics_user_scroll_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                    cx.notify();
+                }))
+                .children(lines.iter().enumerate().map(|(index, line)| {
+                    let is_active = active == Some(index);
+                    let color = if is_active {
+                        theme::accent()
+                    } else {
+                        theme::text_muted()
+                    };
+                    div()
+                        .w_full()
+                        // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
+                        // 会被折行文本吃掉，折成两行时间距就变成 0。
+                        // 上下各 16，相邻两句之间正好 32；单句总高仍是 64。
+                        .py(px(LYRIC_ROW_GAP / 2.0))
+                        // 这里不能加 `flex`：flex 容器给子元素的可用宽度是 MaxContent，
+                        // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
+                        .text_size(theme::Text::Large.size())
+                        .line_height(px(LYRIC_LINE_HEIGHT))
+                        .text_color(color)
+                        .when(is_active, |this| this.font_weight(gpui::FontWeight::BOLD))
+                        .child(line.text.clone())
+                        .into_any_element()
+                }))
+                .into_any_element(),
         )
     };
 
@@ -198,51 +227,35 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .h_full()
             .flex_none()
             .min_h(px(0.0))
-            .gap(px(theme::space::MD))
-            .child(
-                div()
-                    .text_size(theme::Text::Title.size())
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme::text())
-                    .truncate()
-                    .child(track.title.clone()),
-            )
-            .child(
-                div()
-                    .text_size(theme::Text::Small.size())
-                    .text_color(theme::text_muted())
-                    .child(format!(
-                        "{} · {} · {}",
-                        track.artist,
-                        track.duration_label(),
-                        snapshot.progress_label()
-                    )),
-            )
             .child(if root.loading_lyrics {
-                loading_state(root.tr("正在读取歌词…")).into_any_element()
+                centered_state(loading_state(root.tr("正在读取歌词…")).into_any_element())
             } else if let Some(error) = &root.lyrics_error {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::space::SM))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Small.size())
-                            .text_color(theme::text_muted())
-                            .child(error.clone()),
-                    )
-                    .child(retry_button(root.language, cx))
-                    .into_any_element()
+                centered_state(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(theme::space::SM))
+                        .child(
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text_muted())
+                                .child(error.clone()),
+                        )
+                        .child(retry_button(root.language, cx))
+                        .into_any_element(),
+                )
             } else if root.lyrics.is_empty() {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::space::SM))
-                    .child(empty_state("music", root.tr("这首歌暂时没有歌词")))
-                    .child(retry_button(root.language, cx))
-                    .into_any_element()
+                centered_state(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(theme::space::SM))
+                        .child(empty_state("music", root.tr("这首歌暂时没有歌词")))
+                        .child(retry_button(root.language, cx))
+                        .into_any_element(),
+                )
             } else {
                 list.expect("loaded lyrics have a list")
             })
