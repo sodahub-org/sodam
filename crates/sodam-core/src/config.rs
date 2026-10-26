@@ -26,6 +26,9 @@ pub struct Settings {
     /// 当前音量与静音前音量（0..=1）。旧配置缺字段时沿用 100%。
     pub volume: f32,
     pub volume_before_mute: f32,
+    /// 播放模式：列表循环 / 单曲循环 / 随机播放。旧配置缺字段时用列表循环。
+    #[serde(default)]
+    pub play_mode: crate::queue::PlayMode,
     /// 音频磁盘缓存上限（MiB），默认 10 GiB，设置页可调整。
     pub audio_cache_limit_mb: u64,
     /// 是否保存搜索框历史；关闭时同时清空已有记录。
@@ -239,6 +242,7 @@ impl Default for Settings {
             quality: String::new(),
             volume: 1.0,
             volume_before_mute: 1.0,
+            play_mode: crate::queue::PlayMode::default(),
             audio_cache_limit_mb: crate::cache::DEFAULT_AUDIO_LIMIT_MB,
             search_history_enabled: true,
             search_history: Vec::new(),

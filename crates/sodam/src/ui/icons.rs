@@ -118,6 +118,7 @@ icon_set!(
     "skip-back",
     "skip-forward",
     "repeat",
+    "repeat-1",
     "shuffle",
     "volume-2",
     "volume-x",

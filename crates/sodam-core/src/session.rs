@@ -451,6 +451,9 @@ impl Session {
         self.settings.volume = settings.volume;
         self.settings.volume_before_mute = settings.volume_before_mute;
         self.settings.audio_cache_limit_mb = settings.audio_cache_limit_mb;
+        // 播放模式也要同步：登录成功、刷新音质都会用 `settings()` 整体回填
+        // `root.settings`，漏掉这一项就会把用户刚切的模式覆盖回旧值。
+        self.settings.play_mode = settings.play_mode;
     }
 
     pub fn settings(&self) -> &Settings {

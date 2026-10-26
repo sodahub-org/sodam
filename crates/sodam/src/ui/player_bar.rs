@@ -300,6 +300,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .as_ref()
         .is_some_and(|track| root.liked_ids.contains(&track.id));
     let cover_path = track.as_ref().and_then(|track| root.cover_of(&track.cover));
+    let mode_icon = root.queue.mode.icon();
 
     div()
         .flex()
@@ -580,6 +581,17 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     )),
                 )
                 .child(volume_slider(root, cx))
+                .when(!root.queue_origin.is_feed_like(), |bar| {
+                    bar.child(
+                        // 播放模式：列表循环 / 单曲循环 / 随机播放，点击轮换。
+                        // 推荐流与听歌模式不显示——那边的歌由服务端持续追加，
+                        // 播放模式没有意义。
+                        icon_button("play-mode", mode_icon, theme::ICON, theme::text_muted())
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.cycle_play_mode(cx);
+                            })),
+                    )
+                })
                 .child(
                     icon_button("queue", "list-end", theme::ICON, theme::text_muted()).on_click(
                         cx.listener(|root, _event: &ClickEvent, _window, cx| {
@@ -650,13 +662,19 @@ fn queue_slots(root: &Root) -> Vec<QueueSlot> {
             playing: true,
         });
     }
-    if current + 1 < tracks.len() {
-        slots.push(QueueSlot::Upcoming(tracks.len() - current - 1));
-        for index in current + 1..tracks.len() {
-            slots.push(QueueSlot::Track {
-                index,
-                playing: false,
-            });
+    // 「接下来」按真实播放顺序排：列表循环是列表顺序，随机播放是预先算好的
+    // 随机轮次（`Queue::upcoming`），单曲循环则为空。不能再按 `current + 1..len`
+    // 顺序给——随机模式下那样显示的和实际播放不符。
+    let upcoming = root.queue.upcoming();
+    if !upcoming.is_empty() {
+        slots.push(QueueSlot::Upcoming(upcoming.len()));
+        for index in upcoming {
+            if index < tracks.len() {
+                slots.push(QueueSlot::Track {
+                    index,
+                    playing: false,
+                });
+            }
         }
     }
     slots

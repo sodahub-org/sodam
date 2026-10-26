@@ -186,6 +186,19 @@ pub enum QueueOrigin {
     Search,
 }
 
+impl QueueOrigin {
+    /// 是否为推荐 / 听歌模式这类无限流。
+    ///
+    /// 这类队列的歌由服务端持续追加，播放模式没有意义：单曲循环会让流停住，
+    /// 随机也打不乱服务端的推荐节奏。播放器栏因此隐藏模式按钮。
+    pub fn is_feed_like(&self) -> bool {
+        matches!(
+            self,
+            QueueOrigin::Feed | QueueOrigin::FeedMode(_) | QueueOrigin::Radio(_)
+        )
+    }
+}
+
 /// 歌曲右键菜单状态：目标曲目与弹出位置。
 pub struct TrackMenu {
     pub track: TrackItem,
@@ -459,7 +472,9 @@ impl Root {
                 "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
             }
         };
-        let queue = Queue::new(Vec::<TrackItem>::new());
+        let mut queue = Queue::new(Vec::<TrackItem>::new());
+        // 播放模式跨启动保留（设置页没做这一项，按钮在播放栏）。
+        queue.mode = settings.play_mode;
         let engine_progress = engine.snapshot();
 
         let logged_in = !settings.cookie.trim().is_empty();

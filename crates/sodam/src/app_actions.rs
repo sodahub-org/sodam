@@ -896,6 +896,9 @@ impl Root {
             Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
             None => QueueOrigin::Feed,
         };
+        // 推荐流固定列表循环：模式按钮在那边不显示，不能沿用歌单里的单曲循环。
+        self.queue.mode = sodam_core::queue::PlayMode::ListLoop;
+        self.queue.reset_shuffle_round();
         self.recommendation = Some(source);
         self.sync_queue_cache();
         let covers: Vec<String> = self
@@ -1183,6 +1186,12 @@ impl Root {
         label: &str,
         cx: &mut Context<Self>,
     ) {
+        // 推荐流没有播放模式（按钮也不显示），统一按列表循环推进，
+        // 避免上一张歌单留下的单曲循环让流停在同一首。
+        if origin.is_feed_like() {
+            self.queue.mode = sodam_core::queue::PlayMode::ListLoop;
+            self.queue.reset_shuffle_round();
+        }
         self.switching_queue = Some(origin.clone());
         self.switching_label = label.to_string();
         self.set_nav(Nav::Lyrics, cx);
@@ -1455,8 +1464,21 @@ impl Root {
         {
             return;
         }
-        let current = self.queue.index();
-        let remaining = self.queue.len().saturating_sub(current + 1);
+        // 推荐流要保证「接下来还有足够的歌可播」：
+        //
+        // * 列表循环：按顺序剩余量算，和原来一致；
+        // * 随机播放：下一首在整个队列里随机挑，所以按「总长度」算；
+        // * 单曲循环：一直播当前这首，不需要追加，直接放行。
+        let remaining = match self.queue.mode {
+            sodam_core::queue::PlayMode::ListLoop => {
+                self.queue.len().saturating_sub(self.queue.index() + 1)
+            }
+            sodam_core::queue::PlayMode::Shuffle => self.queue.len(),
+            sodam_core::queue::PlayMode::RepeatOne => {
+                self.loading_recommendation = false;
+                return;
+            }
+        };
         if remaining >= 6 {
             return;
         }
@@ -1940,16 +1962,35 @@ impl Root {
         self.play_from(tracks.as_ref().clone(), index, cx);
     }
 
-    /// 随机播放整张歌单：清空当前队列，按洗牌后的顺序从第一首开始。
+    /// 随机播放整张歌单：按原顺序入队，并把播放模式切到随机。
+    ///
+    /// 不洗牌队列本身：官方是「先进队再随机取下一首」，队列抽屉里仍显示
+    /// 真实曲目顺序。洗牌会让「上一首 / 下一首」和抽屉里的顺序对不上。
+    /// 随机播放整张歌单：按原顺序入队，随机挑一首作为起点，并把模式切到随机。
+    ///
+    /// 不洗牌队列本身：官方是「先进队再随机取下一首」，队列抽屉里仍能
+    /// 看到真实曲目。顺序上必须先切模式再入队——`play_from` 里的
+    /// `queue.replace` 会清空随机轮次，反过来的话刚生成的轮次立刻失效。
     pub fn shuffle_play_arc(
         &mut self,
         tracks: std::sync::Arc<Vec<TrackItem>>,
         cx: &mut Context<Self>,
     ) {
-        let shuffled = Queue::shuffled(tracks.as_ref().clone());
-        self.play_from(shuffled, 0, cx);
+        if tracks.is_empty() {
+            return;
+        }
+        self.queue.mode = sodam_core::queue::PlayMode::Shuffle;
+        self.settings.play_mode = self.queue.mode;
+        self.persist_playback_preferences();
+        let start = Queue::random_start(tracks.len());
+        self.play_from(tracks.as_ref().clone(), start, cx);
+        // 入队后立刻生成一轮，让抽屉马上显示真实的「接下来」。
+        self.queue.prepare_shuffle_round();
+        self.sync_queue_cache();
+        cx.notify();
     }
 
+    /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
     /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
     pub fn play_from(&mut self, tracks: Vec<TrackItem>, index: usize, cx: &mut Context<Self>) {
         if tracks.is_empty() {
@@ -1963,7 +2004,8 @@ impl Root {
         self.queue.replace(tracks, index);
         // 列表整体换队时清掉旧播放历史，避免抽屉把上一批队列误标成“已播放”。
         self.played_history.clear();
-        self.queue.mode = sodam_core::queue::PlayMode::Sequential;
+        // 换队时保留用户选好的播放模式：之前这里强制重置成顺序播放，
+        // 导致每次点歌都丢掉「单曲循环 / 随机播放」（#12）。
         self.queue_origin = match self.nav {
             Nav::Liked => QueueOrigin::Liked,
             Nav::Library => self
@@ -1986,6 +2028,10 @@ impl Root {
             _ => self.queue_origin.clone(),
         };
         self.set_status("已入队：{}", std::slice::from_ref(&title));
+        // `queue.replace` 会清空随机轮次。随机模式下直接点歌单里某首歌时，
+        // 这里要立刻补生成，否则抽屉的「接下来」是空的，要等下一次切歌才有。
+        // 其他模式是空操作（`prepare_shuffle_round` 自带判断）。
+        self.queue.prepare_shuffle_round();
         self.sync_queue_cache();
         self.ensure_covers(&covers, cx);
         self.start_track(cx);
@@ -2317,6 +2363,21 @@ impl Root {
             });
         })
         .detach();
+    }
+
+    /// 切到下一个播放模式：列表循环 → 单曲循环 → 随机播放（对齐官方轮换顺序）。
+    pub fn cycle_play_mode(&mut self, cx: &mut Context<Self>) {
+        self.queue.mode = self.queue.mode.next();
+        // 换模式后重算随机顺序，避免沿用上一个模式留下的待播队列。
+        self.queue.reset_shuffle_round();
+        // 切到随机时立刻按当前歌单生成一整轮，否则面板要等下一次切歌才有内容，
+        // 看起来像是「只有当前这首在随机」。
+        self.queue.prepare_shuffle_round();
+        self.settings.play_mode = self.queue.mode;
+        let label = self.tr(self.queue.mode.label());
+        self.set_status("播放模式：{}", &[label.to_string()]);
+        self.persist_playback_preferences();
+        cx.notify();
     }
 
     pub fn next_track(&mut self, cx: &mut Context<Self>) {
