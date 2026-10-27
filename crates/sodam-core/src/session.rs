@@ -52,13 +52,16 @@ pub struct AccountInfo {
     pub avatar_url: String,
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}`，与实际字节数核对后给出（档位，是否试听）。
+/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}`，与实际字节数核对后给出
+/// （档位，是否试听，实际档位分数）。
 ///
 /// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
 /// 所以尺寸不符或档位为空一律 miss，重下自愈。
-/// 第三个字段是新加的：缺它说明是旧缓存，旧格式的试听标记拼在档位里（`无损 · 试听`），
+/// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
 /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
-fn read_sidecar(text: &str, actual: u64) -> Option<(String, bool)> {
+/// 第四个字段是实际档位分数，缺它说明缓存写入时还没记档位：视为未知（`None`），
+/// 不据此标记降档，也不触发重新下载。
+fn read_sidecar(text: &str, actual: u64) -> Option<(String, bool, Option<i64>)> {
     let mut fields = text.split('\t');
     let quality = fields.next()?.trim().to_string();
     let size = fields.next()?.trim().parse::<u64>().ok()?;
@@ -69,25 +72,29 @@ fn read_sidecar(text: &str, actual: u64) -> Option<(String, bool)> {
         Some(flag) => (quality, flag.trim() == "1"),
         None => (quality.replace(" · 试听", ""), quality.contains("试听")),
     };
-    Some((quality, preview))
+    let rank = fields
+        .next()
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    Some((quality, preview, rank))
 }
 
 impl Session {
-    /// 当前音质偏好对应的缓存标签（`auto` 表示未指定）。
+    /// 当前音质**意图**对应的缓存标签。
+    ///
+    /// 缓存按意图命名，所以「自动」下同一首歌始终命中同一个文件：
+    /// 权益升级后仍会先播到非会员时期缓存下来的档位，直到清空缓存或换意图。
     fn quality_tag(&self) -> String {
-        let value = self.settings.quality.trim().to_ascii_lowercase();
-        if value.is_empty() {
-            "auto".to_string()
-        } else {
-            value
-        }
+        self.settings.quality_intent().cache_tag()
     }
 
     /// 命中有效缓存：文件存在，且 sidecar 记录的字节数与实际一致。
     /// 只检查「非空文件」会让被截断的半截下载永久冒充有效缓存，
     /// 表现为同一首歌每次都从中间开始/中途跳下一首。
     /// 旧格式 sidecar（只有音质、没记大小）视为 miss：重下一次完成自愈。
-    fn cached_info(&self, track_id: &str) -> Option<(std::path::PathBuf, String, bool)> {
+    fn cached_info(
+        &self,
+        track_id: &str,
+    ) -> Option<(std::path::PathBuf, String, bool, Option<i64>)> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
@@ -96,14 +103,14 @@ impl Session {
         let quality_path =
             crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
-        let (quality, preview) = read_sidecar(&text, actual)?;
-        Some((path, quality, preview))
+        let (quality, preview, rank) = read_sidecar(&text, actual)?;
+        Some((path, quality, preview, rank))
     }
 
     fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
-        let (path, quality, preview) = self.cached_info(track_id)?;
+        let (path, quality, preview, rank) = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -112,6 +119,7 @@ impl Session {
             path,
             quality,
             preview,
+            quality_rank: rank,
             lease,
         })
     }
@@ -136,26 +144,22 @@ pub struct CachedTrack {
     /// 「为什么三十秒就切歌了」。签名服务不可用或账号没有整曲权益时都会走到这里，
     /// 而且上游是**静默**降级的（返回 `Ok`），所以这个布尔必须一路带到界面。
     pub preview: bool,
+    /// 这条流的档位分数（与取流筛选同一套刻度）；`None` = 旧缓存没记，未知。
+    ///
+    /// 降档是**每次读取时现算**的：用当前意图与这里的实际档位比较，
+    /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
+    pub quality_rank: Option<i64>,
     pub(crate) lease: crate::cache::CacheLease,
 }
 
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
+///
+/// 档位名走 [`crate::quality::tier_label`]，与降档判定共用 libresoda 的那套刻度；
+/// 这里只负责补上码率。两个函数各按各的边界算，就会出现「徽章显示极高、
+/// 降档判定却按较高比」这种自相矛盾的显示。
 fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     let bitrate = info.bitrate.max(0) / 1000;
-    let lossless = libresoda::soda::quality::is_lossless(info)
-        || info.format.eq_ignore_ascii_case("flac")
-        || info.quality.to_ascii_lowercase().contains("lossless");
-    let tier = if lossless {
-        "无损"
-    } else if bitrate >= 300 {
-        "极高"
-    } else if bitrate >= 192 {
-        "较高"
-    } else if bitrate > 0 {
-        "标准"
-    } else {
-        "未知"
-    };
+    let tier = crate::quality::tier_label(crate::quality::stream_rank(info));
     // 只描述档位，不描述时长：**是不是试听片段由 `CachedTrack::preview` 作为布尔传递**。
     // 把 `· 试听` 拼进标签会让下游靠 `contains("试听")` 猜状态，那是我们刚消灭的东西。
     if bitrate > 0 {
@@ -196,8 +200,10 @@ impl Session {
             let provider = HttpSignature::new(url).with_token(settings.signer_token.trim());
             pumpkin.set_signature_provider(Arc::new(provider));
         }
-        if !settings.quality.trim().is_empty() {
-            pumpkin.set_quality_preference(settings.quality.trim());
+        // 「自动」= 不设上限，交给服务端按权益与曲目可用性收敛；
+        // 只有具体档位才需要把上限告诉 libresoda。
+        if let crate::quality::QualityIntent::Tier(tier) = settings.quality_intent() {
+            pumpkin.set_quality_preference(tier);
         }
         // 登录必须走签名页（等价上游 Meting-API 的 signQishuiRequest）：本地直连护照接口
         // 会一路 error_code=7，且确认后的登录态只能由签名页的浏览器会话承接。
@@ -301,34 +307,6 @@ impl Session {
         self.apply(settings)
     }
 
-    /// 按账号权益挑能用的最高档音质：
-    ///
-    /// * VIP：`lossless`（无损封顶；单曲没有无损时按档位从高到低择优）
-    /// * 非 VIP：`""`（自动，取免费档里实际可用的最高一档）
-    ///
-    /// 用户手动设过 `quality` 时不覆盖（返回 `None`）。
-    pub fn auto_quality_for(vip: bool) -> &'static str {
-        if vip {
-            // 无损封顶，但单曲没有无损时会往下降级匹配
-            "lossless"
-        } else {
-            // "auto" 是显式值（和「未设置」区分开），否则每次登录都会被重写
-            "auto"
-        }
-    }
-
-    /// 刷新音质偏好：未手动指定时按 VIP 情况自动选。
-    pub fn refresh_quality(&mut self, vip: bool) -> anyhow::Result<Option<String>> {
-        if !self.settings.quality.trim().is_empty() {
-            return Ok(None);
-        }
-        let quality = Self::auto_quality_for(vip).to_string();
-        let mut settings = self.settings.clone();
-        settings.quality = quality.clone();
-        self.apply(settings)?;
-        Ok(Some(quality))
-    }
-
     /// 把曲目下载并**解密**到本地缓存，返回文件路径（已存在则直接复用）。
     ///
     /// libresoda 的 `download` 会处理加密流（VIP 整曲需要签名服务）。
@@ -410,6 +388,7 @@ impl Session {
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
+        let quality_rank = crate::quality::stream_rank(&info);
         // 这里只可能是无效旧缓存；Windows rename 不覆盖既有文件，先尝试移除。
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -425,7 +404,10 @@ impl Session {
         })?;
         std::fs::write(
             &quality_path,
-            format!("{quality}\t{written}\t{}", u8::from(preview)),
+            format!(
+                "{quality}\t{written}\t{}\t{quality_rank}",
+                u8::from(preview)
+            ),
         )
         .map_err(|err| {
             PlaybackFailure::new(
@@ -442,6 +424,7 @@ impl Session {
             path,
             quality,
             preview,
+            quality_rank: Some(quality_rank),
             lease,
         })
     }
@@ -451,9 +434,12 @@ impl Session {
         self.settings.volume = settings.volume;
         self.settings.volume_before_mute = settings.volume_before_mute;
         self.settings.audio_cache_limit_mb = settings.audio_cache_limit_mb;
-        // 播放模式也要同步：登录成功、刷新音质都会用 `settings()` 整体回填
+        // 播放模式也要同步：登录成功、改音质都会用 `settings()` 整体回填
         // `root.settings`，漏掉这一项就会把用户刚切的模式覆盖回旧值。
         self.settings.play_mode = settings.play_mode;
+        // 详细日志同理：登录走 `apply_login_cookie` → `apply` 会把会话里的副本整体落盘，
+        // 副本漏掉这一项就会把用户刚打开的开关写回 false，重启后失效。
+        self.settings.detailed_logs = settings.detailed_logs;
     }
 
     pub fn settings(&self) -> &Settings {
@@ -646,21 +632,93 @@ mod tests {
         assert_eq!(session.settings().quality, "lossless");
     }
 
+    /// 重建会话不写音质配置：登录/换 Cookie 之后「自动」仍然是自动，
+    /// 否则会员状态一变，档位就再也跟不上。
+    #[test]
+    fn rebuilding_session_leaves_quality_setting_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Settings::default().save_to(&path).unwrap();
+
+        // 模拟「读配置 → 建会话 → 登录后回填设置 → 再建会话」这一整圈
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.quality, crate::quality::AUTO);
+        let mut session = Session::new(loaded);
+        let mut after_login = session.settings().clone();
+        after_login.cookie = "sessionid_ss=x".into();
+        session.update_playback_preferences(&after_login);
+        let rebuilt = Session::new(session.settings().clone());
+
+        assert_eq!(
+            rebuilt.settings().quality,
+            crate::quality::AUTO,
+            "登录后不得被固化成具体档位"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""quality": "auto""#),
+            "配置文件里的自动是 auto 这一种写法：{text}"
+        );
+    }
+
+    /// 登录会用会话里的副本整体落盘，所以偏好同步必须带上「详细日志」：
+    /// 漏掉它，「开详细日志 → 扫码登录」就把开关写回 false，重启后失效。
+    #[test]
+    fn playback_preferences_sync_carries_detailed_logs() {
+        let mut session = Session::new(Settings::default());
+        let mut current = session.settings().clone();
+        current.detailed_logs = true;
+        session.update_playback_preferences(&current);
+
+        assert!(
+            session.settings().detailed_logs,
+            "同步后会话副本要带上用户刚打开的详细日志开关"
+        );
+    }
+
+    /// 缓存标签按意图取：自动与空串同一个文件，换档位就换路径。
+    #[test]
+    fn cache_tag_follows_quality_intent() {
+        let auto = Session::new(Settings::default());
+        let blank = Session::new(Settings {
+            quality: "  ".into(),
+            ..Default::default()
+        });
+        assert_eq!(auto.quality_tag(), "auto");
+        assert_eq!(blank.quality_tag(), "auto");
+
+        let explicit = Session::new(Settings {
+            quality: "Lossless".into(),
+            ..Default::default()
+        });
+        assert_eq!(explicit.quality_tag(), "lossless");
+    }
+
     /// 试听标记与旧 sidecar 的兼容：这条链一断，界面就会把整曲说成试听（或反之）。
     #[test]
     fn sidecar_reads_preview_flag_and_self_heals_legacy_label() {
-        let (quality, preview) = read_sidecar("无损 871k\t2048\t1", 2048).unwrap();
+        let (quality, preview, rank) = read_sidecar("无损 871k\t2048\t1", 2048).unwrap();
         assert_eq!(quality, "无损 871k");
         assert!(preview);
-        let (_, preview) = read_sidecar("无损 871k\t2048\t0", 2048).unwrap();
+        assert_eq!(rank, None, "旧格式没有档位分数，视为未知");
+        let (_, preview, _) = read_sidecar("无损 871k\t2048\t0", 2048).unwrap();
         assert!(!preview);
         // 旧缓存没有第三个字段：试听拼在档位里，要读出来并洗回纯档位
-        let (quality, preview) = read_sidecar("无损 · 试听\t2048", 2048).unwrap();
+        let (quality, preview, _) = read_sidecar("无损 · 试听\t2048", 2048).unwrap();
         assert_eq!(quality, "无损");
         assert!(preview);
-        let (quality, preview) = read_sidecar("无损\t2048", 2048).unwrap();
+        let (quality, preview, _) = read_sidecar("无损\t2048", 2048).unwrap();
         assert_eq!(quality, "无损");
         assert!(!preview);
+    }
+
+    /// 第四个字段（实际档位分数）能读出来；缺失或不是数字时一律未知。
+    #[test]
+    fn sidecar_reads_actual_rank_and_treats_missing_as_unknown() {
+        let (_, _, rank) = read_sidecar("无损 871k\t2048\t0\t100", 2048).unwrap();
+        assert_eq!(rank, Some(100));
+        let (_, _, rank) = read_sidecar("极高 320k\t2048\t0\tabc", 2048).unwrap();
+        assert_eq!(rank, None);
     }
 
     /// 尺寸对不上、档位为空、字段不齐一律 miss——半截文件不许冒充命中。

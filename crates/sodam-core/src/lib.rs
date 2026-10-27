@@ -16,6 +16,7 @@ pub mod models;
 pub mod play_report;
 pub mod playback_trace;
 pub mod preferences;
+pub mod quality;
 pub mod queue;
 pub mod session;
 

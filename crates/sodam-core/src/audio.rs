@@ -38,6 +38,10 @@ pub struct PlaybackSnapshot {
     pub volume: f32,
     /// 当前曲目**实际拉到的流**音质（例：`无损 871k`）。
     pub quality: String,
+    /// 实际档位分数（与取流筛选同一刻度）；`None` = 未知（旧缓存没记）。
+    ///
+    /// 界面拿它和用户选的意图比较得出「是否降档」——结论不落盘，每次现算。
+    pub quality_rank: Option<i64>,
     /// 当前曲目是不是**试听片段**（不是整曲流）。界面用它显示持续标识，
     /// 不再从 `quality` 字符串里猜——「三十秒就切歌」的真相只能在这里表达。
     pub preview: bool,
@@ -91,6 +95,8 @@ enum Command {
         path: PathBuf,
         /// 这次实际拉到的流音质（显示用）
         quality: String,
+        /// 实际档位分数（降档判定用）
+        quality_rank: Option<i64>,
         /// 这次拿到的是试听片段还是整曲
         preview: bool,
         lease: crate::cache::CacheLease,
@@ -182,6 +188,7 @@ impl PlaybackEngine {
             track: Box::new(track),
             path: cached.path,
             quality: cached.quality,
+            quality_rank: cached.quality_rank,
             preview: cached.preview,
             lease: cached.lease,
             sequence,
@@ -290,6 +297,7 @@ fn load_failed(
         snap.position_seconds = 0.0;
         snap.duration_seconds = track.duration_seconds.max(0) as f64;
         snap.quality.clear();
+        snap.quality_rank = None;
         snap.preview = false;
         snap.error = message;
         snap.playing = false;
@@ -555,6 +563,7 @@ fn audio_thread(
                 track,
                 path,
                 quality,
+                quality_rank,
                 preview,
                 lease,
                 sequence,
@@ -614,6 +623,7 @@ fn audio_thread(
                     snap.position_seconds = 0.0;
                     snap.duration_seconds = track.duration_seconds.max(0) as f64;
                     snap.quality = quality.clone();
+                    snap.quality_rank = quality_rank;
                     snap.preview = preview;
                     snap.error.clear();
                     snap.finished = false;
@@ -1064,6 +1074,7 @@ mod tests {
                 path: path.clone(),
                 quality: "test".into(),
                 preview: false,
+                quality_rank: None,
                 lease: crate::cache::CacheLease::acquire(&path),
             };
             let seq = engine.load(
@@ -1103,6 +1114,7 @@ mod tests {
             path,
             quality: "test".into(),
             preview: false,
+            quality_rank: None,
         };
         let seq = engine.load(
             TrackItem {

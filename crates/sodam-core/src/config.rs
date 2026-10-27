@@ -21,7 +21,10 @@ pub struct Settings {
     pub device_id: String,
     pub iid: String,
     pub fp: String,
-    /// 音质偏好：`best` / `lossless` / `highest` / `medium` / `low`。
+    /// 音质偏好：只存**意图**——`auto` 或一个具体档位（`lossless` / `highest` / `medium` / `low`）。
+    ///
+    /// 空串是历史写法，按 `auto` 读；新写入一律写 `auto`。实际拿到哪一档由服务端按
+    /// 账号权益与曲目可用性决定，不落盘（见 [`crate::quality`]）。
     pub quality: String,
     /// 当前音量与静音前音量（0..=1）。旧配置缺字段时沿用 100%。
     pub volume: f32,
@@ -49,6 +52,11 @@ pub struct Settings {
     pub shortcut_previous: String,
     /// 下一首。
     pub shortcut_next: String,
+    /// 详细日志：打开后把六个话题都提到 DEBUG，即时生效、重启保持。
+    ///
+    /// 与环境变量是并集关系——两边都只能「记更多」，不存在谁覆盖谁。
+    #[serde(default)]
+    pub detailed_logs: bool,
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -238,8 +246,9 @@ impl Default for Settings {
             device_id: String::new(),
             iid: String::new(),
             fp: String::new(),
-            // 空 = 自动：登录后按账号 VIP 情况挑能用的最高档（见 Session::refresh_quality）
-            quality: String::new(),
+            // 只存意图，不存实际档位：新写入一律 auto，空串只作历史写法来读
+            //（见 crate::quality）。不再按会员等级推导一个具体档位写回。
+            quality: crate::quality::AUTO.to_string(),
             volume: 1.0,
             volume_before_mute: 1.0,
             play_mode: crate::queue::PlayMode::default(),
@@ -252,6 +261,7 @@ impl Default for Settings {
             shortcut_toggle: String::new(),
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
+            detailed_logs: false,
         }
     }
 }
@@ -453,6 +463,16 @@ impl Settings {
         !self.cookie.trim().is_empty() && !self.signer_url.trim().is_empty()
     }
 
+    /// 音质意图（空串按「自动」读）。
+    pub fn quality_intent(&self) -> crate::quality::QualityIntent {
+        crate::quality::QualityIntent::parse(&self.quality)
+    }
+
+    /// 写入音质意图：只落意图，不落解析出来的实际档位。
+    pub fn set_quality_intent(&mut self, intent: &crate::quality::QualityIntent) {
+        self.quality = intent.as_setting().to_string();
+    }
+
     /// 生效的播放/暂停快捷键（配置为空时用内置默认值）。
     pub fn shortcut_toggle(&self) -> &str {
         effective_shortcut(&self.shortcut_toggle, DEFAULT_SHORTCUT_TOGGLE)
@@ -470,6 +490,10 @@ impl Settings {
 
     /// 用环境变量补全空字段（`SODA_COOKIE` / `QISHUI_SIGNER_URL` / `QISHUI_SIGNER_TOKEN`…），
     /// 便于先用 shell 跑起来，再逐步落到配置文件。
+    ///
+    /// `SODAM_QUALITY` 是唯一例外：音质的「自动」现在写成 `auto` 而不是空串，按「补空字段」
+    /// 的规则它会永远填不进去。所以它按**意图**判断——只有当前意图是自动时才让环境变量
+    /// 覆盖，用户手选的具体档位不会被开发变量悄悄改掉。
     pub fn merged_with_env(mut self) -> Self {
         let pairs = [
             ("SODA_COOKIE", &mut self.cookie),
@@ -478,7 +502,6 @@ impl Settings {
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
-            ("SODAM_QUALITY", &mut self.quality),
         ];
         for (key, slot) in pairs {
             if slot.trim().is_empty() {
@@ -486,6 +509,13 @@ impl Settings {
                     if !value.trim().is_empty() {
                         *slot = value.trim().to_string();
                     }
+                }
+            }
+        }
+        if self.quality_intent() == crate::quality::QualityIntent::Auto {
+            if let Ok(value) = std::env::var("SODAM_QUALITY") {
+                if !value.trim().is_empty() {
+                    self.quality = value.trim().to_string();
                 }
             }
         }
@@ -744,5 +774,53 @@ mod tests {
             reread.contains(expected.as_str()),
             "配置文件里应已是规范串：{reread}"
         );
+    }
+
+    /// 音质只存意图：写 `auto` 读回仍是 `auto`，旧文件的空串读成自动，且不做改写。
+    #[test]
+    fn quality_setting_round_trips_intent_without_rewriting_legacy_values() {
+        use crate::quality::QualityIntent;
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.json");
+
+        let mut settings = Settings::default();
+        settings.set_quality_intent(&QualityIntent::Auto);
+        settings.save_to(&path).expect("save");
+        assert_eq!(
+            Settings::load_from(&path).quality,
+            "auto",
+            "自动要落成 auto 这一种写法"
+        );
+
+        // 旧配置里的空串：读成自动，但文件内容原样保留（我们不猜它是不是用户选的）
+        std::fs::write(&path, r#"{"quality":""}"#).expect("写入旧配置");
+        let legacy = Settings::load_from(&path);
+        assert_eq!(legacy.quality, "");
+        assert_eq!(legacy.quality_intent(), QualityIntent::Auto);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回"),
+            r#"{"quality":""}"#,
+            "没有别的迁移时不应改写文件"
+        );
+
+        // 用户（或旧版本）写的具体档位一律不动
+        std::fs::write(&path, r#"{"quality":"lossless"}"#).expect("写入旧配置");
+        let kept = Settings::load_from(&path);
+        assert_eq!(kept.quality, "lossless");
+        assert_eq!(
+            kept.quality_intent(),
+            QualityIntent::Tier("lossless".into())
+        );
+    }
+
+    /// 详细日志：新配置默认关闭，旧配置缺字段也能读。
+    #[test]
+    fn detailed_logs_defaults_off_and_reads_old_configs() {
+        assert!(!Settings::default().detailed_logs);
+        let parsed: Settings = serde_json::from_str(r#"{"cookie":"x"}"#).expect("老配置应能解析");
+        assert!(!parsed.detailed_logs);
+        let enabled: Settings = serde_json::from_str(r#"{"detailed_logs":true}"#).expect("解析");
+        assert!(enabled.detailed_logs);
     }
 }

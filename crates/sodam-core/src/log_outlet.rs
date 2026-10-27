@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -1079,6 +1079,11 @@ fn writer_loop(rx: Receiver<WriterMsg>, mut state: WriterState) {
 pub struct LogOutlet {
     log_dir: PathBuf,
     level: AtomicU8,
+    /// 设置页的「详细日志」开关：开 = 六个话题全部提到 DEBUG。
+    ///
+    /// 与环境变量是并集关系：两者都只能让某个话题记更多，谁也不会把另一个关掉，
+    /// 所以这里单独存一个标志，而不是把值写进 `topic_levels` 去覆盖环境变量的结果。
+    detailed: AtomicBool,
     /// 每个话题的详细度覆盖；`NO_TOPIC_OVERRIDE` 表示跟随全局 `level`。
     topic_levels: [AtomicU8; LogTopic::ALL.len()],
     tx: Mutex<Option<Sender<WriterMsg>>>,
@@ -1102,6 +1107,7 @@ impl LogOutlet {
             Ok(handle) => Self {
                 log_dir,
                 level: AtomicU8::new(LogLevel::Info as u8),
+                detailed: AtomicBool::new(false),
                 topic_levels: std::array::from_fn(|_| AtomicU8::new(NO_TOPIC_OVERRIDE)),
                 tx: Mutex::new(Some(tx)),
                 writer: Mutex::new(Some(handle)),
@@ -1109,6 +1115,7 @@ impl LogOutlet {
             Err(_) => Self {
                 log_dir,
                 level: AtomicU8::new(LogLevel::Info as u8),
+                detailed: AtomicBool::new(false),
                 topic_levels: std::array::from_fn(|_| AtomicU8::new(NO_TOPIC_OVERRIDE)),
                 tx: Mutex::new(None),
                 writer: Mutex::new(None),
@@ -1174,13 +1181,29 @@ impl LogOutlet {
     }
 
     /// 某个话题实际生效的最低级别。
+    ///
+    /// 取三者的最小（= 最细）：全局级别、「详细日志」开关、话题覆盖。
     pub fn topic_level(&self, topic: LogTopic) -> LogLevel {
-        let raw = self.topic_levels[topic.index()].load(Ordering::Relaxed);
-        if raw == NO_TOPIC_OVERRIDE {
-            self.level()
-        } else {
-            self.level().min(level_from_u8(raw))
+        let mut level = self.level();
+        if self.detailed() {
+            level = level.min(LogLevel::Debug);
         }
+        let raw = self.topic_levels[topic.index()].load(Ordering::Relaxed);
+        if raw != NO_TOPIC_OVERRIDE {
+            level = level.min(level_from_u8(raw));
+        }
+        level
+    }
+
+    /// 设置页的「详细日志」开关；`true` = 六个话题全部记到 DEBUG。
+    ///
+    /// 即时生效，不需要重启；关掉只撤销这个开关，不会撤销环境变量提出的详细度。
+    pub fn set_detailed(&self, detailed: bool) {
+        self.detailed.store(detailed, Ordering::Relaxed);
+    }
+
+    pub fn detailed(&self) -> bool {
+        self.detailed.load(Ordering::Relaxed)
     }
 
     /// 刷新待写盘的折叠缓冲区；返回时此前投递的行都已落到文件（或内存降级缓冲）。
@@ -1360,6 +1383,13 @@ pub fn global() -> Option<&'static LogOutlet> {
 pub fn flush_global() {
     if let Some(outlet) = global() {
         outlet.flush();
+    }
+}
+
+/// 应用设置页的「详细日志」开关；全局出口尚未初始化时什么也不做。
+pub fn set_global_detailed(detailed: bool) {
+    if let Some(outlet) = global() {
+        outlet.set_detailed(detailed);
     }
 }
 
@@ -1777,6 +1807,53 @@ mod tests {
         // `0` 等于没设。
         assert_eq!(outlet.topic_level(LogTopic::Prefetch), LogLevel::Info);
         assert!(!outlet.enabled(LogLevel::Debug, LogTopic::Prefetch));
+    }
+
+    #[test]
+    fn test_detailed_switch_raises_all_topics_and_unions_with_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guards = Vec::new();
+        for (name, _) in TOPIC_VERBOSITY_ENV {
+            let orig = std::env::var_os(name);
+            std::env::remove_var(name);
+            guards.push(EnvGuard(name, orig));
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let outlet = LogOutlet::new(temp.path().to_path_buf());
+
+        // 关：六个话题都是 INFO
+        for topic in LogTopic::ALL {
+            assert_eq!(outlet.topic_level(topic), LogLevel::Info);
+        }
+
+        // 开：六个话题全部 DEBUG，即时生效
+        outlet.set_detailed(true);
+        for topic in LogTopic::ALL {
+            assert_eq!(outlet.topic_level(topic), LogLevel::Debug);
+            assert!(outlet.enabled(LogLevel::Debug, topic));
+        }
+
+        // 环境变量在开关关闭时仍然生效；开与关是并集，不是互相覆盖
+        outlet.set_detailed(false);
+        std::env::set_var("SODAM_PLAYER_LOG", "1");
+        outlet.apply_env_verbosity();
+        outlet.set_detailed(true);
+        outlet.set_detailed(false);
+        assert_eq!(
+            outlet.topic_level(LogTopic::Player),
+            LogLevel::Debug,
+            "关掉开关不能撤销环境变量提出的详细度"
+        );
+
+        outlet.log(LogLevel::Debug, LogTopic::App, "while_off", &[]);
+        outlet.set_detailed(true);
+        outlet.log(LogLevel::Debug, LogTopic::App, "while_on", &[]);
+        outlet.flush();
+
+        let content = fs::read_to_string(outlet.log_file_path()).unwrap();
+        assert!(!content.contains("while_off"), "开关关闭时 DEBUG 不落盘");
+        assert!(content.contains("DEBUG app while_on"));
     }
 
     #[test]
