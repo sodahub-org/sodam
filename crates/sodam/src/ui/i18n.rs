@@ -91,7 +91,6 @@ impl Language {
             }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "账号" => "Account",
-            "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {}",
             "主题已切换为{}" => "Theme switched to {}",
             "浅色" => "Light",
             "深色" => "Dark",
@@ -219,7 +218,7 @@ impl Language {
                 "Language pinned; switch anytime"
             }
             "扫码登录" => "QR Login",
-            "封顶无损；单曲没有无损时自动降级" => {
+            "封顶无损；单曲没有无损时自动降到下一档" => {
                 "Up to lossless; downgrades automatically"
             }
             "封顶极高（≈320k）" => "Up to high (≈320k)",
@@ -282,14 +281,21 @@ impl Language {
             "语言" => "Language",
             "跟随系统" => "System",
             "音质偏好" => "Audio Quality",
-            "按账号权益和单曲实际可用的档位择优" => {
-                "Choose the best usable tier for your account and each track"
+            "音质已设为 {}，从下一首生效" => "Quality set to {}; applies from the next track",
+            "音质：从下一首生效" => "Quality: applies from the next track",
+            "已降档：所选 {}，实际 {}" => "Lower tier than selected: chose {}, got {}",
+            "已降档" => "Lower tier",
+            "不设上限，按账号权益和单曲可用档位取最高" => {
+                "No cap; uses the best tier your account and each track allow"
             }
-            "当前账号是 VIP：登录时默认无损，单曲没有无损会自动降级" => {
-                "VIP account: lossless by default; downgrades automatically when unavailable"
+            "自动 = 取当前账号能拿到的最高档，单曲没有该档位时自动降一档" => {
+                "Auto = the best tier your account can get; steps down one tier when a track lacks it"
             }
-            "当前账号非 VIP：默认自动，取免费档里实际可用的最高一档" => {
-                "Non-VIP account: Auto by default; uses the best free tier available"
+            "若不是你选的，点「自动」即可恢复跟随账号权益" => {
+                "Not your choice? Pick Auto to follow your account again"
+            }
+            "已缓存的歌曲会保持原来的档位；想按新权益重取，清空缓存或换一首" => {
+                "Cached songs keep their original tier; clear the cache or switch tracks to refetch"
             }
             "自动" => "Auto",
             "无损" => "Lossless",
@@ -362,7 +368,6 @@ impl Language {
             }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "非 VIP" => "Non-VIP",
-            "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {quality}",
             "主题已切换为{}" => "Theme switched to {}",
             "浅色" => "light",
             "深色" => "dark",
@@ -470,6 +475,16 @@ impl Language {
             "日志可能含接口地址（查询串已移除），请勿公开上传" => {
                 "Logs may contain service URLs (query strings removed). Don't upload them publicly."
             }
+            "详细日志" => "Detailed Logs",
+            "多记播放、预取与界面耗时等调试信息；仍不含 Cookie、签名与查询串" => {
+                "Record more playback, prefetch and frame-time detail; still no cookies, signatures or query strings"
+            }
+            "已开启详细日志：六个话题都会记到 DEBUG，重启后保持" => {
+                "Detailed logs on: all six topics record at DEBUG and stay on after restart"
+            }
+            "已关闭详细日志：回到 INFO，环境变量仍然有效" => {
+                "Detailed logs off: back to INFO; environment variables still apply"
+            }
             "打开日志目录" => "Open Log Folder",
             "清除诊断日志" => "Clear Diagnostic Logs",
             "正在清除…" => "Clearing…",
@@ -516,7 +531,6 @@ impl Language {
             "当前跟随系统语言；手动选择后会固定语言" => {
                 "Following system; choose a language to pin it"
             }
-            "{}；音质已按权益自动设为 {}" => "{}; quality set to {}",
             _ => return None,
         })
     }

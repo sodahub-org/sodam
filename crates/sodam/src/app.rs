@@ -406,6 +406,8 @@ pub struct Root {
     pub login_modal_open: bool,
     /// 队列右键菜单：被点中的行下标与鼠标位置。
     pub queue_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    /// 音质菜单锚点：播放条徽章被点中时的鼠标位置（`None` = 菜单关着）。
+    pub quality_menu: Option<gpui::Point<gpui::Pixels>>,
     /// 搜索/歌单/我喜欢等歌曲行右键菜单。
     pub track_menu: Option<TrackMenu>,
     /// 播放请求序号：每次 start_track +1。
@@ -458,6 +460,8 @@ pub struct Root {
     pub progress_preview: Option<f32>,
     /// 歌词页大封面：切曲后的 `(track_id, 开始时刻)`；管「至少 200ms 加载态」的门。
     pub lyrics_cover_gate: Option<(String, std::time::Instant)>,
+    /// 上一次记进日志的主题快照键：渲染路径上的 DEBUG 只在值变化时记一行。
+    pub(crate) theme_snapshot_key: Option<String>,
     /// 队列快照（含版本号）：避免抽屉每帧深拷贝整条队列。
     pub queue_cache: (u64, Arc<Vec<TrackItem>>),
     /// 已尝试过的封面 URL（成功在 covers 里，失败的也记下来，避免每帧重复排队）。
@@ -486,6 +490,9 @@ pub struct Root {
 impl Root {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut settings = Settings::load().merged_with_env();
+        // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
+        // 这里补上开关状态（环境变量那一路已在出口初始化时读过，两者取并集）。
+        log_outlet::set_global_detailed(settings.detailed_logs);
         let engine = PlaybackEngine::with_volume(settings.volume);
         settings.volume = engine.snapshot().volume;
         // 首次运行就把配置落盘：用户可以直接编辑 ~/.config/sodam/config.json
@@ -545,6 +552,7 @@ impl Root {
             played_history: Vec::new(),
             login_modal_open: false,
             queue_menu: None,
+            quality_menu: None,
             track_menu: None,
             play_seq: 0,
             playback_error: None,
@@ -671,6 +679,7 @@ impl Root {
             last_seek_seq: engine_progress.seek_seq,
             progress_preview: None,
             lyrics_cover_gate: None,
+            theme_snapshot_key: None,
             queue_cache: (0, Arc::new(Vec::new())),
             cover_attempted: Arc::new(Mutex::new(HashSet::new())),
             cover_requests: Arc::new(Mutex::new(Vec::new())),
@@ -857,7 +866,7 @@ impl Root {
         Self::start_lyrics_ticker(cx);
 
         // 开发验证用：`SODAM_AUTOPLAY=1` 进收藏页并自动播放第一首；
-        // `SODAM_POPUP=quality|queue|volume` 启动即打开对应弹层（便于截图核对）。
+        // `SODAM_POPUP=queue|quality` 启动即打开对应弹层（便于截图核对）。
         if std::env::var("SODAM_AUTOLOGIN").is_ok() && !root.settings.cookie.trim().is_empty() {
             root.login_modal_open = true;
             root.start_login(cx);
@@ -954,11 +963,13 @@ impl Root {
             })
             .detach();
         }
-        if std::env::var("SODAM_POPUP")
-            .map(|value| value.trim() == "queue")
-            .unwrap_or(false)
-        {
-            root.queue_open = true;
+        if let Ok(value) = std::env::var("SODAM_POPUP") {
+            match value.trim() {
+                "queue" => root.queue_open = true,
+                // 固定锚点：截图核对菜单样式时不必真的点中徽章。
+                "quality" => root.quality_menu = Some(gpui::point(px(320.0), px(420.0))),
+                _ => {}
+            }
         }
         root
     }
@@ -1322,6 +1333,12 @@ impl Root {
         self.set_status_text(self.localized(key, args));
     }
 
+    /// 是否有弹层开着（右键菜单或档位菜单）。遮罩与关闭逻辑只看这一处，
+    /// 加第四个菜单时不必再改两个地方。
+    pub(crate) fn any_menu_open(&self) -> bool {
+        self.queue_menu.is_some() || self.track_menu.is_some() || self.quality_menu.is_some()
+    }
+
     /// 普通操作反馈：只进入底部状态行，不触发全局 message。
     pub fn set_status_text(&mut self, text: impl Into<String>) {
         self.status = sodam_core::failure::strip_urls_for_user(&text.into());
@@ -1492,16 +1509,22 @@ impl Render for Root {
             let color = ambient_color
                 .map(|rgb| format!("{rgb:?}"))
                 .unwrap_or_else(|| "none".to_string());
-            log_event(
-                LogLevel::Debug,
-                LogTopic::App,
-                "theme_snapshot",
-                &[
-                    ("current", current.as_str()),
-                    ("url", url.as_str()),
-                    ("color", color.as_str()),
-                ],
-            );
+            // 这条在渲染路径上：只在值变化时记一行。否则详细日志一开就每帧一行，
+            // 真正要看的记录会被自己挤掉。
+            let snapshot_key = format!("{current}\t{url}\t{color}");
+            if self.theme_snapshot_key.as_deref() != Some(snapshot_key.as_str()) {
+                self.theme_snapshot_key = Some(snapshot_key);
+                log_event(
+                    LogLevel::Debug,
+                    LogTopic::App,
+                    "theme_snapshot",
+                    &[
+                        ("current", current.as_str()),
+                        ("url", url.as_str()),
+                        ("color", color.as_str()),
+                    ],
+                );
+            }
         }
         theme::set_ambient_rgb(ambient_color);
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
@@ -1645,6 +1668,9 @@ impl Render for Root {
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
+            .when_some(self.quality_menu, |this, position| {
+                this.child(ui::player_bar::quality_menu(self, cx, position))
+            })
             .when(
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),
                 |this| this.child(crate::views::login_modal(self, cx)),
@@ -1652,34 +1678,32 @@ impl Render for Root {
             .when_some(ui::message::render(self, cx), |this, message| {
                 this.child(message)
             })
-            .when(
-                self.queue_menu.is_some() || self.track_menu.is_some(),
-                |this| {
-                    // 透明遮罩：点任何地方都关掉右键菜单；
-                    // 菜单本身层级更高（priority 2 > 1），点菜单不会走到这里。
-                    this.child(
-                        gpui::deferred(
-                            div()
-                                .id("menu-scrim")
-                                .absolute()
-                                .top(px(0.0))
-                                .left(px(0.0))
-                                .size_full()
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|root, _event, _window, cx| {
-                                        if root.queue_menu.is_some() || root.track_menu.is_some() {
-                                            root.queue_menu = None;
-                                            root.track_menu = None;
-                                            cx.notify();
-                                        }
-                                    }),
-                                ),
-                        )
-                        .with_priority(1),
+            .when(self.any_menu_open(), |this| {
+                // 透明遮罩：点任何地方都关掉右键菜单；
+                // 菜单本身层级更高（priority 2 > 1），点菜单不会走到这里。
+                this.child(
+                    gpui::deferred(
+                        div()
+                            .id("menu-scrim")
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .size_full()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|root, _event, _window, cx| {
+                                    if root.any_menu_open() {
+                                        root.queue_menu = None;
+                                        root.track_menu = None;
+                                        root.quality_menu = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
                     )
-                },
-            );
+                    .with_priority(1),
+                )
+            });
         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
             let elapsed = frame_started.elapsed().as_millis();
             if elapsed > 16 {

@@ -1,7 +1,7 @@
 //! 底部播放条 + 右侧队列抽屉。
 //!
 //! 布局（参考官方客户端）：左「封面 + 标题/歌手」、中「上一首 / 播放 / 下一首 + 进度」、
-//! 右「音量图标 + 内联音量滑条 + 队列开关」。音质不在这里选（见设置页）。
+//! 右「音量图标 + 内联音量滑条 + 队列开关」。音质徽章在左侧曲目信息里，点开选意图。
 
 use gpui::prelude::*;
 use gpui::{
@@ -16,6 +16,8 @@ use crate::ui::{icons, theme};
 /// 内联音量条宽度与滑块直径。
 const VOLUME_TRACK_W: f32 = 96.0;
 const VOLUME_THUMB: f32 = 11.0;
+/// 档位菜单宽度：最宽的一项是「自动」加它的说明，200 足够且不挤压播放条。
+const QUALITY_MENU_W: f32 = 200.0;
 
 fn transport_button(
     id: &'static str,
@@ -241,10 +243,20 @@ fn progress_bar(
         )
 }
 
+/// 档位 key（`auto` / `lossless` …）的显示名。设置页与播放条共用同一套说法。
+pub(crate) fn quality_label(value: &str, language: crate::ui::i18n::Language) -> String {
+    let intent = sodam_core::quality::QualityIntent::parse(value);
+    match intent.label_key() {
+        Some(key) => language.text(key).to_string(),
+        // 认不出的档位原样显示，不硬翻成某一档
+        None => intent.as_setting().to_string(),
+    }
+}
+
 /// 引擎里的音质标签由核心层生成；这里按当前语言显示。
 /// 档位名翻译。试听标注不在这里——它由 `PlaybackSnapshot::preview` 驱动，
 /// 见 [`render`] 里那句 `quality.push_str(...)`。
-fn localized_quality(raw: String, language: crate::ui::i18n::Language) -> String {
+pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language) -> String {
     if language.resolved().is_zh() {
         return raw;
     }
@@ -253,6 +265,109 @@ fn localized_quality(raw: String, language: crate::ui::i18n::Language) -> String
         .replace("较高", "Medium")
         .replace("标准", "Standard")
         .replace("未知", "Unknown")
+}
+
+/// 播放条的档位菜单：勾选的是**意图**，徽章上显示的是**实际**档位。
+pub(crate) fn quality_menu(
+    root: &Root,
+    cx: &mut Context<Root>,
+    position: gpui::Point<gpui::Pixels>,
+) -> impl IntoElement {
+    let current = root.settings.quality_intent();
+    let language = root.language;
+    let rows = std::iter::once(sodam_core::quality::AUTO)
+        .chain(sodam_core::quality::TIERS)
+        .map(|value| {
+            let chosen = sodam_core::quality::QualityIntent::parse(value) == current;
+            let hint = if value == sodam_core::quality::AUTO {
+                root.tr("不设上限，按账号权益和单曲可用档位取最高")
+            } else {
+                ""
+            };
+            div()
+                .id(gpui::ElementId::Name(
+                    format!("quality-menu-{value}").into(),
+                ))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::space::LG))
+                .px(px(theme::space::SM))
+                .py(px(theme::space::XS))
+                .rounded(px(theme::radius::ROW))
+                .cursor_pointer()
+                .when(chosen, |this| this.bg(theme::surface_selected()))
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    root.set_quality(value, cx);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(if chosen {
+                                    theme::text()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(quality_label(value, language)),
+                        )
+                        .when(!hint.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_size(theme::Text::Tiny.size())
+                                    .text_color(theme::text_faint())
+                                    .child(hint),
+                            )
+                        }),
+                )
+                .when(chosen, |this| {
+                    this.child(
+                        svg()
+                            .path(icons::path("check"))
+                            .size(px(theme::ICON_SM))
+                            .text_color(theme::accent()),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+
+    gpui::deferred(
+        gpui::anchored().snap_to_window().position(position).child(
+            div()
+                .id("quality-menu")
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    // 菜单内的点击不要穿透到下层（否则会误触播放条其他按钮）
+                    cx.stop_propagation();
+                })
+                .flex()
+                .flex_col()
+                .w(px(QUALITY_MENU_W))
+                .p(px(theme::space::XS))
+                .rounded(px(theme::radius::CARD))
+                .bg(theme::surface_elevated())
+                .border_1()
+                .border_color(theme::border())
+                .shadow_lg()
+                .child(
+                    div()
+                        .px(px(theme::space::SM))
+                        .py(px(theme::space::XS))
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(root.tr("音质：从下一首生效")),
+                )
+                .children(rows),
+        ),
+    )
+    .with_priority(2)
 }
 
 /// 渲染播放条。
@@ -293,6 +408,10 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     if snapshot.preview {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
+    // 降档：实际档位低于所选档位。每次现算——用户改了意图，旧结论就不该继续成立。
+    // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档。
+    let downgraded =
+        sodam_core::quality::is_downgraded(&root.settings.quality_intent(), snapshot.quality_rank);
     let title_link_track = track.as_ref().cloned();
     let artist_link_track = track.as_ref().cloned();
     let volume = root.settings.volume;
@@ -439,16 +558,42 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                         .child(detail),
                                 )
                                 .when(!quality.is_empty(), |this| {
+                                    // 徽章是音质入口：显示**实际**档位，点开选的是**意图**。
                                     this.child(
                                         div()
+                                            .id("player-quality")
                                             .flex_none()
                                             .px(px(theme::space::SM))
                                             .py(px(1.0))
                                             .rounded(px(theme::radius::PILL))
                                             .bg(theme::surface_elevated())
+                                            .border_1()
+                                            .border_color(if downgraded {
+                                                theme::warning()
+                                            } else {
+                                                theme::surface_elevated()
+                                            })
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(theme::surface_hover()))
                                             .text_size(theme::Text::Tiny.size())
-                                            .text_color(theme::accent())
-                                            .child(quality.clone()),
+                                            .text_color(if downgraded {
+                                                theme::warning()
+                                            } else {
+                                                theme::accent()
+                                            })
+                                            // 徽章没有 flex 容器：两个 child 会上下堆叠成两行，
+                                            // 在固定高度的播放条里把文字挤出可视区，所以合成一段。
+                                            .child(if downgraded {
+                                                format!("{} {}", root.tr("已降档"), quality)
+                                            } else {
+                                                quality.clone()
+                                            })
+                                            .on_click(cx.listener(
+                                                |root, event: &ClickEvent, _window, cx| {
+                                                    root.quality_menu = Some(event.position());
+                                                    cx.notify();
+                                                },
+                                            )),
                                     )
                                 }),
                         )

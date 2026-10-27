@@ -399,10 +399,11 @@ impl Root {
         }
     }
 
-    /// 设置音质档位（`auto` = 按账号权益自动）。换档后重新拉当前曲目的流。
+    /// 设置音质**意图**（`auto` = 不设上限）。换档后按新意图预取下一首，
+    /// 当前这首不重载：中途断开已取到的流不划算，也与主流客户端一致。
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
-        let value = if quality == "auto" { "" } else { quality };
-        self.settings.quality = value.to_string();
+        let intent = sodam_core::quality::QualityIntent::parse(quality);
+        self.settings.set_quality_intent(&intent);
         if let Err(err) = self.settings.save() {
             let message = self.failure_text("保存音质设置失败", &err, SAVE_TEXT);
             self.notify_error_once("quality-save-failed", message);
@@ -410,8 +411,34 @@ impl Root {
         if let Some(session) = self.session.as_mut() {
             let _ = session.apply(self.settings.clone());
         }
-        // 切档后按新档位重新预取下一首（正在播的这首不受影响）
+        // 切档后按新意图重新预取下一首（正在播的这首不受影响）
         self.spawn_prefetch(cx);
+        let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
+        self.set_status_text(self.localized("音质已设为 {}，从下一首生效", &[label]));
+        self.quality_menu = None;
+    }
+
+    /// 设置页「详细日志」开关：写进配置并即时生效，重启后保持。
+    pub fn set_detailed_logs(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.detailed_logs = enabled;
+        log_outlet::set_global_detailed(enabled);
+        // 会话持有一份设置副本，登录时会被整体落盘；不同步就会把这里的选择写回旧值。
+        self.persist_playback_preferences();
+        match self.settings.save() {
+            Ok(()) => {
+                let message = if enabled {
+                    self.tr("已开启详细日志：六个话题都会记到 DEBUG，重启后保持")
+                } else {
+                    self.tr("已关闭详细日志：回到 INFO，环境变量仍然有效")
+                };
+                self.set_status_text(message);
+            }
+            Err(err) => {
+                let message = self.failure_text("详细日志已生效，但保存失败", &err, SAVE_TEXT);
+                self.notify_error_once("detailed-logs-save-failed", message);
+            }
+        }
+        cx.notify();
     }
 
     /// 按比例跳转播放位置（0.0~1.0）。
@@ -682,19 +709,29 @@ impl Root {
                 if finished {
                     let _ = this.update(cx, |root, cx| {
                         match root.session.as_mut() {
-                            Some(session) => match session.apply_login_cookie(&cookie) {
-                                Ok(()) => {
-                                    root.settings = session.settings().clone();
-                                    root.set_status_text(
-                                        language.text("登录成功，正在读取账号信息…").to_string(),
-                                    );
+                            Some(session) => {
+                                // 会话里的设置是启动时的副本：先把用户此刻的偏好同步进去，
+                                // 否则 `apply_login_cookie` 整体落盘会把登录期间改过的字段写回旧值。
+                                session.update_playback_preferences(&root.settings);
+                                match session.apply_login_cookie(&cookie) {
+                                    Ok(()) => {
+                                        root.settings = session.settings().clone();
+                                        root.set_status_text(
+                                            language
+                                                .text("登录成功，正在读取账号信息…")
+                                                .to_string(),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let message = root.failure_text(
+                                            "登录成功但保存失败",
+                                            &err,
+                                            SAVE_TEXT,
+                                        );
+                                        root.notify_error_once("login-save-failed", message);
+                                    }
                                 }
-                                Err(err) => {
-                                    let message =
-                                        root.failure_text("登录成功但保存失败", &err, SAVE_TEXT);
-                                    root.notify_error_once("login-save-failed", message);
-                                }
-                            },
+                            }
                             None => {
                                 let message = language.text("登录成功（会话未初始化）").to_string();
                                 root.notify_warning_once("login-session-missing", message);
@@ -771,7 +808,7 @@ impl Root {
         .detach();
     }
 
-    /// 读取账号信息，并在用户没有手动指定音质时按 VIP 情况自动选最高档。
+    /// 读取账号信息。音质配置不由账号状态推导，这里只刷新昵称、头像与 VIP。
     pub fn refresh_account(&mut self, cx: &mut Context<Self>) {
         if self.settings.cookie.trim().is_empty() {
             return;
@@ -812,24 +849,8 @@ impl Root {
                             ],
                         );
                         root.notify_success_once("login-ready", message);
-                        if let Some(session) = root.session.as_mut() {
-                            match session.refresh_quality(vip) {
-                                Ok(Some(quality)) => {
-                                    root.settings = session.settings().clone();
-                                    let message = root.localized(
-                                        "{}；音质已按权益自动设为 {}",
-                                        &[root.status.clone(), quality.to_string()],
-                                    );
-                                    root.set_status_text(message);
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    let message =
-                                        root.failure_text("音质偏好保存失败", &err, SAVE_TEXT);
-                                    root.notify_error_once("quality-save-failed", message);
-                                }
-                            }
-                        }
+                        // 音质配置不再随账号改写；其余设置由 `set_*` 各自即时落盘，
+                        // 这里整体回填会把请求期间用户改动的字段覆盖回旧值。
                     }
                     Err(err) => {
                         let message = root.failure_text("读取账号信息失败", &err, REMOTE_TEXT);
@@ -2637,6 +2658,8 @@ impl Root {
                 }
                 match result {
                     Ok(cached) => {
+                        let actual_rank = cached.quality_rank;
+                        let actual_quality = cached.quality.clone();
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
@@ -2650,7 +2673,29 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
-                        root.set_status("播放中：{}", std::slice::from_ref(&track.title));
+                        // 降档：实际低于所选时如实说出两边，不猜原因——取流那一段在
+                        // 「账号没有权益」与「这首没有该档位」下返回值相同，没有字段能分开。
+                        // 实际档位标签由核心层按中文档位名生成，英文界面要过一遍翻译。
+                        // 走全局提示而不是 `status`：后者没有渲染（见 #40）。
+                        let intent = root.settings.quality_intent();
+                        if sodam_core::quality::is_downgraded(&intent, actual_rank) {
+                            let message = root.localized(
+                                "已降档：所选 {}，实际 {}",
+                                &[
+                                    crate::ui::player_bar::quality_label(
+                                        intent.as_setting(),
+                                        root.language,
+                                    ),
+                                    crate::ui::player_bar::localized_quality(
+                                        actual_quality,
+                                        root.language,
+                                    ),
+                                ],
+                            );
+                            root.notify_warning_once("quality-downgraded", message);
+                        } else {
+                            root.set_status("播放中：{}", std::slice::from_ref(&track.title));
+                        }
                         // 开播后立刻预取下一首，切歌时基本是秒开
                         root.spawn_prefetch(cx);
                     }
