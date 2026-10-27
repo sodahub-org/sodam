@@ -729,6 +729,8 @@ impl Root {
             let position = demo_position.trim().parse::<f64>().unwrap_or(3.0);
             // 折行验证用的一句：内容长、在当前列宽下会折成两行，给足 8 秒以便观察
             // 亮光从第一行推到第二行的全过程（#80）。
+            // 行尾空档验证：最后一个词的结束时间早于行结束时间，
+            // 用来确认行尾那段空档里亮光仍在推进，而不是一下跳到满格（#80）。
             let wrap_line = "And you think I'm crazy yeah you think I'm crazy";
             let demo = [
                 (0.0, "偷偷搭询总没完地坐立难安", 3.0),
@@ -742,12 +744,14 @@ impl Root {
                 start_seconds: start,
                 end_seconds: start + duration,
                 text: text.to_string(),
-                // 每个字均分这段时长，模拟官方逐字时间轴。
+                // 每个字均分这段时长的 60%。真实歌词里词时长之和常短于行时长
+                // （实测 `I wanna talk it out oh mama` 短 0.28s），所以样张也留出
+                // 行尾空档，用于回归「空档里亮光仍在推进」（#80）。
                 words: text
                     .chars()
                     .enumerate()
                     .map(|(index, ch)| {
-                        let span = duration / text.chars().count() as f64;
+                        let span = duration * 0.6 / text.chars().count() as f64;
                         sodam_core::models::LyricWord {
                             start_seconds: start + span * index as f64,
                             end_seconds: start + span * (index + 1) as f64,
@@ -1505,17 +1509,28 @@ impl Render for Root {
             // 逐字高亮需要每帧的播放位置：存下来给 `lyrics_view` 用，
             // 不能在渲染函数里再取一次快照（那要多一次锁）。
             self.lyrics_position_seconds = position;
+            // 高亮的"当前句"必须严格按**本句的时间区间**判定，不能带提前量：
+            // 提前量会让上一句在还差几百毫秒时就被标成"已唱过"，于是它的逐字推进
+            // 还没走完就被整行点亮（#80 实测："最后一个字一下亮了，然后立刻换下一句"）。
+            //
+            // 滚动跟随另有 250ms 提前量（见下），那是为了让下一句提前进入视野，
+            // 两件事分开算。
             let active = self
                 .lyrics
                 .iter()
-                .rposition(|line| position + 0.25 >= line.start_seconds)
+                .rposition(|line| position >= line.start_seconds)
                 .or_else(|| (!self.lyrics.is_empty()).then_some(0));
             self.lyrics_active = active;
             // 用户刚手动滚过就让位，别把视图拽回去（官方同样是滚轮后 5 秒内不跟随）。
             let user_scrolling = self
                 .lyrics_user_scroll_until
                 .is_some_and(|until| std::time::Instant::now() < until);
-            if let Some(index) = active {
+            // 滚动比高亮早 250ms：下一句提前进入视野，避免"刚唱到就看它跳上来"。
+            let scroll_target = self
+                .lyrics
+                .iter()
+                .rposition(|line| position + 0.25 >= line.start_seconds);
+            if let Some(index) = scroll_target {
                 if !user_scrolling {
                     self.scroll_lyrics_to(index);
                 }

@@ -305,14 +305,9 @@ impl Root {
                     if !snapshot.playing {
                         return std::time::Duration::from_millis(120);
                     }
-                    // 只有**当前行**带逐字时间轴时才需要高频重绘：
-                    // 普通 LRC 是整行跳变，200ms 的主心跳已经够用。
-                    let needs_tick = root.lyrics_active.is_some_and(|index| {
-                        root.lyrics
-                            .get(index)
-                            .is_some_and(|line| line.has_word_timeline)
-                    });
-                    if needs_tick {
+                    // 有当前行就要高频重绘：现在普通 LRC 也是按行内时间平滑扫描，
+                    // 不再是「整行突然点亮」，200ms 的主心跳撑不起这个推进。
+                    if root.lyrics_active.is_some() {
                         std::time::Duration::from_millis(16)
                     } else {
                         std::time::Duration::from_millis(120)

@@ -207,13 +207,27 @@ impl LyricLine {
     ///
     /// 返回连续的浮点比例而不是字节边界：渲染层据此按像素裁剪，
     /// 因此亮光能停在**一个字中间**（#80 的“丝滑”就来自这里）。
-    /// 若改成返回字节边界，就只能整字跳变。
     ///
-    /// 没有逐字时间轴时返回 `0.0`，由调用方决定整行点亮。
+    /// 没有逐字时间轴（普通 LRC）时仍然按行内时间线性推进：亮光会平滑扫过整行，
+    /// 只是字与字之间没有细粒度的停顿差异。这比"整行突然点亮"更接近主流客户端。
+    ///
+    /// # 为什么不能按「已唱词时长 / 词时长之和」
+    ///
+    /// 真实歌词里词与词之间常有空档。例如实测的一行：
+    ///
+    /// ```text
+    /// I     0.00 → 0.56        （下一个词 0.84 才开始，中间空 0.28s）
+    /// wanna 0.84 → 1.08
+    /// ```
+    ///
+    /// 若按「词时长之和」归一化，那么所有词唱完后进度就已经是 1.0，**行尾那段
+    /// 空档完全不推进**；空档期间进度也会冻结，到下一个词开始才突然跳一截。
+    /// 肉眼就是「最后一个字一下亮了，然后立刻换下一句」。
+    ///
+    /// 这里改成：**进度严格跟随行内时间**，词之间/词之外的空档照常推进，
+    /// 只有「当前词内部」按该词的时间线性插值（保证字与字之间平滑）。
+    /// 归一化也用**行时长**，所以整行唱完时进度恰好到 1.0。
     pub fn highlight_fraction(&self, position_seconds: f64) -> f32 {
-        if !self.has_word_timeline || self.words.is_empty() {
-            return 0.0;
-        }
         if position_seconds < self.start_seconds {
             return 0.0;
         }
@@ -221,35 +235,14 @@ impl LyricLine {
             return 1.0;
         }
 
-        // 按词推进：找到当前正在唱的那个词，把它之前所有词的实时长累加，
-        // 再加上当前词内的部分进度。这样每个词的停留时间与歌词时间轴一致。
-        let total: f64 = self
-            .words
-            .iter()
-            .map(|word| (word.end_seconds - word.start_seconds).max(0.0))
-            .sum();
-        if total <= 0.0 {
-            // 全部词零时长（脏数据）：退化成按行线性推进，至少不要卡住。
-            let span = self.end_seconds - self.start_seconds;
-            return if span <= 0.0 {
-                1.0
-            } else {
-                ((position_seconds - self.start_seconds) / span) as f32
-            };
+        let line_span = self.end_seconds - self.start_seconds;
+        if line_span <= 0.0 {
+            return 1.0;
         }
 
-        let mut elapsed = 0.0f64;
-        for word in &self.words {
-            if position_seconds >= word.end_seconds {
-                elapsed += (word.end_seconds - word.start_seconds).max(0.0);
-                continue;
-            }
-            if position_seconds > word.start_seconds {
-                elapsed += position_seconds - word.start_seconds;
-            }
-            break;
-        }
-        (elapsed / total).clamp(0.0, 1.0) as f32
+        // 进度就是「此刻在本行内的时间占比」。逐字信息用来保证词内部平滑，
+        // 但不需要它来推进——时间本身一直在走，空档因此自动被覆盖。
+        (((position_seconds - self.start_seconds) / line_span) as f32).clamp(0.0, 1.0)
     }
 }
 
@@ -502,16 +495,15 @@ mod tests {
         assert_eq!(at(2.0), 1.0);
     }
 
-    /// 普通 LRC（无逐字数据）不能凭空编速度：一律返回 0，交给调用方整行点亮。
+    /// 普通 LRC（无逐字数据）没有时长信息，到点即整行点亮。
     #[test]
     fn plain_lrc_has_no_word_progress() {
-        let line = &parse_lrc(
-            "[00:01.00]普通行
-",
-        )[0];
+        let line = &parse_lrc("[00:01.00]普通行")[0];
         assert_eq!(line.text, "普通行");
-        assert_eq!(line.highlight_fraction(1.5), 0.0);
-        assert_eq!(line.highlight_fraction(99.0), 0.0);
+        assert!(!line.has_word_timeline);
+        assert_eq!(line.highlight_fraction(0.5), 0.0, "行开始前");
+        assert_eq!(line.highlight_fraction(1.0), 1.0, "行到时即满");
+        assert_eq!(line.highlight_fraction(99.0), 1.0);
     }
 
     /// 词与原文对不上、或词里带空格（`trim` 后与原文不一致）时不能崩、不能越界。
@@ -563,6 +555,57 @@ mod tests {
         assert!((at(1.75) - 0.875).abs() < 1e-3, "got {}", at(1.75));
         assert!((at(2.0) - 1.0).abs() < 1e-6);
         assert!((at(99.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// 词与词之间有**空档**时，进度必须照常随时间推进，不能在空档里冻住。
+    ///
+    /// 这是 #80 的真实 bug：按「已唱词时长 / 词时长之和」算时，
+    /// 所有词唱完进度就到 1.0，行尾空档完全不推进 ——
+    /// 肉眼就是「最后一个字一下亮了，然后立刻换下一句」。
+    #[test]
+    fn highlight_fraction_keeps_moving_through_word_gaps() {
+        // 实测真实歌词的形状：`I` 唱到 0.56s，下一个词 0.84s 才开始（空 0.28s），
+        // 行总长 4.82s，最后一个词唱到 4.82s。
+        let raw = "[0,4820]<0,560,0>I <840,240,0>wanna<1080,480,0>talk<4820,0,0>";
+        let line = &parse_lrc(raw)[0];
+        let at = |t: f64| line.highlight_fraction(t);
+
+        // 空档中点（0.7s）：进度应当在 0.56/4.82 与 0.84/4.82 之间持续前进，
+        // 而不是停在「词 1 结束」的那个值上。
+        let in_gap = at(0.7);
+        let after_word1 = 0.56 / 4.82;
+        assert!(
+            (in_gap as f64) > after_word1 + 1e-6,
+            "空档里进度必须继续前进：{in_gap} vs {after_word1}"
+        );
+
+        // 空档前后逐帧采样：不能出现「一段时间完全不动」。
+        let mut prev = at(0.5);
+        let mut t = 0.5;
+        while t <= 1.0 {
+            let value = at(t);
+            assert!(value >= prev, "t={t} 时进度倒退：{prev} -> {value}");
+            prev = value;
+            t += 0.02;
+        }
+    }
+
+    /// 行尾必须恰好走到 1.0（按行时长归一化，不是按词时长之和）。
+    #[test]
+    fn highlight_fraction_reaches_one_at_line_end() {
+        // 行 2s，最后一个词 1.4s 就唱完了，剩余 0.6s 是行尾空档。
+        let raw = "[0,2000]<0,1400,0>唱完";
+        let line = &parse_lrc(raw)[0];
+
+        assert!(
+            (line.highlight_fraction(1.4) - 0.7).abs() < 1e-3,
+            "1.4s 应到 70%"
+        );
+        assert!(
+            (line.highlight_fraction(1.7) - 0.85).abs() < 1e-3,
+            "1.7s 应到 85%"
+        );
+        assert!((line.highlight_fraction(2.0) - 1.0).abs() < 1e-6);
     }
 
     /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。
@@ -653,16 +696,6 @@ mod tests {
             t += 0.05;
         }
         assert!((last - 1.0).abs() < 1e-6);
-    }
-
-    /// 普通 LRC 没有时间轴，返回 0（由调用方整行点亮）。
-    #[test]
-    fn plain_lrc_has_no_fraction_progress() {
-        let line = &parse_lrc(
-            "[00:01.00]普通行
-",
-        )[0];
-        assert_eq!(line.highlight_fraction(1.5), 0.0);
     }
 
     #[test]
