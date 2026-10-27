@@ -375,8 +375,53 @@ fn search_history_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     section.into_any_element()
 }
 
-/// 诊断日志：显示目录、打开目录、只清日志。
-///
+/// 设置页 → 诊断区块的一行开关：左侧标题与说明，右侧是既有的 switch 组件。
+fn log_toggle_row(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .bg(theme::surface())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.0))
+                .flex_1()
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(root.tr("详细日志")),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_muted())
+                        .child(
+                            root.tr(
+                                "多记播放、预取与界面耗时等调试信息；仍不含 Cookie、签名与查询串",
+                            ),
+                        ),
+                ),
+        )
+        .child(crate::ui::switch::render(
+            "detailed-logs-toggle",
+            root.settings.detailed_logs,
+            |root, _window, cx| {
+                let enabled = !root.settings.detailed_logs;
+                root.set_detailed_logs(enabled, cx);
+            },
+            cx,
+        ))
+        .into_any_element()
+}
+
 /// 与「缓存」刻意分开：日志在数据目录，`清空缓存` 不碰它（见 #53）。
 fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let log_dir = sodam_core::log_outlet::log_dir();
@@ -410,6 +455,7 @@ fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .text_color(theme::text_faint())
                 .child(root.tr("日志可能含接口地址（查询串已移除），请勿公开上传")),
         )
+        .child(log_toggle_row(root, cx))
         .child(
             div()
                 .flex()
@@ -462,30 +508,29 @@ fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 }
 
 pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyElement {
-    let options = [
-        (
-            "auto",
-            root.tr("自动"),
-            root.tr("按账号权益和单曲实际可用的档位择优"),
-        ),
-        (
-            "lossless",
-            root.tr("无损"),
-            root.tr("封顶无损；单曲没有无损时自动降级"),
-        ),
-        ("highest", root.tr("极高"), root.tr("封顶极高（≈320k）")),
-        ("medium", root.tr("较高"), root.tr("封顶较高")),
-        ("low", root.tr("标准"), root.tr("省流")),
-    ];
-    let current = {
-        let value = root.settings.quality.trim();
-        if value.is_empty() {
-            "auto"
-        } else {
-            value
+    // 档位与名称都从核心层派生（`TIERS` + `label_key`），这里只保留每档的说明文案：
+    // 否则往 `TIERS` 加一档时，设置页会静默少一项。
+    let hint_key = |value: &str| -> &'static str {
+        match value {
+            "lossless" => "封顶无损；单曲没有无损时自动降到下一档",
+            "highest" => "封顶极高（≈320k）",
+            "medium" => "封顶较高",
+            "low" => "省流",
+            _ => "不设上限，按账号权益和单曲可用档位取最高",
         }
     };
-    let vip = root.account.as_ref().map(|info| info.vip).unwrap_or(false);
+    let options: Vec<(&str, String)> = std::iter::once(sodam_core::quality::AUTO)
+        .chain(sodam_core::quality::TIERS)
+        .map(|value| {
+            let label = sodam_core::quality::QualityIntent::parse(value)
+                .label_key()
+                .map(|key| root.tr(key).to_string())
+                .unwrap_or_else(|| value.to_string());
+            (value, label)
+        })
+        .collect();
+    // 勾选的是**意图**；配置里的空串是历史写法，按「自动」显示。
+    let current = root.settings.quality_intent().as_setting().to_string();
 
     let theme_rows: Vec<AnyElement> = [
         (None, root.tr("跟随系统")),
@@ -571,8 +616,9 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
 
     let rows: Vec<AnyElement> = options
         .iter()
-        .map(|(value, title, hint)| {
+        .map(|(value, title)| {
             let chosen = *value == current;
+            let hint = root.tr(hint_key(value));
             let value = value.to_string();
             div()
                 .id(gpui::ElementId::Name(format!("quality-set-{value}").into()))
@@ -603,13 +649,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 } else {
                                     theme::text_muted()
                                 })
-                                .child(title.to_string()),
+                                .child(title.clone()),
                         )
                         .child(
                             div()
                                 .text_size(theme::Text::Tiny.size())
                                 .text_color(theme::text_faint())
-                                .child(hint.to_string()),
+                                .child(hint),
                         ),
                 )
                 .when(chosen, |this| {
@@ -787,13 +833,29 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                     div()
                         .text_size(theme::Text::Small.size())
                         .text_color(theme::text_muted())
-                        .child(if vip {
-                            root.tr("当前账号是 VIP：登录时默认无损，单曲没有无损会自动降级")
-                                .to_string()
-                        } else {
-                            root.tr("当前账号非 VIP：默认自动，取免费档里实际可用的最高一档")
-                                .to_string()
-                        }),
+                        .child(
+                            root.tr("自动 = 取当前账号能拿到的最高档，单曲没有该档位时自动降一档"),
+                        ),
+                )
+                .child(
+                    // 旧版本按会员等级把「自动」写成了具体档位，盘上无法与手选区分，
+                    // 所以不重置、不改写，只给一句提示和回到「自动」的办法。
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(root.tr("若不是你选的，点「自动」即可恢复跟随账号权益")),
+                )
+                .child(
+                    // 缓存按意图命名：自动档下同一首歌永远命中同一个文件，所以权益变了
+                    // 也不会在旧曲上生效。这是主流客户端的一致行为，必须提前说明。
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(
+                            root.tr(
+                                "已缓存的歌曲会保持原来的档位；想按新权益重取，清空缓存或换一首",
+                            ),
+                        ),
                 ),
         )
         .child(
