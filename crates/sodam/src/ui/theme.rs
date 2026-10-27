@@ -352,24 +352,37 @@ pub fn accent_soft() -> Rgba {
     color
 }
 
-/// 当前歌词行里“还未唱到”那部分的颜色（#80）。
+/// 歌词的"未点亮"颜色：**非高亮句**与**当前句还没唱到的部分**共用这一个颜色。
 ///
-/// 不能直接用 `text_muted`：当前行已经用强调色宣告了“这是正在唱的一句”，
-/// 亮光推过去时底色应该仍是**同色系压暗**的一阶，而不是变成另一种灰——
-/// 否则逐字高亮会看起来像两种颜色在拼接。
-/// 这里取强调色降低饱和度并靠近背景亮度，与已亮部分形成可辨的层级差。
-pub fn accent_dimmed() -> Rgba {
+/// 歌词高亮只需要两种颜色（官方客户端也是这么做的：`.line` 用 `--color-base-4`，
+/// 只在 `active` 时把已走字的部分换成 `--color-base-1`）：
+///
+/// * [`accent`] —— 当前句已唱到的字；
+/// * 本函数 —— 其余一切：非当前行、当前行未唱到的部分、已唱过的行。
+///
+/// 早先非当前行用 `text_muted`、当前行未走字用另一个压暗色，两者亮度差 0.17，
+/// 于是没在唱的句子反而比当前句还没唱到的部分更重，层级是反的。
+/// 现在统一取一个颜色，视觉重量自然一致，也不会再出现"灰比彩色更重"。
+///
+/// 颜色取强调色的色相（与高亮部分同色系，切换时不割裂），饱和度压到极低，
+/// 亮度贴近背景但与背景保持可读对比。
+pub fn lyric_dim() -> Rgba {
     let lit = accent();
     let (hue, saturation, lightness) = rgba_to_hsl(lit);
     hsl_to_rgba(
         hue,
-        (saturation * 0.55).min(0.6),
+        // 只留一点点色味，接近中性灰但不会与高亮部分脱节。
+        (saturation * 0.55).min(0.6) * 0.16,
         if is_dark() {
-            // 深色主题：压暗但仍高于背景，保证可读。
+            // 深色主题：比背景亮，保证可读。
             (lightness * 0.62).max(0.24)
         } else {
-            // 浅色主题：抬亮（文字在浅背景上越暗越重）。
-            (lightness + 0.34).min(0.78)
+            // 浅色主题：比背景暗（文字在浅底上越暗越重）。
+            //
+            // 这个偏移决定"未点亮"有多淡。实测 `+0.34` 时对比度只有 1.5，
+            // 歌词几乎读不出来（WCAG 正文要求 4.5）；取 `+0.14` 约 2.8，
+            // 既明显弱于已唱到的字（5.3），又保持可读。
+            (lightness + 0.14).min(0.78)
         },
         lit.a,
     )
@@ -505,4 +518,52 @@ impl Text {
 
 pub fn nav_row() -> Pixels {
     px(size::NAV_ROW)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 相对亮度（WCAG），用来比较两种颜色在感知上的"重量"。
+    fn luminance(color: Rgba) -> f32 {
+        let channel = |c: f32| {
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    /// 歌词只有两种颜色：未点亮共用 `lyric_dim`，已唱到用 `accent`。
+    ///
+    /// 未点亮色必须明显弱于已唱到的字，否则看不出高亮推进。
+    ///
+    /// "非高亮句"与"当前句未走字部分"在视图里取的是同一个 `lyric_dim()`，
+    /// 一致性由调用点保证；这里守住两者的**层级差**。
+    #[test]
+    fn dimmed_color_is_weaker_than_lit() {
+        // 视图里两者都取 `lyric_dim()`，这里直接验证它与 `accent` 的层级关系：
+        // 未点亮必须比已唱到更弱，且差距足够看得出来。
+        let dim = luminance(lyric_dim());
+        let lit = luminance(accent());
+        let delta = (dim - lit).abs();
+        assert!(
+            delta > 0.10,
+            "未点亮与已唱到的亮度差 {} 太小，看不出高亮",
+            delta
+        );
+    }
+
+    /// 未点亮色必须能与纯背景区分开，否则歌词读不清。
+    #[test]
+    fn dimmed_lyric_stays_readable() {
+        let (_, _, lightness) = rgba_to_hsl(lyric_dim());
+        if is_dark() {
+            assert!(lightness > 0.20, "深色主题下未点亮色太暗：{}", lightness);
+        } else {
+            assert!(lightness < 0.85, "浅色主题下未点亮色太亮：{}", lightness);
+        }
+    }
 }

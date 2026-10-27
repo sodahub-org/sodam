@@ -254,27 +254,14 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 }))
                 .children(lines.iter().enumerate().map(|(index, line)| {
                     let is_active = active == Some(index);
-                    // 已唱过的行保持强调色，当前行按进度逐字点亮（#80）。
+                    // 全程只有两种颜色：`lyric_dim` 未点亮、`accent` 已唱到。
+                    // 非当前行、当前行还没唱到的部分、以及已唱过的行都共用一个颜色，
+                    // 所以"当前句未走字"与非高亮句的视觉重量完全相同（官方也是这个模型）。
                     //
-                    // 主流客户端（官方 / Spotify / Apple Music）都是这个模型：
-                    // 当前行整行已是强调色，亮光在行内从左推到右，“推到哪”靠时间轴。
-                    // 所以底色用强调色、未亮部分压暗，而不是分两级不同颜色。
-                    let passed = active.is_some_and(|current| index < current);
-                    // 只用颜色区分状态，字重/字号全程一致：
-                    // 当前行加粗会让字宽变化，导致高亮行与非高亮行的字距不一致。
-                    let (base, lit) = if is_active {
-                        (theme::accent_dimmed(), theme::accent())
-                    } else if passed {
-                        (theme::text_muted(), theme::text_muted())
-                    } else {
-                        (theme::text_faint(), theme::text_faint())
-                    };
-                    // 只有当前行才做逐字推进：其他行要么整行已点亮要么完全未点亮。
-                    // 用连续比例而不是字节边界，字内才能有过渡（#80）。
+                    // 只有当前行才逐字推进：非当前行整行都是未点亮色，
+                    // 不需要按进度画（`progress` 传 0 走普通文本快路径）。
                     let progress = if is_active {
                         line.highlight_fraction(root.lyrics_position_seconds)
-                    } else if passed {
-                        1.0
                     } else {
                         0.0
                     };
@@ -288,7 +275,12 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
                         .text_size(theme::Text::Large.size())
                         .line_height(px(LYRIC_LINE_HEIGHT))
-                        .child(highlighted_line(&line.text, progress, base, lit))
+                        .child(highlighted_line(
+                            &line.text,
+                            progress,
+                            theme::lyric_dim(),
+                            theme::accent(),
+                        ))
                         .into_any_element()
                 }))
                 .into_any_element(),
