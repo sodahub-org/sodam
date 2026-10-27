@@ -1162,7 +1162,6 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
-                root.switching_queue = None;
                 match result {
                     Ok(start) => {
                         root.activate_recommended_queue(
@@ -1241,10 +1240,32 @@ impl Root {
 
     /// 点击「推荐」：如果当前已是推荐队列，只打开播放页；否则替换队列。
     pub fn activate_recommendation(&mut self, cx: &mut Context<Self>) {
+        // 有失败终态时，点「推荐」的语义就是重试：队列里可能是上一次的旧内容，
+        // 跳到播放页会让用户看不到失败提示，也和页面上的重试按钮自相矛盾（#55）。
+        if self.recommendation_error.is_some() {
+            self.retry_recommendation(cx);
+            return;
+        }
         if matches!(self.queue_origin, QueueOrigin::Feed) {
             self.set_nav(Nav::Lyrics, cx);
             self.lyrics_return_nav = Some(Nav::Home);
             cx.notify();
+            return;
+        }
+        // 在途请求不能吞掉点击：用户至少要知道「正在加载」。（#55）
+        if self.loading_recommendation {
+            self.set_status_text(self.tr("推荐队列还在加载，稍等一下…"));
+            cx.notify();
+            return;
+        }
+        self.start_recommendation(true, cx);
+    }
+
+    /// 推荐页失败终态的「重试」入口。
+    ///
+    /// 一次失败不能把入口永久锁死：只要不在装载中，重试就重新发起请求。
+    pub fn retry_recommendation(&mut self, cx: &mut Context<Self>) {
+        if self.loading_recommendation {
             return;
         }
         self.start_recommendation(true, cx);
@@ -1352,9 +1373,15 @@ impl Root {
             return;
         }
         self.loading_recommendation = true;
-        self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
+        // 重试时先把上一次的失败终态清掉：页面要回到加载态，而不是一边加载
+        // 一边还挂着上一轮的失败提示。
+        self.recommendation_error = None;
         self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
-        let request_seq = self.recommendation_request_seq;
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+        let load_seq = self.recommendation_load_seq;
+        // 切队列前先看看队列里是不是上一次的推荐内容，失败时保住它，不用开空白页。
+        let cached = self.queue_origin == QueueOrigin::Feed && !self.queue.is_empty();
+        self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
         self.set_status_text(self.tr("正在加载推荐队列…"));
         cx.notify();
 
@@ -1364,15 +1391,31 @@ impl Root {
             sodam_core::library::recommended_start(&Session::new(settings), &played_media)
         });
         cx.spawn(async move |this, cx| {
-            let result = work.await;
+            // 请求本身没设截止时间，断网时 HTTP 可能等很久。这里加一层兜底：
+            // 到点就算失败，把 loading 终结为可操作的失败态，而不是让一个全局布尔
+            // 把导航入口锁死（#55）。超时不算过期，所以靠 load_seq 而不是请求序号判定。
+            //
+            // `work` 是 gpui 的 `Task`，drop 它会取消后台任务；所以超时后必须把它
+            // `detach()` 掉，让请求继续跑完（结果没人收，也不会写回界面）。
+            let mut work = work;
+            let result = first_of(
+                &mut work,
+                cx.background_executor().timer(RECOMMENDATION_DEADLINE),
+            )
+            .await;
+            if result.is_none() {
+                work.detach();
+            }
             let _ = this.update(cx, |root, cx| {
-                if root.recommendation_request_seq != request_seq {
+                // 已有更新的装载请求：本次结果作废，但**不能碰 loading 与切换态**。
+                if root.recommendation_load_seq != load_seq {
                     return;
                 }
                 root.loading_recommendation = false;
                 root.switching_queue = None;
                 match result {
-                    Ok(start) => {
+                    Some(Ok(start)) => {
+                        root.recommendation_error = None;
                         root.activate_recommended_queue(
                             start.source,
                             start.tracks,
@@ -1381,15 +1424,52 @@ impl Root {
                             cx,
                         );
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         let message = root.failure_text("加载推荐队列失败", &err, REMOTE_TEXT);
-                        root.notify_error_once("recommendation-load-failed", message);
+                        root.recommendation_failed(message, cached, cx);
+                    }
+                    None => {
+                        let message = root.tr(REMOTE_TEXT).to_string();
+                        // 超时是「界面不再等它」，不是请求已结束：底层请求会自己跑完，
+                        // 结果被 load_seq 丢弃。日志说清楚免得后续排查误读。
+                        root.log_failure(
+                            "加载推荐队列超时（界面已停止等待）",
+                            format_args!("deadline={}s", RECOMMENDATION_DEADLINE.as_secs()),
+                        );
+                        root.recommendation_failed(message, cached, cx);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// 推荐队列装载失败后的统一落地：进入**可重试的终端态**，而不是停在转圈页。
+    ///
+    /// 网络错误 / 超时 / 无数据三种情况都走这里。调用点已经用 `load_seq` 过滤过
+    /// 过期结果，所以这里不再判断请求序号。
+    fn recommendation_failed(
+        &mut self,
+        message: String,
+        had_cached_recommendation: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.recommendation_error = Some(message.clone());
+        // 上次成功加载的推荐内容还在队列里就留着，别把可用内容清空。
+        //
+        // 注意：`begin_queue_switch` 已经把引擎停了，所以这里只是**保住列表**，
+        // 不会自动续播；用户点重试或播放才重新出声。
+        if !had_cached_recommendation {
+            self.recommendation = None;
+            self.queue = Queue::new(Vec::new());
+            self.queue_origin = QueueOrigin::None;
+            self.played_history.clear();
+            self.pending_track = None;
+            self.sync_queue_cache();
+        }
+        self.set_nav(Nav::Home, cx);
+        self.notify_error_once("recommendation-load-failed", message);
     }
 
     /// 听歌模式探索卡：歌单走歌单曲队，电台走 FeedRadioTracks。
@@ -1719,7 +1799,11 @@ impl Root {
         self.shortcut_note = None;
         if !self.settings.cookie.trim().is_empty() {
             match self.nav {
-                Nav::Home => self.start_recommendation(true, cx),
+                // 已经有失败终态时不自动重发：否则「失败 → set_nav(Home) → 再发」会变成
+                // 断网下的无限重试循环。此时页面显示重试入口，重试由用户显式触发（#55）。
+                Nav::Home if self.recommendation_error.is_none() => {
+                    self.start_recommendation(true, cx)
+                }
                 // 听歌模式只负责首屏懒加载；“加载更多”必须由用户显式点击。
                 Nav::Scenes if self.scene_cards.is_empty() && !self.loading_scenes => {
                     self.load_scenes(cx)
@@ -2584,6 +2668,45 @@ const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 /// 熔断复位判据：声音播到这么多秒才算「真的缓过来」。
 const PLAYBACK_RECOVER_SECONDS: f64 = 3.0;
 
+/// 推荐队列请求的客户端截止时间。
+///
+/// 底层 HTTP 在断网 / 黑洞路由下可能很久才放弃，而推荐是唯一一条「先换队列再拉数据」
+/// 的入口：请求不落地，全局 loading 就一直为真，左栏「推荐」会被静默 return（#55）。
+/// 10s 取 NN/g 响应时间三限值的上界：超过它必须有可见的失败终态与可打断的入口。
+/// 超时只终结界面状态，底层请求仍会在后台自己跑完，结果被 `load_seq` 丢弃。
+const RECOMMENDATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `future::select` 的本地实现：两个 future，谁先完成就用谁的结果。
+///
+/// 不引新依赖：`futures-lite` 现在只挂在 Linux target 下，而超时兜底是三个平台
+/// 都要的行为。返回 `Some(value)` 表示 `work` 先完成，`None` 表示截止时间先到。
+///
+/// 拿 `&mut F` 而不是 `F`：`gpui::Task` 被 drop 时会 `set_canceled()` 真正取消任务
+/// （`async_task::Task` 的 Drop 行为）。超时分支的调用方需要任务活下来去把那一次
+/// 请求跑完，所以所有权必须留在外面，由调用方决定要不要 `detach()`。
+async fn first_of<F>(
+    work: &mut F,
+    deadline: impl std::future::Future<Output = ()>,
+) -> Option<F::Output>
+where
+    F: std::future::Future + Unpin,
+{
+    use std::pin::pin;
+    use std::task::Poll;
+
+    let mut deadline = pin!(deadline);
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(value) = std::pin::Pin::new(&mut *work).poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        match deadline.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+}
+
 /// 一次「播出去了没有」的判定材料。
 ///
 /// `PlaybackSnapshot` 有 `pub(crate)` 字段，本 crate 连 `..Default::default()` 都构造不出，
@@ -2715,6 +2838,104 @@ mod failure_text_tests {
             assert!(!text.contains("{err}"), "{text}");
             assert!(!text.contains("：:"), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod recommendation_gate_tests {
+    use super::*;
+
+    /// 一个极简的单线程阻塞执行器：只要能把 future 轮流 poll 到完成即可。
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll};
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// 截止时间必须真的能打断「一直在等」的请求，而不是只写一个常量。（#55）
+    #[test]
+    fn deadline_fires_without_a_result() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let mut work = std::future::pending::<u8>();
+        let outcome = block_on(first_of(&mut work, async {
+            std::thread::sleep(Duration::from_millis(10));
+        }));
+        assert_eq!(outcome, None, "超时必须以「没有结果」的形态返回");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "不该等到请求自己结束"
+        );
+    }
+
+    /// 结果先到时不能被截止时间抢走。
+    #[test]
+    fn early_result_wins_over_the_deadline() {
+        let mut work = std::future::ready(7u8);
+        let outcome = block_on(first_of(&mut work, std::future::pending::<()>()));
+        assert_eq!(outcome, Some(7));
+    }
+
+    /// 超时分支必须 `detach()` 后台任务，而不是让它在 select 结构里被丢掉。
+    ///
+    /// 第一版实现真犯过这个错：`gpui::Task` drop 时会走到 `async_task::Task::drop`
+    /// 的 `set_canceled()`，于是「界面不再等」连带把请求也取消了。gpui 没有暴露
+    /// 可离线构造 `Task` 的测试设施（需要 `test-support` feature），所以这里用源码
+    /// 约束代替运行时断言：超时分支的代码里必须出现 `detach()`。
+    #[test]
+    fn timeout_branch_detaches_instead_of_dropping_the_task() {
+        let source = include_str!("app_actions.rs");
+        let branch = source
+            .split("if result.is_none()")
+            .nth(1)
+            .expect("超时分支应当存在");
+        let branch = &branch[..branch.find("let _ = this.update").unwrap_or(branch.len())];
+        assert!(
+            branch.contains("detach()"),
+            "超时后必须 detach 后台任务，否则请求会被真正取消：{branch}"
+        );
+    }
+
+    /// 截止时间要落在 NN/g 的那个界里：超过 10s 必须有可打断的失败终态。
+    #[test]
+    fn deadline_is_in_the_interactive_budget() {
+        assert!(RECOMMENDATION_DEADLINE >= std::time::Duration::from_secs(1));
+        assert!(RECOMMENDATION_DEADLINE <= std::time::Duration::from_secs(10));
+    }
+
+    /// 有失败终态时，左栏「推荐」的语义必须是重试，而不是跳播放页。
+    ///
+    /// 否则：失败后队列里还留着上一次的推荐内容、`queue_origin` 仍是 `Feed`，
+    /// `activate_recommendation` 会直接跳去播放页——用户看不到失败提示，
+    /// 只能靠页面上的重试按钮，两个入口行为自相矛盾（#55）。
+    #[test]
+    fn clicking_home_with_a_failed_terminal_state_retries() {
+        let source = include_str!("app_actions.rs");
+        let body = source
+            .split("pub fn activate_recommendation")
+            .nth(1)
+            .expect("activate_recommendation 应当存在");
+        let body = &body[..body.find("pub fn begin_queue_switch").unwrap_or(body.len())];
+
+        let retry_at = body
+            .find("recommendation_error.is_some()")
+            .expect("必须先判断失败终态：否则断网失败后点「推荐」会跳到播放页，永远不会重试");
+        let feed_at = body
+            .find("QueueOrigin::Feed)")
+            .expect("应当保留「已是推荐队列则跳播放页」的分支");
+        assert!(
+            retry_at < feed_at,
+            "重试判断必须排在「已是推荐队列」之前，否则不会被命中"
+        );
     }
 }
 

@@ -235,10 +235,24 @@ pub struct Root {
     /// 官方推荐队列分页状态。
     pub recommendation: Option<RecommendationSource>,
     pub loading_recommendation: bool,
+    /// 推荐队列**首次装载**失败的原因（用户可见的那一句，`None` = 没有失败）。
+    ///
+    /// 只描述队列本身，不是播放错误：播放错误有自己的 `playback_error`。有值时推荐页
+    /// 显示重试入口，而不是退回「正在准备推荐队列…」那个永远转圈的加载态。
+    pub recommendation_error: Option<String>,
     /// 点推荐后的整页切换 loading；后台 load-more 不置位。
+    ///
+    /// **只在用户主动换队列时置位，过期请求不得改写它**：它决定播放页画的是队列切换页
+    /// 还是真实内容，属于视图归属的导航状态，不该被一次超时或旧请求回写（#55）。
     pub switching_queue: Option<QueueOrigin>,
     pub switching_label: String,
+    /// 推荐队列请求的序号（装载与分页共用）。
+    ///
+    /// **只在真正发起新请求时递增**：拿它判断「结果是否过期」，所以超时兜底不能动它，
+    /// 否则在途请求回来时会被当成过期结果静默丢弃。
     pub(crate) recommendation_request_seq: u64,
+    /// 推荐队列「装载」请求序号；与分页序号分开，两者可以同时在途。
+    pub(crate) recommendation_load_seq: u64,
     /// 搜索框内容与焦点。
     pub lyrics: Arc<Vec<LyricLine>>,
     pub lyrics_track_id: String,
@@ -510,9 +524,11 @@ impl Root {
             playing: false,
             recommendation: None,
             loading_recommendation: false,
+            recommendation_error: None,
             switching_queue: None,
             switching_label: language.text("推荐队列").to_string(),
             recommendation_request_seq: 0,
+            recommendation_load_seq: 0,
             status,
             status_seq: 0,
             status_since: None,

@@ -496,6 +496,7 @@ impl Language {
             "没有更多探索歌单" => "No more discovery playlists",
             "读取听歌模式失败：" => "Failed to load listening modes: ",
             "正在加载推荐队列…" => "Loading recommendation queue…",
+            "推荐队列还在加载，稍等一下…" => "Recommendations are still loading. One moment…",
             "加载推荐队列失败：" => "Failed to load recommendation queue: ",
             "加载电台失败：" => "Failed to load radio queue: ",
             "正在加载更多推荐…" => "Loading more recommendations…",

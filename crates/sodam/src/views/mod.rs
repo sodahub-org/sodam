@@ -841,6 +841,53 @@ fn page_header(title: &str, subtitle: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// 推荐页的失败终态：一句人话 + 重试。
+///
+/// 不能退回「正在准备推荐队列…」那个加载态：断网时它会一直转圈，用户既看不出
+/// 出了什么事，也没有任何能按的地方（#55）。
+fn recommendation_error_state(root: &Root, message: String, cx: &mut Context<Root>) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::space::MD))
+        .py(px(theme::space::XXL))
+        .child(
+            svg()
+                .path(icons::path("house"))
+                .size(px(theme::ICON_XL))
+                .text_color(theme::text_faint()),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(message),
+        )
+        .child(
+            div()
+                .id("retry-recommendation")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(theme::size::CONTROL_SM))
+                .px(px(theme::space::MD))
+                .rounded(px(theme::radius::PILL))
+                .bg(theme::surface_elevated())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .text_size(theme::Text::Tiny.size())
+                .text_color(theme::text_muted())
+                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                    root.retry_recommendation(cx);
+                }))
+                .child(root.tr("重试加载")),
+        )
+        .into_any_element()
+}
+
 /// 空状态：图标 + 一句说明（不要空白页）。
 fn empty_state(icon: &'static str, text: &str) -> AnyElement {
     div()
@@ -1030,7 +1077,12 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
     let logged_in = !settings.cookie.trim().is_empty();
 
     let body = match root.nav {
-        Nav::Home => loading_state(root.tr("正在准备推荐队列…")),
+        // 推荐页只有切队列时才会是可见加载态：失败后停在这里会永远转圈，
+        // 所以它必须能变成带「重试」的失败终态（#55）。
+        Nav::Home => match &root.recommendation_error {
+            Some(message) => recommendation_error_state(root, message.clone(), cx),
+            None => loading_state(root.tr("正在准备推荐队列…")),
+        },
         Nav::Scenes => scenes::scenes_view(root, cx),
         Nav::Search => search::search_page(root, window, cx),
         Nav::Liked => div()
