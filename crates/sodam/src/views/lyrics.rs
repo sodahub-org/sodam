@@ -22,13 +22,7 @@ const LYRIC_ROW_GAP: f32 = 32.0;
 /// 完全一致，不会出现两层对不齐。
 ///
 /// `progress` 是这一行的时间进度：`0.0` = 整行未点亮，`1.0` = 整行已点亮。
-fn highlighted_line(
-    text: &str,
-    progress: f32,
-    base: gpui::Rgba,
-    lit: gpui::Rgba,
-    bold: bool,
-) -> AnyElement {
+fn highlighted_line(text: &str, progress: f32, base: gpui::Rgba, lit: gpui::Rgba) -> AnyElement {
     let progress = progress.clamp(0.0, 1.0);
 
     // 两端直接走普通文本：省掉 shaping 与两次绘制。
@@ -36,7 +30,6 @@ fn highlighted_line(
         let color = if progress >= 1.0 { lit } else { base };
         return div()
             .text_color(color)
-            .when(bold, |this| this.font_weight(gpui::FontWeight::BOLD))
             .child(text.to_string())
             .into_any_element();
     }
@@ -44,11 +37,6 @@ fn highlighted_line(
     let base: gpui::Hsla = base.into();
     let lit: gpui::Hsla = lit.into();
     let shared: gpui::SharedString = text.to_string().into();
-    let weight = if bold {
-        gpui::FontWeight::BOLD
-    } else {
-        gpui::FontWeight::NORMAL
-    };
 
     let overlay = gpui::canvas(
         move |bounds, window, _cx| {
@@ -61,10 +49,10 @@ fn highlighted_line(
             );
             let run = |color| gpui::TextRun {
                 len: shared.len(),
-                font: gpui::Font {
-                    weight,
-                    ..style.font()
-                },
+                // 字重必须与普通文本**完全一致**：当前行改用粗体会让字宽变化，
+                // 高亮行与非高亮行的字距就对不上了（官方也是整段统一字重，
+                // 只用颜色区分高亮）。这里直接用继承来的字体，不覆盖 weight。
+                font: style.font(),
                 color,
                 background_color: None,
                 underline: None,
@@ -272,12 +260,14 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                     // 当前行整行已是强调色，亮光在行内从左推到右，“推到哪”靠时间轴。
                     // 所以底色用强调色、未亮部分压暗，而不是分两级不同颜色。
                     let passed = active.is_some_and(|current| index < current);
-                    let (base, lit, bold) = if is_active {
-                        (theme::accent_dimmed(), theme::accent(), true)
+                    // 只用颜色区分状态，字重/字号全程一致：
+                    // 当前行加粗会让字宽变化，导致高亮行与非高亮行的字距不一致。
+                    let (base, lit) = if is_active {
+                        (theme::accent_dimmed(), theme::accent())
                     } else if passed {
-                        (theme::text_muted(), theme::text_muted(), false)
+                        (theme::text_muted(), theme::text_muted())
                     } else {
-                        (theme::text_faint(), theme::text_faint(), false)
+                        (theme::text_faint(), theme::text_faint())
                     };
                     // 只有当前行才做逐字推进：其他行要么整行已点亮要么完全未点亮。
                     // 用连续比例而不是字节边界，字内才能有过渡（#80）。
@@ -298,7 +288,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
                         .text_size(theme::Text::Large.size())
                         .line_height(px(LYRIC_LINE_HEIGHT))
-                        .child(highlighted_line(&line.text, progress, base, lit, bold))
+                        .child(highlighted_line(&line.text, progress, base, lit))
                         .into_any_element()
                 }))
                 .into_any_element(),
