@@ -188,6 +188,11 @@ pub struct LyricLine {
     pub end_seconds: f64,
     pub text: String,
     pub words: Vec<LyricWord>,
+    /// 这行是否来自增强 LRC 的逐字标签（`<start,end>字`）。
+    ///
+    /// 不能用 `words.len() > 1` 推断：普通 LRC 会被补一个覆盖整行的伪词，
+    /// 而增强 LRC 的单字句也只有一个词。两者行为完全不同，必须显式区分。
+    pub has_word_timeline: bool,
 }
 
 impl LyricLine {
@@ -197,6 +202,86 @@ impl LyricLine {
             .iter()
             .rposition(|word| position_seconds + 0.05 >= word.start_seconds)
     }
+
+    /// 逐字高亮的**时间比例**：`0.0` = 整行未开始，`1.0` = 整行唱完。
+    ///
+    /// 返回连续的浮点比例而不是字节边界：渲染层据此按像素裁剪，
+    /// 因此亮光能停在**一个字中间**（#80 的“丝滑”就来自这里）。
+    /// 若改成返回字节边界，就只能整字跳变。
+    ///
+    /// 没有逐字时间轴时返回 `0.0`，由调用方决定整行点亮。
+    pub fn highlight_fraction(&self, position_seconds: f64) -> f32 {
+        if !self.has_word_timeline || self.words.is_empty() {
+            return 0.0;
+        }
+        if position_seconds < self.start_seconds {
+            return 0.0;
+        }
+        if position_seconds >= self.end_seconds {
+            return 1.0;
+        }
+
+        // 按词推进：找到当前正在唱的那个词，把它之前所有词的实时长累加，
+        // 再加上当前词内的部分进度。这样每个词的停留时间与歌词时间轴一致。
+        let total: f64 = self
+            .words
+            .iter()
+            .map(|word| (word.end_seconds - word.start_seconds).max(0.0))
+            .sum();
+        if total <= 0.0 {
+            // 全部词零时长（脏数据）：退化成按行线性推进，至少不要卡住。
+            let span = self.end_seconds - self.start_seconds;
+            return if span <= 0.0 {
+                1.0
+            } else {
+                ((position_seconds - self.start_seconds) / span) as f32
+            };
+        }
+
+        let mut elapsed = 0.0f64;
+        for word in &self.words {
+            if position_seconds >= word.end_seconds {
+                elapsed += (word.end_seconds - word.start_seconds).max(0.0);
+                continue;
+            }
+            if position_seconds > word.start_seconds {
+                elapsed += position_seconds - word.start_seconds;
+            }
+            break;
+        }
+        (elapsed / total).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// 在两次进度快照之间做线性外推，让逐字高亮连续推进（#80）。
+///
+/// 背景：音频线程每 100ms 才把播放位置写进快照一次（那是为了省电，不该为歌词改），
+/// 而歌词页以 60fps 重绘。直接读快照会让亮光每 100ms 跳一格，肉眼就是“一顿一顿”。
+///
+/// `anchor` 是「上次读到快照值的本地时刻 + 那个值」。快照值没变说明还在同一拍里，
+/// 就按本地时钟往前外推；变了就重新锚定。
+///
+/// 两个上限都是为了“宁可慢半拍，也不要乱跳”：
+/// * `max_lookahead`：快照长时间不动（卡顿 / 缓冲）时不要凭空往前跑；
+/// * `duration`：不要超过曲目长度。
+///
+/// 只在播放中调用；暂停时位置本就不该变。
+pub fn extrapolate_position(
+    anchor: (std::time::Instant, f64),
+    snapshot_position: f64,
+    now: std::time::Instant,
+    duration_seconds: f64,
+    max_lookahead: f64,
+) -> (f64, (std::time::Instant, f64)) {
+    // 快照值变了 → 用新的值重新锚定到“现在”。
+    let anchored = if (anchor.1 - snapshot_position).abs() > 1e-6 {
+        (now, snapshot_position)
+    } else {
+        anchor
+    };
+    let elapsed = now.duration_since(anchored.0).as_secs_f64().max(0.0);
+    let position = (anchored.1 + elapsed.min(max_lookahead)).min(duration_seconds.max(0.0));
+    (position, anchored)
 }
 
 /// 解析汽水增强 LRC，保留逐字时间轴；也兼容普通 LRC。
@@ -236,6 +321,7 @@ pub fn parse_lrc(raw: &str) -> Vec<LyricLine> {
             continue;
         }
         let mut words = parse_word_tags(rest, start_seconds, line_duration);
+        let has_word_timeline = !words.is_empty();
         if words.is_empty() {
             let end = line_duration
                 .map(|duration| start_seconds + duration)
@@ -247,16 +333,23 @@ pub fn parse_lrc(raw: &str) -> Vec<LyricLine> {
             });
         }
         words.sort_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds));
-        let end_seconds = words
-            .last()
-            .map(|word| word.end_seconds)
-            .unwrap_or(start_seconds)
-            .max(start_seconds);
+        // 行结束时间：优先用行级时长（`[start,duration]` 里的 duration），
+        // 没给时长时取逐字词里最晚的结束时间。
+        // 不能直接取 `words.last().end_seconds`：按 start 排序不等于按 end 排序，
+        // 末尾那个词的结束时间不一定最大。
+        let end_seconds = match line_duration {
+            Some(duration) if duration > 0.0 => start_seconds + duration,
+            _ => words
+                .iter()
+                .map(|word| word.end_seconds)
+                .fold(start_seconds, f64::max),
+        };
         lines.push(LyricLine {
             start_seconds,
             end_seconds,
             text,
             words,
+            has_word_timeline,
         });
     }
     lines.sort_by(|a, b| a.start_seconds.total_cmp(&b.start_seconds));
@@ -291,6 +384,9 @@ fn parse_word_tags(content: &str, line_start: f64, line_duration: Option<f64>) -
     let mut words = Vec::new();
     let mut cursor = 0usize;
     let mut current: Option<(f64, f64)> = None;
+    // 只有真的遇到「可解析的逐字时间标签」才说明这行带逐字时间轴。
+    // 不能用 `words` 非空判断：没有标签时剩下的整行文本也会被当成一个词推入。
+    let mut saw_timeline_tag = false;
 
     while let Some(offset) = content[cursor..].find('<') {
         let open = cursor + offset;
@@ -303,11 +399,17 @@ fn parse_word_tags(content: &str, line_start: f64, line_duration: Option<f64>) -
         current = if tag.starts_with('/') {
             None
         } else {
-            parse_word_tag(tag, line_start, line_duration)
+            let parsed = parse_word_tag(tag, line_start, line_duration);
+            saw_timeline_tag |= parsed.is_some();
+            parsed
         };
         cursor = close + 1;
     }
     push_text_before(&mut words, &content[cursor..], line_start, current);
+    if !saw_timeline_tag {
+        // 没有逐字标签：把推入的词清掉，让调用方当成普通 LRC。
+        words.clear();
+    }
     words
 }
 
@@ -328,16 +430,25 @@ fn push_text_before(
     });
 }
 
+/// 解析一个逐字标签，换成行内绝对时间（秒）。
+///
+/// 汽水真实格式是**三个字段**：`<offset, span, flag>`，单位毫秒，且
+/// **`offset` 是相对行首的偏移**，不是绝对时间。例如：
+///
+/// ```text
+/// [17240,5060]<0,480,0>Don't <480,240,0>want <720,240,0>it
+/// ```
+///
+/// 旧实现只切两段、还当绝对时间，结果真实数据一个词都解析不出来（`words` 只剩
+/// 解析器补的整行伪词），逐字高亮只能空跑。这里按行首 + 偏移换算。
 fn parse_word_tag(tag: &str, line_start: f64, _line_duration: Option<f64>) -> Option<(f64, f64)> {
-    let (first, second) = tag.split_once(',')?;
-    let start = first.trim().parse::<f64>().ok()? / 1000.0;
-    let second = second.trim().parse::<f64>().ok()? / 1000.0;
-    let end = if second >= start {
-        second
-    } else {
-        start + second
-    };
-    Some((start.max(line_start), end.max(start)))
+    let mut parts = tag.split(',');
+    let offset: f64 = parts.next()?.trim().parse().ok()?;
+    let span: f64 = parts.next()?.trim().parse().ok()?;
+    // 第三个字段（flag）不参与时间计算，但要允许它存在。
+    let start = line_start + offset / 1000.0;
+    let end = start + span.max(0.0) / 1000.0;
+    Some((start, end))
 }
 
 #[cfg(test)]
@@ -346,18 +457,212 @@ mod tests {
 
     #[test]
     fn parse_lrc_preserves_word_timings() {
-        let raw =
-            "[14500,5200]<14500,180>你</14680,180>好<14860,340>呀</15200,340>\n[00:01.20]普通行\n";
+        // 汽水真实格式：`<相对偏移,时长,flag>`，偏移**相对行首**。
+        let raw = "[14500,5200]<0,180,0>你<180,180,0>好<360,340,0>呀\n[00:01.20]普通行\n";
         let lines = parse_lrc(raw);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].start_seconds, 1.2);
         assert_eq!(lines[0].text, "普通行");
         assert_eq!(lines[0].words.len(), 1);
+        // 普通 LRC 没有逐字时间轴。
+        assert!(!lines[0].has_word_timeline);
         assert_eq!(lines[1].start_seconds, 14.5);
         assert_eq!(lines[1].text, "你好呀");
+        assert!(lines[1].has_word_timeline);
         assert_eq!(lines[1].words.len(), 3);
         assert_eq!(lines[1].words[0].text, "你");
-        assert_eq!(lines[1].words[0].end_seconds, 14.68);
+        // 首词从行首开始，持续 180ms。
+        assert!((lines[1].words[0].start_seconds - 14.5).abs() < 1e-9);
+        assert!((lines[1].words[0].end_seconds - 14.68).abs() < 1e-9);
+    }
+
+    /// 逐字高亮：行开始前是 0，行结束后是 1。
+    #[test]
+    fn highlight_is_empty_before_the_line_and_full_after_it() {
+        let raw = "[10000,2000]<0,500,0>你<500,500,0>好<1000,1000,0>呀";
+        let line = &parse_lrc(raw)[0];
+        assert_eq!(line.text, "你好呀");
+        assert_eq!(line.highlight_fraction(9.9), 0.0, "行开始前不该亮");
+        assert_eq!(line.highlight_fraction(10.0), 0.0, "刚开嗓时还一个字没吐");
+        assert_eq!(line.highlight_fraction(12.0), 1.0, "行结束后整行亮");
+        assert_eq!(line.highlight_fraction(99.0), 1.0);
+    }
+
+    /// 亮光必须随时间往前推，并且是连续值（不是只落在整字边界上）。
+    #[test]
+    fn highlight_advances_with_time() {
+        let raw = "[0,2000]<0,1000,0>你<1000,1000,0>好";
+        let line = &parse_lrc(raw)[0];
+        let at = |seconds: f64| line.highlight_fraction(seconds);
+
+        assert_eq!(at(0.0), 0.0);
+        // 一半进度：这正是“字内过渡”的来源——旧实现只能整字跳变，这里必须是 0.5。
+        assert!((at(1.0) - 0.5).abs() < 1e-3, "got {}", at(1.0));
+        assert!((at(1.5) - 0.75).abs() < 1e-3, "got {}", at(1.5));
+        assert_eq!(at(2.0), 1.0);
+    }
+
+    /// 普通 LRC（无逐字数据）不能凭空编速度：一律返回 0，交给调用方整行点亮。
+    #[test]
+    fn plain_lrc_has_no_word_progress() {
+        let line = &parse_lrc(
+            "[00:01.00]普通行
+",
+        )[0];
+        assert_eq!(line.text, "普通行");
+        assert_eq!(line.highlight_fraction(1.5), 0.0);
+        assert_eq!(line.highlight_fraction(99.0), 0.0);
+    }
+
+    /// 词与原文对不上、或词里带空格（`trim` 后与原文不一致）时不能崩、不能越界。
+    ///
+    /// 旧实现靠“累加 word.text.len()”定位字节偏移，这两种情况都会错位；
+    /// 现在按时间比例计算，天然不受文本与词表长度差异影响。
+    #[test]
+    fn highlight_tolerates_mismatched_and_spaced_words() {
+        // 脏数据：词与原文完全对不上。
+        let broken = LyricLine {
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+            text: "实际歌词".to_string(),
+            words: vec![LyricWord {
+                start_seconds: 0.0,
+                end_seconds: 1.0,
+                text: "对不上的词".to_string(),
+            }],
+            has_word_timeline: true,
+        };
+        let value = broken.highlight_fraction(1.5);
+        assert!((0.0..=1.0).contains(&value), "比例必须落在 0..=1：{value}");
+
+        // 词之间的空格被 trim 掉，而 text 保留空格。
+        let spaced = &parse_lrc("[0,3000]<0,1500,0>first <1500,1500,0>second")[0];
+        assert!(
+            spaced.text.contains(' '),
+            "原文应保留空格：{:?}",
+            spaced.text
+        );
+        assert_eq!(spaced.highlight_fraction(3.0), 1.0, "全部唱完是整行");
+    }
+
+    /// 时间比例必须连续推进，且按词的真实时长加权（不是按字符数均分）。
+    #[test]
+    fn highlight_fraction_is_continuous_and_time_weighted() {
+        // 三个词时长不同：0.5s / 0.25s / 1.25s，总 2s。
+        let raw = "[0,2000]<0,500,0>短<500,250,0>很短<750,1250,0>很长很长";
+        let line = &parse_lrc(raw)[0];
+        let at = |t: f64| line.highlight_fraction(t);
+
+        assert!((at(-1.0) - 0.0).abs() < 1e-6, "行开始前是 0");
+        assert!((at(0.0) - 0.0).abs() < 1e-6);
+        // 第 1 个词唱完 = 0.5/2 = 0.25
+        assert!((at(0.5) - 0.25).abs() < 1e-3, "got {}", at(0.5));
+        // 第 2 个词唱完 = 0.75/2 = 0.375
+        assert!((at(0.75) - 0.375).abs() < 1e-3, "got {}", at(0.75));
+        // 中途：1.75s = (0.5+0.25+1.0)/2 = 0.875
+        assert!((at(1.75) - 0.875).abs() < 1e-3, "got {}", at(1.75));
+        assert!((at(2.0) - 1.0).abs() < 1e-6);
+        assert!((at(99.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。
+    #[test]
+    fn extrapolation_advances_within_a_snapshot_tick() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let anchor = (t0, 10.0);
+        let lookahead = 0.25;
+
+        // 快照还是 10.0，过了 50ms → 外推到 10.05
+        let (pos, _) = extrapolate_position(
+            anchor,
+            10.0,
+            t0 + Duration::from_millis(50),
+            200.0,
+            lookahead,
+        );
+        assert!((pos - 10.05).abs() < 1e-6, "got {pos}");
+
+        // 快照跳到 10.1（音频线程写了新值）→ 立即以新值为准，不叠加旧外推
+        let (pos, new_anchor) = extrapolate_position(
+            anchor,
+            10.1,
+            t0 + Duration::from_millis(100),
+            200.0,
+            lookahead,
+        );
+        assert!((pos - 10.1).abs() < 1e-6, "got {pos}");
+        assert!((new_anchor.1 - 10.1).abs() < 1e-6);
+    }
+
+    /// 快照长期不动（卡顿 / 缓冲）时，外推必须有上限，不能跑到声音前面。
+    #[test]
+    fn extrapolation_is_capped_when_the_snapshot_stalls() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let (pos, _) =
+            extrapolate_position((t0, 5.0), 5.0, t0 + Duration::from_secs(5), 200.0, 0.25);
+        assert!((pos - 5.25).abs() < 1e-6, "最多外推 250ms，got {pos}");
+    }
+
+    /// 外推不能超过曲目时长。
+    #[test]
+    fn extrapolation_never_exceeds_duration() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let (pos, _) =
+            extrapolate_position((t0, 199.9), 199.9, t0 + Duration::from_secs(1), 200.0, 0.25);
+        assert!(pos <= 200.0, "got {pos}");
+    }
+
+    /// 单调性：外推不能让位置倒退（倒退比慢半拍更刺眼）。
+    #[test]
+    fn extrapolation_never_goes_backwards() {
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let mut anchor = (t0, 0.0);
+        let mut last = 0.0f64;
+        // 模拟快照每 100ms 更新、UI 每 16ms 读一次
+        for frame in 0..30u64 {
+            let now = t0 + Duration::from_millis(frame * 16);
+            let snapshot = (frame * 16 / 100) as f64 * 0.1;
+            let (pos, next) = extrapolate_position(anchor, snapshot, now, 200.0, 0.25);
+            assert!(pos >= last - 1e-9, "第 {frame} 帧倒退了：{last} -> {pos}");
+            last = pos;
+            anchor = next;
+        }
+        assert!(last > 0.3, "应当持续推进到 0.3 以上，got {last}");
+    }
+
+    /// 比例必须单调递增：不能出现“倒回去”。
+    #[test]
+    fn highlight_fraction_never_goes_backwards() {
+        let raw = "[0,3000]<0,1000,0>甲<1000,1000,0>乙<2000,1000,0>丙";
+        let line = &parse_lrc(raw)[0];
+        let mut last = -1.0f32;
+        let mut t = 0.0;
+        while t <= 3.0 {
+            let value = line.highlight_fraction(t);
+            assert!(value >= last, "t={t} 时倒退了：{last} -> {value}");
+            assert!((0.0..=1.0).contains(&value));
+            last = value;
+            t += 0.05;
+        }
+        assert!((last - 1.0).abs() < 1e-6);
+    }
+
+    /// 普通 LRC 没有时间轴，返回 0（由调用方整行点亮）。
+    #[test]
+    fn plain_lrc_has_no_fraction_progress() {
+        let line = &parse_lrc(
+            "[00:01.00]普通行
+",
+        )[0];
+        assert_eq!(line.highlight_fraction(1.5), 0.0);
     }
 
     #[test]

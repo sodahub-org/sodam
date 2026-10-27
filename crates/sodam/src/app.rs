@@ -84,6 +84,12 @@ impl CoverPool {
 /// 会把主线程顶住；分批渲染 + 「显示更多」是这里最稳的做法。
 pub const ROW_BATCH: usize = 40;
 
+/// 逐字高亮最多往前外推多久（秒）。
+///
+/// 音频线程 100ms 一拍，正常外推不超过 100ms；250ms 是给「快照刚好停住」留的余量——
+/// 再多就说明真的卡了，宁可停住也别让亮光跑到声音前面（#80）。
+const LYRIC_LOOKAHEAD_SECONDS: f64 = 0.25;
+
 /// 把扫码状态翻成中文短标签（用于「等待扫码 / 已扫码」这类提示）。
 pub(crate) fn status_label(status: LoginStatus, language: Language) -> &'static str {
     match status {
@@ -262,6 +268,21 @@ pub struct Root {
     pub loading_lyrics: bool,
     pub lyrics_error: Option<String>,
     pub lyrics_active: Option<usize>,
+    /// 最近一帧的播放位置（秒）；逐字高亮按它决定亮到第几个字。
+    ///
+    /// 由 `Root::render` 每帧写入，`views::lyrics` 只读。存在这里而不是在渲染函数里
+    /// 取快照，是因为渲染路径不应该额外拿锁。
+    pub(crate) lyrics_position_seconds: f64,
+    /// 上一次从引擎读到播放位置时的「本地时刻」与「读到的那一帧的值」。
+    ///
+    /// 音频线程每 100ms 才写一次 `position_seconds`，而 UI 以 60fps 重绘。
+    /// 直接读快照会让亮光每 100ms 跳一格（肉眼就是“不流畅”）。这里按本地
+    /// 单调时钟把两次快照之间的位置线性外推，让高亮连续地走。
+    /// `(读到时的 Instant, 读到时的秒数)`。
+    pub(crate) lyrics_position_anchor: Option<(std::time::Instant, f64)>,
+    /// 逐字高亮样张模式：设置后 `render` 每帧把播放位置固定在这个秒数（#80 的视觉验证）。
+    /// 生产环境恒为 `None`。
+    pub(crate) lyrics_demo_position: Option<f64>,
     /// 歌词区自己管滚动（外层是普通滚动容器，不是虚拟列表），
     /// 这样长句折行后行高不一致也能正确定位。
     pub lyrics_scroll: gpui::ScrollHandle,
@@ -543,6 +564,9 @@ impl Root {
             loading_lyrics: false,
             lyrics_error: None,
             lyrics_active: None,
+            lyrics_position_seconds: 0.0,
+            lyrics_position_anchor: None,
+            lyrics_demo_position: None,
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
@@ -689,6 +713,71 @@ impl Root {
             root.on_nav_changed(cx);
             cx.notify();
         }
+        // 开发/验证便利：`SODAM_LYRICS_DEMO=<秒>` 直接进入歌词页并注入一份逐字样张，
+        // 把播放位置固定在该秒数以观察逐字高亮（#80）。不依赖登录与网络。
+        //
+        // 和 `SODAM_QUERY` / `SODAM_NAV` 同级：只在显式设置时才生效，生产环境不设就等于不存在。
+        // 位置来自环境变量，或临时目录里的 `sodam-lyrics-demo` 文件——后者是为了在
+        // GUI 会话（无法注入环境变量）里也能触发。
+        let demo_position = std::env::var("SODAM_LYRICS_DEMO")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .or_else(|| {
+                std::fs::read_to_string(std::env::temp_dir().join("sodam-lyrics-demo")).ok()
+            });
+        if let Some(demo_position) = demo_position {
+            let position = demo_position.trim().parse::<f64>().unwrap_or(3.0);
+            // 折行验证用的一句：内容长、在当前列宽下会折成两行，给足 8 秒以便观察
+            // 亮光从第一行推到第二行的全过程（#80）。
+            let wrap_line = "And you think I'm crazy yeah you think I'm crazy";
+            let demo = [
+                (0.0, "偷偷搭询总没完地坐立难安", 3.0),
+                (3.0, "试探说晚安多空泛又心酸", 3.0),
+                (7.0, "低头呢喃", 3.0),
+                (10.0, "对你的偏爱太过于明目张胆", 3.0),
+                (13.0, wrap_line, 8.0),
+            ]
+            .into_iter()
+            .map(|(start, text, duration)| sodam_core::models::LyricLine {
+                start_seconds: start,
+                end_seconds: start + duration,
+                text: text.to_string(),
+                // 每个字均分这段时长，模拟官方逐字时间轴。
+                words: text
+                    .chars()
+                    .enumerate()
+                    .map(|(index, ch)| {
+                        let span = duration / text.chars().count() as f64;
+                        sodam_core::models::LyricWord {
+                            start_seconds: start + span * index as f64,
+                            end_seconds: start + span * (index + 1) as f64,
+                            text: ch.to_string(),
+                        }
+                    })
+                    .collect(),
+                has_word_timeline: true,
+            })
+            .collect::<Vec<_>>();
+            // 歌词页在没有当前曲目时会提前返回占位页，所以样张模式也塞一首假曲目。
+            let demo_track = TrackItem {
+                id: "sodam-lyrics-demo".to_string(),
+                title: "逐字高亮样张".to_string(),
+                artist: "SodaM".to_string(),
+                duration_seconds: 200,
+                ..Default::default()
+            };
+            root.queue.replace(vec![demo_track], 0);
+            root.queue_origin = QueueOrigin::None;
+            root.lyrics = Arc::new(demo);
+            root.lyrics_position_seconds = position;
+            root.lyrics_demo_position = Some(position);
+            root.lyrics_active = root
+                .lyrics
+                .iter()
+                .rposition(|line| position + 0.25 >= line.start_seconds);
+            root.nav = Nav::Lyrics;
+            cx.notify();
+        }
         // 封面需求消费循环：渲染只往队列里塞 URL，这里统一喂给请求池
         //（最多 8 并发 + 去重），避免渲染过程中做任何网络/状态更新。
         {
@@ -730,6 +819,8 @@ impl Root {
             .detach();
         }
         Self::start_heartbeat(cx);
+        // 歌词逐字高亮需要比主心跳更高的刷新率（#80）。
+        Self::start_lyrics_ticker(cx);
 
         // 开发验证用：`SODAM_AUTOPLAY=1` 进收藏页并自动播放第一首；
         // `SODAM_POPUP=quality|queue|volume` 启动即打开对应弹层（便于截图核对）。
@@ -1382,7 +1473,38 @@ impl Render for Root {
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
         self.flush_pending_lyrics_scroll();
         if self.nav == Nav::Lyrics {
-            let position = self.engine.snapshot().position_seconds;
+            let position = if let Some(demo) = self.lyrics_demo_position {
+                demo
+            } else {
+                // 音频线程每 100ms 才更新一次快照，而这里以 60fps 重绘。直接读快照会让
+                // 逐字亮光每 100ms 才跳一格——肉眼看就是“一顿一顿”。
+                // 这里按本地时钟在两次快照之间做线性外推，让高亮连续推进。
+                //
+                // 只在**播放中**外推：暂停时位置本就不该变。
+                // “不回退”由 `extrapolate_position` 保证：`Instant` 单调，
+                // 且快照值变化时会重新锚定，不会把旧外推叠加上去。
+                let snapshot = self.engine.snapshot();
+                let raw = snapshot.position_seconds;
+                let now = std::time::Instant::now();
+                if snapshot.playing && snapshot.duration_seconds > 0.0 {
+                    let anchor = self.lyrics_position_anchor.unwrap_or((now, raw));
+                    let (position, anchor) = sodam_core::models::extrapolate_position(
+                        anchor,
+                        raw,
+                        now,
+                        snapshot.duration_seconds,
+                        LYRIC_LOOKAHEAD_SECONDS,
+                    );
+                    self.lyrics_position_anchor = Some(anchor);
+                    position
+                } else {
+                    self.lyrics_position_anchor = Some((now, raw));
+                    raw
+                }
+            };
+            // 逐字高亮需要每帧的播放位置：存下来给 `lyrics_view` 用，
+            // 不能在渲染函数里再取一次快照（那要多一次锁）。
+            self.lyrics_position_seconds = position;
             let active = self
                 .lyrics
                 .iter()

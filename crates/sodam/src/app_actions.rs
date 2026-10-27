@@ -277,6 +277,56 @@ impl Root {
         .detach();
     }
 
+    /// 歌词页的逐字高亮节拍（#80）。
+    ///
+    /// 主心跳是 200ms（5fps），对进度条够用，但逐字高亮按像素推进时需要更高帧率，
+    /// 否则亮光会一跳一跳地走。这里单独跑一个约 60fps 的节拍，**只在歌词页且正在
+    /// 播放时**才 notify，其它情况空转（每拍只读一个快照，开销可忽略）。
+    ///
+    /// 为什么不用 `with_animation`：那个是给 SVG / 变换用的，无法带动文字重排；
+    /// 而 `cx.notify()` 只是标脏，真正重绘仍由 gpui 的帧调度合并，不会堆帧。
+    pub(crate) fn start_lyrics_ticker(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            // 先决定这一拍要不要跑、以及下一拍睡多久。
+            //
+            // 空闲时睡久一点（120ms）而不是继续 16ms 空转：歌词页关掉、暂停、
+            // 或当前行没有逐字时间轴时，没必要每秒醒 60 次。主心跳（200ms）
+            // 会负责在这些状态变化后把 ticker 叫醒到“热”路径。
+            let interval = this
+                .update(cx, |root, _cx| {
+                    if root.nav != Nav::Lyrics {
+                        return std::time::Duration::from_millis(120);
+                    }
+                    // 样张模式（开发验证）也要能刷新。
+                    if root.lyrics_demo_position.is_some() {
+                        return std::time::Duration::from_millis(16);
+                    }
+                    let snapshot = root.engine.snapshot();
+                    if !snapshot.playing {
+                        return std::time::Duration::from_millis(120);
+                    }
+                    // 只有**当前行**带逐字时间轴时才需要高频重绘：
+                    // 普通 LRC 是整行跳变，200ms 的主心跳已经够用。
+                    let needs_tick = root.lyrics_active.is_some_and(|index| {
+                        root.lyrics
+                            .get(index)
+                            .is_some_and(|line| line.has_word_timeline)
+                    });
+                    if needs_tick {
+                        std::time::Duration::from_millis(16)
+                    } else {
+                        std::time::Duration::from_millis(120)
+                    }
+                })
+                .unwrap_or(std::time::Duration::from_millis(120));
+            if interval == std::time::Duration::from_millis(16) {
+                let _ = this.update(cx, |_root, cx| cx.notify());
+            }
+            cx.background_executor().timer(interval).await;
+        })
+        .detach();
+    }
+
     /// 打开抽屉时把滚动位置锚到「正在播放」这一行。
     pub fn anchor_queue_scroll(&self) {
         let row = crate::ui::player_bar::now_playing_slot(self);
@@ -865,6 +915,10 @@ impl Root {
 
     pub(crate) fn load_lyrics(&mut self, track: TrackItem, force: bool, cx: &mut Context<Self>) {
         if !force && self.lyrics_track_id == track.id && !self.lyrics.is_empty() {
+            return;
+        }
+        // 样张模式：歌词由样张提供，不让真实歌词覆盖（仅用于逐字高亮的视觉验证）。
+        if self.lyrics_demo_position.is_some() {
             return;
         }
         self.lyrics_request_seq = self.lyrics_request_seq.wrapping_add(1);

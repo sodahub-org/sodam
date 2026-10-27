@@ -352,6 +352,29 @@ pub fn accent_soft() -> Rgba {
     color
 }
 
+/// 当前歌词行里“还未唱到”那部分的颜色（#80）。
+///
+/// 不能直接用 `text_muted`：当前行已经用强调色宣告了“这是正在唱的一句”，
+/// 亮光推过去时底色应该仍是**同色系压暗**的一阶，而不是变成另一种灰——
+/// 否则逐字高亮会看起来像两种颜色在拼接。
+/// 这里取强调色降低饱和度并靠近背景亮度，与已亮部分形成可辨的层级差。
+pub fn accent_dimmed() -> Rgba {
+    let lit = accent();
+    let (hue, saturation, lightness) = rgba_to_hsl(lit);
+    hsl_to_rgba(
+        hue,
+        (saturation * 0.55).min(0.6),
+        if is_dark() {
+            // 深色主题：压暗但仍高于背景，保证可读。
+            (lightness * 0.62).max(0.24)
+        } else {
+            // 浅色主题：抬亮（文字在浅背景上越暗越重）。
+            (lightness + 0.34).min(0.78)
+        },
+        lit.a,
+    )
+}
+
 /// 警示色：message 的 warning 级别使用；不替代主色，也不用于普通按钮。
 pub fn warning() -> Rgba {
     if is_dark() {
