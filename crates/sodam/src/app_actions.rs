@@ -406,7 +406,7 @@ impl Root {
         let active = self
             .lyrics
             .iter()
-            .rposition(|line| position_seconds + 0.25 >= line.start_seconds)
+            .rposition(|line| position_seconds >= line.start_seconds)
             .or(Some(0));
         self.lyrics_active = active;
         // 用户在手动浏览时不抢滚动位置：只有自动跟随才动。

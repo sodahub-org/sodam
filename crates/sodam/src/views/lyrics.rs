@@ -21,13 +21,87 @@ const LYRIC_ROW_GAP: f32 = 32.0;
 /// 两层文字共用**同一次 shaping**（同一份 `WrappedLine`），所以折行、字距、基线
 /// 完全一致，不会出现两层对不齐。
 ///
-/// `progress` 是这一行的时间进度：`0.0` = 整行未点亮，`1.0` = 整行已点亮。
-fn highlighted_line(text: &str, progress: f32, base: gpui::Rgba, lit: gpui::Rgba) -> AnyElement {
-    let progress = progress.clamp(0.0, 1.0);
+/// `reveal` 说明亮光走到哪：整行未亮 / 已亮一部分（按**字符位置**给出）/ 整行全亮。
+/// 用字符位置而不是比例，是为了让渲染层能按真实字形宽度换算像素。
+/// 把「亮到第几个字符」换算成**未折行坐标下的像素 x**。
+///
+/// 逐字形累加真实前进宽度，而不是用「字符比例 × 总宽」：
+/// 字符宽度差异很大（`I` 窄、`friends` 宽），按比例算会让亮光位置与字形
+/// 错位，末尾那段被一次性点亮，看起来就是"最后一个字一闪而过"。
+///
+/// `done` 可带小数（`7.42` = 前 7 字已满 + 第 8 字亮 42%），小数部分按
+/// 该字形自身的宽度插值，所以亮光能停在**一个字中间**。
+fn reveal_x_from_chars(line: &gpui::WrappedLine, done: f32, fallback_width: f32) -> f32 {
+    let xs: Vec<f32> = line
+        .runs()
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|glyph| f32::from(glyph.position.x))
+        .collect();
+    reveal_x_from_glyph_xs(&xs, done, fallback_width)
+}
 
+/// [`reveal_x_from_chars`] 的纯计算部分：只依赖各字形的左边界 x。
+///
+/// 抽出来是为了能脱离窗口环境做单元测试 —— 这里是"走得丝不丝滑"的核心，
+/// 之前反复出错（比例当像素、末字不亮）。
+fn reveal_x_from_glyph_xs(xs: &[f32], done: f32, fallback_width: f32) -> f32 {
+    if xs.is_empty() || done <= 0.0 {
+        return 0.0;
+    }
+
+    // `done` 已经是「`text` 里第几个字符」，与字形序列一一对应，直接索引即可。
+    // （`total` 保留在签名里是为了让调用方显式表明这是字符位置，不再做缩放。）
+    let whole = done.floor().max(0.0) as usize;
+    let fraction = (done - whole as f32).clamp(0.0, 1.0);
+
+    // 全部字符都亮完：返回一个足够大的 x，让所有视觉行都被整段裁剪。
+    //
+    // 不能返回最后一个字形的左边界 —— 那样**最后一个字永远不亮**，
+    // 正是"最后一个字走不完"的直接来源。
+    if whole >= xs.len() {
+        return f32::MAX;
+    }
+    let start_x = xs[whole];
+    if fraction <= 0.0 {
+        return start_x;
+    }
+    // 该字形的自身宽度 = 下一个字形的左边界 - 本字形左边界。
+    // 末字形没有"下一个"，用调用方补上的宽度（`fallback_width`）兜底：
+    // 否则末字宽被算成 0，它的字内推进恒为 0 —— 表现就是"最后一个字不亮，
+    // 直接跳到下一句"。这是实测复现过的 bug。
+    let next_x = xs
+        .get(whole + 1)
+        .copied()
+        .unwrap_or(start_x + fallback_width);
+    let glyph_width = (next_x - start_x).max(0.0);
+    start_x + glyph_width * fraction
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LyricReveal {
+    /// 整行未点亮。
+    None,
+    /// 整行已点亮。
+    All,
+    /// 亮到 `done` 个字符（可含小数）。字符下标与 `text` 一一对应，
+    /// 渲染层直接索引字形即可，不需要总数。
+    Partial { done: f32 },
+}
+
+fn highlighted_line(
+    text: &str,
+    reveal: LyricReveal,
+    base: gpui::Rgba,
+    lit: gpui::Rgba,
+) -> AnyElement {
     // 两端直接走普通文本：省掉 shaping 与两次绘制。
-    if progress >= 1.0 || progress <= 0.0 {
-        let color = if progress >= 1.0 { lit } else { base };
+    if matches!(reveal, LyricReveal::None) || matches!(reveal, LyricReveal::All) {
+        let color = if matches!(reveal, LyricReveal::All) {
+            lit
+        } else {
+            base
+        };
         return div()
             .text_color(color)
             .child(text.to_string())
@@ -37,6 +111,8 @@ fn highlighted_line(text: &str, progress: f32, base: gpui::Rgba, lit: gpui::Rgba
     let base: gpui::Hsla = base.into();
     let lit: gpui::Hsla = lit.into();
     let shared: gpui::SharedString = text.to_string().into();
+    // paint 阶段也要取字符（算末字形宽度），这里留一份 owned 副本。
+    let paint_text: gpui::SharedString = shared.clone();
 
     let overlay = gpui::canvas(
         move |bounds, window, _cx| {
@@ -68,9 +144,11 @@ fn highlighted_line(text: &str, progress: f32, base: gpui::Rgba, lit: gpui::Rgba
                 .ok()
                 .map(|lines| lines.into_iter().collect::<Vec<_>>())
                 .unwrap_or_default();
-            (lines, line_height, font_size)
+            // 把字体 id / 字号一并带出来：计算末字形宽度要用文字系统的 advance。
+            let font_id = window.text_system().resolve_font(&style.font());
+            (lines, line_height, font_size, font_id)
         },
-        move |bounds, (lines, line_height, _font_size), window, cx| {
+        move |bounds, (lines, line_height, font_size, font_id), window, cx| {
             // 已唱到的宽度按**像素**算，不对齐字符边界 —— 这是字内过渡的全部来源。
             let origin_x = bounds.origin.x;
 
@@ -120,17 +198,47 @@ fn highlighted_line(text: &str, progress: f32, base: gpui::Rgba, lit: gpui::Rgba
                     .last()
                     .map(|glyph| f32::from(glyph.position.x))
                     .unwrap_or(0.0);
-                // 末行宽度 = 整段宽度 - 末行起点，但这个“整段宽度”要用真实内容宽度。
-                let content_right = last_glyph_right.max(cursor_x);
+                // 末字形没有"下一个字形"，宽度要单独取：用文字系统给的真实步进。
+                //
+                // 这个宽度有两个用途，缺了任何一个都会让**最后一个字永远不亮**：
+                //   1. 末字的字内插值（否则推进恒为 0，亮光卡在末字左边界）；
+                //   2. 末行总宽（`content_right` 若只取末字左边界，裁剪区域就
+                //      不包含末字本身，末字被裁掉）。
+                let last_advance = base_line
+                    .runs()
+                    .iter()
+                    .flat_map(|run| run.glyphs.iter())
+                    .last()
+                    .and_then(|glyph| paint_text.chars().nth(glyph.index))
+                    .and_then(|last_char| {
+                        window
+                            .text_system()
+                            .advance(font_id, font_size, last_char)
+                            .ok()
+                            .map(|size| f32::from(size.width))
+                    })
+                    .unwrap_or(0.0);
+
+                // 末行右端 = 末字形左边界 + 末字形宽度。
+                //
+                // 之前只取 `last_glyph_right`（左边界），末行宽度少了一个字，
+                // 裁剪区域永远覆盖不到最后一个字 —— 实测"最后一个字不亮、
+                // 直接跳到下一句"就是这个原因。
+                let content_right = (last_glyph_right + last_advance).max(cursor_x);
                 line_spans.push((cursor_x, content_right.max(cursor_x)));
 
-                // 本段（这一句）的内容总宽：折行后所有视觉行之和。
+                // 把"亮到第几个字符"换算成**像素位置**。
                 //
-                // **必须用内容宽度，不能用 `bounds.size.width`（列宽）**：
-                // 折行后内容总宽可能远大于列宽（实测 455px vs 300px），用列宽乘进度
-                // 会让进度永远到不了后面的视觉行——progress=1 也只点亮第一行（#80）。
-                let content_width: f32 = line_spans.iter().map(|(a, b)| (b - a).max(0.0)).sum();
-                let mut remaining = content_width * progress;
+                // 不能拿字符比例乘内容总宽：字符宽度差异很大（`I` 窄、`friends` 宽），
+                // 比例和像素位置不成正比，末尾那段会被一次性点亮——表现为
+                // "最后一个字一闪而过"。这里按字形逐个累加真实宽度。
+                let revealed_x = match reveal {
+                    LyricReveal::Partial { done } => {
+                        reveal_x_from_chars(base_line, done, last_advance)
+                    }
+                    _ => 0.0,
+                };
+                let mut remaining = revealed_x;
                 for (visual, (start_x, end_x)) in line_spans.iter().enumerate() {
                     if remaining <= 0.0 {
                         break;
@@ -255,23 +363,21 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 }))
                 .children(lines.iter().enumerate().map(|(index, line)| {
                     let next_start = lines.get(index + 1).map(|next| next.start_seconds);
-                    // 是否"正在唱"由本行自己的区间决定（`[start, 下一句开始)`），
-                    // 而不是靠外部下标的相等判断。
+                    // 本行此刻是否"正在唱"：区间是 `[start, 下一句开始)`。
                     //
-                    // 这样上一句会一直保持高亮直到下一句接管：走完之后亮光停在
-                    // 整行全亮，切句时是"旧的整句亮着 -> 新的整句接上"，
-                    // 中间不会出现整屏都暗一下的空档。
-                    let is_active = line.is_active_at(root.lyrics_position_seconds, next_start);
-                    // 全程只有两种颜色：`lyric_dim` 未点亮、`accent` 已唱到。
-                    // 非当前行、当前行还没唱到的部分、以及已唱过的行都共用一个颜色，
-                    // 所以"当前句未走字"与非高亮句的视觉重量完全相同（官方也是这个模型）。
-                    //
-                    // 只有当前行才逐字推进：非当前行整行都是未点亮色，
-                    // 不需要按进度画（`progress` 传 0 走普通文本快路径）。
-                    let progress = if is_active {
-                        line.highlight_fraction(root.lyrics_position_seconds)
+                    // 上一句一直保持高亮到下一句接管为止 —— 走完后亮光停在整行全亮，
+                    // 不会提前变暗。切句动画在**下一句开始之后**才起跑（滚动跟随
+                    // 不再提前 250ms），所以顺序是：先切换高亮（上一句归还强调色、
+                    // 下一句亮起），再播滚动动画把下一句带进来。
+                    let position = root.lyrics_position_seconds;
+                    let reveal = if line.is_active_at(position, next_start) {
+                        match line.chars_revealed(position) {
+                            Some((done, _total)) => LyricReveal::Partial { done },
+                            // 普通 LRC（没有逐字轴）：整行直接算已亮。
+                            None => LyricReveal::All,
+                        }
                     } else {
-                        0.0
+                        LyricReveal::None
                     };
                     div()
                         .w_full()
@@ -285,7 +391,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .line_height(px(LYRIC_LINE_HEIGHT))
                         .child(highlighted_line(
                             &line.text,
-                            progress,
+                            reveal,
                             theme::lyric_dim(),
                             theme::accent(),
                         ))
@@ -526,4 +632,86 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 ),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_x_from_glyph_xs;
+
+    /// 各字形的左边界（未折行坐标）。注意宽度不等：
+    /// `I` 很窄（10px），`wide` 很宽（60px），用来暴露"按比例算"的错误。
+    const XS: [f32; 5] = [0.0, 10.0, 40.0, 100.0, 160.0];
+    /// 末字形的宽度（末字后面没有"下一个字形"，必须由调用方补）。
+    const LAST_W: f32 = 40.0;
+
+    /// 走满时必须覆盖整行 —— 最后一个字要亮起来。
+    ///
+    /// 旧实现走到 `whole == glyphs.len()` 时返回最后一个字的**左边界**，
+    /// 于是最后一个字永远不亮，就是"最后一个字走不完"。
+    #[test]
+    fn full_reveal_covers_every_glyph() {
+        assert_eq!(
+            reveal_x_from_glyph_xs(&XS, 5.0, LAST_W),
+            f32::MAX,
+            "走满必须覆盖整行，不能停在最后一个字的左边界"
+        );
+    }
+
+    /// 字内插值按**该字形自身宽度**，不是按平均宽度。
+    ///
+    /// 第 1 个字宽 10px，第 2 个字宽 30px。走到 1.5 个字时，
+    /// 应当是 10 + 30*0.5 = 25，而不是 (1.5/5)*总宽。
+    #[test]
+    fn partial_reveal_uses_each_glyph_width() {
+        assert!((reveal_x_from_glyph_xs(&XS, 1.5, LAST_W) - 25.0).abs() < 1e-3);
+        // 第 3 个字宽 60px，走到 2.5 个字 = 40 + 30 = 70。
+        assert!((reveal_x_from_glyph_xs(&XS, 2.5, LAST_W) - 70.0).abs() < 1e-3);
+    }
+
+    /// 整字位置必须精确落在字形左边界上（否则字与字之间会有跳变）。
+    #[test]
+    fn integer_positions_snap_to_glyph_edges() {
+        assert!((reveal_x_from_glyph_xs(&XS, 2.0, LAST_W) - 40.0).abs() < 1e-3);
+        assert!((reveal_x_from_glyph_xs(&XS, 3.0, LAST_W) - 100.0).abs() < 1e-3);
+    }
+
+    /// **最后一个字必须能推进**：末字形没有"下一个字形"，宽度要靠
+    /// 调用方补；补成 0 的话末字的字内推进恒为 0，亮光会卡在它的左边界，
+    /// 然后直接跳到下一句（实测复现过的 bug）。
+    #[test]
+    fn last_glyph_advances_with_its_real_width() {
+        let last_start = XS[XS.len() - 1]; // 160
+                                           // 走到 4.5 个字：末字形亮一半 = 160 + 40*0.5 = 180。
+        let x = reveal_x_from_glyph_xs(&XS, 4.5, LAST_W);
+        assert!(
+            (x - (last_start + LAST_W * 0.5)).abs() < 1e-3,
+            "末字应能按自身宽度推进，得到 {x}"
+        );
+        // 宽度为 0 时末字确实推不动——这就是要防的情况。
+        let stuck = reveal_x_from_glyph_xs(&XS, 4.5, 0.0);
+        assert!((stuck - last_start).abs() < 1e-3);
+    }
+
+    /// 推进必须单调：不能出现亮光回退（回退会看到"抽一下"）。
+    #[test]
+    fn reveal_is_monotonic() {
+        let mut prev = -1.0f32;
+        let mut t = 0.0f32;
+        while t <= 5.0 {
+            let x = reveal_x_from_glyph_xs(&XS, t, LAST_W);
+            assert!(x >= prev, "t={t} 处回退：{prev} -> {x}");
+            prev = x;
+            t += 0.05;
+        }
+    }
+
+    /// 边界输入不能崩。
+    #[test]
+    fn reveal_handles_edge_inputs() {
+        assert_eq!(reveal_x_from_glyph_xs(&[], 1.0, LAST_W), 0.0);
+        assert_eq!(reveal_x_from_glyph_xs(&XS, 0.0, LAST_W), 0.0);
+        // 超过字形数（走满或脏数据）：按走满处理，否则最后一个字不亮。
+        assert_eq!(reveal_x_from_glyph_xs(&XS, 5.0, LAST_W), f32::MAX);
+        assert_eq!(reveal_x_from_glyph_xs(&XS, 9.0, LAST_W), f32::MAX);
+    }
 }

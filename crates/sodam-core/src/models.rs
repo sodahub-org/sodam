@@ -229,11 +229,14 @@ impl LyricLine {
 
     /// 逐字高亮的**进度比例**：`0.0` = 整行未开始，`1.0` = 整行唱完。
     ///
-    /// 返回连续的浮点比例而不是字节边界：渲染层据此按像素裁剪，
-    /// 因此亮光能停在**一个字中间**（#80 的“丝滑”就来自这里）。
-    ///
-    /// 有逐字时间轴时按**每个字真实的演唱时长**推进（见 [`Self::timed_char_fraction`]），
+    /// 有逐字时间轴时按**每个字真实的演唱时长**推进（见 [`Self::chars_revealed`]），
     /// 没有时退化成按行内时间线性摊平。
+    ///
+    /// 注意：渲染层**不应该**用这个比例去乘内容总宽。字符宽度差异很大
+    /// （`I` 窄、`friends` 宽），按比例乘会让亮光位置与字形位置错位，
+    /// 最后一段像素被一次性点亮（"最后一个字一闪而过"）。
+    /// 渲染层请改用 [`Self::chars_revealed`]，拿到连续字符位置后再按真实
+    /// 字形宽度换算像素。
     pub fn highlight_fraction(&self, position_seconds: f64) -> f32 {
         if position_seconds < self.start_seconds {
             return 0.0;
@@ -241,77 +244,156 @@ impl LyricLine {
         if position_seconds >= self.end_seconds {
             return 1.0;
         }
-
+        if self.has_word_timeline {
+            if let Some((revealed, total)) = self.chars_revealed(position_seconds) {
+                if total > 0.0 {
+                    return (revealed / total).clamp(0.0, 1.0);
+                }
+            }
+        }
         let line_span = self.end_seconds - self.start_seconds;
         if line_span <= 0.0 {
             return 1.0;
         }
-
-        // 有逐字时间轴就按**每个字真实的演唱时长**推进。
-        //
-        // 为什么不能按行内时间线性摊平：歌词里每个字占的时长差异很大——
-        // 拖长音的字可能占一个词 1.5s 中的全部，而快词 3 个字只占 0.5s。
-        // 线性摊平会让最后一个字"唰"一下掠过（这正是实测到的
-        // "最后一个字走字速度特别快"），而长音反而走得慢。
-        //
-        // 这里把每个词的时长**按字符数均分**到它的字上，逐个累加。
-        // 词与词之间的空档不计入（真实演唱中那段本来就没在唱）。
-        if self.has_word_timeline {
-            if let Some(fraction) = self.timed_char_fraction(position_seconds) {
-                return fraction;
-            }
-        }
-
-        // 没有可用逐字轴（普通 LRC / 脏数据）：退化成按行内时间线性推进。
+        // 没有可用逐字轴（普通 LRC / 脏数据）：按行内时间线性推进。
         (((position_seconds - self.start_seconds) / line_span) as f32).clamp(0.0, 1.0)
     }
 
-    /// 按逐字时间轴算出「已唱完的字数占比」，范围 `0.0..=1.0`。
+    /// 亮光此刻走到**第几个字符**：`7.42` 表示前 7 个字已满、第 8 个字亮了 42%。
     ///
-    /// 每个词的总时长按它的**字符数均分**——汽水的逐字标签只给到词一级
-    /// （`<offset,span,flag>` 后跟整段文本），单字内部没有独立时间，
-    /// 均分是最接近实际的近似。
+    /// 返回的字符位置与 `self.text` 的字符序列**一一对应**（含空格），
+    /// 渲染层可以直接拿它去索引字形，不需要任何缩放。
+    /// 没有可用逐字轴时返回 `None`。
     ///
-    /// 返回 `None` 表示这条时间轴不可用（没有任何有时长的词），由调用方退化。
-    fn timed_char_fraction(&self, position_seconds: f64) -> Option<f32> {
-        // 只统计"真正在唱"的词：时长为零的词（纯空格/标点占位）不占进度。
-        let mut timed: Vec<(&LyricWord, f64, usize)> = Vec::new();
-        for word in &self.words {
-            let span = word.end_seconds - word.start_seconds;
-            let count = word.text.chars().count();
-            if count == 0 {
-                continue;
-            }
-            // 词时长可以为 0（同一时刻的连读），仍要占宽度，但不占时间。
-            timed.push((word, span.max(0.0), count));
+    /// 为什么返回字符位置而不是比例：字符的**像素宽度差异很大**，
+    /// 只有先落到"第几个字"，渲染层才能用该字真实的字形宽度把小数部分
+    /// 换算成像素。直接乘总宽会错位，末尾那段会被一次性点亮。
+    pub fn chars_revealed(&self, position_seconds: f64) -> Option<(f32, f32)> {
+        if !self.has_word_timeline {
+            return None;
         }
-        let total_chars: usize = timed.iter().map(|(_, _, count)| count).sum();
-        if total_chars == 0 {
+        let chars: Vec<char> = self.text.chars().collect();
+        let total = chars.len();
+        if total == 0 {
             return None;
         }
 
-        let mut done_chars = 0.0f64;
-        for (word, span, count) in &timed {
-            if position_seconds >= word.end_seconds {
-                // 整个词已唱完。
-                done_chars += *count as f64;
+        // 把每个字符映射到它所属的词，再从词的时间区间里取该字的起止时刻。
+        //
+        // 关键：字符数一律以 `self.text` 为准。词的文本是 trim 过的、不含词间空格，
+        // 直接按词字符数累加会和 `text` 错位（实测某行：词字符 34 个、文本 43 个），
+        // 亮光位置偏到最后整段对不上，看起来就是"最后一个字不亮就切走了"。
+        let timeline = self.char_timeline(&chars);
+        let mut done = 0.0f64;
+        for (start, end) in timeline {
+            if position_seconds >= end {
+                done += 1.0;
                 continue;
             }
-            if position_seconds <= word.start_seconds {
-                // 还没开始这个词。
-                break;
+            if position_seconds > start {
+                let span = end - start;
+                if span > 0.0 {
+                    done += ((position_seconds - start) / span).clamp(0.0, 1.0);
+                } else {
+                    done += 1.0;
+                }
             }
-            // 正在这个词内部：按时间比例推进它的字符。
-            let ratio = if *span > 0.0 {
-                (position_seconds - word.start_seconds) / span
-            } else {
-                1.0
-            };
-            done_chars += *count as f64 * ratio.clamp(0.0, 1.0);
             break;
         }
+        Some((done as f32, total as f32))
+    }
 
-        Some((done_chars / total_chars as f64) as f32)
+    /// 给 `text` 的每个字符分配 `(起, 止)` 时刻，长度恒等于 `chars.len()`。
+    ///
+    /// 逐字标签是词级的，词内没有独立时间，所以把词的时长**按字符数均分**。
+    /// 词之间与行首/行尾的空档，摊给相邻的未分配字符，保证时间轴连续、
+    /// 不出现"某个字时长为 0 于是永远不亮"。
+    fn char_timeline(&self, chars: &[char]) -> Vec<(f64, f64)> {
+        let mut assigned: Vec<Option<(f64, f64)>> = vec![None; chars.len()];
+
+        // 把每个词的文本（去空白）按顺序在 `text` 里定位，得到 `[begin, end)`。
+        //
+        // 必须用 `text` 的真实下标：词文本是 trim 过的、不含词间空格，
+        // 若按词字符数累加，会和 `text` 错位（实测某行词字符 34 个、文本 43 个），
+        // 亮光位置一路偏移，末尾整段对不上 —— 表现就是"最后一个字不亮就切走"。
+        let mut cursor = 0usize;
+        for word in &self.words {
+            let needle: Vec<char> = word.text.chars().filter(|c| !c.is_whitespace()).collect();
+            if needle.is_empty() {
+                continue;
+            }
+            let Some((begin, end_ix)) = find_subsequence(chars, &needle, cursor) else {
+                continue;
+            };
+            let count = end_ix.saturating_sub(begin);
+            if count == 0 {
+                continue;
+            }
+            let span = (word.end_seconds - word.start_seconds).max(0.0);
+            let per = span / count as f64;
+            for offset in 0..count {
+                let start = word.start_seconds + per * offset as f64;
+                assigned[begin + offset] = Some((start, start + per));
+            }
+            cursor = end_ix;
+        }
+
+        // 词与原文完全对不上：整行按行时长均分，至少让亮光能走。
+        if assigned.iter().all(Option::is_none) {
+            let span = (self.end_seconds - self.start_seconds).max(0.0);
+            let per = span / chars.len() as f64;
+            return (0..chars.len())
+                .map(|index| {
+                    let start = self.start_seconds + per * index as f64;
+                    (start, start + per)
+                })
+                .collect();
+        }
+
+        // 未分配的字符（空格、行首/行尾、词间空隙）：在左右最近的已分配区间
+        // 之间均分，把空档一起摊掉。
+        let mut index = 0;
+        while index < assigned.len() {
+            if assigned[index].is_some() {
+                index += 1;
+                continue;
+            }
+            let run_start = index;
+            while index < assigned.len() && assigned[index].is_none() {
+                index += 1;
+            }
+            let run_end = index; // 不含
+            let left = if run_start > 0 {
+                assigned[run_start - 1]
+                    .map(|(_, end)| end)
+                    .unwrap_or(self.start_seconds)
+            } else {
+                self.start_seconds
+            };
+            let right = if run_end < assigned.len() {
+                assigned[run_end]
+                    .map(|(start, _)| start)
+                    .unwrap_or(self.end_seconds)
+            } else {
+                self.end_seconds
+            };
+            let count = run_end - run_start;
+            let usable = (right - left).max(0.0);
+            let step = if count > 0 {
+                usable / count as f64
+            } else {
+                0.0
+            };
+            for offset in 0..count {
+                let start = left + step * offset as f64;
+                assigned[run_start + offset] = Some((start, start + step));
+            }
+        }
+
+        assigned
+            .into_iter()
+            .map(|slot| slot.unwrap_or((self.start_seconds, self.end_seconds)))
+            .collect()
     }
 }
 
@@ -424,6 +506,33 @@ fn parse_lrc_time_tag(tag: &str) -> Option<f64> {
     let minutes = minutes.trim().parse::<f64>().ok()?;
     let seconds = seconds.trim().parse::<f64>().ok()?;
     Some(minutes * 60.0 + seconds)
+}
+
+/// 在 `haystack` 中从 `from` 起找 `needle`（跳过空白后再逐字比对）。
+///
+/// 返回 `haystack` 里匹配段的真实下标 `[begin, end)`，用于把词文本对回原文。
+fn find_subsequence(haystack: &[char], needle: &[char], from: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    for begin in from..haystack.len() {
+        let mut at = begin;
+        let mut matched = true;
+        for want in needle {
+            while at < haystack.len() && haystack[at].is_whitespace() {
+                at += 1;
+            }
+            if at >= haystack.len() || haystack[at] != *want {
+                matched = false;
+                break;
+            }
+            at += 1;
+        }
+        if matched {
+            return Some((begin, at));
+        }
+    }
+    None
 }
 
 /// 保留文字并删除 `<...>` 标记。
@@ -725,6 +834,58 @@ mod tests {
         assert!(!line.is_active_at(14.0, Some(14.0)), "下一句开始即让位");
         // 没有下一句就一直亮着。
         assert!(line.is_active_at(99.0, None));
+    }
+
+    /// 词文本不含词间空格，而 `text` 含空格 —— 字符位置必须以 `text` 为准。
+    ///
+    /// 这是"最后一个字不亮就切走"的根因：词字符数（34）与文本字符数（43）
+    /// 不一致时，若按词字符累加，亮光位置会一路偏移，末尾整段对不上。
+    #[test]
+    fn char_timeline_aligns_with_text_not_words() {
+        // 逐字标签里词后带空格（汽水真实形态）：空格属于 text，但不属于词文本。
+        let line = &parse_lrc("[0,3000]<0,1000,0>ab <1000,1000,0>cd <2000,1000,0>ef")[0];
+        assert_eq!(line.text, "ab cd ef", "原文保留空格");
+        assert_eq!(line.text.chars().count(), 8);
+        let (done, total) = line.chars_revealed(3.0).expect("应有逐字轴");
+        assert_eq!(total, 8.0, "总字符数必须是 text 的长度（含空格）");
+        assert_eq!(done, 8.0, "走满时每个字符都要算上");
+
+        // 中途：第一个词唱完（1.0s）时，应当只亮 "ab" 两个字符。
+        let (done, _) = line.chars_revealed(1.0).expect("应有逐字轴");
+        assert!(
+            (done - 2.0).abs() < 1e-3,
+            "1.0s 应恰好亮完前 2 个字符，得到 {done}"
+        );
+    }
+
+    /// 走满之后 `done` 必须等于 `total`，否则最后一个字永远不亮。
+    #[test]
+    fn completed_line_reveals_every_char() {
+        let line = &parse_lrc("[0,2000]<0,1000,0>ab<1000,1000,0>cd")[0];
+        let (done, total) = line.chars_revealed(line.end_seconds).expect("应有逐字轴");
+        assert_eq!(done, total, "走到行结束必须一个字符都不少");
+        // 稍微超过也要保持走满。
+        let (done, total) = line.chars_revealed(99.0).expect("应有逐字轴");
+        assert_eq!(done, total);
+    }
+
+    /// 词与原文完全对不上时不能崩，且仍能走满。
+    #[test]
+    fn mismatched_words_still_reveal() {
+        let line = LyricLine {
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+            text: "实际歌词".to_string(),
+            words: vec![LyricWord {
+                start_seconds: 0.0,
+                end_seconds: 1.0,
+                text: "对不上的词".to_string(),
+            }],
+            has_word_timeline: true,
+        };
+        let (done, total) = line.chars_revealed(2.0).expect("应有逐字轴");
+        assert_eq!(total, 4.0);
+        assert_eq!(done, total, "对不上时也要能走满，不能卡住");
     }
 
     /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。

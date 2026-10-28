@@ -800,7 +800,7 @@ impl Root {
             root.lyrics_active = root
                 .lyrics
                 .iter()
-                .rposition(|line| position + 0.25 >= line.start_seconds);
+                .rposition(|line| position >= line.start_seconds);
             root.nav = Nav::Lyrics;
             cx.notify();
         }
@@ -1543,12 +1543,10 @@ impl Render for Root {
             // 逐字高亮需要每帧的播放位置：存下来给 `lyrics_view` 用，
             // 不能在渲染函数里再取一次快照（那要多一次锁）。
             self.lyrics_position_seconds = position;
-            // 高亮的"当前句"必须严格按**本句的时间区间**判定，不能带提前量：
-            // 提前量会让上一句在还差几百毫秒时就被标成"已唱过"，于是它的逐字推进
-            // 还没走完就被整行点亮（#80 实测："最后一个字一下亮了，然后立刻换下一句"）。
+            // 高亮的"当前句"严格按**本句的时间区间**判定，不带任何提前量。
             //
-            // 滚动跟随另有 250ms 提前量（见下），那是为了让下一句提前进入视野，
-            // 两件事分开算。
+            // 提前量会让上一句在还差几百毫秒时就被标成"已唱过"，于是它最后几个字
+            // 还没走完就被整行点亮（#80 实测："最后一个字一下亮了，然后立刻换下一句"）。
             let active = self
                 .lyrics
                 .iter()
@@ -1559,16 +1557,12 @@ impl Render for Root {
             let user_scrolling = self
                 .lyrics_user_scroll_until
                 .is_some_and(|until| std::time::Instant::now() < until);
-            // 滚动比高亮早 250ms：下一句提前进入视野，避免"刚唱到就看它跳上来"。
+            // 滚动跟随**与高亮同一个判定**，不再提前。
             //
-            // 注意这里的 `position` 是**外推后**的值（见上），可能最多超前
-            // `LYRIC_LOOKAHEAD_SECONDS`。滚动以它为基准没关系——滚动本来就要提前；
-            // 但高亮不能，否则行尾会提前走满再干等切换，看起来像"跳"。
-            let scroll_target = self
-                .lyrics
-                .iter()
-                .rposition(|line| position + 0.25 >= line.start_seconds);
-            if let Some(index) = scroll_target {
+            // 早先这里用 `position + 0.25` 让下一句提前进入视野，结果是滚动动画
+            // 先跑、上一句还亮着，看起来像"还没唱完就开始跳"。现在两者同步：
+            // 上一句交出高亮的同时，才开始把它滑上去。
+            if let Some(index) = active {
                 if !user_scrolling {
                     self.scroll_lyrics_to(index);
                 }
