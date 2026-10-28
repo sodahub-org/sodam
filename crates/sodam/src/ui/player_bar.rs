@@ -583,8 +583,10 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                             })
                                             // 徽章没有 flex 容器：两个 child 会上下堆叠成两行，
                                             // 在固定高度的播放条里把文字挤出可视区，所以合成一段。
+                                            // 用短词「降档」而不是整句：徽章只有几厘米宽，
+                                            // 拼成「Lower tier Lossless」这类长句会被挤断。
                                             .child(if downgraded {
-                                                format!("{} {}", root.tr("已降档"), quality)
+                                                format!("{}·{}", root.tr("降档"), quality)
                                             } else {
                                                 quality.clone()
                                             })
