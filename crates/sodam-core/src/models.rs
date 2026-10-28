@@ -517,6 +517,12 @@ fn find_subsequence(haystack: &[char], needle: &[char], from: usize) -> Option<(
     }
     for begin in from..haystack.len() {
         let mut at = begin;
+        // 返回**首个匹配字符**的下标，而不是扫描起点。
+        //
+        // 若返回扫描起点（可能指向词前空格），那个空格就会被算进这个词的时长里：
+        // 例如 `ab cd ef` 里 `cd` 的时长会被摊成 3 份（空格 + c + d），
+        // `c` 要等到 1.333s 才开始亮，而正确值是 1.0s。
+        let mut first = None;
         let mut matched = true;
         for want in needle {
             while at < haystack.len() && haystack[at].is_whitespace() {
@@ -526,10 +532,11 @@ fn find_subsequence(haystack: &[char], needle: &[char], from: usize) -> Option<(
                 matched = false;
                 break;
             }
+            first.get_or_insert(at);
             at += 1;
         }
         if matched {
-            return Some((begin, at));
+            return first.map(|first| (first, at));
         }
     }
     None
@@ -850,11 +857,39 @@ mod tests {
         assert_eq!(total, 8.0, "总字符数必须是 text 的长度（含空格）");
         assert_eq!(done, 8.0, "走满时每个字符都要算上");
 
-        // 中途：第一个词唱完（1.0s）时，应当只亮 "ab" 两个字符。
+        // 中途：`ab` 唱完那一刻，已完成字符数应落在 [2, 3]：
+        // 2 = 两个字符都亮完；3 = 词间的零时长空格也被算作完成（它的时间窗是
+        // [1.0, 1.0]，恰好在边界上，两种都合理）。关键是**不能超过 3**，
+        // 否则说明后面的词被提前算进来了。
         let (done, _) = line.chars_revealed(1.0).expect("应有逐字轴");
         assert!(
-            (done - 2.0).abs() < 1e-3,
-            "1.0s 应恰好亮完前 2 个字符，得到 {done}"
+            (2.0..=3.0).contains(&done),
+            "1.0s 应只亮完前 2~3 个字符，得到 {done}"
+        );
+    }
+
+    /// 词前的空格不能算进该词的时长。
+    ///
+    /// 旧实现返回扫描起点（可能指向空格），于是 `cd` 的 1.0s 被摊成 3 份
+    /// （空格 + c + d），`c` 要等到 1.333s 才开始亮。
+    #[test]
+    fn leading_space_is_not_charged_to_the_word() {
+        // `ab` 0~1s，`cd` 1~2s，`ef` 2~3s
+        let line = &parse_lrc("[0,3000]<0,1000,0>ab <1000,1000,0>cd <2000,1000,0>ef")[0];
+        assert_eq!(line.text, "ab cd ef");
+
+        // `ab` 唱完、还没进 `cd`：最多算到 2~3 个字符
+        // （3 = 词间零时长空格在边界上也被算作完成，见上一个测试的说明）。
+        let (done, _) = line.chars_revealed(1.0).expect("应有逐字轴");
+        assert!((2.0..=3.0).contains(&done), "1.0s 应只亮完 ab，得到 {done}");
+
+        // 关键断言：`cd` 从 1.0s 就开始，而不是 1.333s。
+        // 1.25s 时 `c` 已走了一半 -> 3.5 个字符。
+        // 若词前空格被摊进词时长，`c` 要到 1.333s 才开始，这里只会是 3.0。
+        let (done, _) = line.chars_revealed(1.25).expect("应有逐字轴");
+        assert!(
+            (done - 3.5).abs() < 1e-3,
+            "1.25s 应亮到 c 的一半（3.5），得到 {done}——偏小说明空格被摊进了词时长"
         );
     }
 
@@ -888,7 +923,7 @@ mod tests {
         assert_eq!(done, total, "对不上时也要能走满，不能卡住");
     }
 
-    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。
+    /// 外推：同一拍快照内按本地时钟连续推进，快照变化时重新锚定。
     #[test]
     fn extrapolation_advances_within_a_snapshot_tick() {
         use std::time::{Duration, Instant};

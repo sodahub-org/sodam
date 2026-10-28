@@ -341,10 +341,12 @@ impl Root {
                         .filter(|start| *start > snapshot.position_seconds)
                         .fold(f64::INFINITY, f64::min);
                     let next_start = next_start.is_finite().then_some(next_start);
-                    (
-                        lyrics_idle_wait(snapshot.position_seconds, next_start),
-                        false,
-                    )
+                    // 已经到点就必须 notify：`lyrics_position_seconds` 与
+                    // `lyrics_active` 只在 `Root::render` 里更新。若醒来自顾自继续睡，
+                    // 就会一直拿旧位置判定"还没到"，直到 200ms 主心跳才切句 ——
+                    // 正好抵消 `lyrics_idle_wait` 想到达的"刚好赶上"。
+                    let due = next_start.is_some_and(|next| snapshot.position_seconds >= next);
+                    (lyrics_idle_wait(snapshot.position_seconds, next_start), due)
                 })
                 .unwrap_or((std::time::Duration::from_millis(120), false));
             let _ = this.update(cx, |_root, cx| {
@@ -3220,7 +3222,9 @@ mod playback_budget_tests {
 /// 且还没走到行尾。这是 60fps 节拍的唯一正当理由 ——
 /// 实测无逐字轴的歌若仍按 60fps 重绘，会白占近半个核。
 fn line_undergoing_reveal(line: &LyricLine, position: f64) -> bool {
-    line.has_word_timeline && position < line.end_seconds
+    // 下界同样重要：第一句开始前 `lyrics_active` 会回退到 0，
+    // 只判上界会让**前奏阶段**也按 60fps 重绘，而画面完全不变。
+    line.has_word_timeline && position >= line.start_seconds && position < line.end_seconds
 }
 
 /// 没有走字动画时，下一拍该睡多久。
@@ -3309,6 +3313,9 @@ mod tests {
     #[test]
     fn only_word_timeline_lines_need_high_fps() {
         let timed = line(10.0, 12.0, true);
+        // 前奏阶段：第一句还没开始。`lyrics_active` 会回退到 0，
+        // 若只判上界就会让前奏也按 60fps 空转（画面完全不变）。
+        assert!(!line_undergoing_reveal(&timed, 5.0), "第一句开始前不该高频");
         assert!(line_undergoing_reveal(&timed, 11.0), "走字进行中应高频");
         assert!(!line_undergoing_reveal(&timed, 12.0), "走满后不必高频");
         assert!(!line_undergoing_reveal(&timed, 13.0));

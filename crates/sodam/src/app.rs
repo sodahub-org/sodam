@@ -730,10 +730,18 @@ impl Root {
         // 和 `SODAM_QUERY` / `SODAM_NAV` 同级：只在显式设置时才生效，生产环境不设就等于不存在。
         // 位置来自环境变量，或临时目录里的 `sodam-lyrics-demo` 文件——后者是为了在
         // GUI 会话（无法注入环境变量）里也能触发。
+        // 环境变量是**显式**的，任何构建都可用；临时文件只在 debug 构建读取。
+        //
+        // 文件入口必须限死在 debug：`/tmp` 在 Linux 上所有用户可写，测试残留或
+        // 别人创建的同名文件都会把正式版拖进样张模式（换掉队列、真实歌词永不加载、
+        // ticker 恒 60fps）。生产二进制不该有这种外部可触发的开关。
         let demo_position = std::env::var("SODAM_LYRICS_DEMO")
             .ok()
             .map(|value| value.trim().to_string())
             .or_else(|| {
+                if !cfg!(debug_assertions) {
+                    return None;
+                }
                 std::fs::read_to_string(std::env::temp_dir().join("sodam-lyrics-demo")).ok()
             });
         if let Some(demo_position) = demo_position {
@@ -1565,6 +1573,15 @@ impl Render for Root {
             if let Some(index) = active {
                 if !user_scrolling {
                     self.scroll_lyrics_to(index);
+                    // 刚刚创建的补间必须当场请求下一帧。
+                    //
+                    // 上面那段 `if self.lyrics_scroll_animating()` 在本函数**更早**的位置，
+                    // 那时补间还不存在；而 ticker 又因"动画进行中"退回空闲档不 notify，
+                    // 所以下一次渲染要等 200ms 主心跳 —— 单行滚动只有 180ms，
+                    // 第一次推进就直接到 1.0，自动换句的"滑上去"会变成瞬移。
+                    if self.lyrics_scroll_animating() {
+                        window.request_animation_frame();
+                    }
                 }
             }
             // 切曲后强制大封面显示至少 200ms 的加载态（即便图已在缓存里）。

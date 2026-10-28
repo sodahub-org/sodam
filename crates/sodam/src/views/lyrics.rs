@@ -31,48 +31,64 @@ const LYRIC_ROW_GAP: f32 = 32.0;
 ///
 /// `done` 可带小数（`7.42` = 前 7 字已满 + 第 8 字亮 42%），小数部分按
 /// 该字形自身的宽度插值，所以亮光能停在**一个字中间**。
-fn reveal_x_from_chars(line: &gpui::WrappedLine, done: f32, fallback_width: f32) -> f32 {
-    let xs: Vec<f32> = line
+fn reveal_x_from_chars(
+    line: &gpui::WrappedLine,
+    text: &str,
+    done: f32,
+    fallback_width: f32,
+) -> f32 {
+    // 用**字节下标**对齐字符与字形。
+    //
+    // `done` 是"第几个字符"，而 shaping 的产物是字形：连字（fi/fl）、组合符号、
+    // emoji ZWJ 序列都可能让「字符数 ≠ 字形数」。直接拿字符下标去索引字形会错位，
+    // 甚至在文本还没走完时就跑出范围、提前返回 `f32::MAX` 把整行点亮。
+    // `ShapedGlyph::index` 是原文的 UTF-8 字节下标，字符序号换成字节偏移后再定位才是对的。
+    let glyphs: Vec<(usize, f32)> = line
         .runs()
         .iter()
         .flat_map(|run| run.glyphs.iter())
-        .map(|glyph| f32::from(glyph.position.x))
+        .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
         .collect();
-    reveal_x_from_glyph_xs(&xs, done, fallback_width)
+    reveal_x_from_glyphs(&glyphs, text, done, fallback_width)
 }
 
 /// [`reveal_x_from_chars`] 的纯计算部分：只依赖各字形的左边界 x。
 ///
 /// 抽出来是为了能脱离窗口环境做单元测试 —— 这里是"走得丝不丝滑"的核心，
 /// 之前反复出错（比例当像素、末字不亮）。
-fn reveal_x_from_glyph_xs(xs: &[f32], done: f32, fallback_width: f32) -> f32 {
-    if xs.is_empty() || done <= 0.0 {
+fn reveal_x_from_glyphs(
+    glyphs: &[(usize, f32)],
+    text: &str,
+    done: f32,
+    fallback_width: f32,
+) -> f32 {
+    if glyphs.is_empty() || done <= 0.0 {
         return 0.0;
     }
 
-    // `done` 已经是「`text` 里第几个字符」，与字形序列一一对应，直接索引即可。
-    // （`total` 保留在签名里是为了让调用方显式表明这是字符位置，不再做缩放。）
     let whole = done.floor().max(0.0) as usize;
     let fraction = (done - whole as f32).clamp(0.0, 1.0);
 
-    // 全部字符都亮完：返回一个足够大的 x，让所有视觉行都被整段裁剪。
-    //
-    // 不能返回最后一个字形的左边界 —— 那样**最后一个字永远不亮**，
-    // 正是"最后一个字走不完"的直接来源。
-    if whole >= xs.len() {
+    // 字符序号 → 字节偏移。越界说明整行都走完了。
+    let Some((byte_offset, _)) = text.char_indices().nth(whole) else {
+        return f32::MAX;
+    };
+    // 第一个字节下标 >= byte_offset 的字形，就是"该字符"开始的地方。
+    // 连字情况下可能没有精确等于的字形，取第一个不小于它的。
+    let index = glyphs.partition_point(|(byte, _)| *byte < byte_offset);
+    if index >= glyphs.len() {
         return f32::MAX;
     }
-    let start_x = xs[whole];
+    let start_x = glyphs[index].1;
     if fraction <= 0.0 {
         return start_x;
     }
     // 该字形的自身宽度 = 下一个字形的左边界 - 本字形左边界。
-    // 末字形没有"下一个"，用调用方补上的宽度（`fallback_width`）兜底：
-    // 否则末字宽被算成 0，它的字内推进恒为 0 —— 表现就是"最后一个字不亮，
-    // 直接跳到下一句"。这是实测复现过的 bug。
-    let next_x = xs
-        .get(whole + 1)
-        .copied()
+    // 末字形没有"下一个"，用调用方补上的宽度兜底：否则末字宽被算成 0，
+    // 它的字内推进恒为 0 —— 表现就是"最后一个字不亮，直接跳到下一句"。
+    let next_x = glyphs
+        .get(index + 1)
+        .map(|(_, x)| *x)
         .unwrap_or(start_x + fallback_width);
     let glyph_width = (next_x - start_x).max(0.0);
     start_x + glyph_width * fraction
@@ -162,6 +178,8 @@ fn highlighted_line(
     let base: gpui::Hsla = base.into();
     let lit: gpui::Hsla = lit.into();
     let shared: gpui::SharedString = text.to_string().into();
+    // paint 阶段也要按字节下标对齐字形（见 `reveal_x_from_chars`），留一份副本。
+    let paint_text: gpui::SharedString = shared.clone();
 
     let overlay = gpui::canvas(
         move |bounds, window, _cx| {
@@ -311,7 +329,7 @@ fn highlighted_line(
                 // "最后一个字一闪而过"。这里按字形逐个累加真实宽度。
                 let revealed_x = match reveal {
                     LyricReveal::Partial { done } => {
-                        reveal_x_from_chars(base_line, done, last_advance)
+                        reveal_x_from_chars(base_line, &paint_text, done, last_advance)
                     }
                     _ => 0.0,
                 };
@@ -449,6 +467,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                     let position = root.lyrics_position_seconds;
                     let reveal = if line.is_active_at(position, next_start) {
                         match line.chars_revealed(position) {
+                            // 已经走满：直接走纯文本快路径。
+                            // 否则"已唱满、等下一句"的整段都要走 canvas 两遍绘制，白花 CPU。
+                            Some((done, total)) if done >= total => LyricReveal::All,
                             Some((done, _total)) => LyricReveal::Partial { done },
                             // 普通 LRC（没有逐字轴）：整行直接算已亮。
                             None => LyricReveal::All,
@@ -713,13 +734,18 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
 
 #[cfg(test)]
 mod tests {
-    use super::reveal_x_from_glyph_xs;
+    use super::reveal_x_from_glyphs;
 
-    /// 各字形的左边界（未折行坐标）。注意宽度不等：
-    /// `I` 很窄（10px），`wide` 很宽（60px），用来暴露"按比例算"的错误。
-    const XS: [f32; 5] = [0.0, 10.0, 40.0, 100.0, 160.0];
+    /// 5 个单字节字符（`abcde`）的字形：`(字节下标, 左边界 x)`。
+    /// 宽度刻意不等：`b` 只有 10px，`d` 有 60px。
+    const TEXT: &str = "abcde";
+    const GLYPHS: [(usize, f32); 5] = [(0, 0.0), (1, 10.0), (2, 40.0), (3, 100.0), (4, 160.0)];
     /// 末字形的宽度（末字后面没有"下一个字形"，必须由调用方补）。
     const LAST_W: f32 = 40.0;
+
+    fn reveal(glyphs: &[(usize, f32)], text: &str, done: f32) -> f32 {
+        reveal_x_from_glyphs(glyphs, text, done, LAST_W)
+    }
 
     /// 走满时必须覆盖整行 —— 最后一个字要亮起来。
     ///
@@ -728,7 +754,7 @@ mod tests {
     #[test]
     fn full_reveal_covers_every_glyph() {
         assert_eq!(
-            reveal_x_from_glyph_xs(&XS, 5.0, LAST_W),
+            reveal(&GLYPHS, TEXT, 5.0),
             f32::MAX,
             "走满必须覆盖整行，不能停在最后一个字的左边界"
         );
@@ -736,20 +762,20 @@ mod tests {
 
     /// 字内插值按**该字形自身宽度**，不是按平均宽度。
     ///
-    /// 第 1 个字宽 10px，第 2 个字宽 30px。走到 1.5 个字时，
-    /// 应当是 10 + 30*0.5 = 25，而不是 (1.5/5)*总宽。
+    /// 第 2 个字宽 30px。走到 1.5 个字时应当是 10 + 30*0.5 = 25，
+    /// 而不是 (1.5/5)*总宽。
     #[test]
     fn partial_reveal_uses_each_glyph_width() {
-        assert!((reveal_x_from_glyph_xs(&XS, 1.5, LAST_W) - 25.0).abs() < 1e-3);
-        // 第 3 个字宽 60px，走到 2.5 个字 = 40 + 30 = 70。
-        assert!((reveal_x_from_glyph_xs(&XS, 2.5, LAST_W) - 70.0).abs() < 1e-3);
+        assert!((reveal(&GLYPHS, TEXT, 1.5) - 25.0).abs() < 1e-3);
+        // 第 4 个字宽 60px，走到 2.5 个字 = 40 + 30 = 70。
+        assert!((reveal(&GLYPHS, TEXT, 2.5) - 70.0).abs() < 1e-3);
     }
 
     /// 整字位置必须精确落在字形左边界上（否则字与字之间会有跳变）。
     #[test]
     fn integer_positions_snap_to_glyph_edges() {
-        assert!((reveal_x_from_glyph_xs(&XS, 2.0, LAST_W) - 40.0).abs() < 1e-3);
-        assert!((reveal_x_from_glyph_xs(&XS, 3.0, LAST_W) - 100.0).abs() < 1e-3);
+        assert!((reveal(&GLYPHS, TEXT, 2.0) - 40.0).abs() < 1e-3);
+        assert!((reveal(&GLYPHS, TEXT, 3.0) - 100.0).abs() < 1e-3);
     }
 
     /// **最后一个字必须能推进**：末字形没有"下一个字形"，宽度要靠
@@ -757,15 +783,14 @@ mod tests {
     /// 然后直接跳到下一句（实测复现过的 bug）。
     #[test]
     fn last_glyph_advances_with_its_real_width() {
-        let last_start = XS[XS.len() - 1]; // 160
-                                           // 走到 4.5 个字：末字形亮一半 = 160 + 40*0.5 = 180。
-        let x = reveal_x_from_glyph_xs(&XS, 4.5, LAST_W);
+        let last_start = GLYPHS[GLYPHS.len() - 1].1; // 160
+        let x = reveal(&GLYPHS, TEXT, 4.5);
         assert!(
             (x - (last_start + LAST_W * 0.5)).abs() < 1e-3,
             "末字应能按自身宽度推进，得到 {x}"
         );
         // 宽度为 0 时末字确实推不动——这就是要防的情况。
-        let stuck = reveal_x_from_glyph_xs(&XS, 4.5, 0.0);
+        let stuck = reveal_x_from_glyphs(&GLYPHS, TEXT, 4.5, 0.0);
         assert!((stuck - last_start).abs() < 1e-3);
     }
 
@@ -775,7 +800,7 @@ mod tests {
         let mut prev = -1.0f32;
         let mut t = 0.0f32;
         while t <= 5.0 {
-            let x = reveal_x_from_glyph_xs(&XS, t, LAST_W);
+            let x = reveal(&GLYPHS, TEXT, t);
             assert!(x >= prev, "t={t} 处回退：{prev} -> {x}");
             prev = x;
             t += 0.05;
@@ -785,10 +810,38 @@ mod tests {
     /// 边界输入不能崩。
     #[test]
     fn reveal_handles_edge_inputs() {
-        assert_eq!(reveal_x_from_glyph_xs(&[], 1.0, LAST_W), 0.0);
-        assert_eq!(reveal_x_from_glyph_xs(&XS, 0.0, LAST_W), 0.0);
-        // 超过字形数（走满或脏数据）：按走满处理，否则最后一个字不亮。
-        assert_eq!(reveal_x_from_glyph_xs(&XS, 5.0, LAST_W), f32::MAX);
-        assert_eq!(reveal_x_from_glyph_xs(&XS, 9.0, LAST_W), f32::MAX);
+        assert_eq!(reveal_x_from_glyphs(&[], TEXT, 1.0, LAST_W), 0.0);
+        assert_eq!(reveal(&GLYPHS, TEXT, 0.0), 0.0);
+        assert_eq!(reveal(&GLYPHS, TEXT, 9.0), f32::MAX);
+    }
+
+    /// 中文字符是多字节：字符序号必须先换成**字节偏移**再找字形。
+    ///
+    /// 直接拿字符下标当字形下标时，`ab中文` 第 3 个字符会被定位到第 3 个字形，
+    /// 而中文字形从字节 2 开始 —— 亮光会整体偏移。
+    #[test]
+    fn multibyte_chars_map_through_byte_offsets() {
+        // 4 个字符，8 个字节：a(0) b(1) 中(2..5) 文(5..8)
+        let text = "ab中文";
+        let glyphs = [(0usize, 0.0f32), (1, 10.0), (2, 20.0), (5, 50.0)];
+        // 走到第 3 个字符（"中"）的开头：字节 2 -> 字形下标 2 -> x=20
+        assert!((reveal_x_from_glyphs(&glyphs, text, 2.0, 30.0) - 20.0).abs() < 1e-3);
+        // 走到第 4 个字符（"文"）的开头：字节 5 -> 字形下标 3 -> x=50
+        assert!((reveal_x_from_glyphs(&glyphs, text, 3.0, 30.0) - 50.0).abs() < 1e-3);
+        // "中"字亮一半：20 + (50-20)*0.5 = 35
+        assert!((reveal_x_from_glyphs(&glyphs, text, 2.5, 30.0) - 35.0).abs() < 1e-3);
+    }
+
+    /// 连字（多字符 → 少字形）不能错位，也不能提前整行点亮。
+    #[test]
+    fn ligatures_do_not_skip_ahead() {
+        // "fi" 是 1 个字形（字节 0），后面还有 1 个字符
+        let text = "fix";
+        let glyphs = [(0usize, 0.0f32), (2, 20.0)];
+        // 3 个字符、2 个字形：走到第 2 个字符时应落在 x=20，而不是直接 f32::MAX
+        let x = reveal_x_from_glyphs(&glyphs, text, 2.0, 20.0);
+        assert_eq!(x, 20.0, "第 2 个字符对应字节 2 的字形");
+        // 只有超过整段文本长度才应整行点亮。
+        assert_eq!(reveal_x_from_glyphs(&glyphs, text, 3.0, 20.0), f32::MAX);
     }
 }
