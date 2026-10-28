@@ -193,7 +193,15 @@ scripts/run.sh
 | `QISHUI_SIGNER_URL` | 签名服务 `/sign` 地址 |
 | `QISHUI_SIGNER_TOKEN` | 签名服务 Bearer Token |
 | `SODA_DEVICE_ID` / `SODA_IID` / `SODA_FP` | 设备身份；覆盖时必须与签名器一致 |
-| `SODAM_QUALITY` | `best` / `lossless` / `highest` / `medium` / `low` |
+| `SODAM_QUALITY` | 音质意图：`auto` / `best` / `lossless` / `highest` / `medium` / `low` |
+| `SODAM_PLAYER_LOG` / `SODAM_PREFETCH_LOG` / `SODAM_REPORT_LOG` | 把对应日志话题（`player` / `prefetch` / `report`）提到 `DEBUG` |
+| `SODAM_SCENE_LOG` / `SODAM_THEME_LOG` / `SODAM_COVER_LOG` / `SODAM_FRAME_LOG` | 同上，这四个都归 `app` 话题 |
+
+音质偏好只表达**意图**：「自动」= 不设上限，由服务端按账号权益与单曲可用档位收敛，
+实际拿到哪一档由播放条徽章如实显示。选具体档位时从**下一首**开始生效，当前曲目不重载。
+
+日志默认按 `INFO` 记录在本机。设置页「诊断 → 详细日志」可把六个话题全部提到 `DEBUG`，
+即时生效、重启保持；环境变量与这个开关是并集——两边都只能记更多，不存在谁覆盖谁。
 
 SodaM 默认内置一个公共签名服务，未部署 `libmssdk` 的用户也可以直接使用。
 可以在设置页或环境变量中替换为自己的签名服务。
@@ -209,6 +217,9 @@ SodaM 默认内置一个公共签名服务，未部署 `libmssdk` 的用户也�
   正在下载、等待装载或正在播放的文件受保护，可能暂时超过上限，释放后再清理。
 - 「清空缓存」在后台递归清理音频、封面及封面原图；正在使用的音频和近期下载临时文件
   会保留。中断下载遗留的临时文件超过 24 小时后可被清理。
+- 音频缓存按**音质意图**命名：选「自动」时同一首歌始终命中同一个文件，所以开通会员后
+  旧歌仍播缓存里那一档，想按新权益重取需清空缓存或换一首。选具体档位时，切档后新曲目
+  按新档位另存一份。
 
 以下是显式覆盖项，不受上面“只补全空字段”的规则限制：
 
