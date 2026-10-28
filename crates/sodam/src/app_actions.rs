@@ -10,7 +10,7 @@ use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
-use sodam_core::models::{PlaylistItem, SceneItem, TrackItem};
+use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::session::Session;
 use sodam_core::Settings;
@@ -280,52 +280,77 @@ impl Root {
     /// 歌词页的逐字高亮节拍（#80）。
     ///
     /// 主心跳是 200ms（5fps），对进度条够用，但逐字高亮按像素推进时需要更高帧率，
-    /// 否则亮光会一跳一跳地走。这里单独跑一个约 60fps 的节拍，**只在歌词页且正在
-    /// 播放时**才 notify，其它情况空转（每拍只读一个快照，开销可忽略）。
+    /// 否则亮光会一跳一跳地走。这里单独跑一个节拍，**只在"亮光确实在推进"时**
+    /// 才用 60fps 并触发重绘；其余时间睡到下一个会变化的时刻，一次 `notify` 都不发。
+    ///
+    /// 判据见 [`line_undergoing_reveal`] 与 [`lyrics_idle_wait`]。
     ///
     /// 为什么不用 `with_animation`：那个是给 SVG / 变换用的，无法带动文字重排；
     /// 而 `cx.notify()` 只是标脏，真正重绘仍由 gpui 的帧调度合并，不会堆帧。
     pub(crate) fn start_lyrics_ticker(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
-            // 先决定这一拍要不要跑、以及下一拍睡多久。
+            // 先决定这一拍要不要重绘、以及下一拍睡多久。
             //
-            // 空闲时睡久一点（120ms）而不是继续 16ms 空转：歌词页关掉、暂停、
-            // 或当前行没有逐字时间轴时，没必要每秒醒 60 次。主心跳（200ms）
-            // 会负责在这些状态变化后把 ticker 叫醒到“热”路径。
-            let interval = this
+            // 关键判据是「**这一行此刻是否真的在走字**」，而不是「有没有当前行」：
+            // 没有逐字时间轴的歌（普通 LRC）整行直接全亮，根本不会有动画；
+            // 逐字行也有大半时间停在"已走满、等下一句"。这些时候按 60fps 重绘
+            // 纯粹是空转 —— 实测一首无逐字轴的歌能占到单核 46%，白白浪费。
+            //
+            // 所以只在真正需要时用 16ms，其余时间直接**睡到下一个会变化的时刻**。
+            let (interval, notify) = this
                 .update(cx, |root, _cx| {
+                    const HOT: std::time::Duration = std::time::Duration::from_millis(16);
+                    const IDLE: std::time::Duration = std::time::Duration::from_millis(120);
                     if root.nav != Nav::Lyrics {
-                        return std::time::Duration::from_millis(120);
+                        return (IDLE, false);
                     }
                     // 样张模式（开发验证）也要能刷新。
                     if root.lyrics_demo_position.is_some() {
-                        return std::time::Duration::from_millis(16);
+                        return (HOT, true);
                     }
                     // 滚动过渡进行中：让 timer 退到空闲档，动画交给
                     // `request_animation_frame` 驱动（见 `Root::render`）。
-                    //
                     // 两个驱动源同时推进会造成重复推进、间隔不匀，反而更不平滑。
-                    // 帧回调是与平台刷新对齐的，timer 只是兜底。
                     if root.lyrics_scroll_animating() {
-                        return std::time::Duration::from_millis(120);
+                        return (IDLE, false);
                     }
                     let snapshot = root.engine.snapshot();
                     if !snapshot.playing {
-                        return std::time::Duration::from_millis(120);
+                        return (IDLE, false);
                     }
-                    // 有当前行就要高频重绘：逐字推进需要足够的帧率，
-                    // 200ms 的主心跳撑不起亮光连续地走。
-                    if root.lyrics_active.is_some() {
-                        std::time::Duration::from_millis(16)
-                    } else {
-                        std::time::Duration::from_millis(120)
+
+                    // 当前行是否还在"走字"：有逐字轴，且还没走到行尾。
+                    let revealing = root
+                        .lyrics_active
+                        .and_then(|index| root.lyrics.get(index))
+                        .is_some_and(|line| {
+                            line_undergoing_reveal(line, root.lyrics_position_seconds)
+                        });
+                    if revealing {
+                        return (HOT, true);
                     }
+
+                    // 空闲：睡到下一句开始之前，那时才需要重新点亮/开始走字。
+                    //
+                    // 用快照位置而不是 `lyrics_position_seconds`：后者只在渲染时更新，
+                    // 空闲期间不渲染就会滞后，按它算等待会睡过头。
+                    let next_start = root
+                        .lyrics
+                        .iter()
+                        .map(|line| line.start_seconds)
+                        .filter(|start| *start > snapshot.position_seconds)
+                        .fold(f64::INFINITY, f64::min);
+                    let next_start = next_start.is_finite().then_some(next_start);
+                    (
+                        lyrics_idle_wait(snapshot.position_seconds, next_start),
+                        false,
+                    )
                 })
-                .unwrap_or(std::time::Duration::from_millis(120));
+                .unwrap_or((std::time::Duration::from_millis(120), false));
             let _ = this.update(cx, |_root, cx| {
                 // 滚动过渡不在这里推进：它跑在 `Root::render` 的帧回调里，
                 // 那里与平台刷新同步。这里只负责常规的逐字高亮重绘。
-                if interval == std::time::Duration::from_millis(16) {
+                if notify {
                     cx.notify();
                 }
             });
@@ -3189,6 +3214,34 @@ mod playback_budget_tests {
     }
 }
 
+/// 这一行此刻是否"正在走字"（亮光还在推进）。
+///
+/// 只有同时满足两个条件才算：有逐字时间轴（否则整行瞬间全亮、没有动画），
+/// 且还没走到行尾。这是 60fps 节拍的唯一正当理由 ——
+/// 实测无逐字轴的歌若仍按 60fps 重绘，会白占近半个核。
+fn line_undergoing_reveal(line: &LyricLine, position: f64) -> bool {
+    line.has_word_timeline && position < line.end_seconds
+}
+
+/// 没有走字动画时，下一拍该睡多久。
+///
+/// 目标是「下一句开始」那一刻 —— 那时才需要重新点亮并开始走字。
+///
+/// 为什么要提前 `SAFETY`：`position` 来自音频快照，最多滞后约 100ms。
+/// 若直接睡到 `next_start`，可能睡过头，导致新一句的高亮迟到（肉眼是"亮晚了"）。
+/// 提前一点醒来最多多跑几拍（下界 8ms），代价远小于迟到。
+fn lyrics_idle_wait(position: f64, next_start: Option<f64>) -> std::time::Duration {
+    const MIN: f64 = 0.008;
+    const MAX: f64 = 0.12;
+    const SAFETY: f64 = 0.1;
+    match next_start {
+        Some(next) if next > position => {
+            std::time::Duration::from_secs_f64((next - position - SAFETY).clamp(MIN, MAX))
+        }
+        _ => std::time::Duration::from_millis(120),
+    }
+}
+
 /// 歌词滚动的缓出曲线：`1 - (1-t)^3`。
 ///
 /// 起步快、收尾慢，符合"滑到位置"的观感，与官方 `transition: ... ease-out` 一致。
@@ -3232,7 +3285,55 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::lyrics_scroll_ease;
+    use super::{line_undergoing_reveal, lyrics_idle_wait, lyrics_scroll_ease};
+    use sodam_core::models::{LyricLine, LyricWord};
+
+    fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
+        LyricLine {
+            start_seconds: start,
+            end_seconds: end,
+            text: "测试".to_string(),
+            words: vec![LyricWord {
+                start_seconds: start,
+                end_seconds: end,
+                text: "测试".to_string(),
+            }],
+            has_word_timeline,
+        }
+    }
+
+    /// 只有"有逐字轴且还没走到行尾"才算需要 60fps。
+    ///
+    /// 无逐字轴的歌整行瞬间全亮，没有任何动画；逐字行走满之后也只是停在原地
+    /// 等下一句。这两种情况按 60fps 重绘纯属空转（实测能白占近半个核）。
+    #[test]
+    fn only_word_timeline_lines_need_high_fps() {
+        let timed = line(10.0, 12.0, true);
+        assert!(line_undergoing_reveal(&timed, 11.0), "走字进行中应高频");
+        assert!(!line_undergoing_reveal(&timed, 12.0), "走满后不必高频");
+        assert!(!line_undergoing_reveal(&timed, 13.0));
+
+        let plain = line(10.0, 10.0, false);
+        assert!(!line_undergoing_reveal(&plain, 10.0), "无逐字轴没有动画");
+        assert!(!line_undergoing_reveal(&plain, 11.0));
+    }
+
+    /// 空闲等待朝「下一句开始」对齐，并夹在 8~120ms 之间。
+    #[test]
+    fn idle_wait_sleeps_until_next_line() {
+        // 距离下一句还很久：按上限 120ms 醒一次（保证状态变化能被及时看到）。
+        assert_eq!(lyrics_idle_wait(10.0, Some(99.0)).as_millis(), 120);
+        // 距下一句 0.3s：扣掉安全提前量后仍超过上限。
+        assert_eq!(lyrics_idle_wait(10.0, Some(10.3)).as_millis(), 120);
+        // 距下一句 0.15s：扣掉 0.1s 安全量后剩 50ms。
+        assert_eq!(lyrics_idle_wait(10.0, Some(10.15)).as_millis(), 50);
+        // 下一句马上到：不能退化成 0（否则会在毫秒级空转）。
+        assert!(lyrics_idle_wait(10.0, Some(10.0001)).as_millis() >= 8);
+        // 没有下一句（最后一行唱完）：走满档等待。
+        assert_eq!(lyrics_idle_wait(10.0, None).as_millis(), 120);
+        // 边界：下一句等于当前（脏数据）时不能睡 0。
+        assert_eq!(lyrics_idle_wait(10.0, Some(10.0)).as_millis(), 120);
+    }
 
     #[test]
     fn ease_starts_at_zero_and_ends_at_one() {
