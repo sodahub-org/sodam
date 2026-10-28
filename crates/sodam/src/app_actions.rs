@@ -341,12 +341,16 @@ impl Root {
                         .filter(|start| *start > snapshot.position_seconds)
                         .fold(f64::INFINITY, f64::min);
                     let next_start = next_start.is_finite().then_some(next_start);
-                    // 已经到点就必须 notify：`lyrics_position_seconds` 与
-                    // `lyrics_active` 只在 `Root::render` 里更新。若醒来自顾自继续睡，
-                    // 就会一直拿旧位置判定"还没到"，直到 200ms 主心跳才切句 ——
-                    // 正好抵消 `lyrics_idle_wait` 想到达的"刚好赶上"。
-                    let due = next_start.is_some_and(|next| snapshot.position_seconds >= next);
-                    (lyrics_idle_wait(snapshot.position_seconds, next_start), due)
+                    // 进入"下一句马上开始"的窗口就必须 notify：
+                    // `lyrics_position_seconds` 与 `lyrics_active` 只在 `Root::render`
+                    // 里更新。若醒来自顾自继续睡，就会一直拿旧位置判定"还没到"，
+                    // 直到 200ms 主心跳才切句 —— 正好抵消 `lyrics_idle_wait`
+                    // 想到达的"刚好赶上"。
+                    let near = lyrics_near_next_line(snapshot.position_seconds, next_start);
+                    (
+                        lyrics_idle_wait(snapshot.position_seconds, next_start),
+                        near,
+                    )
                 })
                 .unwrap_or((std::time::Duration::from_millis(120), false));
             let _ = this.update(cx, |_root, cx| {
@@ -3234,16 +3238,26 @@ fn line_undergoing_reveal(line: &LyricLine, position: f64) -> bool {
 /// 为什么要提前 `SAFETY`：`position` 来自音频快照，最多滞后约 100ms。
 /// 若直接睡到 `next_start`，可能睡过头，导致新一句的高亮迟到（肉眼是"亮晚了"）。
 /// 提前一点醒来最多多跑几拍（下界 8ms），代价远小于迟到。
+/// 空闲时"提前量"：在下一句开始前这么久就醒，留出渲染与状态更新的余量。
+const LYRIC_IDLE_SAFETY: f64 = 0.1;
+
 fn lyrics_idle_wait(position: f64, next_start: Option<f64>) -> std::time::Duration {
     const MIN: f64 = 0.008;
     const MAX: f64 = 0.12;
-    const SAFETY: f64 = 0.1;
     match next_start {
-        Some(next) if next > position => {
-            std::time::Duration::from_secs_f64((next - position - SAFETY).clamp(MIN, MAX))
-        }
+        Some(next) if next > position => std::time::Duration::from_secs_f64(
+            (next - position - LYRIC_IDLE_SAFETY).clamp(MIN, MAX),
+        ),
         _ => std::time::Duration::from_millis(120),
     }
+}
+
+/// 是否已进入「下一句马上开始」的窗口。
+///
+/// 一旦进入就必须 notify 一次：位置与当前行只在渲染路径里更新，
+/// 不 notify 的话下一次醒来仍拿旧位置判定"还没到"，会一直空转到主心跳。
+fn lyrics_near_next_line(position: f64, next_start: Option<f64>) -> bool {
+    next_start.is_some_and(|next| next - position <= LYRIC_IDLE_SAFETY)
 }
 
 /// 歌词滚动的缓出曲线：`1 - (1-t)^3`。
@@ -3289,7 +3303,9 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_undergoing_reveal, lyrics_idle_wait, lyrics_scroll_ease};
+    use super::{
+        line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
+    };
     use sodam_core::models::{LyricLine, LyricWord};
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
@@ -3323,6 +3339,19 @@ mod tests {
         let plain = line(10.0, 10.0, false);
         assert!(!line_undergoing_reveal(&plain, 10.0), "无逐字轴没有动画");
         assert!(!line_undergoing_reveal(&plain, 11.0));
+    }
+
+    /// 进入下一句窗口必须 notify，否则位置不更新会一直空转。
+    #[test]
+    fn notify_once_the_next_line_window_opens() {
+        // 距下一句 0.3s：还没进窗口，安静等待。
+        assert!(!lyrics_near_next_line(10.0, Some(10.3)));
+        // 距下一句 0.05s：已进窗口，必须 notify 让渲染刷新位置/当前行。
+        assert!(lyrics_near_next_line(10.0, Some(10.05)));
+        // 刚好在安全提前量上也算（边界闭合）。
+        assert!(lyrics_near_next_line(10.0, Some(10.1)));
+        // 没有下一句：不需要为了切句而 notify。
+        assert!(!lyrics_near_next_line(10.0, None));
     }
 
     /// 空闲等待朝「下一句开始」对齐，并夹在 8~120ms 之间。
