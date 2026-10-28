@@ -413,6 +413,113 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     let lyrics_viewport_height =
         (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
     let lyric_padding = lyrics_viewport_height / 2.0;
+    // 屏幕外裁剪：只构建/绘制视口附近的若干行。
+    //
+    // 歌词动辄几十上百行，而每帧都要重建整棵元素树并绘制每一行文字。
+    // 实测（debug，样张 60fps）：5 行占单核 19%，100 行占到 50% —— 每多一行
+    // 约 +0.33pp。而屏幕上真正可见的只有十来行，其余都是白画。
+    //
+    // 被裁掉的行走**等高占位**，保证滚动几何不变：高度取自上一帧的实测 bounds，
+    // 所以滚动位置、居中偏移都不受影响。首帧还没布局时 `bounds_for_item`
+    // 返回 None，这时不做裁剪（退化为全量渲染）。
+    let cull_window = {
+        let viewport = root.lyrics_scroll.bounds();
+        // 上下各留 0.35 个视口：足够覆盖滚动动画期间新露出的行
+        // （一次换句最多滚一行高），又不会把太多行带进每帧的重建里。
+        let margin = (viewport.size.height * 0.35).max(px(160.0));
+        let top = viewport.origin.y - margin;
+        let bottom = viewport.origin.y + viewport.size.height + margin;
+        (top, bottom)
+    };
+
+    // 逐行构建歌词元素，但**跳过视口外的行**，并把连续跳过的行合并成一个等高占位。
+    //
+    // 为什么：歌词动辄几十上百行，每帧都要重建整棵元素树并绘制每一行文字。
+    // 实测（debug，样张 60fps）：5 行占单核 19%，100 行占 50% —— 每多一行约 +0.33pp，
+    // 而屏幕上可见的只有十来行，其余全是白画。
+    //
+    // 占位块的高度取自上一帧的实测 `bounds`，所以滚动几何、居中偏移都不变。
+    // 首帧还没布局（`bounds_for_item` 返回 None）时不做裁剪，退化为全量渲染。
+    let culled_children: Vec<AnyElement> = {
+        let position = root.lyrics_position_seconds;
+        let mut out: Vec<AnyElement> = Vec::with_capacity(lines.len().min(32));
+        // 当前行及其近邻始终渲染：它们可能压在边界上，且当前行承担走字动画。
+        let near = |index: usize| {
+            root.lyrics_active
+                .is_some_and(|active| index.abs_diff(active) <= 3)
+        };
+        let cull_enabled = root.lyrics_layout_settle == 0;
+        let keep = |index: usize| -> bool {
+            if near(index) || !cull_enabled {
+                return true;
+            }
+            match root.lyrics_scroll.bounds_for_item(index) {
+                Some(bounds) => {
+                    bounds.origin.y + bounds.size.height >= cull_window.0
+                        && bounds.origin.y <= cull_window.1
+                }
+                // 还没布局：保守地全渲染。
+                None => true,
+            }
+        };
+
+        let mut index = 0usize;
+        while index < lines.len() {
+            if !keep(index) {
+                // 把这一串连续被裁掉的行合成一个等高占位。
+                let mut height = px(0.0);
+                while index < lines.len() && !keep(index) {
+                    if let Some(bounds) = root.lyrics_scroll.bounds_for_item(index) {
+                        height += bounds.size.height;
+                    }
+                    index += 1;
+                }
+                if height > px(0.0) {
+                    out.push(div().w_full().h(height).into_any_element());
+                }
+                continue;
+            }
+
+            let line = &lines[index];
+            let next_start = lines.get(index + 1).map(|next| next.start_seconds);
+            // 本行此刻是否"正在唱"：区间是 `[start, 下一句开始)`。
+            //
+            // 上一句一直保持高亮到下一句接管为止 —— 走完后亮光停在整行全亮，
+            // 不会提前变暗。切句动画在**下一句开始之后**才起跑（滚动跟随
+            // 不再提前 250ms），所以顺序是：先切换高亮，再播滚动动画。
+            let reveal = if line.is_active_at(position, next_start) {
+                match line.chars_revealed(position) {
+                    Some((done, _total)) => LyricReveal::Partial { done },
+                    // 普通 LRC（没有逐字轴）：整行直接算已亮。
+                    None => LyricReveal::All,
+                }
+            } else {
+                LyricReveal::None
+            };
+            out.push(
+                div()
+                    .w_full()
+                    // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
+                    // 会被折行文本吃掉，折成两行时间距就变成 0。
+                    // 上下各 16，相邻两句之间正好 32；单句总高仍是 64。
+                    .py(px(LYRIC_ROW_GAP / 2.0))
+                    // 这里不能加 `flex`：flex 容器给子元素的可用宽度是 MaxContent，
+                    // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
+                    .text_size(theme::Text::Large.size())
+                    .line_height(px(LYRIC_LINE_HEIGHT))
+                    .child(highlighted_line(
+                        &line.text,
+                        reveal,
+                        theme::lyric_dim(),
+                        theme::accent(),
+                    ))
+                    .into_any_element(),
+            );
+            index += 1;
+        }
+        out
+    };
+
     let list = if root.lyrics.is_empty() {
         None
     } else {
@@ -438,42 +545,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                     root.cancel_lyrics_scroll_tween();
                     cx.notify();
                 }))
-                .children(lines.iter().enumerate().map(|(index, line)| {
-                    let next_start = lines.get(index + 1).map(|next| next.start_seconds);
-                    // 本行此刻是否"正在唱"：区间是 `[start, 下一句开始)`。
-                    //
-                    // 上一句一直保持高亮到下一句接管为止 —— 走完后亮光停在整行全亮，
-                    // 不会提前变暗。切句动画在**下一句开始之后**才起跑（滚动跟随
-                    // 不再提前 250ms），所以顺序是：先切换高亮（上一句归还强调色、
-                    // 下一句亮起），再播滚动动画把下一句带进来。
-                    let position = root.lyrics_position_seconds;
-                    let reveal = if line.is_active_at(position, next_start) {
-                        match line.chars_revealed(position) {
-                            Some((done, _total)) => LyricReveal::Partial { done },
-                            // 普通 LRC（没有逐字轴）：整行直接算已亮。
-                            None => LyricReveal::All,
-                        }
-                    } else {
-                        LyricReveal::None
-                    };
-                    div()
-                        .w_full()
-                        // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
-                        // 会被折行文本吃掉，折成两行时间距就变成 0。
-                        // 上下各 16，相邻两句之间正好 32；单句总高仍是 64。
-                        .py(px(LYRIC_ROW_GAP / 2.0))
-                        // 这里不能加 `flex`：flex 容器给子元素的可用宽度是 MaxContent，
-                        // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
-                        .text_size(theme::Text::Large.size())
-                        .line_height(px(LYRIC_LINE_HEIGHT))
-                        .child(highlighted_line(
-                            &line.text,
-                            reveal,
-                            theme::lyric_dim(),
-                            theme::accent(),
-                        ))
-                        .into_any_element()
-                }))
+                .children(culled_children)
                 .into_any_element(),
         )
     };

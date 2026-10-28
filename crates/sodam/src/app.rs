@@ -293,6 +293,12 @@ pub struct Root {
     pub lyrics_user_scroll_until: Option<std::time::Instant>,
     /// 等待下一帧补做的歌词对齐（布局未就绪时记下目标句）。
     pub(crate) pending_lyrics_scroll: Option<usize>,
+    /// 换歌词后还要等几帧才允许按视口裁剪。
+    ///
+    /// `bounds_for_item` 反映的是**上一次布局**的结果。刚换歌时它仍是上一首的行高，
+    /// 拿去算占位高度会让滚动几何错位（表现为跳一下）。所以换词后先全量渲染几帧，
+    /// 等新布局落定再开始裁剪。
+    pub(crate) lyrics_layout_settle: u8,
     /// 歌词滚动的过渡动画：`(起点偏移, 终点偏移, 开始时刻)`。
     ///
     /// 直接 `set_offset` 会让整块歌词在换句瞬间瞬移，即便只是挪一行的高度，
@@ -579,6 +585,7 @@ impl Root {
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
+            lyrics_layout_settle: 0,
             lyrics_scroll_tween: None,
             lyrics_scroll_tween_index: None,
             lyrics_request_seq: 0,
@@ -795,6 +802,7 @@ impl Root {
             root.queue.replace(vec![demo_track], 0);
             root.queue_origin = QueueOrigin::None;
             root.lyrics = Arc::new(demo);
+            root.lyrics_layout_settle = 2;
             root.lyrics_position_seconds = position;
             root.lyrics_demo_position = Some(position);
             root.lyrics_active = root
@@ -1496,6 +1504,8 @@ impl Render for Root {
             );
         }
         theme::set_ambient_rgb(ambient_color);
+        // 换歌词后的过渡帧递减（见 `lyrics_layout_settle`）。
+        self.lyrics_layout_settle = self.lyrics_layout_settle.saturating_sub(1);
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
         self.flush_pending_lyrics_scroll();
         // 歌词滚动过渡进行中：用**帧回调**驱动下一帧，而不是等背景 timer。
