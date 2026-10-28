@@ -293,6 +293,15 @@ pub struct Root {
     pub lyrics_user_scroll_until: Option<std::time::Instant>,
     /// 等待下一帧补做的歌词对齐（布局未就绪时记下目标句）。
     pub(crate) pending_lyrics_scroll: Option<usize>,
+    /// 歌词滚动的过渡动画：`(起点偏移, 终点偏移, 开始时刻)`。
+    ///
+    /// 直接 `set_offset` 会让整块歌词在换句瞬间瞬移，即便只是挪一行的高度，
+    /// 肉眼也会觉得"跳"。这里改成在 ticker 的每一帧里按缓出曲线插值，
+    /// 让换句像"滑上去"而不是"闪过去"（官方 CSS 是 `transition: transform .4s ease-out`）。
+    pub(crate) lyrics_scroll_tween: Option<(f32, f32, std::time::Instant, std::time::Duration)>,
+    /// 当前过渡动画的目标句。用来判断"目标句有没有变"，
+    /// 避免每帧重算目标（`bounds_for_item` 含滚动偏移，滚动中每帧都在变）。
+    pub(crate) lyrics_scroll_tween_index: Option<usize>,
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
     pub search_field: TextField,
@@ -570,6 +579,8 @@ impl Root {
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
+            lyrics_scroll_tween: None,
+            lyrics_scroll_tween_index: None,
             lyrics_request_seq: 0,
             search_field: TextField::default(),
             search_drag_by_word: false,
@@ -744,21 +755,32 @@ impl Root {
                 start_seconds: start,
                 end_seconds: start + duration,
                 text: text.to_string(),
-                // 每个字均分这段时长的 60%。真实歌词里词时长之和常短于行时长
-                // （实测 `I wanna talk it out oh mama` 短 0.28s），所以样张也留出
-                // 行尾空档，用于回归「空档里亮光仍在推进」（#80）。
-                words: text
-                    .chars()
-                    .enumerate()
-                    .map(|(index, ch)| {
-                        let span = duration * 0.6 / text.chars().count() as f64;
-                        sodam_core::models::LyricWord {
-                            start_seconds: start + span * index as f64,
-                            end_seconds: start + span * (index + 1) as f64,
+                // 前 70% 的字只占 40% 时长，最后 30% 的字占 60% 时长。
+                //
+                // 真实歌词里每字的演唱时长差异很大（拖长音 vs 快词）。这样构造能
+                // 回归两件事：末字不能"唰"一下掠过（按字推进才对），以及末字
+                // 恰好走到行结束。
+                words: {
+                    let chars: Vec<char> = text.chars().collect();
+                    let split = (chars.len() * 7 / 10).max(1);
+                    let mut words = Vec::with_capacity(chars.len());
+                    let mut at = start;
+                    for (index, ch) in chars.iter().enumerate() {
+                        let share = if index < split {
+                            0.4 / split as f64
+                        } else {
+                            0.6 / (chars.len() - split).max(1) as f64
+                        };
+                        let span = duration * share;
+                        words.push(sodam_core::models::LyricWord {
+                            start_seconds: at,
+                            end_seconds: at + span,
                             text: ch.to_string(),
-                        }
-                    })
-                    .collect(),
+                        });
+                        at += span;
+                    }
+                    words
+                },
                 has_word_timeline: true,
             })
             .collect::<Vec<_>>();
@@ -1476,6 +1498,18 @@ impl Render for Root {
         theme::set_ambient_rgb(ambient_color);
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
         self.flush_pending_lyrics_scroll();
+        // 歌词滚动过渡进行中：用**帧回调**驱动下一帧，而不是等背景 timer。
+        //
+        // `background_executor().timer(16ms)` 不是帧同步的：Windows 默认计时器精度
+        // 约 15.6ms，再叠上调度延迟，实际可能只有 30fps 且间隔不匀 —— 观感就是
+        // "滑得一顿一顿"。`request_animation_frame` 对齐平台的刷新节奏，
+        // 才是真正的逐帧动画。
+        if self.lyrics_scroll_animating() {
+            // 每帧推进一次插值，再请求下一帧（帧回调天然与 VSync 对齐）。
+            if self.advance_lyrics_scroll_tween() {
+                window.request_animation_frame();
+            }
+        }
         if self.nav == Nav::Lyrics {
             let position = if let Some(demo) = self.lyrics_demo_position {
                 demo
@@ -1526,6 +1560,10 @@ impl Render for Root {
                 .lyrics_user_scroll_until
                 .is_some_and(|until| std::time::Instant::now() < until);
             // 滚动比高亮早 250ms：下一句提前进入视野，避免"刚唱到就看它跳上来"。
+            //
+            // 注意这里的 `position` 是**外推后**的值（见上），可能最多超前
+            // `LYRIC_LOOKAHEAD_SECONDS`。滚动以它为基准没关系——滚动本来就要提前；
+            // 但高亮不能，否则行尾会提前走满再干等切换，看起来像"跳"。
             let scroll_target = self
                 .lyrics
                 .iter()

@@ -223,7 +223,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     };
 
     let liked = root.liked_ids.contains(&track.id);
-    let active = root.lyrics_active;
     let lines = root.lyrics.clone();
     // 歌词区高度：滚到中间要给首尾句留出半个视口的空白，所以先算出来。
     let lyrics_viewport_height =
@@ -250,10 +249,19 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 .on_scroll_wheel(cx.listener(|root, _event, _window, cx| {
                     root.lyrics_user_scroll_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                    // 用户已经自己滚了，过渡动画必须让位，否则会和手动滚动打架。
+                    root.cancel_lyrics_scroll_tween();
                     cx.notify();
                 }))
                 .children(lines.iter().enumerate().map(|(index, line)| {
-                    let is_active = active == Some(index);
+                    let next_start = lines.get(index + 1).map(|next| next.start_seconds);
+                    // 是否"正在唱"由本行自己的区间决定（`[start, 下一句开始)`），
+                    // 而不是靠外部下标的相等判断。
+                    //
+                    // 这样上一句会一直保持高亮直到下一句接管：走完之后亮光停在
+                    // 整行全亮，切句时是"旧的整句亮着 -> 新的整句接上"，
+                    // 中间不会出现整屏都暗一下的空档。
+                    let is_active = line.is_active_at(root.lyrics_position_seconds, next_start);
                     // 全程只有两种颜色：`lyric_dim` 未点亮、`accent` 已唱到。
                     // 非当前行、当前行还没唱到的部分、以及已唱过的行都共用一个颜色，
                     // 所以"当前句未走字"与非高亮句的视觉重量完全相同（官方也是这个模型）。

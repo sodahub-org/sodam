@@ -301,12 +301,20 @@ impl Root {
                     if root.lyrics_demo_position.is_some() {
                         return std::time::Duration::from_millis(16);
                     }
+                    // 滚动过渡进行中：让 timer 退到空闲档，动画交给
+                    // `request_animation_frame` 驱动（见 `Root::render`）。
+                    //
+                    // 两个驱动源同时推进会造成重复推进、间隔不匀，反而更不平滑。
+                    // 帧回调是与平台刷新对齐的，timer 只是兜底。
+                    if root.lyrics_scroll_animating() {
+                        return std::time::Duration::from_millis(120);
+                    }
                     let snapshot = root.engine.snapshot();
                     if !snapshot.playing {
                         return std::time::Duration::from_millis(120);
                     }
-                    // 有当前行就要高频重绘：现在普通 LRC 也是按行内时间平滑扫描，
-                    // 不再是「整行突然点亮」，200ms 的主心跳撑不起这个推进。
+                    // 有当前行就要高频重绘：逐字推进需要足够的帧率，
+                    // 200ms 的主心跳撑不起亮光连续地走。
                     if root.lyrics_active.is_some() {
                         std::time::Duration::from_millis(16)
                     } else {
@@ -314,9 +322,13 @@ impl Root {
                     }
                 })
                 .unwrap_or(std::time::Duration::from_millis(120));
-            if interval == std::time::Duration::from_millis(16) {
-                let _ = this.update(cx, |_root, cx| cx.notify());
-            }
+            let _ = this.update(cx, |_root, cx| {
+                // 滚动过渡不在这里推进：它跑在 `Root::render` 的帧回调里，
+                // 那里与平台刷新同步。这里只负责常规的逐字高亮重绘。
+                if interval == std::time::Duration::from_millis(16) {
+                    cx.notify();
+                }
+            });
             cx.background_executor().timer(interval).await;
         })
         .detach();
@@ -1349,27 +1361,107 @@ impl Root {
         self.playback_error = None;
     }
 
-    /// 把歌词列表滚到第 `index` 句。
+    /// 歌词滚动过渡的时长范围与换算。
     ///
-    /// 沿用之前的定位：当前句顶部落在视口顶部往下 80px 处（`offsetTop - 80`），
+    /// 固定时长在两种场景下都不对：换一句只挪 64px，280ms 会显得慢吞吞；
+    /// 拖动进度条可能跨越几十句、好几千像素，同样 280ms 就变成"唰"一下闪过。
+    /// 所以按距离伸缩，并夹在上下限之间。
+    const LYRICS_SCROLL_MIN_MS: f32 = 180.0;
+    const LYRICS_SCROLL_MAX_MS: f32 = 420.0;
+    /// 每移动这么多像素就多给 1ms，其余由上下限约束。
+    const LYRICS_SCROLL_MS_PER_PIXEL: f32 = 0.55;
+
+    /// 按滚动距离算出这次过渡该用多久。
+    fn lyrics_scroll_duration(distance: f32) -> std::time::Duration {
+        let ms = (distance.abs() * Self::LYRICS_SCROLL_MS_PER_PIXEL)
+            .clamp(Self::LYRICS_SCROLL_MIN_MS, Self::LYRICS_SCROLL_MAX_MS);
+        std::time::Duration::from_secs_f32(ms / 1000.0)
+    }
+
+    /// 计算「让第 `index` 句停在视口顶部 + 80px」所需的滚动偏移。
+    fn lyrics_scroll_target(&self, index: usize) -> Option<f32> {
+        const LYRIC_TOP_INSET: f32 = 80.0;
+        let bounds = self.lyrics_scroll.bounds_for_item(index)?;
+        let viewport_top = self.lyrics_scroll.bounds().top();
+        // offset 为负表示内容上移，所以取「该句顶部 - 视口顶 - 80」的相反数。
+        let distance = bounds.top() - viewport_top - gpui::px(LYRIC_TOP_INSET);
+        Some(-f32::from(distance))
+    }
+
+    /// 把歌词滚到指定句，**走过渡动画**。
+    ///
+    /// 定位沿用之前的行为：当前句顶部落在视口顶部往下 80px 处（`offsetTop - 80`），
     /// 不做垂直居中。列表顶部留了半屏空白，所以首句也能停在这个位置。
     ///
     /// 布局还没就绪时（切歌、拖动进度后的第一帧）记下目标句，由下一帧的
     /// `flush_pending_lyrics_scroll` 补上，避免歌词停在上一首的位置。
+    ///
+    /// 换句时整块歌词瞬移会显得很硬（即便只挪一行的高度），这里改成记下
+    /// 起终点，由 [`Self::advance_lyrics_scroll_tween`] 在每帧里插值。
     pub(crate) fn scroll_lyrics_to(&mut self, index: usize) {
-        const LYRIC_TOP_INSET: f32 = 80.0;
-        let Some(bounds) = self.lyrics_scroll.bounds_for_item(index) else {
+        // 动画进行中且**目标句没变**：直接返回，绝不能在动画途中重算目标。
+        //
+        // 这是"不丝滑"的根因。`bounds_for_item` 返回的是含滚动偏移的窗口坐标
+        // （`layout_bounds` 内部会加 `element_offset()`），滚动过程中它每帧都在变。
+        // 若每帧重算 target，就会一路追着"此刻追到哪"去改目标，
+        // 形成一个正反馈：动画自己把自己的终点往后推，于是永远收不了尾，
+        // 看起来像卡顿、或者最后一段突然刹住。
+        //
+        // 正确做法：目标句确定后就把目标**冻结**下来，等动画跑完再接受新目标。
+        if let Some((_, _, _, _)) = self.lyrics_scroll_tween {
+            if self.lyrics_scroll_tween_index == Some(index) {
+                return;
+            }
+        }
+        let Some(target) = self.lyrics_scroll_target(index) else {
             self.pending_lyrics_scroll = Some(index);
             return;
         };
         self.pending_lyrics_scroll = None;
-        let viewport_top = self.lyrics_scroll.bounds().top();
-        // 目标：让该句顶部落在视口顶部 + 80。
-        // offset 为负表示内容上移，所以直接取「该句顶部 - 视口顶 - 80」的相反数。
-        let distance = bounds.top() - viewport_top - gpui::px(LYRIC_TOP_INSET);
+        let current = f32::from(self.lyrics_scroll.offset().y);
+        // 已经在目标位置（比如暂停时重复调用）：清掉动画即可。
+        if (target - current).abs() < 0.5 {
+            self.lyrics_scroll_tween = None;
+            self.lyrics_scroll_tween_index = None;
+            return;
+        }
+        // 起点取**当前实际偏移**而不是上一次的终点：中途换目标时能接得上，不会回弹。
+        let duration = Self::lyrics_scroll_duration(target - current);
+        self.lyrics_scroll_tween = Some((current, target, std::time::Instant::now(), duration));
+        self.lyrics_scroll_tween_index = Some(index);
+    }
+
+    /// 推进歌词滚动的过渡动画；返回是否还需要下一帧。
+    ///
+    /// 缓动见 [`lyrics_scroll_ease`]（CSS `ease-out`）。
+    pub(crate) fn advance_lyrics_scroll_tween(&mut self) -> bool {
+        let Some((from, to, started, duration)) = self.lyrics_scroll_tween else {
+            return false;
+        };
+        let elapsed = started.elapsed();
+        let progress = (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0);
+        let eased = lyrics_scroll_ease(progress);
         let mut offset = self.lyrics_scroll.offset();
-        offset.y = -distance;
+        offset.y = gpui::px(from + (to - from) * eased);
         self.lyrics_scroll.set_offset(offset);
+        if progress >= 1.0 {
+            self.lyrics_scroll_tween = None;
+            self.lyrics_scroll_tween_index = None;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// 中断进行中的歌词滚动动画（用户手动滚轮时调用）。
+    pub(crate) fn cancel_lyrics_scroll_tween(&mut self) {
+        self.lyrics_scroll_tween = None;
+        self.lyrics_scroll_tween_index = None;
+    }
+
+    /// 歌词滚动是否还在过渡中。
+    pub(crate) fn lyrics_scroll_animating(&self) -> bool {
+        self.lyrics_scroll_tween.is_some()
     }
 
     /// 补做上一帧没能完成的歌词对齐。
@@ -3094,5 +3186,96 @@ mod playback_budget_tests {
         let shown = Language::Chinese.text("连续 3 首没播出来，已暂停");
         let hits = shown.contains(&PLAY_FAILURE_HALT_AFTER.to_string());
         assert!(hits, "{shown}");
+    }
+}
+
+/// 歌词滚动的缓出曲线：`1 - (1-t)^3`。
+///
+/// 起步快、收尾慢，符合"滑到位置"的观感，与官方 `transition: ... ease-out` 一致。
+/// 单独抽出来是为了能脱离窗口环境测试（其余滚动逻辑都要 `ScrollHandle`）。
+fn lyrics_scroll_ease(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    // 三次贝塞尔近似 `cubic-bezier(0, 0, 0.58, 1)`（即 CSS 的 ease-out）。
+    //
+    // 之前用的 `1-(1-t)^3` 首帧就吃掉 17.6% 的位移，峰均比 2.82 ——
+    // 起步那一下太猛，肉眼像"弹"过去而不是"滑"过去。
+    // 这条曲线首帧 10.2%、峰均比 1.63，加速度更平缓，也正好是 CSS ease-out。
+    cubic_bezier_ease_out(progress)
+}
+
+/// `cubic-bezier(0, 0, 0.58, 1)` 在给定 x 上的 y 值。
+///
+/// 贝塞尔参数方程里 x 和 y 都由同一个 t 表达，给定 x 求 y 需要先解出 t。
+/// 用二分即可：曲线在两个方向上都是单调的，20 次迭代精度远高于一像素。
+fn cubic_bezier_ease_out(x: f32) -> f32 {
+    const P1X: f32 = 0.0;
+    const P1Y: f32 = 0.0;
+    const P2X: f32 = 0.58;
+    const P2Y: f32 = 1.0;
+
+    let bezier = |t: f32, p1: f32, p2: f32| {
+        let u = 1.0 - t;
+        3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t
+    };
+
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..20 {
+        let mid = (lo + hi) * 0.5;
+        if bezier(mid, P1X, P2X) < x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    bezier((lo + hi) * 0.5, P1Y, P2Y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lyrics_scroll_ease;
+
+    #[test]
+    fn ease_starts_at_zero_and_ends_at_one() {
+        assert!((lyrics_scroll_ease(0.0) - 0.0).abs() < 1e-6);
+        assert!((lyrics_scroll_ease(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// 缓出：前半程走完一半以上，收尾变慢。
+    #[test]
+    fn ease_front_loads_the_motion() {
+        assert!(
+            lyrics_scroll_ease(0.5) > 0.5,
+            "0.5 处应已过半，实际 {}",
+            lyrics_scroll_ease(0.5)
+        );
+    }
+
+    /// 起步不能太猛：首帧位移占比过高会让动画看起来像"弹"过去。
+    ///
+    /// 旧的 `1-(1-t)^3` 在 60fps / 17 帧下首帧就吃掉 17.6%（峰均比 2.82），
+    /// 这是"不够丝滑"的直接观感来源之一。
+    #[test]
+    fn ease_does_not_jump_on_the_first_frame() {
+        const FRAMES: usize = 17;
+        let first = lyrics_scroll_ease(1.0 / FRAMES as f32);
+        assert!(first < 0.13, "首帧位移占比 {} 过大，会显得像弹出", first);
+    }
+
+    /// 全程单调递增，不能回弹（回弹会看到歌词"抽一下"）。
+    #[test]
+    fn ease_is_monotonic() {
+        let mut prev = -1.0;
+        for i in 0..=100 {
+            let value = lyrics_scroll_ease(i as f32 / 100.0);
+            assert!(value >= prev, "t={} 处倒退：{} -> {}", i, prev, value);
+            prev = value;
+        }
+    }
+
+    /// 越界输入要夹住，避免进度算飞导致歌词滚出可视区。
+    #[test]
+    fn ease_clamps_out_of_range_input() {
+        assert!((lyrics_scroll_ease(-0.5) - 0.0).abs() < 1e-6);
+        assert!((lyrics_scroll_ease(2.0) - 1.0).abs() < 1e-6);
     }
 }
