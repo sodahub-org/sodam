@@ -111,8 +111,6 @@ fn highlighted_line(
     let base: gpui::Hsla = base.into();
     let lit: gpui::Hsla = lit.into();
     let shared: gpui::SharedString = text.to_string().into();
-    // paint 阶段也要取字符（算末字形宽度），这里留一份 owned 副本。
-    let paint_text: gpui::SharedString = shared.clone();
 
     let overlay = gpui::canvas(
         move |bounds, window, _cx| {
@@ -144,11 +142,9 @@ fn highlighted_line(
                 .ok()
                 .map(|lines| lines.into_iter().collect::<Vec<_>>())
                 .unwrap_or_default();
-            // 把字体 id / 字号一并带出来：计算末字形宽度要用文字系统的 advance。
-            let font_id = window.text_system().resolve_font(&style.font());
-            (lines, line_height, font_size, font_id)
+            (lines, line_height)
         },
-        move |bounds, (lines, line_height, font_size, font_id), window, cx| {
+        move |bounds, (lines, line_height), window, cx| {
             // 已唱到的宽度按**像素**算，不对齐字符边界 —— 这是字内过渡的全部来源。
             let origin_x = bounds.origin.x;
 
@@ -198,26 +194,33 @@ fn highlighted_line(
                     .last()
                     .map(|glyph| f32::from(glyph.position.x))
                     .unwrap_or(0.0);
-                // 末字形没有"下一个字形"，宽度要单独取：用文字系统给的真实步进。
+                // 末字形没有"下一个字形"，它的宽度得单独估。
                 //
                 // 这个宽度有两个用途，缺了任何一个都会让**最后一个字永远不亮**：
                 //   1. 末字的字内插值（否则推进恒为 0，亮光卡在末字左边界）；
                 //   2. 末行总宽（`content_right` 若只取末字左边界，裁剪区域就
                 //      不包含末字本身，末字被裁掉）。
-                let last_advance = base_line
-                    .runs()
-                    .iter()
-                    .flat_map(|run| run.glyphs.iter())
-                    .last()
-                    .and_then(|glyph| paint_text.chars().nth(glyph.index))
-                    .and_then(|last_char| {
-                        window
-                            .text_system()
-                            .advance(font_id, font_size, last_char)
-                            .ok()
-                            .map(|size| f32::from(size.width))
-                    })
-                    .unwrap_or(0.0);
+                //
+                // 不能用 `text_system().advance(font_id, ..)` 查：`font_id` 是主字体，
+                // 而中日韩字符往往由 **fallback 字体**渲染，主字体查不到对应字形，
+                // `advance` 直接失败返回 0 —— 末字就又回到"永远不亮"。
+                // 这里改用与末字形**同一 run** 里前一个字形的间距：同一 run 意味着
+                // 同一个实际字体，间距才是对的。只有一个字形时退化成整行宽度。
+                let last_advance = {
+                    let glyphs: Vec<&gpui::ShapedGlyph> =
+                        runs.iter().flat_map(|run| run.glyphs.iter()).collect();
+                    match glyphs.len() {
+                        0 => 0.0,
+                        1 => f32::from(base_line.width()),
+                        _ => {
+                            let last = glyphs[glyphs.len() - 1];
+                            let prev = glyphs[glyphs.len() - 2];
+                            let gap = f32::from(last.position.x) - f32::from(prev.position.x);
+                            // 同一字体里中文等宽、西文差异不大；用一个正的间距兜底。
+                            gap.max(0.0)
+                        }
+                    }
+                };
 
                 // 末行右端 = 末字形左边界 + 末字形宽度。
                 //
