@@ -979,8 +979,6 @@ impl Root {
                 match result {
                     Ok(raw) => {
                         root.lyrics = Arc::new(raw);
-                        // 换词后先全量渲染几帧，等新布局落定再启用视口裁剪。
-                        root.lyrics_layout_settle = 2;
                         root.lyrics_active = None;
                         // 新歌词到位后立刻对齐到当前播放位置，不等下一帧进度回调；
                         // 布局还没就绪时由 pending 标记在下一帧补做。
@@ -1000,7 +998,6 @@ impl Root {
                     }
                     Err(err) => {
                         root.lyrics = Arc::new(Vec::new());
-                        root.lyrics_layout_settle = 2;
                         root.lyrics_active = None;
                         root.log_failure("读取歌词失败", &err);
                         root.lyrics_error = Some(root.tr(REMOTE_TEXT).to_string());
