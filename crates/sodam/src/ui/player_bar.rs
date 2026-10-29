@@ -411,9 +411,12 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
     // 降档：实际档位低于所选档位。每次现算——用户改了意图，旧结论就不该继续成立。
-    // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档。
-    let downgraded =
-        sodam_core::quality::is_downgraded(&root.settings.quality_intent(), snapshot.quality_rank);
+    // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档；两边显示名相同时也不徽章，
+    // 避免出现「降档·流畅」这种看起来没降的提示。
+    let downgraded = sodam_core::quality::is_visible_downgrade(
+        &root.settings.quality_intent(),
+        snapshot.quality_rank,
+    );
     let title_link_track = track.as_ref().cloned();
     let artist_link_track = track.as_ref().cloned();
     let volume = root.settings.volume;
@@ -1163,4 +1166,27 @@ fn queue_drawer_inner(
                 .with_priority(2),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::localized_quality;
+    use crate::ui::i18n::Language;
+
+    #[test]
+    fn localized_quality_translates_current_and_legacy_low_labels() {
+        assert_eq!(
+            localized_quality("流畅 128k".into(), Language::English),
+            "Low 128k"
+        );
+        // 旧缓存 sidecar 里仍有「标准」；它属于 50 分档，不能翻成 Standard。
+        assert_eq!(
+            localized_quality("标准 128k".into(), Language::English),
+            "Low 128k"
+        );
+        assert_eq!(
+            localized_quality("流畅 128k".into(), Language::Chinese),
+            "流畅 128k"
+        );
+    }
 }

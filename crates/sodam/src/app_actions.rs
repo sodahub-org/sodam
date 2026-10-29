@@ -2936,6 +2936,8 @@ impl Root {
                         // 降档：实际低于所选时如实说出两边，不猜原因——取流那一段在
                         // 「账号没有权益」与「这首没有该档位」下返回值相同，没有字段能分开。
                         // 实际档位标签由核心层按中文档位名生成，英文界面要过一遍翻译。
+                        // 两边显示名相同时（所选流畅、实际更低分仍是流畅）不提示，避免
+                        // 「所选 流畅，实际 流畅」这种读反的句子。
                         // 走全局提示而不是 `status`：后者没有渲染（见 #40）。
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
@@ -2948,7 +2950,7 @@ impl Root {
                         {
                             root.spawn_background_cache_upgrade(track.clone(), intent.clone(), cx);
                         }
-                        if sodam_core::quality::is_downgraded(&intent, actual_rank) {
+                        if sodam_core::quality::is_visible_downgrade(&intent, actual_rank) {
                             let message = root.localized(
                                 "已降档：所选 {}，实际 {}",
                                 &[

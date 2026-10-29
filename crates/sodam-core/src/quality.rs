@@ -80,10 +80,15 @@ pub enum QualityIntent {
 
 impl QualityIntent {
     /// 从配置里的原始字符串解析。空串 / 空白 / `auto` / `best` → 自动。
+    ///
+    /// libresoda 把 `standard` 当作 70 分档（与 `medium` 同档），这里归一成 `medium`：
+    /// 否则设置页选不中任何一行，状态行还会把原始 token 当显示名。
     pub fn parse(raw: &str) -> Self {
         let value = raw.trim().to_ascii_lowercase();
         if value.is_empty() || value == AUTO || value == "best" {
             Self::Auto
+        } else if value == "standard" {
+            Self::Tier("medium".to_string())
         } else {
             Self::Tier(value)
         }
@@ -132,7 +137,7 @@ impl QualityIntent {
             Self::Tier(tier) => match tier.as_str() {
                 "lossless" => Some("无损"),
                 "highest" => Some("极高"),
-                "medium" => Some("较高"),
+                "medium" | "standard" => Some("较高"),
                 "low" => Some("流畅"),
                 _ => None,
             },
@@ -149,6 +154,25 @@ pub fn is_downgraded(intent: &QualityIntent, actual: Option<i64>) -> bool {
         return false;
     };
     actual < max
+}
+
+/// 是否值得向用户显示降档提示。
+///
+/// 分数确实降了、但实际档位与所选档位落在同一个显示名时（例如所选「流畅」50、
+/// 实际 10/20 也显示「流畅」），照实说只会得到「所选 流畅，实际 流畅」。
+/// 这种提示读起来像没降档，干脆不显示；判定本身仍由 [`is_downgraded`] 负责，
+/// 不改变缓存升级等内部决策。
+pub fn is_visible_downgrade(intent: &QualityIntent, actual: Option<i64>) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    if !is_downgraded(intent, Some(actual)) {
+        return false;
+    }
+    match intent.label_key() {
+        Some(selected) => selected != tier_label(actual),
+        None => true,
+    }
 }
 
 /// 获取音质意图在给定账号 VIP 状态下的目标档位分数。
@@ -302,6 +326,24 @@ mod tests {
         assert_eq!(tier_label(50), "流畅");
         assert_eq!(tier_label(70), "较高");
         assert_ne!(tier_label(50), "标准");
+        assert_eq!(
+            QualityIntent::parse("standard"),
+            QualityIntent::Tier("medium".into()),
+            "standard 与 medium 同属 70 分档，必须归一到同一行"
+        );
+        assert_eq!(QualityIntent::parse("standard").label_key(), Some("较高"));
+    }
+
+    /// 同名的「降档」不该提示：所选流畅、实际更低分也显示流畅时，句子会自相矛盾。
+    #[test]
+    fn visible_downgrade_requires_a_different_display_name() {
+        let low = QualityIntent::parse("low");
+        let medium = QualityIntent::parse("medium");
+        assert!(!is_visible_downgrade(&low, Some(50)));
+        assert!(!is_visible_downgrade(&low, Some(20)));
+        assert!(!is_visible_downgrade(&low, Some(10)));
+        assert!(is_visible_downgrade(&medium, Some(50)));
+        assert!(is_downgraded(&low, Some(20)), "内部降档判定保持不变");
     }
 
     /// 显示名与降档判定必须同源：真实流样本上，徽章写的档位就是判定用的那一档。

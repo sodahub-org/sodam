@@ -309,7 +309,6 @@ impl Language {
             "极高" => "High",
             "较高" => "Medium",
             "流畅" => "Low",
-            "省流" => "Data saver",
             "省流（≈128k）" => "Data saver (≈128k)",
             "缓存" => "Cache",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
@@ -902,6 +901,8 @@ mod tests {
                 key
             );
         }
+        // hint_key 返回动态字符串，静态扫描器看不见，这里单独兜住。
+        assert!(Language::english_text("省流（≈128k）").is_some());
     }
 
     /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。
