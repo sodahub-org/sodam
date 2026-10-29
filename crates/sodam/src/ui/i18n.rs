@@ -218,17 +218,24 @@ impl Language {
                 "Language pinned; switch anytime"
             }
             "扫码登录" => "QR Login",
-            "封顶无损；单曲没有无损时自动降到下一档" => {
-                "Up to lossless; downgrades automatically"
+            "优先 Hi-Res 无损；没有可用档位时由服务端回退" => {
+                "Prefer Hi-Res lossless; the service falls back when unavailable"
             }
-            "封顶 Hi-Res 无损；没有时自动降到下一档" => {
-                "Up to Hi-Res lossless; downgrades automatically"
+            "优先无损；没有可用无损时由服务端回退" => {
+                "Prefer lossless; the service falls back when unavailable"
             }
-            "封顶杜比全景声；没有时自动降到下一档" => {
-                "Up to Dolby Atmos; downgrades automatically"
+            "优先杜比全景声；没有可用档位时由服务端回退" => {
+                "Prefer Dolby Atmos; the service falls back when unavailable"
             }
-            "封顶极高（≈320k）" => "Up to high (≈320k)",
-            "封顶较高" => "Up to medium",
+            "优先极高（≈320k）；没有可用档位时由服务端回退" => {
+                "Prefer high (≈320k); the service falls back when unavailable"
+            }
+            "优先较高；没有可用档位时由服务端回退" => {
+                "Prefer medium; the service falls back when unavailable"
+            }
+            "优先标准（≈128k）；没有可用档位时由服务端回退" => {
+                "Prefer standard (≈128k); the service falls back when unavailable"
+            }
             "正在准备推荐队列…" => "Preparing recommendations…",
             "正在准备播放…" => "Preparing playback…",
             "正在创建二维码…" => "Creating QR code…",
@@ -502,9 +509,9 @@ impl Language {
             "缓存升级完成：成功升级 {} 首，{} 首跳过或无更高档位" => {
                 "Cache upgrade complete: upgraded {} songs, {} skipped or no higher quality"
             }
-            "无损音质需 VIP 会员权限" => "Lossless quality requires VIP membership",
-            "无损音质需 VIP 会员权限，当前账号无法升级为无损" => {
-                "Lossless quality requires VIP membership; current account cannot upgrade to lossless"
+            "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
+            "「{}」音质需 VIP 会员权限，当前账号无法升级" => {
+                "\"{}\" quality requires VIP membership; current account cannot upgrade"
             }
             "诊断日志" => "Diagnostic Logs",
             "默认记录在本机，用于排查播放问题；「清空缓存」不会删除它们" => {
@@ -900,6 +907,8 @@ mod tests {
     /// 确保音质档位的显示名都有英文翻译，避免核心层新增档位后英文界面露出中文。
     #[test]
     fn quality_tier_labels_have_english_entries() {
+        use std::collections::BTreeSet;
+
         use sodam_core::quality::{tier_label, QualityIntent, TIERS, TIER_LABELS};
 
         let mut keys: Vec<&'static str> =
@@ -909,19 +918,26 @@ mod tests {
                 .iter()
                 .filter_map(|tier| QualityIntent::parse(tier).label_key()),
         );
-        keys.extend([110, 100, 90, 88, 80, 70, 65, 55, 50, 20, 10, 0].map(tier_label));
+
+        // 遍历完整分数区间，确保 `tier_label` 没有产出 `TIER_LABELS` 之外的档名；
+        // 同时把实际值域与清单对齐，新增档名时漏登记会在这里失败。
+        let mut seen = BTreeSet::new();
+        for rank in -10..=1000 {
+            let label = tier_label(rank);
+            assert!(
+                TIER_LABELS.contains(&label),
+                "tier_label({rank}) = {label} 未登记到 TIER_LABELS"
+            );
+            seen.insert(label);
+        }
+        let expected: BTreeSet<_> = TIER_LABELS.into_iter().collect();
+        assert_eq!(seen, expected, "TIER_LABELS 与 tier_label 的值域不一致");
+        keys.extend(TIER_LABELS);
 
         for key in keys {
             assert!(
                 Language::english_text(key).is_some(),
                 "英文词典缺少音质档位的翻译：{key}"
-            );
-        }
-        // 显示名清单与 `tier_label` 的取值域同步：漏一项，英文界面就会露出中文。
-        for label in TIER_LABELS {
-            assert!(
-                Language::english_text(label).is_some(),
-                "英文词典缺少音质显示名 {label}"
             );
         }
     }

@@ -510,27 +510,69 @@ fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyElement {
     // 档位与名称都从核心层派生（`TIERS` + `label_key`），这里只保留每档的说明文案：
     // 否则往 `TIERS` 加一档时，设置页会静默少一项。
+    // 档位是“上限”而不是“目标”：libresoda 在没有任何候选低于上限时，会回退成全部候选
+    //（实际可能比所选更高），所以这里说“优先 / 由服务端回退”，不承诺“只降一档”。
     let hint_key = |value: &str| -> &'static str {
         match value {
-            "hires" => "封顶 Hi-Res 无损；没有时自动降到下一档",
-            "lossless" => "封顶无损；单曲没有无损时自动降到下一档",
-            "dolby" => "封顶杜比全景声；没有时自动降到下一档",
-            "highest" => "封顶极高（≈320k）",
-            "medium" => "封顶较高",
-            "low" => "省流",
+            "hires" => "优先 Hi-Res 无损；没有可用档位时由服务端回退",
+            "lossless" => "优先无损；没有可用无损时由服务端回退",
+            "dolby" => "优先杜比全景声；没有可用档位时由服务端回退",
+            "highest" => "优先极高（≈320k）；没有可用档位时由服务端回退",
+            "medium" => "优先较高；没有可用档位时由服务端回退",
+            "low" => "优先标准（≈128k）；没有可用档位时由服务端回退",
             _ => "不设上限，按账号权益和单曲可用档位取最高",
         }
     };
+    let language = root.language;
+    let label_for = |value: &str| crate::ui::player_bar::quality_label(value, language);
     let options: Vec<(&str, String)> = std::iter::once(sodam_core::quality::AUTO)
         .chain(sodam_core::quality::TIERS)
-        .map(|value| {
-            let label = sodam_core::quality::QualityIntent::parse(value)
-                .label_key()
-                .map(|key| root.tr(key).to_string())
-                .unwrap_or_else(|| value.to_string());
-            (value, label)
+        .map(|value| (value, label_for(value)))
+        .collect();
+    // 批量升级同样从 `TIERS` 派生，避免播放档位能选、批量升级却少几档。
+    let batch_tiers: Vec<(&str, String)> = sodam_core::quality::TIERS
+        .into_iter()
+        .map(|tier| (tier, label_for(tier)))
+        .collect();
+    // 先建行再交给 `children`：在 `children(map(...))` 里直接展开会让 rustfmt 反复改缩进。
+    let batch_tier_rows: Vec<AnyElement> = batch_tiers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (tier, label))| {
+            let is_selected = root.batch_upgrade_target
+                == sodam_core::quality::QualityIntent::Tier(tier.to_string());
+            div()
+                .id(("batch-upgrade-tier", index))
+                .h(px(theme::size::CONTROL_SM))
+                .px(px(theme::space::MD))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::radius::ROW))
+                .bg(if is_selected {
+                    theme::surface_selected()
+                } else {
+                    theme::surface_elevated()
+                })
+                .hover(|style| style.bg(theme::surface_hover()))
+                .cursor_pointer()
+                .text_size(theme::Text::Small.size())
+                .child(label)
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    if !root.batch_upgrading {
+                        root.set_batch_upgrade_target(
+                            sodam_core::quality::QualityIntent::Tier(tier.to_string()),
+                            cx,
+                        );
+                    }
+                }))
+                .into_any_element()
         })
         .collect();
+    let batch_target = root.batch_upgrade_target.clone();
+    let batch_target_label = label_for(batch_target.as_setting());
+    let batch_upgrade_blocked_by_vip =
+        batch_target.requires_membership() && root.account.as_ref().is_some_and(|a| !a.vip);
     // 勾选的是**意图**；配置里的空串是历史写法，按「自动」显示。
     let current = root.settings.quality_intent().as_setting().to_string();
 
@@ -1058,59 +1100,18 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 ),
                         )
                         .child(
-                            div().flex().flex_wrap().gap(px(theme::space::SM)).children(
-                                [
-                                    ("lossless", root.tr("无损")),
-                                    ("highest", root.tr("极高")),
-                                    ("medium", root.tr("较高")),
-                                    ("low", root.tr("标准")),
-                                ]
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, (tier, label))| {
-                                    let is_selected = root.batch_upgrade_target
-                                        == sodam_core::quality::QualityIntent::Tier(
-                                            tier.to_string(),
-                                        );
-                                    div()
-                                        .id(("batch-upgrade-tier", index))
-                                        .h(px(theme::size::CONTROL_SM))
-                                        .px(px(theme::space::MD))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(theme::radius::ROW))
-                                        .bg(if is_selected {
-                                            theme::surface_selected()
-                                        } else {
-                                            theme::surface_elevated()
-                                        })
-                                        .hover(|style| style.bg(theme::surface_hover()))
-                                        .cursor_pointer()
-                                        .text_size(theme::Text::Small.size())
-                                        .child(label)
-                                        .on_click(cx.listener(
-                                            move |root, _event: &ClickEvent, _window, cx| {
-                                                if !root.batch_upgrading {
-                                                    root.set_batch_upgrade_target(
-                                                        sodam_core::quality::QualityIntent::Tier(
-                                                            tier.to_string(),
-                                                        ),
-                                                        cx,
-                                                    );
-                                                }
-                                            },
-                                        ))
-                                }),
-                            ),
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(theme::space::SM))
+                                .children(batch_tier_rows),
                         )
                         .child({
-                            let is_non_vip_lossless = root.batch_upgrade_target
-                                == sodam_core::quality::QualityIntent::Tier("lossless".into())
-                                && root.account.as_ref().is_some_and(|a| !a.vip);
-                            let estimate_text = if is_non_vip_lossless {
-                                root.tr("无损音质需 VIP 会员权限，当前账号无法升级为无损")
-                                    .to_string()
+                            let estimate_text = if batch_upgrade_blocked_by_vip {
+                                root.localized(
+                                    "「{}」音质需 VIP 会员权限，当前账号无法升级",
+                                    std::slice::from_ref(&batch_target_label),
+                                )
                             } else if root.batch_upgrading {
                                 root.localized(
                                     "正在升级 ({} / {})…",
@@ -1147,15 +1148,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .child(estimate_text)
                         })
                         .child({
-                            let is_non_vip_lossless = root.batch_upgrade_target
-                                == sodam_core::quality::QualityIntent::Tier("lossless".into())
-                                && root.account.as_ref().is_some_and(|a| !a.vip);
                             let upgradeable = root
                                 .batch_upgrade_estimate
                                 .as_ref()
                                 .map_or(0, |e| e.upgradeable_count);
-                            let can_upgrade =
-                                !root.batch_upgrading && !is_non_vip_lossless && upgradeable > 0;
+                            let can_upgrade = !root.batch_upgrading
+                                && !batch_upgrade_blocked_by_vip
+                                && upgradeable > 0;
                             let mut btn = div()
                                 .id("batch-upgrade")
                                 .flex()

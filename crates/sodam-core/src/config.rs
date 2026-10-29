@@ -21,7 +21,8 @@ pub struct Settings {
     pub device_id: String,
     pub iid: String,
     pub fp: String,
-    /// 音质偏好：只存**意图**——`auto` 或一个具体档位（`lossless` / `highest` / `medium` / `low`）。
+    /// 音质偏好：只存**意图**——`auto` 或一个具体档位
+    ///（`hires` / `lossless` / `dolby` / `highest` / `medium` / `low`）。
     ///
     /// 空串是历史写法，按 `auto` 读；新写入一律写 `auto`。实际拿到哪一档由服务端按
     /// 账号权益与曲目可用性决定，不落盘（见 [`crate::quality`]）。

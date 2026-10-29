@@ -70,7 +70,10 @@ pub const AUTO: &str = "auto";
 ///
 /// 新增档位时必须同时检查三处边界：[`TIERS`]、[`QualityIntent::label_key`] 与
 /// [`tier_label`]——菜单能选、会显示名字、实际档位能被正确命名，缺一处就会出现
-/// 「选中却看不到」或「显示同名却判降档」。
+/// 「选中却看不到」或「显示同名却判降档」。设置页的批量升级也直接派生自这里。
+///
+/// libresoda 的取流筛选认识这些 key；服务端是否真的下发 Hi-Res / 杜比标签仍取决于
+/// 账号权益与曲目可用性，候选不足时它会回退成全量候选（可能高于所选上限）。
 pub const TIERS: [&str; 6] = ["hires", "lossless", "dolby", "highest", "medium", "low"];
 
 /// 归一化后的音质意图。
@@ -78,18 +81,35 @@ pub const TIERS: [&str; 6] = ["hires", "lossless", "dolby", "highest", "medium",
 pub enum QualityIntent {
     /// 不设上限：由服务端按账号权益与曲目可用性收敛。
     Auto,
-    /// 一个具体档位（已小写化）；未知值也走这里，按原样保留。
+    /// 一个具体档位（已小写化并归一成菜单写法）；未知值也走这里，按原样保留。
     Tier(String),
 }
 
+/// 把 libresoda 认识的档位别名归一成菜单里的规范写法。
+///
+/// 别名只该影响“怎么读旧配置 / 环境变量”，不该影响菜单高亮或缓存文件身份：
+/// 否则 `hi-res` 与 `hires` 会显示同一个名字却不高亮同一行，还会各存一份缓存。
+fn canonical_tier(value: &str) -> &str {
+    match value {
+        "hi_res" | "hi-res" => "hires",
+        "flac" => "lossless",
+        "dolby_atmos" => "dolby",
+        "hq" | "high" => "highest",
+        "standard" | "320k" => "medium",
+        "128k" | "saver" => "low",
+        other => other,
+    }
+}
+
 impl QualityIntent {
-    /// 从配置里的原始字符串解析。空串 / 空白 / `auto` / `best` → 自动。
+    /// 从配置里的原始字符串解析。空串 / 空白 / `auto` / `best` → 自动；
+    /// 已知别名归一成菜单写法，未知档位按原样保留。
     pub fn parse(raw: &str) -> Self {
         let value = raw.trim().to_ascii_lowercase();
         if value.is_empty() || value == AUTO || value == "best" {
             Self::Auto
         } else {
-            Self::Tier(value)
+            Self::Tier(canonical_tier(&value).to_string())
         }
     }
 
@@ -124,6 +144,14 @@ impl QualityIntent {
     /// 这个意图允许的最高档位分数；`None` = 不设上限。
     pub fn max_rank(&self) -> Option<i64> {
         preference_rank(self.as_setting())
+    }
+
+    /// 该意图是否依赖账号会员权益（无损及更高、杜比全景声）。
+    ///
+    /// 仅用于批量升级这类会消耗流量的操作预检；单个播放档位仍允许用户选择，
+    /// 实际能不能拿到由服务端按账号权益与曲目可用性决定。
+    pub fn requires_membership(&self) -> bool {
+        self.max_rank().is_some_and(|rank| rank >= 88)
     }
 
     /// 档位的稳定中文名（i18n 的 key）；认不出的档位返回 `None`，由调用方原样显示。
@@ -368,15 +396,30 @@ mod tests {
         }
     }
 
+    /// `TIER_LABELS` 必须恰好是 `tier_label` 的输出集合；新增档名时漏登记会被这里抓住。
+    #[test]
+    fn tier_label_values_match_the_documented_label_set() {
+        use std::collections::BTreeSet;
+
+        let mut seen = BTreeSet::new();
+        for rank in -10..=1000 {
+            let label = tier_label(rank);
+            assert!(
+                TIER_LABELS.contains(&label),
+                "tier_label({rank}) = {label} 未登记到 TIER_LABELS"
+            );
+            seen.insert(label);
+        }
+        let expected: BTreeSet<_> = TIER_LABELS.into_iter().collect();
+        assert_eq!(seen, expected, "TIER_LABELS 与 tier_label 的值域不一致");
+    }
+
     /// 表驱动覆盖「所选 N、实际 M」：只要判了降档，两个显示名就不能同名。
     ///
     /// 这是 issue #85 的回归测试：旧实现里 88 和 80 都叫「极高」，
     /// 若把 `dolby` 加进菜单，选中 highest 拿到 88 就会显示同名却判降档。
     #[test]
     fn downgraded_pairs_never_share_a_display_name() {
-        // libresoda `quality_rank` / `preference_rank` 会产出的全部分数。
-        const RANKS: [i64; 12] = [110, 100, 90, 88, 80, 70, 65, 55, 50, 20, 10, 0];
-
         for tier in TIERS {
             let intent = QualityIntent::parse(tier);
             let selected_name = intent.label_key().expect("菜单档位必须有显示名");
@@ -385,7 +428,9 @@ mod tests {
             // 同分必须同名：徽章显示的就是菜单选的那一档。
             assert_eq!(tier_label(selected_rank), selected_name, "所选 {tier}");
 
-            for actual in RANKS {
+            // 遍历整个可能分数区间，而不是硬编码当前 libresoda 的 12 个返回值：
+            // 上游将来新增分数时，这里仍会覆盖到。
+            for actual in 0..=200 {
                 let downgraded = is_downgraded(&intent, Some(actual));
                 let actual_name = tier_label(actual);
                 assert!(
@@ -394,6 +439,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn aliases_normalize_to_menu_tiers() {
+        for (alias, canonical) in [
+            ("hi-res", "hires"),
+            ("hi_res", "hires"),
+            ("flac", "lossless"),
+            ("dolby_atmos", "dolby"),
+            ("hq", "highest"),
+            ("high", "highest"),
+            ("standard", "medium"),
+            ("320k", "medium"),
+            ("128k", "low"),
+            ("saver", "low"),
+        ] {
+            let intent = QualityIntent::parse(alias);
+            assert_eq!(
+                intent,
+                QualityIntent::Tier(canonical.to_string()),
+                "别名 {alias} 应归一为 {canonical}"
+            );
+            assert_eq!(intent.as_setting(), canonical, "别名 {alias} 的落盘写法");
+            assert_eq!(intent.cache_tag(), canonical, "别名 {alias} 的缓存 tag");
+        }
+    }
+
+    #[test]
+    fn membership_required_for_lossless_and_above() {
+        for (tier, expected) in [
+            ("hires", true),
+            ("lossless", true),
+            ("dolby", true),
+            ("highest", false),
+            ("medium", false),
+            ("low", false),
+        ] {
+            assert_eq!(
+                QualityIntent::parse(tier).requires_membership(),
+                expected,
+                "{tier}"
+            );
+        }
+        assert!(!QualityIntent::Auto.requires_membership());
+        assert!(!QualityIntent::parse("ultra").requires_membership());
     }
 
     /// 显示名与降档判定必须同源：真实流样本上，徽章写的档位就是判定用的那一档。

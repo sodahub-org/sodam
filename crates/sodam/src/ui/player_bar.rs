@@ -1167,3 +1167,50 @@ fn queue_drawer_inner(
             )
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::localized_quality;
+    use crate::ui::i18n::Language;
+
+    /// 徽章文本是“档位名 + 码率”的拼接，翻译必须只换档位名、保留码率。
+    #[test]
+    fn localized_quality_translates_every_tier_and_keeps_bitrate() {
+        let cases = [
+            ("无损 871k", "Lossless 871k"),
+            ("Hi-Res 无损 871k", "Hi-Res Lossless 871k"),
+            ("Hi-Res 320k", "Hi-Res 320k"),
+            ("杜比全景声 768k", "Dolby Atmos 768k"),
+            ("极高 320k", "High 320k"),
+            ("较高 256k", "Medium 256k"),
+            ("标准 128k", "Low 128k"),
+            ("省流 96k", "Data saver 96k"),
+            ("未知", "Unknown"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                localized_quality(raw.to_string(), Language::English),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn localized_quality_passes_chinese_through_unchanged() {
+        for raw in [
+            "无损 871k",
+            "Hi-Res 无损 871k",
+            "Hi-Res 320k",
+            "杜比全景声 768k",
+            "省流 96k",
+            "未知",
+        ] {
+            assert_eq!(
+                localized_quality(raw.to_string(), Language::Chinese),
+                raw,
+                "{raw}"
+            );
+        }
+    }
+}

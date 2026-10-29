@@ -132,7 +132,7 @@ pub struct CachedTrack {
 }
 
 impl CachedTrack {
-    /// 实际档位对应的显示名（如 "无损"、"极高"、"较高"、"标准"；未知返回 None）。
+    /// 实际档位对应的显示名（见 [`crate::quality::tier_label`]；档位未知返回 `None`）。
     pub fn actual_tier(&self) -> Option<&'static str> {
         self.quality_rank.map(crate::quality::tier_label)
     }

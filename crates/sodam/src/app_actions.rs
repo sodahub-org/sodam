@@ -2096,11 +2096,11 @@ impl Root {
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
 
-        // P2 权益预检：非 VIP 选无损拦截
-        if target_intent == sodam_core::quality::QualityIntent::Tier("lossless".into())
-            && is_vip == Some(false)
-        {
-            let warn = self.tr("无损音质需 VIP 会员权限");
+        // P2 权益预检：非 VIP 选择需要会员的档位（无损 / Hi-Res / 杜比）时拦截。
+        if target_intent.requires_membership() && is_vip == Some(false) {
+            let label =
+                crate::ui::player_bar::quality_label(target_intent.as_setting(), self.language);
+            let warn = self.localized("「{}」音质需 VIP 会员权限", std::slice::from_ref(&label));
             self.notify_warning_once("batch-upgrade-vip", warn);
             cx.notify();
             return;
