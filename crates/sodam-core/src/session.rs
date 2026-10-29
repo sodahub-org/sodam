@@ -132,7 +132,7 @@ pub struct CachedTrack {
 }
 
 impl CachedTrack {
-    /// 实际档位对应的显示名（如 "无损"、"极高"、"较高"、"标准"；未知返回 None）。
+    /// 实际档位对应的显示名（如 "无损"、"极高"、"较高"、"流畅"；未知返回 None）。
     pub fn actual_tier(&self) -> Option<&'static str> {
         self.quality_rank.map(crate::quality::tier_label)
     }
@@ -870,6 +870,11 @@ mod tests {
         let (quality, preview, _) = crate::cache::parse_sidecar("无损\t2048", 2048).unwrap();
         assert_eq!(quality, "无损");
         assert!(!preview);
+        // 旧缓存把 50 分档写成「标准」：读取时洗成新显示名，不再与 standard(70) 撞名。
+        let (quality, _, rank) =
+            crate::cache::parse_sidecar("标准 128k\t2048\t0\t50", 2048).unwrap();
+        assert_eq!(quality, "流畅 128k");
+        assert_eq!(rank, Some(50));
     }
 
     /// 第四个字段（实际档位分数）能读出来；缺失或不是数字时一律未知。

@@ -515,7 +515,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
             "lossless" => "封顶无损；单曲没有无损时自动降到下一档",
             "highest" => "封顶极高（≈320k）",
             "medium" => "封顶较高",
-            "low" => "省流",
+            "low" => "省流（≈128k）",
             _ => "不设上限，按账号权益和单曲可用档位取最高",
         }
     };
@@ -1061,7 +1061,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     ("lossless", root.tr("无损")),
                                     ("highest", root.tr("极高")),
                                     ("medium", root.tr("较高")),
-                                    ("low", root.tr("标准")),
+                                    ("low", root.tr("流畅")),
                                 ]
                                 .into_iter()
                                 .enumerate()

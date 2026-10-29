@@ -263,7 +263,9 @@ pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language
     raw.replace("无损", "Lossless")
         .replace("极高", "High")
         .replace("较高", "Medium")
-        .replace("标准", "Standard")
+        // 旧缓存里 50 分档曾写作「标准」；它在这里同样属于低档，不能翻成 Standard。
+        .replace("标准", "Low")
+        .replace("流畅", "Low")
         .replace("未知", "Unknown")
 }
 

@@ -308,8 +308,9 @@ impl Language {
             "无损" => "Lossless",
             "极高" => "High",
             "较高" => "Medium",
-            "标准" => "Low",
+            "流畅" => "Low",
             "省流" => "Data saver",
+            "省流（≈128k）" => "Data saver (≈128k)",
             "缓存" => "Cache",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
                 "Total {} ({} songs {}, {} covers {})"
@@ -885,6 +886,22 @@ mod tests {
             "英文词典缺少这些 key：\n{}",
             missing.join("\n")
         );
+    }
+
+    /// 音质档位名由核心层动态提供，静态扫描器看不到；这里直接校验词典同步。
+    #[test]
+    fn quality_tier_labels_have_english_entries() {
+        for intent in ["auto", "lossless", "highest", "medium", "low"] {
+            let key = sodam_core::quality::QualityIntent::parse(intent)
+                .label_key()
+                .expect("known tier should have a label");
+            assert!(
+                Language::english_text(key).is_some(),
+                "英文词典缺少音质档位 {} 的翻译：{}",
+                intent,
+                key
+            );
+        }
     }
 
     /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。

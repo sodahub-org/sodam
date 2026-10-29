@@ -133,7 +133,7 @@ impl QualityIntent {
                 "lossless" => Some("无损"),
                 "highest" => Some("极高"),
                 "medium" => Some("较高"),
-                "low" => Some("标准"),
+                "low" => Some("流畅"),
                 _ => None,
             },
         }
@@ -153,7 +153,7 @@ pub fn is_downgraded(intent: &QualityIntent, actual: Option<i64>) -> bool {
 
 /// 获取音质意图在给定账号 VIP 状态下的目标档位分数。
 ///
-/// 具体档位返回其对应的分数（如无损 100、极高 80、较高 70、标准 50）；
+/// 具体档位返回其对应的分数（如无损 100、极高 80、较高 70、流畅 50）；
 /// 「自动」在意图上不设上限，但在已知为 VIP 时目标为无损（100）。
 /// 若在「自动」下且非 VIP 或 VIP 状态未知，则返回 `None`（不指定确定目标）。
 pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> {
@@ -212,7 +212,7 @@ pub fn tier_label(rank: i64) -> &'static str {
     } else if rank >= 70 {
         "较高"
     } else if rank > 0 {
-        "标准"
+        "流畅"
     } else {
         "未知"
     }
@@ -282,7 +282,7 @@ mod tests {
             ("lossless", "无损"),
             ("highest", "极高"),
             ("medium", "较高"),
-            ("low", "标准"),
+            ("low", "流畅"),
         ] {
             assert_eq!(
                 QualityIntent::parse(tier).label_key(),
@@ -291,6 +291,17 @@ mod tests {
             );
         }
         assert_eq!(QualityIntent::parse("ultra").label_key(), None);
+    }
+
+    /// 50 分档不能借用 libresoda 意图里的 `standard`（70）之名，否则降档提示会读反。
+    #[test]
+    fn low_tier_label_is_not_named_after_libresoda_standard() {
+        assert_eq!(preference_rank("standard"), Some(70));
+        assert_eq!(preference_rank("low"), Some(50));
+        assert_eq!(QualityIntent::parse("low").label_key(), Some("流畅"));
+        assert_eq!(tier_label(50), "流畅");
+        assert_eq!(tier_label(70), "较高");
+        assert_ne!(tier_label(50), "标准");
     }
 
     /// 显示名与降档判定必须同源：真实流样本上，徽章写的档位就是判定用的那一档。
@@ -313,7 +324,9 @@ mod tests {
             (info("lossless", "flac", 871_000), "无损", false),
             (info("highest", "m4a", 320_000), "极高", true),
             (info("higher", "m4a", 320_000), "较高", true),
-            (info("standard", "m4a", 128_000), "标准", true),
+            // libresoda 把实际流里的 `standard` 评为 50（与意图 `standard`=70 不同），
+            // 显示名必须用 50 分档的「流畅」，不能复用意图档的「标准」。
+            (info("standard", "m4a", 128_000), "流畅", true),
             // 码率与标签冲突时以档位分数为准，不再是「码率超过 300 就叫极高」
             (info("higher", "m4a", 320_000), "较高", true),
         ];
