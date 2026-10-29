@@ -512,7 +512,9 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
     // 否则往 `TIERS` 加一档时，设置页会静默少一项。
     let hint_key = |value: &str| -> &'static str {
         match value {
+            "hires" => "封顶 Hi-Res 无损；没有时自动降到下一档",
             "lossless" => "封顶无损；单曲没有无损时自动降到下一档",
+            "dolby" => "封顶杜比全景声；没有时自动降到下一档",
             "highest" => "封顶极高（≈320k）",
             "medium" => "封顶较高",
             "low" => "省流",

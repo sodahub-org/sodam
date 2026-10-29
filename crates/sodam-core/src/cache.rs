@@ -311,15 +311,22 @@ impl UpgradeEstimate {
 
 /// 估算目标档位单曲的平均字节数。
 pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
-    match crate::quality::tier_label(target_rank) {
+    const MIB: u64 = 1024 * 1024;
+    // 按档位分数估算，而不是按 `tier_label` 的显示名：显示名属于 UI，
+    // 改一次文案不该让缓存升级估算跟着失准。
+    match target_rank {
+        // Hi-Res 无损：FLAC 24bit，通常约 50-80 MB，取 60 MiB
+        rank if rank >= 110 => 60 * MIB,
         // 无损 FLAC 通常约 30-45 MB，取 35 MiB
-        "无损" => 35 * 1024 * 1024,
+        rank if rank >= 100 => 35 * MIB,
+        // Hi-Res 非无损 / 杜比全景声，取 25 MiB
+        rank if rank >= 88 => 25 * MIB,
         // 极高 320k 通常约 8-12 MB，取 10 MiB
-        "极高" => 10 * 1024 * 1024,
+        rank if rank >= 80 => 10 * MIB,
         // 较高 通常约 5-8 MB，取 7 MiB
-        "较高" => 7 * 1024 * 1024,
+        rank if rank >= 70 => 7 * MIB,
         // 标准/低档 通常约 3-5 MB，取 4 MiB
-        _ => 4 * 1024 * 1024,
+        _ => 4 * MIB,
     }
 }
 

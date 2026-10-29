@@ -67,7 +67,11 @@ impl std::fmt::Display for QualitySource {
 pub const AUTO: &str = "auto";
 
 /// 设置页与播放条共用的档位顺序（从高到低，也是菜单里的展示顺序）。
-pub const TIERS: [&str; 4] = ["lossless", "highest", "medium", "low"];
+///
+/// 新增档位时必须同时检查三处边界：[`TIERS`]、[`QualityIntent::label_key`] 与
+/// [`tier_label`]——菜单能选、会显示名字、实际档位能被正确命名，缺一处就会出现
+/// 「选中却看不到」或「显示同名却判降档」。
+pub const TIERS: [&str; 6] = ["hires", "lossless", "dolby", "highest", "medium", "low"];
 
 /// 归一化后的音质意图。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,10 +134,12 @@ impl QualityIntent {
         match self {
             Self::Auto => Some("自动"),
             Self::Tier(tier) => match tier.as_str() {
-                "lossless" => Some("无损"),
-                "highest" => Some("极高"),
-                "medium" => Some("较高"),
-                "low" => Some("标准"),
+                "hires" | "hi_res" | "hi-res" => Some("Hi-Res 无损"),
+                "lossless" | "flac" => Some("无损"),
+                "dolby" | "dolby_atmos" => Some("杜比全景声"),
+                "highest" | "hq" | "high" => Some("极高"),
+                "medium" | "standard" | "320k" => Some("较高"),
+                "low" | "128k" | "saver" => Some("标准"),
                 _ => None,
             },
         }
@@ -153,8 +159,8 @@ pub fn is_downgraded(intent: &QualityIntent, actual: Option<i64>) -> bool {
 
 /// 获取音质意图在给定账号 VIP 状态下的目标档位分数。
 ///
-/// 具体档位返回其对应的分数（如无损 100、极高 80、较高 70、标准 50）；
-/// 「自动」在意图上不设上限，但在已知为 VIP 时目标为无损（100）。
+/// 具体档位返回其对应的分数（如 Hi-Res 110、无损 100、杜比 88、极高 80、
+/// 较高 70、标准 50）；「自动」在意图上不设上限，但在已知为 VIP 时目标为无损（100）。
 /// 若在「自动」下且非 VIP 或 VIP 状态未知，则返回 `None`（不指定确定目标）。
 pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> {
     match intent {
@@ -204,19 +210,62 @@ pub fn stream_rank(info: &libresoda::soda::types::DownloadInfo) -> i64 {
 ///
 /// 必须与 [`is_downgraded`] 用同一套刻度：两者若各按各的边界算，就会出现
 /// 「徽章写着极高、降档判定却按较高比」这种自相矛盾的显示。
+///
+/// 分数与显示名的对应（每个区间都对应 libresoda 里一个不能互相混淆的档位）：
+///
+/// | 分数 | 显示名 | 说明 |
+/// | --- | --- | --- |
+/// | >= 110 | Hi-Res 无损 | `quality_rank` 给 Hi-Res 无损 110 |
+/// | 100..110 | 无损 | 普通无损（100） |
+/// | 90..100 | Hi-Res | 有 Hi-Res 标签但没有无损格式；不是真无损，不能叫「无损」 |
+/// | 88..90 | 杜比全景声 | 杜比 / Atmos / Spatial 固定 88 |
+/// | 80..88 | 极高 | 极高 / HQ（80） |
+/// | 70..80 | 较高 | 较高 / 320k（70） |
+/// | 50..70 | 标准 | 标准与码率兜底 65 / 55（都比省流高） |
+/// | 1..50 | 省流 | 低码率兜底 20 / 10 |
+/// | 0 | 未知 | 没有可用信息 |
+///
+/// 区间按 [`preference_rank`] 的边界切开：**所选档位的显示名与实际档位在数值不同时
+/// 必须不同名**。一旦把 `hires` / `dolby` 加进 [`TIERS`]，88 和 80 若还都叫「极高」，
+/// 选中极高、实际 88 就会重现「显示同名却判降档」。新增档位时必须同步检查
+/// [`TIERS`]、[`QualityIntent::label_key`] 与本函数三处边界。
 pub fn tier_label(rank: i64) -> &'static str {
-    if rank >= 100 {
+    if rank >= 110 {
+        "Hi-Res 无损"
+    } else if rank >= 100 {
         "无损"
+    } else if rank >= 90 {
+        "Hi-Res"
+    } else if rank >= 88 {
+        "杜比全景声"
     } else if rank >= 80 {
         "极高"
     } else if rank >= 70 {
         "较高"
-    } else if rank > 0 {
+    } else if rank >= 50 {
         "标准"
+    } else if rank > 0 {
+        "省流"
     } else {
         "未知"
     }
 }
+
+/// [`tier_label`] 可能返回的全部显示名。
+///
+/// UI 把实际档位翻成当前语言时按这张表整体替换；顺序按长度从长到短，
+/// 避免短名先替换掉长名的一部分（如「无损」吃掉「Hi-Res 无损」）。
+pub const TIER_LABELS: [&str; 9] = [
+    "Hi-Res 无损",
+    "Hi-Res",
+    "杜比全景声",
+    "无损",
+    "极高",
+    "较高",
+    "标准",
+    "省流",
+    "未知",
+];
 
 #[cfg(test)]
 mod tests {
@@ -279,7 +328,12 @@ mod tests {
     fn label_key_covers_known_tiers_and_returns_none_for_unknown() {
         assert_eq!(QualityIntent::Auto.label_key(), Some("自动"));
         for (tier, label) in [
+            ("hires", "Hi-Res 无损"),
+            ("hi-res", "Hi-Res 无损"),
             ("lossless", "无损"),
+            ("flac", "无损"),
+            ("dolby", "杜比全景声"),
+            ("dolby_atmos", "杜比全景声"),
             ("highest", "极高"),
             ("medium", "较高"),
             ("low", "标准"),
@@ -291,6 +345,55 @@ mod tests {
             );
         }
         assert_eq!(QualityIntent::parse("ultra").label_key(), None);
+    }
+
+    /// 菜单里的每一档都必须同时有分数与显示名，否则会出现能选却显示不出名字的档位。
+    #[test]
+    fn every_menu_tier_has_preference_rank_and_label() {
+        for tier in TIERS {
+            let intent = QualityIntent::parse(tier);
+            assert!(intent.max_rank().is_some(), "{tier} 缺少 preference_rank");
+            assert!(intent.label_key().is_some(), "{tier} 缺少 label_key");
+        }
+    }
+
+    /// 每个可选档位在自己的分数边界上显示的名字必须与菜单里的名字一致。
+    #[test]
+    fn tier_label_matches_each_menu_tier_at_its_preference_rank() {
+        for tier in TIERS {
+            let intent = QualityIntent::parse(tier);
+            let rank = intent.max_rank().expect("菜单档位必须有分数");
+            let label = intent.label_key().expect("菜单档位必须有显示名");
+            assert_eq!(tier_label(rank), label, "所选 {tier}（{rank}）");
+        }
+    }
+
+    /// 表驱动覆盖「所选 N、实际 M」：只要判了降档，两个显示名就不能同名。
+    ///
+    /// 这是 issue #85 的回归测试：旧实现里 88 和 80 都叫「极高」，
+    /// 若把 `dolby` 加进菜单，选中 highest 拿到 88 就会显示同名却判降档。
+    #[test]
+    fn downgraded_pairs_never_share_a_display_name() {
+        // libresoda `quality_rank` / `preference_rank` 会产出的全部分数。
+        const RANKS: [i64; 12] = [110, 100, 90, 88, 80, 70, 65, 55, 50, 20, 10, 0];
+
+        for tier in TIERS {
+            let intent = QualityIntent::parse(tier);
+            let selected_name = intent.label_key().expect("菜单档位必须有显示名");
+            let selected_rank = intent.max_rank().expect("菜单档位必须有分数");
+
+            // 同分必须同名：徽章显示的就是菜单选的那一档。
+            assert_eq!(tier_label(selected_rank), selected_name, "所选 {tier}");
+
+            for actual in RANKS {
+                let downgraded = is_downgraded(&intent, Some(actual));
+                let actual_name = tier_label(actual);
+                assert!(
+                    !(downgraded && actual_name == selected_name),
+                    "所选 {tier}（{selected_rank}）实际 {actual}，判降档却同名「{actual_name}」"
+                );
+            }
+        }
     }
 
     /// 显示名与降档判定必须同源：真实流样本上，徽章写的档位就是判定用的那一档。
@@ -310,10 +413,16 @@ mod tests {
 
         // (样本, 期望显示档位, 期望所选无损时算不算降档)
         let cases = [
+            (info("hires", "flac", 871_000), "Hi-Res 无损", false),
             (info("lossless", "flac", 871_000), "无损", false),
+            (info("hires", "m4a", 320_000), "Hi-Res", true),
+            (info("dolby", "m4a", 320_000), "杜比全景声", true),
             (info("highest", "m4a", 320_000), "极高", true),
             (info("higher", "m4a", 320_000), "较高", true),
             (info("standard", "m4a", 128_000), "标准", true),
+            (info("low", "m4a", 96_000), "省流", true),
+            (info("", "m4a", 96_000), "省流", true),
+            (info("", "m4a", 0), "未知", true),
             // 码率与标签冲突时以档位分数为准，不再是「码率超过 300 就叫极高」
             (info("higher", "m4a", 320_000), "较高", true),
         ];

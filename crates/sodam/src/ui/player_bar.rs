@@ -260,11 +260,16 @@ pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language
     if language.resolved().is_zh() {
         return raw;
     }
-    raw.replace("无损", "Lossless")
-        .replace("极高", "High")
-        .replace("较高", "Medium")
-        .replace("标准", "Standard")
-        .replace("未知", "Unknown")
+    // 档位名由核心层 `tier_label` 产出，新增档位时只要同步 `TIER_LABELS` 与词典，
+    // 这里不用再维护一串手写 replace（漏一个就会在英文界面露出中文）。
+    let mut text = raw;
+    for label in sodam_core::quality::TIER_LABELS {
+        let translated = language.text(label);
+        if translated != label {
+            text = text.replace(label, translated);
+        }
+    }
+    text
 }
 
 /// 播放条的档位菜单：勾选的是**意图**，徽章上显示的是**实际**档位。

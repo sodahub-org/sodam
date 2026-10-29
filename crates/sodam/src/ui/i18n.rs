@@ -221,6 +221,12 @@ impl Language {
             "封顶无损；单曲没有无损时自动降到下一档" => {
                 "Up to lossless; downgrades automatically"
             }
+            "封顶 Hi-Res 无损；没有时自动降到下一档" => {
+                "Up to Hi-Res lossless; downgrades automatically"
+            }
+            "封顶杜比全景声；没有时自动降到下一档" => {
+                "Up to Dolby Atmos; downgrades automatically"
+            }
             "封顶极高（≈320k）" => "Up to high (≈320k)",
             "封顶较高" => "Up to medium",
             "正在准备推荐队列…" => "Preparing recommendations…",
@@ -305,11 +311,15 @@ impl Language {
                 "Cached songs keep their original tier; clear the cache or switch tracks to refetch"
             }
             "自动" => "Auto",
+            "Hi-Res 无损" => "Hi-Res Lossless",
+            "Hi-Res" => "Hi-Res",
+            "杜比全景声" => "Dolby Atmos",
             "无损" => "Lossless",
             "极高" => "High",
             "较高" => "Medium",
             "标准" => "Low",
             "省流" => "Data saver",
+            "未知" => "Unknown",
             "缓存" => "Cache",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
                 "Total {} ({} songs {}, {} covers {})"
@@ -885,6 +895,35 @@ mod tests {
             "英文词典缺少这些 key：\n{}",
             missing.join("\n")
         );
+    }
+
+    /// 确保音质档位的显示名都有英文翻译，避免核心层新增档位后英文界面露出中文。
+    #[test]
+    fn quality_tier_labels_have_english_entries() {
+        use sodam_core::quality::{tier_label, QualityIntent, TIERS, TIER_LABELS};
+
+        let mut keys: Vec<&'static str> =
+            vec![QualityIntent::Auto.label_key().expect("自动必须有显示名")];
+        keys.extend(
+            TIERS
+                .iter()
+                .filter_map(|tier| QualityIntent::parse(tier).label_key()),
+        );
+        keys.extend([110, 100, 90, 88, 80, 70, 65, 55, 50, 20, 10, 0].map(tier_label));
+
+        for key in keys {
+            assert!(
+                Language::english_text(key).is_some(),
+                "英文词典缺少音质档位的翻译：{key}"
+            );
+        }
+        // 显示名清单与 `tier_label` 的取值域同步：漏一项，英文界面就会露出中文。
+        for label in TIER_LABELS {
+            assert!(
+                Language::english_text(label).is_some(),
+                "英文词典缺少音质显示名 {label}"
+            );
+        }
     }
 
     /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。
