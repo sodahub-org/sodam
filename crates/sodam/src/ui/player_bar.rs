@@ -260,13 +260,18 @@ pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language
     if language.resolved().is_zh() {
         return raw;
     }
-    raw.replace("无损", "Lossless")
-        .replace("极高", "High")
-        .replace("较高", "Medium")
-        // 旧缓存里 50 分档曾写作「标准」；它在这里同样属于低档，不能翻成 Standard。
-        .replace("标准", "Low")
-        .replace("流畅", "Low")
-        .replace("未知", "Unknown")
+    // 档位名由核心层 `tier_label` 产出，新增档位时只要同步 `TIER_LABELS` 与词典，
+    // 这里不用再维护一串手写 replace（漏一个就会在英文界面露出中文）。
+    let mut text = raw;
+    for label in sodam_core::quality::TIER_LABELS {
+        let translated = language.text(label);
+        if translated != label {
+            text = text.replace(label, translated);
+        }
+    }
+    // 旧缓存 sidecar 里 50 分档曾写作「标准」；按新名「流畅」的译法处理：
+    // 既不能在英文界面露出中文，也不能翻成 libresoda 的 Standard(70)。
+    text.replace("标准", language.text("流畅"))
 }
 
 /// 播放条的档位菜单：勾选的是**意图**，徽章上显示的是**实际**档位。
@@ -412,7 +417,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     }
     // 降档：实际档位低于所选档位。每次现算——用户改了意图，旧结论就不该继续成立。
     // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档；两边显示名相同时也不徽章，
-    // 避免出现「降档·流畅」这种看起来没降的提示。
+    // 避免出现「降档·X」这种看起来没降的提示（分数拆档后真实降档都已不同名）。
     let downgraded = sodam_core::quality::is_visible_downgrade(
         &root.settings.quality_intent(),
         snapshot.quality_rank,
@@ -1173,20 +1178,44 @@ mod tests {
     use super::localized_quality;
     use crate::ui::i18n::Language;
 
+    /// 徽章文本是“档位名 + 码率”的拼接，翻译必须只换档位名、保留码率。
     #[test]
-    fn localized_quality_translates_current_and_legacy_low_labels() {
-        assert_eq!(
-            localized_quality("流畅 128k".into(), Language::English),
-            "Low 128k"
-        );
-        // 旧缓存 sidecar 里仍有「标准」；它属于 50 分档，不能翻成 Standard。
-        assert_eq!(
-            localized_quality("标准 128k".into(), Language::English),
-            "Low 128k"
-        );
-        assert_eq!(
-            localized_quality("流畅 128k".into(), Language::Chinese),
-            "流畅 128k"
-        );
+    fn localized_quality_translates_every_tier_and_keeps_bitrate() {
+        let cases = [
+            ("无损 871k", "Lossless 871k"),
+            ("Hi-Res 无损 871k", "Hi-Res Lossless 871k"),
+            ("Hi-Res 320k", "Hi-Res 320k"),
+            ("杜比全景声 768k", "Dolby Atmos 768k"),
+            ("极高 320k", "High 320k"),
+            ("较高 256k", "Medium 256k"),
+            ("标准 128k", "Low 128k"),
+            ("省流 96k", "Data saver 96k"),
+            ("未知", "Unknown"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                localized_quality(raw.to_string(), Language::English),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn localized_quality_passes_chinese_through_unchanged() {
+        for raw in [
+            "无损 871k",
+            "Hi-Res 无损 871k",
+            "Hi-Res 320k",
+            "杜比全景声 768k",
+            "省流 96k",
+            "未知",
+        ] {
+            assert_eq!(
+                localized_quality(raw.to_string(), Language::Chinese),
+                raw,
+                "{raw}"
+            );
+        }
     }
 }

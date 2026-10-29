@@ -2096,11 +2096,11 @@ impl Root {
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
 
-        // P2 权益预检：非 VIP 选无损拦截
-        if target_intent == sodam_core::quality::QualityIntent::Tier("lossless".into())
-            && is_vip == Some(false)
-        {
-            let warn = self.tr("无损音质需 VIP 会员权限");
+        // P2 权益预检：非 VIP 选择需要会员的档位（无损 / Hi-Res / 杜比）时拦截。
+        if target_intent.requires_membership() && is_vip == Some(false) {
+            let label =
+                crate::ui::player_bar::quality_label(target_intent.as_setting(), self.language);
+            let warn = self.localized("「{}」音质需 VIP 会员权限", std::slice::from_ref(&label));
             self.notify_warning_once("batch-upgrade-vip", warn);
             cx.notify();
             return;
@@ -2936,8 +2936,8 @@ impl Root {
                         // 降档：实际低于所选时如实说出两边，不猜原因——取流那一段在
                         // 「账号没有权益」与「这首没有该档位」下返回值相同，没有字段能分开。
                         // 实际档位标签由核心层按中文档位名生成，英文界面要过一遍翻译。
-                        // 两边显示名相同时（所选流畅、实际更低分仍是流畅）不提示，避免
-                        // 「所选 流畅，实际 流畅」这种读反的句子。
+                        // 两边显示名相同时不提示，避免「所选 X，实际 X」这种读反的句子；
+                        // 分数拆档后真实降档都会落在不同名字上，这条是将来改表时的护栏。
                         // 走全局提示而不是 `status`：后者没有渲染（见 #40）。
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);

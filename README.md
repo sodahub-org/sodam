@@ -193,7 +193,7 @@ scripts/run.sh
 | `QISHUI_SIGNER_URL` | 签名服务 `/sign` 地址 |
 | `QISHUI_SIGNER_TOKEN` | 签名服务 Bearer Token |
 | `SODA_DEVICE_ID` / `SODA_IID` / `SODA_FP` | 设备身份；覆盖时必须与签名器一致 |
-| `SODAM_QUALITY` | 音质意图：`auto` / `best` / `lossless` / `highest` / `medium` / `low` |
+| `SODAM_QUALITY` | 音质意图：`auto` / `best` / `hires` / `lossless` / `dolby` / `highest` / `medium` / `low` |
 | `SODAM_PLAYER_LOG` / `SODAM_PREFETCH_LOG` / `SODAM_REPORT_LOG` | 把对应日志话题（`player` / `prefetch` / `report`）提到 `DEBUG` |
 | `SODAM_SCENE_LOG` / `SODAM_THEME_LOG` / `SODAM_COVER_LOG` / `SODAM_FRAME_LOG` | 同上，这四个都归 `app` 话题 |
 

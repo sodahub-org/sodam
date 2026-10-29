@@ -218,11 +218,24 @@ impl Language {
                 "Language pinned; switch anytime"
             }
             "扫码登录" => "QR Login",
-            "封顶无损；单曲没有无损时自动降到下一档" => {
-                "Up to lossless; downgrades automatically"
+            "优先 Hi-Res 无损；没有可用档位时由服务端回退" => {
+                "Prefer Hi-Res lossless; the service falls back when unavailable"
             }
-            "封顶极高（≈320k）" => "Up to high (≈320k)",
-            "封顶较高" => "Up to medium",
+            "优先无损；没有可用无损时由服务端回退" => {
+                "Prefer lossless; the service falls back when unavailable"
+            }
+            "优先杜比全景声；没有可用档位时由服务端回退" => {
+                "Prefer Dolby Atmos; the service falls back when unavailable"
+            }
+            "优先极高（≈320k）；没有可用档位时由服务端回退" => {
+                "Prefer high (≈320k); the service falls back when unavailable"
+            }
+            "优先较高；没有可用档位时由服务端回退" => {
+                "Prefer medium; the service falls back when unavailable"
+            }
+            "优先流畅（≈128k）；没有可用档位时由服务端回退" => {
+                "Prefer low (≈128k); the service falls back when unavailable"
+            }
             "正在准备推荐队列…" => "Preparing recommendations…",
             "正在准备播放…" => "Preparing playback…",
             "正在创建二维码…" => "Creating QR code…",
@@ -305,11 +318,15 @@ impl Language {
                 "Cached songs keep their original tier; clear the cache or switch tracks to refetch"
             }
             "自动" => "Auto",
+            "Hi-Res 无损" => "Hi-Res Lossless",
+            "Hi-Res" => "Hi-Res",
+            "杜比全景声" => "Dolby Atmos",
             "无损" => "Lossless",
             "极高" => "High",
             "较高" => "Medium",
             "流畅" => "Low",
-            "省流（≈128k）" => "Data saver (≈128k)",
+            "省流" => "Data saver",
+            "未知" => "Unknown",
             "缓存" => "Cache",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
                 "Total {} ({} songs {}, {} covers {})"
@@ -492,9 +509,9 @@ impl Language {
             "缓存升级完成：成功升级 {} 首，{} 首跳过或无更高档位" => {
                 "Cache upgrade complete: upgraded {} songs, {} skipped or no higher quality"
             }
-            "无损音质需 VIP 会员权限" => "Lossless quality requires VIP membership",
-            "无损音质需 VIP 会员权限，当前账号无法升级为无损" => {
-                "Lossless quality requires VIP membership; current account cannot upgrade to lossless"
+            "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
+            "「{}」音质需 VIP 会员权限，当前账号无法升级" => {
+                "\"{}\" quality requires VIP membership; current account cannot upgrade"
             }
             "诊断日志" => "Diagnostic Logs",
             "默认记录在本机，用于排查播放问题；「清空缓存」不会删除它们" => {
@@ -887,22 +904,42 @@ mod tests {
         );
     }
 
-    /// 音质档位名由核心层动态提供，静态扫描器看不到；这里直接校验词典同步。
+    /// 确保音质档位的显示名都有英文翻译，避免核心层新增档位后英文界面露出中文。
     #[test]
     fn quality_tier_labels_have_english_entries() {
-        for intent in ["auto", "lossless", "highest", "medium", "low"] {
-            let key = sodam_core::quality::QualityIntent::parse(intent)
-                .label_key()
-                .expect("known tier should have a label");
+        use std::collections::BTreeSet;
+
+        use sodam_core::quality::{tier_label, QualityIntent, TIERS, TIER_LABELS};
+
+        let mut keys: Vec<&'static str> =
+            vec![QualityIntent::Auto.label_key().expect("自动必须有显示名")];
+        keys.extend(
+            TIERS
+                .iter()
+                .filter_map(|tier| QualityIntent::parse(tier).label_key()),
+        );
+
+        // 遍历完整分数区间，确保 `tier_label` 没有产出 `TIER_LABELS` 之外的档名；
+        // 同时把实际值域与清单对齐，新增档名时漏登记会在这里失败。
+        let mut seen = BTreeSet::new();
+        for rank in -10..=1000 {
+            let label = tier_label(rank);
+            assert!(
+                TIER_LABELS.contains(&label),
+                "tier_label({rank}) = {label} 未登记到 TIER_LABELS"
+            );
+            seen.insert(label);
+        }
+        let expected: BTreeSet<_> = TIER_LABELS.into_iter().collect();
+        assert_eq!(seen, expected, "TIER_LABELS 与 tier_label 的值域不一致");
+        keys.extend(TIER_LABELS);
+
+        for key in keys {
             assert!(
                 Language::english_text(key).is_some(),
-                "英文词典缺少音质档位 {} 的翻译：{}",
-                intent,
-                key
+                "英文词典缺少音质档位的翻译：{key}"
             );
         }
-        // hint_key 返回动态字符串，静态扫描器看不见，这里单独兜住。
-        assert!(Language::english_text("省流（≈128k）").is_some());
     }
 
     /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。

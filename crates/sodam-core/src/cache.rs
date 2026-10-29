@@ -187,7 +187,8 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
 ///
 /// 尺寸不符或档位为空一律返回 `None`。
 /// 第四个字段是实际档位分数，旧格式缺失时为 `None`。
-/// 旧缓存把 50 分档写作「标准」，这里统一洗成当前显示名「流畅」，旧文件不必重下。
+/// 旧缓存把 50 分档写作「标准」，这里按记录里的实际分数洗成当前显示名
+///（50 分档是「流畅」、更低分是「省流」），只换档位前缀、保留码率，旧文件不必重下。
 pub fn parse_sidecar(text: &str, actual: u64) -> Option<(String, bool, Option<i64>)> {
     let mut fields = text.split('\t');
     let quality = fields.next()?.trim().to_string();
@@ -203,8 +204,27 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<(String, bool, Option<i6
         .next()
         .and_then(|value| value.trim().parse::<i64>().ok());
     // 只改显示名，不动文件与分数：50 分档曾经叫「标准」，与 libresoda 的 standard(70) 撞名。
-    let quality = quality.replace("标准", "流畅");
+    let quality = normalize_quality_label(&quality, rank);
     Some((quality, preview, rank))
+}
+
+/// 把旧 sidecar 里的档位名洗成当前显示名。
+///
+/// 有分数时按分数重写档位前缀（`标准 128k` + 50 → `流畅 128k`，+ 20 → `省流 96k` 同理），
+/// 这样旧缓存的徽章与新缓存的命名一致；没有分数（旧三字段记录）就只把撞名的「标准」
+/// 换成 50 分档的新名字，至少不再是 libresoda 的 `standard`(70)。
+fn normalize_quality_label(label: &str, rank: Option<i64>) -> String {
+    let Some(rank) = rank else {
+        return label.replace("标准", crate::quality::tier_label(50));
+    };
+    let tier = crate::quality::tier_label(rank);
+    // `TIER_LABELS` 已按长度从长到短排列；「标准」是历史写法，不在表里。
+    for known in crate::quality::TIER_LABELS.iter().copied().chain(["标准"]) {
+        if let Some(rest) = label.strip_prefix(known) {
+            return format!("{tier}{rest}");
+        }
+    }
+    label.to_string()
 }
 
 /// 本地缓存中的音频记录信息。
@@ -227,7 +247,7 @@ pub struct CachedAudioRecord {
 }
 
 impl CachedAudioRecord {
-    /// 实际档位对应的显示名（如 "无损"、"极高"、"较高"、"流畅"；未知返回 None）。
+    /// 实际档位对应的显示名（见 [`crate::quality::tier_label`]；档位未知返回 `None`）。
     pub fn actual_tier(&self) -> Option<&'static str> {
         self.actual_rank.map(crate::quality::tier_label)
     }
@@ -314,15 +334,22 @@ impl UpgradeEstimate {
 
 /// 估算目标档位单曲的平均字节数。
 pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
-    match crate::quality::tier_label(target_rank) {
+    const MIB: u64 = 1024 * 1024;
+    // 按档位分数估算，而不是按 `tier_label` 的显示名：显示名属于 UI，
+    // 改一次文案不该让缓存升级估算跟着失准。
+    match target_rank {
+        // Hi-Res 无损：FLAC 24bit，通常约 50-80 MB，取 60 MiB
+        rank if rank >= 110 => 60 * MIB,
         // 无损 FLAC 通常约 30-45 MB，取 35 MiB
-        "无损" => 35 * 1024 * 1024,
+        rank if rank >= 100 => 35 * MIB,
+        // Hi-Res 非无损 / 杜比全景声，取 25 MiB
+        rank if rank >= 88 => 25 * MIB,
         // 极高 320k 通常约 8-12 MB，取 10 MiB
-        "极高" => 10 * 1024 * 1024,
+        rank if rank >= 80 => 10 * MIB,
         // 较高 通常约 5-8 MB，取 7 MiB
-        "较高" => 7 * 1024 * 1024,
+        rank if rank >= 70 => 7 * MIB,
         // 流畅/低档 通常约 3-5 MB，取 4 MiB
-        _ => 4 * 1024 * 1024,
+        _ => 4 * MIB,
     }
 }
 
@@ -565,6 +592,26 @@ mod tests {
         assert_eq!(
             parse_sidecar(legacy_sidecar, 2000),
             Some(("极高 320k".into(), false, None))
+        );
+        // 没有分数时认不出具体档位，只把撞名的「标准」换成 50 分档的新名字。
+        assert_eq!(
+            parse_sidecar("标准 96k\t2000\t0", 2000),
+            Some(("流畅 96k".into(), false, None))
+        );
+
+        // 有分数就按分数洗：同一个旧「标准」在 50 分档叫流畅、在 20 分档叫省流。
+        assert_eq!(
+            parse_sidecar("标准 128k\t500\t0\t50", 500),
+            Some(("流畅 128k".into(), false, Some(50)))
+        );
+        assert_eq!(
+            parse_sidecar("标准 96k\t500\t0\t20", 500),
+            Some(("省流 96k".into(), false, Some(20)))
+        );
+        // 旧「Hi-Res 无损」在 100 分档要降级写成「无损」，前缀按长度从长到短匹配。
+        assert_eq!(
+            parse_sidecar("Hi-Res 无损 871k\t500\t0\t100", 500),
+            Some(("无损 871k".into(), false, Some(100)))
         );
     }
 
