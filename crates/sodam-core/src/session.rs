@@ -52,16 +52,15 @@ pub struct AccountInfo {
     pub avatar_url: String,
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}`，
-/// 与实际字节数核对后给出（档位，是否试听，实际档位分数，仍有效的已探测目标）。
-///
-/// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
-/// 所以尺寸不符或档位为空一律 miss，重下自愈。
-/// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
-/// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
-/// 第四个字段是实际档位分数，缺它说明缓存写入时还没记档位：视为未知（`None`），
-/// 不据此标记与所选不符，也不触发重新下载。
-/// 第五、六个字段记录升级探测结论；过期记录不参与跳过判断。
+/// 读取 sidecar 后、构造 [`CachedTrack`] 前的中间结果。
+struct CachedInfo {
+    path: std::path::PathBuf,
+    quality: String,
+    preview: bool,
+    quality_rank: Option<i64>,
+    checked_rank: Option<i64>,
+}
+
 impl Session {
     /// 当前音质**意图**对应的缓存标签。
     ///
@@ -71,10 +70,16 @@ impl Session {
         self.settings.quality_intent().cache_tag()
     }
 
-    fn cached_info(
-        &self,
-        track_id: &str,
-    ) -> Option<(std::path::PathBuf, String, bool, Option<i64>, Option<i64>)> {
+    /// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}`，
+    /// 与实际字节数核对后给出完整记录。
+    ///
+    /// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
+    /// 所以尺寸不符或档位为空一律 miss，重下自愈。
+    /// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
+    /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
+    /// 第四到第六个字段后加：实际档位缺失时视为未知，不据此标记降档；
+    /// 第五、六个字段记录升级探测结论，过期记录不参与跳过判断。
+    fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
@@ -85,23 +90,29 @@ impl Session {
         let text = std::fs::read_to_string(&quality_path).ok()?;
         let meta = crate::cache::parse_sidecar(&text, actual)?;
         let checked = meta.fresh_checked_rank(crate::cache::now_epoch_secs());
-        Some((path, meta.quality, meta.preview, meta.actual_rank, checked))
+        Some(CachedInfo {
+            path,
+            quality: meta.quality,
+            preview: meta.preview,
+            quality_rank: meta.actual_rank,
+            checked_rank: checked,
+        })
     }
 
     pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
-        let (path, quality, preview, rank, checked_rank) = self.cached_info(track_id)?;
+        let info = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
             .write(true)
-            .open(&path)
+            .open(&info.path)
             .and_then(|file| file.set_modified(std::time::SystemTime::now()));
         Some(CachedTrack {
-            path,
-            quality,
-            preview,
-            quality_rank: rank,
-            checked_rank,
+            path: info.path,
+            quality: info.quality,
+            preview: info.preview,
+            quality_rank: info.quality_rank,
+            checked_rank: info.checked_rank,
             lease,
         })
     }
@@ -212,7 +223,7 @@ fn confirmed_miss_rank(
     preview: bool,
     can_record: bool,
 ) -> Option<i64> {
-    if preview || !can_record {
+    if preview || !can_record || actual_rank <= 0 {
         return None;
     }
     let target = target_rank?;
@@ -531,8 +542,7 @@ impl Session {
         };
         let target_rank = crate::quality::target_rank(intent, vip);
         // 没有会员权益时拿不到更高档位，不能据此断言曲库没有；等权益确认后再记录。
-        let can_record_check =
-            crate::quality::can_record_unavailable(target_rank, account_is_vip);
+        let can_record_check = crate::quality::can_record_unavailable(target_rank, vip);
 
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经确认过该目标没有更高流时同样不再请求，避免跨会话重复下载。
@@ -996,6 +1006,8 @@ mod tests {
         assert_eq!(confirmed_miss_rank(Some(100), 80, true, true), None);
         assert_eq!(confirmed_miss_rank(Some(100), 80, false, false), None);
         assert_eq!(confirmed_miss_rank(None, 80, false, true), None);
+        // 档位算不出来（未知，0 分）时不是确认性结论。
+        assert_eq!(confirmed_miss_rank(Some(100), 0, false, true), None);
     }
 
     /// 命中缓存时，确认过的目标不再触发升级；目标提高后仍要重新探测。

@@ -283,7 +283,7 @@ pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>)
 /// `expected_actual_rank` 与 sidecar 现有分数不一致时直接跳过——说明文件已经被
 /// 另一个写者替换，不能再把旧结论写到新文件上。调用方必须持有该文件的
 /// `download_lock`，避免与替换序列交错。
-pub fn record_upgrade_check(
+pub(crate) fn record_upgrade_check(
     sidecar_path: &Path,
     expected_actual_rank: i64,
     checked_rank: i64,
@@ -313,8 +313,8 @@ pub fn record_upgrade_check(
     let tmp = sidecar_path.with_extension("quality.tmp");
     std::fs::write(&tmp, content)?;
     if std::fs::rename(&tmp, sidecar_path).is_err() {
-        // Windows 的 rename 不覆盖既有文件；先删后改名。最坏情况是丢了这条负缓存记录，
-        // 音频缓存本身不受影响，下次播放会重新探测。
+        // Windows 的 rename 不覆盖既有文件；先删后改名。最坏情况是 sidecar 丢失：
+        // 音频文件还在，但下次会被当成未命中重新下载，不会破坏正在使用的音频。
         let _ = std::fs::remove_file(sidecar_path);
         std::fs::rename(&tmp, sidecar_path)?;
     }
