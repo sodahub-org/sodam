@@ -217,18 +217,22 @@ pub enum TierMismatch {
 ///
 /// 徽章与状态行都只读这一个出处，两边共用同一套刻度与同一道显示名闸。
 pub fn visible_tier_mismatch(intent: &QualityIntent, actual: Option<i64>) -> Option<TierMismatch> {
-    let direction = if is_downgraded(intent, actual) {
+    let Some(actual) = actual else {
+        return None;
+    };
+    let direction = if is_downgraded(intent, Some(actual)) {
         TierMismatch::Below
-    } else if is_above_selected(intent, actual) {
+    } else if is_above_selected(intent, Some(actual)) {
         TierMismatch::Above
     } else {
         return None;
     };
-    // 两侧同名（例如所选 50、实际 65 都显示「流畅」）就不说
-    match (intent.label_key(), actual) {
-        (Some(selected), Some(actual)) if selected == tier_label(actual) => None,
-        _ => Some(direction),
+    // 两侧同名（例如所选 50、实际 65 都显示「流畅」）就不说。
+    // 认不出的档位（label_key 为空）仍然要说：它的上限是明确的，只是名字翻不出来。
+    if intent.label_key() == Some(tier_label(actual)) {
+        return None;
     }
+    Some(direction)
 }
 
 /// 获取音质意图在给定账号 VIP 状态下的目标档位分数。
@@ -476,44 +480,33 @@ mod tests {
 
     /// 不符提示按显示名去重：分数不同但两侧同名就不提示。
     ///
-    /// 合并 #85 的分数拆档后，表里已不存在「同名却判不符」的降档组合（50 分档叫流畅、
-    /// 更低分叫省流），所以真实降档都会提示；抬档却确实会撞名（50..70 全是流畅），
-    /// 所以两边共用同一道显示名闸。
+    /// 抬档确实会撞名（50..70 都显示「流畅」），降档在 #85 拆档后不会（50 流畅、
+    /// 更低叫省流）。方向与「自动」的口径由 `mismatch_reports_both_directions_but_never_auto`
+    /// 负责，这里只钉显示名这一道闸。
     #[test]
     fn visible_mismatch_follows_display_names() {
-        let low = QualityIntent::parse("low");
-        let medium = QualityIntent::parse("medium");
-
-        let same_score = visible_tier_mismatch(&low, Some(50));
-        assert_eq!(same_score, None, "同分不算不符");
-        assert_eq!(tier_label(20), "省流");
-
-        // 流畅 ≠ 省流，应当提示
-        let downgraded = visible_tier_mismatch(&low, Some(20));
-        assert_eq!(downgraded, Some(TierMismatch::Below));
-        assert!(is_downgraded(&low, Some(20)), "内部降档判定保持不变");
-
-        let medium_to_low = visible_tier_mismatch(&medium, Some(50));
-        assert_eq!(medium_to_low, Some(TierMismatch::Below));
-        let medium_unknown = visible_tier_mismatch(&medium, None);
-        assert_eq!(medium_unknown, None);
-        let auto_low = visible_tier_mismatch(&QualityIntent::Auto, Some(10));
-        assert_eq!(auto_low, None);
-
-        // 抬档落在同一个显示名里（65 仍显示「流畅」）：不提示
         assert_eq!(tier_label(65), "流畅");
         let saver = QualityIntent::parse("128k");
         assert!(is_above_selected(&saver, Some(65)), "65 高于所选上限 50");
         let same_label = visible_tier_mismatch(&saver, Some(65));
         assert_eq!(same_label, None, "所选与实际同名就不提示");
+
+        // 显示名不同就提示：所选 较高(70)，实际 流畅(50)
+        let medium = QualityIntent::parse("medium");
+        let medium_to_low = visible_tier_mismatch(&medium, Some(50));
+        assert_eq!(medium_to_low, Some(TierMismatch::Below));
     }
 
-    /// 每一档在明显更高的实际档位上都要报「高于所选」；认不出的意图不设上限，也就从不报。
+    /// 每一档在实际档位明显更高时都要报「高于所选」。
+    ///
+    /// 认不出的意图不设上限、因此从不报，这条已由
+    /// `normalizes_empty_auto_and_unknown` 钉住，不在这里重复。
     #[test]
     fn every_tier_reports_above_when_a_much_higher_stream_is_delivered() {
         for tier in TIERS {
             let intent = QualityIntent::parse(tier);
             let cap = intent.max_rank().expect("菜单档位必须有分数");
+            // Hi-Res 无损 是菜单里的最高档，没有比它更高的实际档位
             if cap >= 110 {
                 continue;
             }
@@ -522,12 +515,6 @@ mod tests {
             // 高于所选绝不算降档
             assert!(!is_downgraded(&intent, Some(110)));
         }
-
-        // 未知档位按「不设上限」读，与 libresoda 的 preference_rank 一致，因此不提示
-        let ultra = QualityIntent::parse("ultra");
-        assert_eq!(ultra.max_rank(), None, "未知档位不设上限");
-        let ultra_70 = visible_tier_mismatch(&ultra, Some(70));
-        assert_eq!(ultra_70, None);
     }
 
     /// 菜单里的每一档都必须同时有分数与显示名，否则会出现能选却显示不出名字的档位。

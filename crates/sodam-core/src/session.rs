@@ -60,7 +60,7 @@ pub struct AccountInfo {
 /// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
 /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
 /// 第四个字段是实际档位分数，缺它说明缓存写入时还没记档位：视为未知（`None`），
-/// 不据此标记降档，也不触发重新下载。
+/// 不据此标记与所选不符，也不触发重新下载。
 impl Session {
     /// 当前音质**意图**对应的缓存标签。
     ///
@@ -125,7 +125,7 @@ pub struct CachedTrack {
     pub preview: bool,
     /// 这条流的档位分数（与取流筛选同一套刻度）；`None` = 旧缓存没记，未知。
     ///
-    /// 降档是**每次读取时现算**的：用当前意图与这里的实际档位比较，
+    /// 与所选是否相符是**每次读取时现算**的：用当前意图与这里的实际档位比较，
     /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
     pub quality_rank: Option<i64>,
     pub(crate) lease: crate::cache::CacheLease,
@@ -140,9 +140,9 @@ impl CachedTrack {
 
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
 ///
-/// 档位名走 [`crate::quality::tier_label`]，与降档判定共用 libresoda 的那套刻度；
+/// 档位名走 [`crate::quality::tier_label`]，与不符判定共用 libresoda 的那套刻度；
 /// 这里只负责补上码率。两个函数各按各的边界算，就会出现「徽章显示极高、
-/// 降档判定却按较高比」这种自相矛盾的显示。
+/// 不符判定却按较高比」这种自相矛盾的显示。
 fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     let bitrate = info.bitrate.max(0) / 1000;
     let tier = crate::quality::tier_label(crate::quality::stream_rank(info));
