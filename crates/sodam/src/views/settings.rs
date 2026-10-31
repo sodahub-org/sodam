@@ -1123,7 +1123,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                             } else if let Some(estimate) = &root.batch_upgrade_estimate {
                                 if estimate.upgradeable_count == 0 {
                                     root.tr(
-                                        "没有可升级的缓存歌曲：已达目标、已确认无更高档位，或受缓存音质设置限制",
+                                        "没有可升级的缓存歌曲：已达目标、无更高档位或当前缓存条件不支持升级",
                                     )
                                     .to_string()
                                 } else {

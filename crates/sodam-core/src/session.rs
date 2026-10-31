@@ -213,9 +213,9 @@ fn record_upgrade_check(
     );
 }
 
-/// 确认性 miss：拿到完整流、目标存在、权益已确认，且实际档位低于目标。
+/// 确认性 miss：拿到完整流、档位可识别、目标存在、权益已确认，且实际档位低于目标。
 ///
-/// 返回应写入 sidecar 的 `checked_rank`。试听回退、权益未确认、目标未知或
+/// 返回应写入 sidecar 的 `checked_rank`。试听回退、权益未确认、档位未知、目标未知或
 /// 实际已经达标都不写——这些结论会随账号权益或曲库变化，不能持久化。
 fn confirmed_miss_rank(
     target_rank: Option<i64>,
@@ -228,6 +228,24 @@ fn confirmed_miss_rank(
     }
     let target = target_rank?;
     (actual_rank < target).then_some(target)
+}
+
+/// 拼出 sidecar 内容；有探测结论时写第 5、6 字段。
+fn encode_sidecar(
+    quality: &str,
+    written: u64,
+    preview: bool,
+    actual_rank: i64,
+    checked_rank: Option<i64>,
+) -> String {
+    match checked_rank {
+        Some(rank) => format!(
+            "{quality}\t{written}\t{}\t{actual_rank}\t{rank}\t{}",
+            u8::from(preview),
+            crate::cache::now_epoch_secs(),
+        ),
+        None => format!("{quality}\t{written}\t{}\t{actual_rank}", u8::from(preview)),
+    }
 }
 
 /// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
@@ -467,14 +485,8 @@ impl Session {
                 err.to_string(),
             )
         })?;
-        let sidecar_content = match checked_rank {
-            Some(rank) => format!(
-                "{quality}\t{written}\t{}\t{quality_rank}\t{rank}\t{}",
-                u8::from(preview),
-                crate::cache::now_epoch_secs(),
-            ),
-            None => format!("{quality}\t{written}\t{}\t{quality_rank}", u8::from(preview)),
-        };
+        let sidecar_content =
+            encode_sidecar(&quality, written, preview, quality_rank, checked_rank);
         std::fs::write(&quality_path, sidecar_content).map_err(|err| {
             PlaybackFailure::new(
                 Stage::Unpack,
@@ -623,6 +635,9 @@ impl Session {
         }
 
         let new_rank = crate::quality::stream_rank(&info);
+        // 成功拿到完整流但仍在目标之下，同样是确认性结论：服务端已给出它能给的最好档位。
+        let checked_rank =
+            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
         // 若新流档位并未高于旧档位，且未发生「由试听升级为整曲」，丢弃临时文件，保留旧文件
         if let Some(old_rank) = current.quality_rank {
             let is_improved = new_rank > old_rank || (current.preview && !info.is_preview);
@@ -630,9 +645,7 @@ impl Session {
                 let _ = std::fs::remove_file(&part);
                 // 只有「拿到完整流、档位仍没提升」才是确认性结论。试听回退与下载失败
                 // 会随会员权益或网络变化，不能写成「没有更高档位」。
-                if let Some(checked_rank) =
-                    confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check)
-                {
+                if let Some(checked_rank) = checked_rank {
                     record_upgrade_check(&quality_path, &path, old_rank, checked_rank);
                 }
                 return Ok(current);
@@ -641,7 +654,8 @@ impl Session {
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
-        let sidecar_content = format!("{quality}\t{written}\t{}\t{new_rank}", u8::from(preview));
+        let sidecar_content =
+            encode_sidecar(&quality, written, preview, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -667,7 +681,7 @@ impl Session {
             quality,
             preview,
             quality_rank: Some(new_rank),
-            checked_rank: None,
+            checked_rank,
             lease: target_lease,
         })
     }
@@ -1008,6 +1022,25 @@ mod tests {
         assert_eq!(confirmed_miss_rank(None, 80, false, true), None);
         // 档位算不出来（未知，0 分）时不是确认性结论。
         assert_eq!(confirmed_miss_rank(Some(100), 0, false, true), None);
+    }
+
+    /// 写出与解析必须用同一套字段布局，避免两边各改一处后错位。
+    #[test]
+    fn encode_sidecar_round_trips_through_parser() {
+        let plain = encode_sidecar("极高 320k", 2000, false, 80, None);
+        assert_eq!(plain, "极高 320k\t2000\t0\t80");
+        assert_eq!(
+            crate::cache::parse_sidecar(&plain, 2000)
+                .unwrap()
+                .checked_rank,
+            None
+        );
+
+        let checked = encode_sidecar("极高 320k", 2000, false, 80, Some(100));
+        let parsed = crate::cache::parse_sidecar(&checked, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, Some(80));
+        assert_eq!(parsed.checked_rank, Some(100));
+        assert!(parsed.checked_at.is_some());
     }
 
     /// 命中缓存时，确认过的目标不再触发升级；目标提高后仍要重新探测。
