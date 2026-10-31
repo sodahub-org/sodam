@@ -419,8 +419,7 @@ impl Session {
         }
         let intent = self.settings.quality_intent();
         let target_rank = crate::quality::target_rank(&intent, account_is_vip);
-        let can_record_check =
-            crate::quality::can_record_unavailable(target_rank, account_is_vip);
+        let can_record_check = crate::quality::can_record_unavailable(target_rank, account_is_vip);
         let lease = crate::cache::CacheLease::acquire(&path);
 
         let song = libresoda::Song {
@@ -654,8 +653,7 @@ impl Session {
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
-        let sidecar_content =
-            encode_sidecar(&quality, written, preview, new_rank, checked_rank);
+        let sidecar_content = encode_sidecar(&quality, written, preview, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -1029,12 +1027,8 @@ mod tests {
     fn encode_sidecar_round_trips_through_parser() {
         let plain = encode_sidecar("极高 320k", 2000, false, 80, None);
         assert_eq!(plain, "极高 320k\t2000\t0\t80");
-        assert_eq!(
-            crate::cache::parse_sidecar(&plain, 2000)
-                .unwrap()
-                .checked_rank,
-            None
-        );
+        let plain_checked = crate::cache::parse_sidecar(&plain, 2000).unwrap();
+        assert_eq!(plain_checked.checked_rank, None);
 
         let checked = encode_sidecar("极高 320k", 2000, false, 80, Some(100));
         let parsed = crate::cache::parse_sidecar(&checked, 2000).unwrap();

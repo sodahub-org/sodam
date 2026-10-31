@@ -1028,18 +1028,14 @@ mod tests {
 
         // 换一个更高目标重探后，记录被替换而不是叠加。
         record_upgrade_check(&sidecar, 80, 110, 1_700_000_002).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&sidecar).unwrap(),
-            "极高 320k\t2000\t0\t80\t110\t1700000002"
-        );
+        let updated = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(updated, "极高 320k\t2000\t0\t80\t110\t1700000002");
 
         // 旧三字段没有实际档位，身份无法确认，跳过写入。
         std::fs::write(&sidecar, "极高 320k\t2000\t0").unwrap();
         record_upgrade_check(&sidecar, 80, 100, 1_700_000_003).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&sidecar).unwrap(),
-            "极高 320k\t2000\t0"
-        );
+        let legacy = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(legacy, "极高 320k\t2000\t0");
     }
 
     #[test]
