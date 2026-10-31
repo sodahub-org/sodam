@@ -295,7 +295,8 @@ impl Language {
             "音质已设为 {}，从下一首生效" => "Quality set to {}; applies from the next track",
             "音质：从下一首生效" => "Quality: applies from the next track",
             "已降档：所选 {}，实际 {}" => "Lower tier than selected: chose {}, got {}",
-            "降档" => "Lower",
+            "高于所选：所选 {}，实际 {}" => "Higher tier than selected: chose {}, got {}",
+            "不符" => "Mismatch",
             "不设上限，按账号权益和单曲可用档位取最高" => {
                 "No cap; uses the best tier your account and each track allow"
             }

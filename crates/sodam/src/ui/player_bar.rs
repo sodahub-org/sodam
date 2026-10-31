@@ -415,13 +415,13 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     if snapshot.preview {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
-    // 降档：实际档位低于所选档位。每次现算——用户改了意图，旧结论就不该继续成立。
-    // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档；两边显示名相同时也不徽章，
-    // 避免出现「降档·X」这种看起来没降的提示（分数拆档后真实降档都已不同名）。
-    let downgraded = sodam_core::quality::is_visible_downgrade(
-        &root.settings.quality_intent(),
-        snapshot.quality_rank,
-    );
+    // 与所选不符：实际档位低于或高于所选，两个方向共用同一个标记（#82）。
+    // 每次现算——用户改了意图，旧结论就不该继续成立。实际档位未知（旧缓存）、
+    // 意图为「自动」、两侧显示名相同时一律不标。方向只在状态行里说：徽章
+    // 只有几厘米宽，放不下两个方向各自的短词。
+    let intent = root.settings.quality_intent();
+    let mismatch =
+        sodam_core::quality::visible_tier_mismatch(&intent, snapshot.quality_rank).is_some();
     let title_link_track = track.as_ref().cloned();
     let artist_link_track = track.as_ref().cloned();
     let volume = root.settings.volume;
@@ -578,7 +578,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                             .rounded(px(theme::radius::PILL))
                                             .bg(theme::surface_elevated())
                                             .border_1()
-                                            .border_color(if downgraded {
+                                            .border_color(if mismatch {
                                                 theme::warning()
                                             } else {
                                                 theme::surface_elevated()
@@ -586,17 +586,18 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                             .cursor_pointer()
                                             .hover(|style| style.bg(theme::surface_hover()))
                                             .text_size(theme::Text::Tiny.size())
-                                            .text_color(if downgraded {
+                                            .text_color(if mismatch {
                                                 theme::warning()
                                             } else {
                                                 theme::accent()
                                             })
                                             // 徽章没有 flex 容器：两个 child 会上下堆叠成两行，
                                             // 在固定高度的播放条里把文字挤出可视区，所以合成一段。
-                                            // 用短词「降档」而不是整句：徽章只有几厘米宽，
-                                            // 拼成「Lower tier Lossless」这类长句会被挤断。
-                                            .child(if downgraded {
-                                                format!("{}·{}", root.tr("降档"), quality)
+                                            // 用短词「不符」而不是整句：徽章只有几厘米宽，
+                                            // 拼成「Higher tier than selected」这类长句会被挤断。
+                                            // 方向（低于还是高于所选）在状态行里说。
+                                            .child(if mismatch {
+                                                format!("{}·{}", root.tr("不符"), quality)
                                             } else {
                                                 quality.clone()
                                             })
