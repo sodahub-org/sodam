@@ -301,11 +301,8 @@ pub fn record_upgrade_check(
     if parse_rank(fields.get(3).copied()) != Some(expected_actual_rank) {
         return Ok(());
     }
-    // 前四个字段原样保留；缺档位分数时补空位，保证后两个字段的位置稳定。
+    // 前四个字段原样保留，丢掉旧的探测结论后重新写。
     fields.truncate(4);
-    if fields.len() < 4 {
-        fields.resize(4, "");
-    }
     let content = format!(
         "{}\t{}\t{}\t{}\t{checked_rank}\t{now}",
         fields[0].trim(),
@@ -316,7 +313,8 @@ pub fn record_upgrade_check(
     let tmp = sidecar_path.with_extension("quality.tmp");
     std::fs::write(&tmp, content)?;
     if std::fs::rename(&tmp, sidecar_path).is_err() {
-        // Windows 的 rename 不覆盖既有文件；先删后改名。
+        // Windows 的 rename 不覆盖既有文件；先删后改名。最坏情况是丢了这条负缓存记录，
+        // 音频缓存本身不受影响，下次播放会重新探测。
         let _ = std::fs::remove_file(sidecar_path);
         std::fs::rename(&tmp, sidecar_path)?;
     }

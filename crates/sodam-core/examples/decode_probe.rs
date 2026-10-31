@@ -37,7 +37,7 @@ fn main() {
         ..Default::default()
     };
 
-    let cached = match session.download_to_cache(&track) {
+    let cached = match session.download_to_cache(&track, None) {
         Ok(cached) => cached,
         Err(err) => {
             println!("下载失败: {err}");
