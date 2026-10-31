@@ -703,7 +703,10 @@ mod tests {
 
         // 试听标志为1
         let preview = parse_sidecar("标准 128k\t500\t1\t50", 500).unwrap();
-        assert_eq!(preview.quality, "流畅 128k", "旧缓存里的「标准」按 50 分档洗名");
+        assert_eq!(
+            preview.quality, "流畅 128k",
+            "旧缓存里的「标准」按 50 分档洗名"
+        );
         assert!(preview.preview);
         assert_eq!(preview.actual_rank, Some(50));
 

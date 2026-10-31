@@ -1063,7 +1063,9 @@ mod tests {
             id: "non-existent-track-999".into(),
             ..Default::default()
         };
-        let err = session.upgrade_cached_track(&track, None, None).unwrap_err();
+        let err = session
+            .upgrade_cached_track(&track, None, None)
+            .unwrap_err();
         assert_eq!(err.stage, crate::failure::Stage::Input);
         assert_eq!(err.retryability, crate::failure::Retryability::Never);
     }
