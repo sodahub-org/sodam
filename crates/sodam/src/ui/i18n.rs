@@ -864,6 +864,9 @@ mod tests {
     }
 
     /// 英文界面的静态文案必须都能在词典里查到，否则会静默回退中文。
+    ///
+    /// `set_status` 也要扫：它就是「`localized` + 写状态行」，而状态行现在是切档、
+    /// 档位不符这类反馈的唯一去处（#82），漏在守卫外面等于英文界面随时会露出中文。
     #[test]
     fn every_static_ui_key_has_an_english_entry() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -882,6 +885,7 @@ mod tests {
             };
             let mut keys = literal_keys(&source, ".tr(");
             keys.extend(literal_keys(&source, ".localized("));
+            keys.extend(literal_keys(&source, ".set_status("));
             keys.extend(nth_argument_literal(&source, ".failure_text(", 2));
             for key in keys {
                 scanned += 1;

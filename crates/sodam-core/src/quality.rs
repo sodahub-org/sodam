@@ -227,8 +227,8 @@ pub fn visible_tier_mismatch(intent: &QualityIntent, actual: Option<i64>) -> Opt
     } else {
         return None;
     };
-    // 两侧同名（例如所选 50、实际 65 都显示「流畅」）就不说。
-    // 认不出的档位（label_key 为空）仍然要说：它的上限是明确的，只是名字翻不出来。
+    // 两侧同名（例如所选 50、实际 65 都显示「流畅」）就不说：照实读出来是
+    // 「所选 流畅，实际 流畅」，等于没说。
     if intent.label_key() == Some(tier_label(actual)) {
         return None;
     }

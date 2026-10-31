@@ -2973,15 +2973,19 @@ impl Root {
                             root.language,
                         );
                         let both = [selected_name, actual_name];
-                        // 三条文案都写状态行，且都过 `.localized(`：i18n 守卫
-                        // `every_static_ui_key_has_an_english_entry` 只扫这条路径。
-                        let (key, args) = match mismatch {
-                            Some(TierMismatch::Below) => ("已降档：所选 {}，实际 {}", both),
-                            Some(TierMismatch::Above) => ("高于所选：所选 {}，实际 {}", both),
-                            None => ("播放中：{}", [track.title.clone()]),
-                        };
-                        let text = root.localized(key, &args);
-                        root.set_status_text(text);
+                        // 三条文案都写状态行，字面量留在 `.set_status(` 后面，
+                        // 好让 i18n 守卫 `every_static_ui_key_has_an_english_entry` 扫到。
+                        match mismatch {
+                            Some(TierMismatch::Below) => {
+                                root.set_status("已降档：所选 {}，实际 {}", &both);
+                            }
+                            Some(TierMismatch::Above) => {
+                                root.set_status("高于所选：所选 {}，实际 {}", &both);
+                            }
+                            None => {
+                                root.set_status("播放中：{}", std::slice::from_ref(&track.title));
+                            }
+                        }
                         // 开播后立刻预取下一首，切歌时基本是秒开
                         root.spawn_prefetch(cx);
                     }
