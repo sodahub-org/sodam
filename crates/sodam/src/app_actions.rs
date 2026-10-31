@@ -2946,12 +2946,11 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
-                        // 与所选不符：低于和高于都用同一句格式说出两侧，不猜原因。
-                        // 低于是「账号没有权益」与「这首没有该档位」返回值相同，分不开；
-                        // 高于是候选集里没有等于或低于上限的流，服务端退回全量取最优（#82），
-                        // 但据此说「这首只有更高档」是过头的——实测回退的全是试听片段。
-                        // 两侧同名不提示，免得读出「所选 流畅，实际 流畅」。通道走状态行：
-                        // #94 之后它有渲染出口，这类事实不该打断用户。
+                        // 与所选不符：低于和高于都用同一句格式说出两侧，不猜原因——
+                        // 低于是「没有权益」与「这首没有该档位」返回值相同；高于是候选集里
+                        // 没有等于或低于上限的流，服务端退回全量取最优（#82），但据此说
+                        // 「这首只有更高档」是过头的：实测回退的全是试听片段。
+                        // 通道走状态行，#94 之后它有渲染出口，这类事实不该打断用户。
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
                         if was_cached
@@ -2974,15 +2973,15 @@ impl Root {
                             root.language,
                         );
                         let both = [selected_name, actual_name];
-                        if mismatch == Some(TierMismatch::Below) {
-                            let text = root.localized("已降档：所选 {}，实际 {}", &both);
-                            root.set_status_text(text);
-                        } else if mismatch == Some(TierMismatch::Above) {
-                            let text = root.localized("高于所选：所选 {}，实际 {}", &both);
-                            root.set_status_text(text);
-                        } else {
-                            root.set_status("播放中：{}", std::slice::from_ref(&track.title));
-                        }
+                        // 三条文案都写状态行，且都过 `.localized(`：i18n 守卫
+                        // `every_static_ui_key_has_an_english_entry` 只扫这条路径。
+                        let (key, args) = match mismatch {
+                            Some(TierMismatch::Below) => ("已降档：所选 {}，实际 {}", both),
+                            Some(TierMismatch::Above) => ("高于所选：所选 {}，实际 {}", both),
+                            None => ("播放中：{}", [track.title.clone()]),
+                        };
+                        let text = root.localized(key, &args);
+                        root.set_status_text(text);
                         // 开播后立刻预取下一首，切歌时基本是秒开
                         root.spawn_prefetch(cx);
                     }
