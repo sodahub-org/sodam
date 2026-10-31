@@ -1122,7 +1122,10 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 )
                             } else if let Some(estimate) = &root.batch_upgrade_estimate {
                                 if estimate.upgradeable_count == 0 {
-                                    root.tr("所有缓存歌曲均已达到或超过该档位").to_string()
+                                    root.tr(
+                                        "没有可升级的缓存歌曲：已达目标或已确认没有更高档位",
+                                    )
+                                    .to_string()
                                 } else {
                                     let delta = estimate.net_disk_delta_bytes();
                                     let delta_str = if delta >= 0 {

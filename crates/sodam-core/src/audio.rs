@@ -1075,6 +1075,7 @@ mod tests {
                 quality: "test".into(),
                 preview: false,
                 quality_rank: None,
+                checked_rank: None,
                 lease: crate::cache::CacheLease::acquire(&path),
             };
             let seq = engine.load(
@@ -1115,6 +1116,7 @@ mod tests {
             quality: "test".into(),
             preview: false,
             quality_rank: None,
+            checked_rank: None,
         };
         let seq = engine.load(
             TrackItem {

@@ -2037,6 +2037,7 @@ impl Root {
         &mut self,
         track: TrackItem,
         intent: sodam_core::quality::QualityIntent,
+        account_is_vip: Option<bool>,
         cx: &mut Context<Self>,
     ) {
         let max_inflight = prefetch_concurrency().max(1);
@@ -2060,7 +2061,7 @@ impl Root {
         let track_clone = track.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            session.upgrade_cached_track(&track_clone, Some(&intent))
+            session.upgrade_cached_track(&track_clone, Some(&intent), account_is_vip)
         });
         let key_clone = key;
         let track_id = track.id.clone();
@@ -2178,7 +2179,7 @@ impl Root {
                 let upgrade_result = cx
                     .background_spawn(async move {
                         let session = Session::new(settings_clone);
-                        session.upgrade_cached_track(&track, Some(&target_clone))
+                        session.upgrade_cached_track(&track, Some(&target_clone), is_vip)
                     })
                     .await;
 
@@ -2933,6 +2934,7 @@ impl Root {
                     Ok(cached) => {
                         let actual_rank = cached.quality_rank;
                         let actual_quality = cached.quality.clone();
+                        let checked_rank = cached.checked_rank;
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
@@ -2953,14 +2955,23 @@ impl Root {
                         // 通道走状态行，#94 之后它有渲染出口，这类事实不该打断用户。
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
+                        let target_rank = sodam_core::quality::target_rank(&intent, is_vip);
+                        let already_checked =
+                            sodam_core::cache::upgrade_check_covers(checked_rank, target_rank);
                         if was_cached
                             && sodam_core::quality::is_tier_below_selected(
                                 actual_rank,
                                 &intent,
                                 is_vip,
                             )
+                            && !already_checked
                         {
-                            root.spawn_background_cache_upgrade(track.clone(), intent.clone(), cx);
+                            root.spawn_background_cache_upgrade(
+                                track.clone(),
+                                intent.clone(),
+                                is_vip,
+                                cx,
+                            );
                         }
                         let mismatch =
                             sodam_core::quality::visible_tier_mismatch(&intent, actual_rank);

@@ -492,8 +492,8 @@ impl Language {
             "将已有低档位缓存重新拉取为更高音质，失败不会损坏旧缓存" => {
                 "Re-fetch cached audio at a higher quality without affecting existing files on failure"
             }
-            "所有缓存歌曲均已达到或超过该档位" => {
-                "All cached songs are already at or above this quality"
+            "没有可升级的缓存歌曲：已达目标或已确认没有更高档位" => {
+                "No cached songs to upgrade: already at the target or no higher quality is available"
             }
             "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}" => {
                 "{} songs can be upgraded · Est. traffic {} · Storage change {}"
