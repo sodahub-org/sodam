@@ -602,7 +602,6 @@ pub(crate) fn quality_menu(
     let menu_left = (width - 271.5 - menu_width / 2.0).max(12.0);
     let pill_center = width - 271.5;
     let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
-    let _ = menu_right;
     let _ = position;
     gpui::deferred(
         div()
