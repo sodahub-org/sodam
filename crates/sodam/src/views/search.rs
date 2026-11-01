@@ -72,13 +72,13 @@ pub(crate) fn search_box(
         .when(header, |this| this.rounded(px(16.0)))
         .when(!header, |this| this.rounded_md())
         .bg(if header {
-            theme::surface_hover()
+            theme::surface_elevated()
         } else {
             theme::surface()
         })
         .border_1()
         .border_color(if header {
-            theme::surface_hover()
+            theme::border()
         } else if focused {
             theme::accent()
         } else {

@@ -142,8 +142,8 @@ fn render_with_maximize_icon(
             ));
     }
 
-    // 原生在箭头与搜索框之间留了一段空白；按 2x 实测补上等宽占位。
-    row = row.child(div().w(px(52.0)).h_full());
+    // 箭头与搜索框之间留弹性空白，搜索框靠右侧控件组。
+    row = row.child(drag_area(anchor.clone(), None));
 
     if let Some(search) = extras.search.take() {
         row = row.child(
@@ -158,7 +158,8 @@ fn render_with_maximize_icon(
         );
     }
 
-    row = row.child(drag_area(anchor.clone(), None));
+    // 搜索框 → 账号区固定 15，与账号区内部的「SVIP → 头像」保持一致。
+    row = row.child(div().w(px(15.0)).h_full());
 
     if let Some(account) = extras.account {
         row = row.child(account_chip(account, extras.on_account_click.take()));
@@ -215,9 +216,15 @@ fn arrow_button(
                 .path(icons::path(icon))
                 .size(px(18.0))
                 .text_color(if enabled {
-                    theme::text()
+                    gpui::Rgba {
+                        a: 0.85,
+                        ..theme::text()
+                    }
                 } else {
-                    theme::text_muted()
+                    gpui::Rgba {
+                        a: 0.4,
+                        ..theme::text()
+                    }
                 }),
         )
 }
@@ -243,7 +250,6 @@ fn account_chip(
         .items_center()
         .gap(px(15.0))
         .h(px(STRIP_HEIGHT))
-        .px(px(theme::space::SM))
         .cursor_pointer()
         .hover(|style| style.bg(theme::surface_hover()));
 
@@ -405,7 +411,10 @@ fn caption_button(
             svg()
                 .path(icons::path(icon))
                 .size(px(GLYPH_SIZE))
-                .text_color(theme::text_muted())
+                .text_color(gpui::Rgba {
+                    a: 0.85,
+                    ..theme::text()
+                })
                 .group_hover(id, |style| {
                     if danger {
                         style.text_color(gpui::white())
