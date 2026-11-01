@@ -443,7 +443,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
         cover_size *= scale;
         lyrics_width *= scale;
     }
-    let lyric_padding = cover_size / 2.0;
+    // 歌词列高度 = 封面 + 32 间距 + 信息区（约 78），和官方 stretch 到 info 列一致。
+    let lyrics_box_height = cover_size + 110.0;
+    let lyric_padding = lyrics_box_height / 2.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
@@ -646,8 +648,8 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             // 官方歌词区和左侧「封面 + 歌曲信息」同高（lyrics-container
             // align-self: stretch），不是铺满整页。显式给 h + max_h，
             // 防止父级 flex 把它拉伸回整页高度。
-            .h(px(cover_size))
-            .max_h(px(cover_size))
+            .h(px(lyrics_box_height))
+            .max_h(px(lyrics_box_height))
             .overflow_hidden()
             .flex_none()
             .min_h(px(0.0))
@@ -712,13 +714,13 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .min_h(px(0.0))
                         .gap(px(50.0))
                         .child(
+                            // 官方 .info：封面 + 32px 间距 + 信息/操作，自然高度，
+                            // 不用 h_full，否则歌词列无法和它等高。
                             div()
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .justify_center()
-                                .h_full()
-                                .gap(px(theme::space::LG))
+                                .gap(px(32.0))
                                 .w(px(cover_size))
                                 .flex_none()
                                 .child(
