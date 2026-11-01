@@ -578,8 +578,8 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .child(
             div()
                 .absolute()
-                .left(px(92.0))
-                .top(px(46.0))
+                .left(px(20.0))
+                .top(px((theme::PLAYER_H - 32.0) / 2.0))
                 .flex()
                 .flex_row()
                 .items_center()
