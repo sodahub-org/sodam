@@ -41,9 +41,9 @@ fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     div()
         .id("volume-popover")
         .absolute()
-        .right(px(20.0))
-        .bottom(px(theme::PLAYER_H))
-        .mb(px(8.0))
+        .left(px(50.0))
+        .ml(px(-20.0))
+        .bottom(px(40.0))
         .w(px(40.0))
         .h(px(140.0))
         .flex()
@@ -88,7 +88,6 @@ fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .absolute()
                         .left(px(-3.0))
                         .bottom(gpui::relative(volume))
-                        .ml(px(-3.0))
                         .size(px(10.0))
                         .rounded_full()
                         .bg(theme::text()),
@@ -542,7 +541,6 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .right(px(0.0))
                 .child(progress_bar(root, progress, chorus, loading, cx)),
         )
-        .when(root.volume_open, |this| this.child(volume_popover(root, cx)))
         // 左：封面 + 标题/歌手/进度文案
         .child(
             // 官方：track 绝对定位在左，left 20、宽 50vw-150（这里用 50% 近似）。
@@ -812,6 +810,27 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .justify_end()
                 .gap(px(12.0))
                 .flex_shrink(1.0)
+                // 官方 actions-right 的音质入口。
+                .child(
+                    div()
+                        .id("quality-button")
+                        .h(px(32.0))
+                        .px(px(6.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .text_size(px(13.0))
+                        .text_color(theme::text_muted())
+                        .on_click(cx.listener(
+                            |root, event: &ClickEvent, _window, cx| {
+                                root.quality_menu = Some(event.position());
+                                cx.notify();
+                            },
+                        ))
+                        .child(quality.clone()),
+                )
                 // 官方 BottomPlayerDurationIndicator：当前 / 总时长
                 .child(
                     div()
@@ -826,22 +845,27 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         )),
                 )
                 .child(
-                    icon_button(
-                        "volume",
-                        if volume <= 0.01 {
-                            "volume-x"
-                        } else {
-                            "volume-2"
-                        },
-                        theme::ICON,
-                        theme::text_muted(),
-                    )
-                    .on_click(cx.listener(
-                        |root, _event: &ClickEvent, _window, cx| {
-                            root.volume_open = !root.volume_open;
-                            cx.notify();
-                        },
-                    )),
+                    div()
+                        .relative()
+                        .child(
+                            icon_button(
+                                "volume",
+                                if volume <= 0.01 {
+                                    "volume-x"
+                                } else {
+                                    "volume-2"
+                                },
+                                theme::ICON,
+                                theme::text_muted(),
+                            )
+                            .on_click(cx.listener(
+                                |root, _event: &ClickEvent, _window, cx| {
+                                    root.volume_open = !root.volume_open;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .when(root.volume_open, |this| this.child(volume_popover(root, cx))),
                 )
                 .when(!root.queue_origin.is_feed_like(), |bar| {
                     bar.child(

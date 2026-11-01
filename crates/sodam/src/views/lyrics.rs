@@ -671,17 +671,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .into_any_element(),
                 )
             } else {
-                // 官方歌词区上下有渐隐遮罩，滚到边缘时文字淡出。
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .child(list.expect("loaded lyrics have a list"))
-                    .child(fade_overlay(true))
-                    .child(fade_overlay(false))
-                    .into_any_element()
+                list.expect("loaded lyrics have a list")
             })
             .into_any_element()
     };
@@ -870,26 +860,4 @@ mod tests {
         // 只有超过整段文本长度才应整行点亮。
         assert_eq!(reveal_x_from_glyphs(&glyphs, text, 3.0, 20.0), f32::MAX);
     }
-}
-
-/// 歌词区上/下沿的渐隐遮罩。
-fn fade_overlay(top: bool) -> AnyElement {
-    let solid = theme::bg();
-    let clear = gpui::Rgba { a: 0.0, ..solid };
-    let background = if top {
-        gpui::linear_gradient(
-            180.0,
-            gpui::linear_color_stop(solid, 0.0),
-            gpui::linear_color_stop(clear, 1.0),
-        )
-    } else {
-        gpui::linear_gradient(
-            0.0,
-            gpui::linear_color_stop(clear, 0.0),
-            gpui::linear_color_stop(solid, 1.0),
-        )
-    };
-    let mut overlay = div().absolute().left(px(0.0)).right(px(0.0)).h(px(48.0)).bg(background);
-    overlay = if top { overlay.top(px(0.0)) } else { overlay.bottom(px(0.0)) };
-    overlay.into_any_element()
 }
