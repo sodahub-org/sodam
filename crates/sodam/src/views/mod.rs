@@ -1278,7 +1278,7 @@ mod tests {
 
 /// 底部「更多功能」菜单：对齐官方四项（查看专辑 / 分享 / 歌曲信息反馈 / 举报歌曲）。
 pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let Some((track, position)) = root.more_menu.clone() else {
+    let Some((track, _position)) = root.more_menu.clone() else {
         return div().into_any_element();
     };
     let item = |id: &'static str,
@@ -1318,62 +1318,49 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .child(label),
             )
     };
-    // 菜单向上展开：点击点靠近播放条，向下会出窗口；同时避免 snap 只挪绘制
-    // 不挪 hitbox 导致“看得见点不到”。
-    let menu_y = (f32::from(position.y) - 190.0).max(8.0);
     gpui::deferred(
-        gpui::anchored()
-            .snap_to_window()
-            .position(point(position.x, px(menu_y)))
-            .child(
-                div()
-                    .id("more-menu")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .w(px(220.0))
-                    .p(px(8.0))
-                    .rounded(px(12.0))
-                    .bg(theme::surface_elevated())
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow_lg()
-                    .child(item("more-album", "disc-3", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
-                        let album_id = if track.album_id.is_empty() {
-                            root.album_ids.get(&track.id).cloned().unwrap_or_default()
-                        } else {
-                            track.album_id.clone()
-                        };
-                        if album_id.is_empty() {
-                            root.set_status("暂时拿不到这张专辑的信息", &[]);
-                        } else {
-                            root.set_status("正在打开专辑…", &[]);
-                            root.open_track_album(track, cx);
-                        }
-                    }))
-                    .child(item("more-share", "share-2", root.tr("分享").to_string(), cx, |root, track, cx| {
-                        let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
-                        root.set_status("已复制歌曲链接", &[]);
-                        root.set_toast("已复制链接".to_string(), cx);
-                    }))
-                    .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, cx| {
-                        root.set_status("已记录歌曲信息反馈", &[]);
-                        root.set_toast(format!("已记录对《{}》的信息反馈", track.title), cx);
-                    }))
-                    .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, cx| {
-                        root.set_status("已提交举报", &[]);
-                        root.set_toast(format!("已收到对《{}》的举报", track.title), cx);
-                    })),
-            ),
+        div()
+            .id("more-menu")
+            .absolute()
+            .left(px(20.0))
+            .bottom(px(theme::PLAYER_H + 8.0))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(220.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(item("more-album", "disc-3", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
+                root.open_track_album(track, cx);
+            }))
+            .child(item("more-share", "share-2", root.tr("分享").to_string(), cx, |root, track, cx| {
+                let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                root.set_status("已复制歌曲链接", &[]);
+                root.set_toast("已复制链接".to_string(), cx);
+            }))
+            .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, cx| {
+                root.set_status("已记录歌曲信息反馈", &[]);
+                root.set_toast(format!("已记录对《{}》的信息反馈", track.title), cx);
+            }))
+            .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, cx| {
+                root.set_status("已提交举报", &[]);
+                root.set_toast(format!("已收到对《{}》的举报", track.title), cx);
+            })),
     )
+    .with_priority(3)
     .into_any_element()
 }
 
 /// 「添加到歌单」：列出自己的歌单，点一条就追加当前曲目。
 
 pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let Some((track, position)) = root.add_menu.clone() else {
+    let Some((track, _position)) = root.add_menu.clone() else {
         return div().into_any_element();
     };
     let item = |id: &'static str,
@@ -1394,6 +1381,7 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                crate::debug_log(&format!("add-menu click {id}"));
                 root.add_menu = None;
                 action(root, track.clone(), cx);
                 cx.notify();
@@ -1412,41 +1400,31 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .child(label),
             )
     };
-    let menu_y = (f32::from(position.y) - 110.0).max(8.0);
     gpui::deferred(
-        gpui::anchored()
-            .snap_to_window()
-            .position(point(position.x, px(menu_y)))
-            .child(
-                div()
-                    .id("add-to-playlist-menu")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .w(px(220.0))
-                    .p(px(8.0))
-                    .rounded(px(12.0))
-                    .bg(theme::surface_elevated())
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow_lg()
-                    .child(item(
-                        "add-create",
-                        "plus",
-                        root.tr("创建新歌单").to_string(),
-                        cx,
-                        |root, track, cx| root.create_playlist_with_track(track, cx),
-                    ))
-                    .child(item(
-                        "add-liked",
-                        "heart",
-                        root.tr("我喜欢的音乐").to_string(),
-                        cx,
-                        |root, track, cx| root.toggle_like(track, cx),
-                    )),
-            ),
+        div()
+            .id("add-to-playlist-menu")
+            .absolute()
+            .left(px(64.0))
+            .bottom(px(theme::PLAYER_H + 8.0))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(220.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(item("add-create", "plus", root.tr("创建新歌单").to_string(), cx, |root, track, cx| {
+                root.create_playlist_with_track(track, cx);
+            }))
+            .child(item("add-liked", "heart", root.tr("我喜欢的音乐").to_string(), cx, |root, track, cx| {
+                root.toggle_like(track, cx);
+            })),
     )
-    .with_priority(2)
+    .with_priority(3)
     .into_any_element()
 }
 

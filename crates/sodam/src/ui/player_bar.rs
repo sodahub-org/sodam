@@ -668,6 +668,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     this.child(
                         icon_button("bar-more", "three-points-vertical", theme::ICON, theme::text_muted())
                             .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
+                                crate::debug_log("bar-more click");
                                 if let Some(track) = root.queue.current().cloned() {
                                     root.queue_menu = None;
                                     root.track_menu = None;

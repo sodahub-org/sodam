@@ -246,6 +246,7 @@ fn start_single_instance_service(
 }
 
 fn main() {
+    debug_log("process start");
     // 单实例：第二次启动不再开第二个窗口，只把已在跑的窗口提到前台。
     // Secondary 时已经代为请求前台，本进程直接退出（静默，符合 issue #14）。
     let instance = single_instance::acquire();
