@@ -1434,33 +1434,84 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .comment_items
         .iter()
         .map(|comment| {
+            let avatar = root.cover_of(&comment.avatar);
             div()
                 .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .px(px(theme::space::MD))
-                .py(px(theme::space::SM))
-                .border_b_1()
-                .border_color(theme::border())
+                .flex_row()
+                .gap(px(10.0))
+                .px(px(20.0))
+                .py(px(12.0))
                 .child(
                     div()
-                        .text_size(theme::Text::Tiny.size())
-                        .text_color(theme::text_muted())
-                        .child(comment.user.clone()),
-                )
-                .child(
-                    div()
-                        .text_size(theme::Text::Body.size())
-                        .text_color(theme::text())
-                        .child(comment.content.clone()),
+                        .flex_none()
+                        .child(cover(avatar, 36.0, 999.0)),
                 )
                 .child(
                     div()
                         .flex()
-                        .flex_row()
-                        .gap(px(theme::space::MD))
-                        .text_size(theme::Text::Tiny.size())
-                        .text_color(theme::text_faint())
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.6,
+                                            ..theme::text()
+                                        })
+                                        .child(comment.user.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        })
+                                        .child(format_comment_time(comment.created_at)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .line_height(px(22.0))
+                                .text_color(theme::text())
+                                .child(render_emoji_tokens(&comment.content)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.0))
+                                .text_size(px(12.0))
+                                .text_color(gpui::Rgba {
+                                    a: 0.45,
+                                    ..theme::text()
+                                })
+                                .child(root.tr("回复").to_string())
+                                .when(comment.replies > 0, |this| {
+                                    this.child(format!(
+                                        "— 展开 {} 条回复",
+                                        comment.replies
+                                    ))
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(2.0))
                         .child(
                             div()
                                 .id(gpui::ElementId::Name(
@@ -1468,17 +1519,35 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 ))
                                 .cursor_pointer()
                                 .hover(|style| style.text_color(theme::accent()))
+                                .child(
+                                    svg()
+                                        .path(icons::path("thumb-up"))
+                                        .size(px(18.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.45,
+                                            ..theme::text()
+                                        }),
+                                )
                                 .on_click(cx.listener({
                                     let id = comment.id.clone();
                                     move |root, _event: &ClickEvent, _window, cx| {
                                         root.like_comment(id.clone(), cx);
                                     }
-                                }))
-                                .child(format!("赞 {}", comment.likes)),
+                                })),
                         )
-                        .when(comment.replies > 0, |this| {
-                            this.child(format!("回复 {}", comment.replies))
-                        }),
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(gpui::Rgba {
+                                    a: 0.45,
+                                    ..theme::text()
+                                })
+                                .child(if comment.likes > 0 {
+                                    comment.likes.to_string()
+                                } else {
+                                    String::new()
+                                }),
+                        ),
                 )
                 .into_any_element()
         })
@@ -1488,33 +1557,27 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         div()
             .id("comment-panel")
             .absolute()
-            .right(px(20.0))
-            .bottom(px(theme::PLAYER_H + 10.0))
-            .w(px(360.0))
-            .max_h(px(460.0))
+            .right(px(0.0))
+            .top(px(48.0))
+            .bottom(px(theme::PLAYER_H))
+            .w(px(420.0))
             .flex()
             .flex_col()
-            .rounded(px(theme::radius::CARD))
-            .bg(theme::surface_elevated())
-            .border_1()
+            .bg(gpui::Rgba {
+                a: 0.94,
+                ..theme::surface_elevated()
+            })
+            .border_l_1()
             .border_color(theme::border())
-            .shadow_lg()
             .occlude()
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .px(px(theme::space::MD))
-                    .py(px(theme::space::SM))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Body.size())
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child(format!("评论 {}", root.comment_total)),
-                    )
+                    .gap(px(16.0))
+                    .px(px(20.0))
+                    .py(px(16.0))
                     .child(
                         div()
                             .id("comment-close")
@@ -1522,16 +1585,22 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.0))
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::surface_hover()))
-                            .text_size(px(14.0))
+                            .text_size(px(22.0))
                             .text_color(theme::text_muted())
+                            .hover(|style| style.text_color(theme::text()))
                             .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
                                 root.comment_panel_open = false;
                                 cx.notify();
                             }))
                             .child("×"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(format!("评论（{}）", root.comment_total)),
                     ),
             )
             .child(
@@ -1562,10 +1631,51 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .child(root.tr("加载更多").to_string()),
                         )
                     }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .mx(px(20.0))
+                    .my(px(12.0))
+                    .px(px(12.0))
+                    .h(px(36.0))
+                    .rounded(px(999.0))
+                    .bg(gpui::Rgba {
+                        a: 0.08,
+                        ..theme::text()
+                    })
+                    .text_size(px(13.0))
+                    .text_color(gpui::Rgba {
+                        a: 0.4,
+                        ..theme::text()
+                    })
+                    .child(root.tr("写下你想说的…").to_string()),
             ),
     )
     .with_priority(4)
     .into_any_element()
+}
+
+fn format_comment_time(seconds: i64) -> String {
+    if seconds <= 0 {
+        return String::new();
+    }
+    // Howard Hinnant civil_from_days
+    let days = seconds.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}-{m:02}-{d:02}")
 }
 
 /// 顶部居中的轻提示。
@@ -1596,4 +1706,44 @@ pub fn toast_overlay(text: String, _cx: &mut Context<Root>) -> AnyElement {
     )
     .with_priority(8)
     .into_any_element()
+}
+
+/// 把抖音评论里的 `[流泪]` 这类表情标记换成 Unicode 表情；
+/// 没收录的保留原文，避免内容被吃掉。
+fn render_emoji_tokens(text: &str) -> String {
+    const MAP: [(&str, &str); 28] = [
+        ("[微笑]", "🙂"),
+        ("[大笑]", "😄"),
+        ("[笑哭]", "😂"),
+        ("[流泪]", "😢"),
+        ("[哭]", "😭"),
+        ("[赞]", "👍"),
+        ("[鼓掌]", "👏"),
+        ("[爱心]", "❤️"),
+        ("[心碎]", "💔"),
+        ("[玫瑰]", "🌹"),
+        ("[火]", "🔥"),
+        ("[捂脸]", "🤦"),
+        ("[思考]", "🤔"),
+        ("[得意]", "😎"),
+        ("[调皮]", "😜"),
+        ("[疑问]", "❓"),
+        ("[拜拜]", "👋"),
+        ("[加油]", "💪"),
+        ("[音乐]", "🎵"),
+        ("[话筒]", "🎤"),
+        ("[庆祝]", "🎉"),
+        ("[蛋糕]", "🎂"),
+        ("[礼物]", "🎁"),
+        ("[星星]", "⭐"),
+        ("[月亮]", "🌙"),
+        ("[太阳]", "☀️"),
+        ("[狗]", "🐶"),
+        ("[猫]", "🐱"),
+    ];
+    let mut out = text.to_string();
+    for (token, emoji) in MAP {
+        out = out.replace(token, emoji);
+    }
+    out
 }

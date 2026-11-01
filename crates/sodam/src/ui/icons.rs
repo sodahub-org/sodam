@@ -132,7 +132,7 @@ icon_set!(
     "shuffle",
     "volume-2",
     "volume-x",
-    "list-end", "maximize-2", "alert-triangle", "info", "share-2", "note-plus", "comment-bubble", "three-points-vertical", "add-to-playlist", "sparkles", "thumb-down", "list-plus", "message-circle", "more-horizontal",
+    "list-end", "maximize-2", "thumb-up", "alert-triangle", "info", "share-2", "note-plus", "comment-bubble", "three-points-vertical", "add-to-playlist", "sparkles", "thumb-down", "list-plus", "message-circle", "more-horizontal",
     "music",
     "spinner",
     "chevron-left",
