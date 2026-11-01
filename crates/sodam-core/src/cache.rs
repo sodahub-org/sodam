@@ -311,13 +311,30 @@ pub(crate) fn record_upgrade_check(
         fields[3].trim(),
     );
     let tmp = sidecar_path.with_extension("quality.tmp");
-    std::fs::write(&tmp, content)?;
-    if std::fs::rename(&tmp, sidecar_path).is_err() {
-        // Windows 的 rename 不覆盖既有文件；先删后改名。最坏情况是 sidecar 丢失：
-        // 音频文件还在，但下次会被当成未命中重新下载，不会破坏正在使用的音频。
-        let _ = std::fs::remove_file(sidecar_path);
-        std::fs::rename(&tmp, sidecar_path)?;
+    if let Err(err) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
     }
+    // 负结果只是可选优化：先备份旧 sidecar，替换失败就回滚，绝不把有效的
+    // 缓存元数据删掉换一条记录。备份名与 atomic_replace_cache 共用，二者都
+    // 由同一把 download_lock 串行化。
+    let backup = sidecar_path.with_extension("quality.old");
+    let _ = std::fs::remove_file(&backup);
+    let had_sidecar = sidecar_path.exists();
+    if had_sidecar {
+        if let Err(err) = std::fs::rename(sidecar_path, &backup) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp, sidecar_path) {
+        if had_sidecar {
+            let _ = std::fs::rename(&backup, sidecar_path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&backup);
     Ok(())
 }
 
@@ -1039,6 +1056,33 @@ mod tests {
         record_upgrade_check(&sidecar, 80, 100, 1_700_000_003).unwrap();
         let legacy = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(legacy, "极高 320k\t2000\t0");
+    }
+
+    /// 写回失败或字段不完整时只报错，不碰原 sidecar。
+    #[test]
+    fn record_upgrade_check_errors_without_touching_existing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.quality");
+        assert!(record_upgrade_check(&missing, 80, 100, 1).is_err());
+
+        let short = dir.path().join("short.quality");
+        std::fs::write(&short, "x\ty").unwrap();
+        assert!(record_upgrade_check(&short, 80, 100, 1).is_err());
+        assert_eq!(std::fs::read_to_string(&short).unwrap(), "x\ty");
+    }
+
+    /// 写回成功时清掉可能遗留的旧备份，不留下临时文件。
+    #[test]
+    fn record_upgrade_check_cleans_stale_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        let backup = dir.path().join("song-auto.quality.old");
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        std::fs::write(&backup, "stale").unwrap();
+        record_upgrade_check(&sidecar, 80, 100, 1_700_000_000).unwrap();
+        assert!(!backup.exists());
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "极高 320k\t2000\t0\t80\t100\t1700000000");
     }
 
     #[test]
