@@ -67,6 +67,8 @@ pub struct HeaderExtras {
     pub on_vip_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
     /// 点头像：弹出账号菜单。
     pub on_account_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    /// 未登录时的「登录」按钮。
+    pub on_login_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl Default for HeaderExtras {
@@ -77,6 +79,7 @@ impl Default for HeaderExtras {
             account: None,
             on_vip_click: None,
             on_account_click: None,
+            on_login_click: None,
         }
     }
 }
@@ -164,6 +167,36 @@ fn render_with_maximize_icon(
 
     // 搜索框 → 账号区固定 15，与账号区内部的「SVIP → 头像」保持一致。
     row = row.child(div().w(px(16.0)).h_full());
+
+    if let Some(login) = extras.on_login_click.take() {
+        row = row.child(
+            div()
+                .id("titlebar-login")
+                .h(px(32.0))
+                .px(px(10.0))
+                .ml(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(100.0))
+                .bg(gpui::Rgba {
+                    a: 0.1,
+                    ..theme::text()
+                })
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::text())
+                .cursor_pointer()
+                .on_click(move |_, window, cx| login(window, cx))
+                .child("登录")
+                .child(
+                    svg()
+                        .path(icons::path("user"))
+                        .size(px(20.0))
+                        .text_color(theme::text()),
+                ),
+        );
+    }
 
     if let Some(account) = extras.account {
         row = row.child(account_chip(

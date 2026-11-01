@@ -8,7 +8,6 @@ use sodam_core::models::{AlbumDetail, AlbumItem, ArtistDetail, ArtistItem, Searc
 use sodam_core::session::Session;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::{Nav, Root};
 

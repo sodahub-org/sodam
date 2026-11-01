@@ -34,6 +34,38 @@ fn transport_button(
     ))
 }
 
+/// 官方控制栏的宽按钮：前后各 64×48，播放键 84×48。
+fn wide_transport_button(
+    id: &'static str,
+    icon: &'static str,
+    width: f32,
+    height: f32,
+    icon_size: f32,
+    cx: &mut Context<Root>,
+    action: fn(&mut Root, &mut Context<Root>),
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(width))
+        .h(px(height))
+        .rounded(px(100.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(gpui::Rgba { a: 0.1, ..theme::text() }))
+        .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+            action(root, cx);
+            cx.notify();
+        }))
+        .child(
+            svg()
+                .path(icons::path(icon))
+                .size(px(icon_size))
+                .text_color(theme::text()),
+        )
+}
+
 /// 内联音量滑条：细轨道 + 强调色已播段 + 圆形滑块，点或拖都能调。
 fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     let volume = root.settings.volume;
@@ -128,6 +160,8 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
 ///
 /// 之前是「每移动一次就 try_seek 一次」，解码器被反复打断，
 /// 听起来像变速/鬼畜；sonora 的做法也是拖动预览、松手提交。
+const PROGRESS_GROUP: &str = "player-progress";
+
 fn progress_bar(
     root: &Root,
     progress: f32,
@@ -151,6 +185,7 @@ fn progress_bar(
 
     div()
         .relative()
+        .group(PROGRESS_GROUP)
         .flex()
         .items_center()
         .h(px(14.0))
@@ -175,7 +210,10 @@ fn progress_bar(
                 .h(px(3.0))
                 .rounded(px(2.0))
                 .bg(theme::accent())
-                .w(gpui::relative(shown)),
+                .w(gpui::relative(shown))
+                .group_hover(PROGRESS_GROUP, |style| {
+                    style.h(px(6.0)).top(px(4.0))
+                }),
         )
         .child(
             div()
@@ -185,6 +223,18 @@ fn progress_bar(
                 .size(px(3.0))
                 .rounded_full()
                 .bg(theme::text()),
+        )
+        .child(
+            // 悬停时出现的 10px 圆点（官方 slider-thumb，平时隐藏）。
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(gpui::relative(shown))
+                .size(px(10.0))
+                .rounded_full()
+                .bg(theme::text())
+                .opacity(0.0)
+                .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
         )
         .child(
             canvas(
@@ -644,10 +694,12 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .flex_row()
                         .items_center()
                         .gap(px(theme::space::LG))
-                        .child(transport_button(
+                        .child(wide_transport_button(
                             "prev",
                             "skip-back",
-                            theme::ICON_LG,
+                            64.0,
+                            48.0,
+                            20.0,
                             cx,
                             |root, cx| {
                                 root.prev_track(cx);
@@ -659,9 +711,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .size(px(40.0))
-                                .rounded_full()
-                                .bg(theme::accent())
+                                .w(px(84.0))
+                                .h(px(48.0))
+                                .rounded(px(100.0))
+                                .bg(gpui::Rgba { a: 0.05, ..theme::text() })
+                                .hover(|style| style.bg(gpui::Rgba { a: 0.1, ..theme::text() }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
                                     root.toggle_play(cx);
@@ -669,8 +723,8 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                 }))
                                 .child(if loading {
                                     crate::ui::spinner::spinner(
-                                        theme::ICON_LG,
-                                        theme::accent_foreground(),
+                                        24.0,
+                                        theme::text(),
                                     )
                                     .into_any_element()
                                 } else {
@@ -680,15 +734,17 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                         } else {
                                             "play"
                                         }))
-                                        .size(px(theme::ICON_LG))
-                                        .text_color(theme::accent_foreground())
+                                        .size(px(24.0))
+                                        .text_color(theme::text())
                                         .into_any_element()
                                 }),
                         )
-                        .child(transport_button(
+                        .child(wide_transport_button(
                             "next",
                             "skip-forward",
-                            theme::ICON_LG,
+                            64.0,
+                            48.0,
+                            20.0,
                             cx,
                             |root, cx| {
                                 root.next_track(cx);

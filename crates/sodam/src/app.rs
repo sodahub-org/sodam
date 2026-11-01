@@ -1751,6 +1751,16 @@ impl Render for Root {
                             .into_any_element(),
                     );
                 }
+                if !logged_in {
+                    let login_root = cx.entity();
+                    extras.on_login_click = Some(Box::new(move |_window, cx| {
+                        login_root.update(cx, |root, cx| {
+                            root.set_nav(Nav::Settings, cx);
+                            root.login_modal_open = true;
+                            cx.notify();
+                        });
+                    }));
+                }
                 if let Some(info) = self.account.as_ref().filter(|_| logged_in) {
                     let badge = if info.vip_stage == "svip" {
                         "SVIP"
