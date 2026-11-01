@@ -165,6 +165,7 @@ const PROGRESS_GROUP: &str = "player-progress";
 fn progress_bar(
     root: &Root,
     progress: f32,
+    chorus: Option<f32>,
     loading: bool,
     cx: &mut Context<Root>,
 ) -> impl IntoElement {
@@ -210,10 +211,7 @@ fn progress_bar(
                 .h(px(3.0))
                 .rounded(px(2.0))
                 .bg(theme::accent())
-                .w(gpui::relative(shown))
-                .group_hover(PROGRESS_GROUP, |style| {
-                    style.h(px(6.0)).top(px(4.0))
-                }),
+                .w(gpui::relative(shown)),
         )
         .child(
             div()
@@ -223,6 +221,31 @@ fn progress_bar(
                 .size(px(3.0))
                 .rounded_full()
                 .bg(theme::text()),
+        )
+        // 悬停时的加粗层：单独画一条 6px，避免和基础条抢同一个高度样式。
+        .child(
+            div()
+                .absolute()
+                .top(px(4.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(6.0))
+                .rounded(px(3.0))
+                .bg(theme::surface_hover())
+                .opacity(0.0)
+                .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(4.0))
+                .left(px(0.0))
+                .h(px(6.0))
+                .rounded(px(3.0))
+                .bg(theme::accent())
+                .w(gpui::relative(shown))
+                .opacity(0.0)
+                .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
         )
         .child(
             // 悬停时出现的 10px 圆点（官方 slider-thumb，平时隐藏）。
@@ -236,6 +259,18 @@ fn progress_bar(
                 .opacity(0.0)
                 .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
         )
+        .when_some(chorus, |this, fraction| {
+            this.child(
+                // 高潮点：官方 slider-dot，高度跟随轨道、正方形圆点。
+                div()
+                    .absolute()
+                    .top(px(5.0))
+                    .left(gpui::relative(fraction))
+                    .size(px(4.0))
+                    .rounded_full()
+                    .bg(gpui::Rgba { a: 0.8, ..theme::text() }),
+            )
+        })
         .child(
             canvas(
                 move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
@@ -459,6 +494,12 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         }
     };
     let progress = snapshot.progress_fraction();
+    let chorus = track
+        .as_ref()
+        .and_then(|track| root.chorus_cache.get(&track.id).copied())
+        .filter(|seconds| *seconds > 0.0 && snapshot.duration_seconds > 0.0)
+        .map(|seconds| (seconds / snapshot.duration_seconds) as f32)
+        .filter(|fraction| *fraction > 0.01 && *fraction < 0.99);
     // 实际拉到的流音质（不是设置里的偏好档位）；是不是试听片段由布尔决定标注，
     // 不再从标签字符串里 `contains("试听")` —— 那样显示与状态就同一个事实两处真相。
     let mut quality = localized_quality(snapshot.quality.clone(), language);
@@ -502,18 +543,21 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .top(px(-9.0))
                 .left(px(0.0))
                 .right(px(0.0))
-                .child(progress_bar(root, progress, loading, cx)),
+                .child(progress_bar(root, progress, chorus, loading, cx)),
         )
         // 左：封面 + 标题/歌手/进度文案
         .child(
+            // 官方：track 绝对定位在左，left 20、宽 50vw-150（这里用 50% 近似）。
             div()
+                .absolute()
+                .left(px(20.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(theme::space::MD))
-                .w(px(280.0))
-                .min_w(px(200.0))
-                .flex_shrink(1.0)
+                .w(gpui::relative(0.5))
                 .child(
                     div()
                         .id("now-playing-cover")
@@ -683,11 +727,15 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         // 中：传输控制 + 进度
         .child(
             div()
+                .absolute()
+                .left(gpui::relative(0.5))
+                .ml(px(-122.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
                 .flex()
-                .flex_col()
+                .flex_row()
                 .items_center()
-                .gap(px(theme::space::XS))
-                .flex_1()
+                .justify_center()
                 .child(
                     div()
                         .flex()
@@ -755,13 +803,15 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         // 右：音量（内联滑条）+ 队列抽屉开关
         .child(
             div()
+                .absolute()
+                .right(px(20.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
                 .flex()
                 .flex_row()
                 .items_center()
                 .justify_end()
-                .gap(px(theme::space::SM))
-                .w(px(240.0))
-                .min_w(px(180.0))
+                .gap(px(12.0))
                 .flex_shrink(1.0)
                 .child(
                     icon_button(

@@ -1340,6 +1340,32 @@ impl Root {
         .detach();
     }
 
+    /// 异步取当前歌曲的高潮点，拿到后刷新进度条上的标记。
+    pub(crate) fn load_chorus(&mut self, track: &sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        if track.id.is_empty() || self.chorus_cache.contains_key(&track.id) {
+            return;
+        }
+        let settings = self.settings.clone();
+        let id = track.id.clone();
+        let title = track.title.clone();
+        let artist = track.artist.clone();
+        let work_id = id.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::track_chorus(&session, &work_id, &title, &artist)
+        });
+        cx.spawn(async move |this, cx| {
+            let value = work.await;
+            if let Some(seconds) = value {
+                let _ = this.update(cx, |root, cx| {
+                    root.chorus_cache.insert(id, seconds);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// 装载第一首但不播放，停在第一秒等待用户点播放。
     pub(crate) fn pause_pending(&mut self, cx: &mut Context<Self>) {
         self.playing = true;
@@ -1349,6 +1375,7 @@ impl Root {
             return;
         };
         self.pending_track = Some(track.clone());
+        self.load_chorus(&track, cx);
         self.pending_engine_load = None;
         self.progress_preview = Some(0.0);
         self.set_status("已准备播放：{}", std::slice::from_ref(&track.title));

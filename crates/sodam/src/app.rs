@@ -318,6 +318,8 @@ pub struct Root {
     pub search_field: TextField,
     /// 自绘标题栏是否承担了搜索框：是的话搜索页不再重复画一个输入框。
     pub(crate) header_owns_search: bool,
+    /// 每首歌的高潮点（秒），进队列后异步补齐。
+    pub chorus_cache: std::collections::HashMap<String, f64>,
     /// 搜索联想词与下拉状态。
     pub search_sug: Vec<sodam_core::library::SearchSuggestion>,
     pub search_sug_open: bool,
@@ -629,6 +631,7 @@ impl Root {
             lyrics_request_seq: 0,
             search_field: TextField::default(),
             header_owns_search: false,
+            chorus_cache: std::collections::HashMap::new(),
             search_sug: Vec::new(),
             search_sug_open: false,
             search_sug_index: 0,

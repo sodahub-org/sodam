@@ -882,6 +882,16 @@ pub fn search_pc(
         ("search_scene", String::new()),
         ("scene_name", String::new()),
     ];
+    let body = pc_search_body_with(session, &params, search_type)?;
+    raw_search_results(keyword, body.as_bytes())
+}
+
+/// 直接拿 PC 搜索的原始回包（歌 chorused 取点时复用）。
+fn pc_search_body_with(
+    session: &Session,
+    params: &[(&str, String)],
+    search_type: &str,
+) -> anyhow::Result<String> {
     let query = params
         .iter()
         .map(|(key, value)| format!("{key}={}", encode_query(value)))
@@ -901,10 +911,71 @@ pub fn search_pc(
         .set("x-luna-is-local-user", "1")
         .call()
         .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))?;
-    let body = response
+    response
         .into_string()
-        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))?;
-    raw_search_results(keyword, body.as_bytes())
+        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))
+}
+
+/// 取某首歌的高潮点（`chorus.start`，单位秒）。
+pub fn track_chorus(
+    session: &Session,
+    track_id: &str,
+    title: &str,
+    artist: &str,
+) -> Option<f64> {
+    let keyword = format!("{title} {artist}");
+    let keyword = keyword.trim();
+    if keyword.is_empty() || track_id.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let params = [
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        ("device_id", now.to_string()),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("q", keyword.to_string()),
+        ("cursor", "0".to_string()),
+        ("search_id", now.to_string()),
+        ("search_method", String::new()),
+        ("debug_params", String::new()),
+        ("from_search_id", String::new()),
+        ("search_scene", String::new()),
+        ("scene_name", String::new()),
+    ];
+    let body = pc_search_body_with(session, &params, "all").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    for group in value.get("result_groups")?.as_array()? {
+        for item in group.get("data")?.as_array()? {
+            let track = match item.pointer("/entity/track") {
+                Some(track) => track,
+                None => continue,
+            };
+            if track.get("id").and_then(|id| id.as_str()) != Some(track_id) {
+                continue;
+            }
+            let start = track
+                .pointer("/chorus/start")
+                .and_then(|start| start.as_f64())
+                .unwrap_or(0.0);
+            if start > 0.0 {
+                return Some(start / 1000.0);
+            }
+        }
+    }
+    None
 }
 
 pub fn search(
