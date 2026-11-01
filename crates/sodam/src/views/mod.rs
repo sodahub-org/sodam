@@ -1442,6 +1442,7 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     )),
             ),
     )
+    .with_priority(2)
     .into_any_element()
 }
 
