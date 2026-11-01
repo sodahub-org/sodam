@@ -566,21 +566,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .gap(px(theme::space::MD))
                 .w(gpui::relative(0.5))
                 .pr(px(150.0))
-                .child(
-                    div()
-                        .id("now-playing-cover")
-                        .flex_none()
-                        .cursor_pointer()
-                        .hover(|style| style.opacity(0.82))
-                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                            root.open_playback(cx);
-                        }))
-                        .child(cover(
-                            cover_path,
-                            theme::size::PLAYER_THUMB,
-                            theme::radius::ART,
-                        )),
-                )
+                
                 .child(
                     div()
                         .flex()
@@ -593,27 +579,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                 .items_center()
                                 .gap(px(theme::space::SM))
                                 .min_w(px(0.0))
-                                .child(
-                                    div()
-                                        .id("player-title-link")
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .cursor_pointer()
-                                        .text_size(theme::Text::Body.size())
-                                        .text_color(theme::text())
-                                        .hover(|style| style.text_color(theme::accent()))
-                                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(cx.listener({
-                                            move |root, _event: &ClickEvent, _window, cx| {
-                                                if let Some(track) = title_link_track.as_ref() {
-                                                    root.open_track_album(track.clone(), cx);
-                                                }
-                                            }
-                                        }))
-                                        .child(title),
-                                )
+                                
                                 
                         )
                         
@@ -638,12 +604,45 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .gap(px(12.0))
+                .child({
+                    let count = track
+                        .as_ref()
+                        .and_then(|track| root.comment_cache.get(&track.id).copied())
+                        .unwrap_or(0);
+                    div()
+                        .id("bar-comment")
+                        .relative()
+                        .size(px(32.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .child(
+                            svg()
+                                .path(icons::path("comment-bubble"))
+                                .size(px(20.0))
+                                .text_color(theme::text_muted()),
+                        )
+                        .when(count > 0, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(px(1.0))
+                                    .right(px(0.0))
+                                    .text_size(px(10.0))
+                                    .text_color(theme::text_muted())
+                                    .child(if count >= 10_000 {
+                                        format!("{:.1}w", count as f64 / 10_000.0)
+                                    } else {
+                                        count.to_string()
+                                    }),
+                            )
+                        })
+                })
                 .child(
-                    icon_button("bar-comment", "message-circle", theme::ICON, theme::text_muted())
-                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
-                )
-                .child(
-                    icon_button("bar-add", "add-to-playlist", theme::ICON, theme::text_muted())
+                    icon_button("bar-add", "note-plus", theme::ICON, theme::text_muted())
                         .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
                 )
                 .child(

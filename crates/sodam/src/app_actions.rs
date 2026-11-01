@@ -1360,13 +1360,16 @@ impl Root {
         let work_id = id.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            sodam_core::library::track_chorus(&session, &work_id, &title, &artist)
+            sodam_core::library::track_extras(&session, &work_id, &title, &artist)
         });
         cx.spawn(async move |this, cx| {
             let value = work.await;
-            if let Some(seconds) = value {
+            if let Some((seconds, comments)) = value {
                 let _ = this.update(cx, |root, cx| {
-                    root.chorus_cache.insert(id, seconds);
+                    if seconds > 0.0 {
+                        root.chorus_cache.insert(id.clone(), seconds);
+                    }
+                    root.comment_cache.insert(id, comments);
                     cx.notify();
                 });
             }

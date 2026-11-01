@@ -916,13 +916,13 @@ fn pc_search_body_with(
         .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))
 }
 
-/// 取某首歌的高潮点（`chorus.start`，单位秒）。
-pub fn track_chorus(
+/// 取某首歌的高潮点与评论数（`chorus.start` 秒、`stats.count_comment`）。
+pub fn track_extras(
     session: &Session,
     track_id: &str,
     title: &str,
     artist: &str,
-) -> Option<f64> {
+) -> Option<(f64, i64)> {
     let keyword = format!("{title} {artist}");
     let keyword = keyword.trim();
     if keyword.is_empty() || track_id.is_empty() {
@@ -970,8 +970,12 @@ pub fn track_chorus(
                 .pointer("/chorus/start")
                 .and_then(|start| start.as_f64())
                 .unwrap_or(0.0);
-            if start > 0.0 {
-                return Some(start / 1000.0);
+            let comments = track
+                .pointer("/stats/count_comment")
+                .and_then(|count| count.as_i64())
+                .unwrap_or(0);
+            if start > 0.0 || comments > 0 {
+                return Some((start / 1000.0, comments));
             }
         }
     }

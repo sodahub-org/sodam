@@ -320,6 +320,8 @@ pub struct Root {
     pub(crate) header_owns_search: bool,
     /// 每首歌的高潮点（秒），进队列后异步补齐。
     pub chorus_cache: std::collections::HashMap<String, f64>,
+    /// 每首歌的评论数。
+    pub comment_cache: std::collections::HashMap<String, i64>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
     /// 静音前的音量，用于再次点击恢复。
@@ -637,6 +639,7 @@ impl Root {
             search_field: TextField::default(),
             header_owns_search: false,
             chorus_cache: std::collections::HashMap::new(),
+            comment_cache: std::collections::HashMap::new(),
             volume_open: false,
             volume_before_mute: 0.8,
             search_sug: Vec::new(),
