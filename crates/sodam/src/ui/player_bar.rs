@@ -593,12 +593,14 @@ pub(crate) fn quality_menu(
         cover *= centered / natural;
     }
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
-    let menu_left = cover_left + cover + 25.0;
+    let _ = cover_left;
     let menu_top = (48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0)
         .min(height - theme::PLAYER_H - 48.0);
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
     let menu_right = width - 108.0;
-    let menu_width = (menu_right - menu_left).max(280.0);
+    // 尺寸按官方 350 固定；右边框仍对齐循环图标右缘，左边框随窗宽回推。
+    let menu_width = 350.0;
+    let menu_left = (menu_right - menu_width).max(12.0);
     let pill_center = width - 271.5;
     let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
     let _ = position;

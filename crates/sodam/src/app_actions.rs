@@ -405,12 +405,22 @@ impl Root {
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
         let intent = sodam_core::quality::QualityIntent::parse(quality);
         self.settings.set_quality_intent_by_user(&intent);
-        let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
+        let label = crate::ui::player_bar::official_quality_label(intent.as_setting());
         match self.settings.save() {
             Ok(()) => {
+                // 官方：切换音质立即生效、不中断当前播放位置。
+                let snapshot = self.engine.snapshot();
+                if snapshot.track_id == self.queue.current().map(|item| item.id.clone()).unwrap_or_default()
+                    && !self.queue.is_empty()
+                {
+                    self.quality_resume = Some((snapshot.position_seconds, snapshot.playing));
+                    let tracks = self.queue.tracks().to_vec();
+                    let index = self.queue.index();
+                    self.play_from(tracks, index, cx);
+                }
                 // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
                 // 不值得再弹一条抢注意力的全局提示（见 #83）。
-                let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
+                let message = self.localized("音质已切换为 {}", &[label.to_string()]);
                 self.set_status_text(message);
             }
             Err(err) => {
@@ -3221,6 +3231,14 @@ impl Root {
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
                         root.playback_error = None;
+                        if let Some((position, was_playing)) = root.quality_resume.take() {
+                            if position > 0.5 {
+                                root.engine.seek(position);
+                            }
+                            if !was_playing {
+                                root.engine.pause();
+                            }
+                        }
                         // 记录真实播放历史（去重最近一条，避免重复刷屏）
                         if root.played_history.last().map(String::as_str) != Some(track.id.as_str())
                         {

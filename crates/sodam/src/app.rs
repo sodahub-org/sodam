@@ -327,6 +327,8 @@ pub struct Root {
     pub artist_ids: std::collections::HashMap<String, String>,
     /// 顶部轻提示（分享/反馈/举报等即时回执）。
     pub toast: Option<(String, std::time::Instant)>,
+    /// 切音质后重载当前曲目要恢复的进度与播放状态。
+    pub quality_resume: Option<(f64, bool)>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
     /// 静音前的音量，用于再次点击恢复。
@@ -675,6 +677,7 @@ impl Root {
             album_ids: std::collections::HashMap::new(),
             artist_ids: std::collections::HashMap::new(),
             toast: None,
+            quality_resume: None,
             volume_open: false,
             volume_before_mute: 0.8,
             search_sug: Vec::new(),
