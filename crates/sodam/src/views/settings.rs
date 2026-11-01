@@ -571,10 +571,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         .collect();
     let batch_target = root.batch_upgrade_target.clone();
     let batch_target_label = label_for(batch_target.as_setting());
-    // 需要会员的档位只在账号**确认**有权益时才放行：账号没加载时既取不到更高流，
-    // 也记不下「没有更高档位」，跑一轮只会白花流量——与 `start_batch_upgrade` 同一口径。
-    let batch_upgrade_blocked_by_vip = batch_target.requires_membership()
-        && !root.account.as_ref().is_some_and(|account| account.vip);
+    // 需要会员的档位只在账号**确认**有权益时才放行；与 `start_batch_upgrade` 共用同一条
+    // 判定，按钮状态和执行结果不会各说各话。
+    let batch_upgrade_blocked_by_vip =
+        sodam_core::quality::batch_upgrade_needs_confirmed_entitlement(
+            &batch_target,
+            root.account.as_ref().map(|account| account.vip),
+        );
     // 勾选的是**意图**；配置里的空串是历史写法，按「自动」显示。
     let current = root.settings.quality_intent().as_setting().to_string();
 

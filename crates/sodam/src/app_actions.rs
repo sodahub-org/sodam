@@ -2110,10 +2110,8 @@ impl Root {
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
 
-        // P2 权益预检：需要会员的档位（无损 / Hi-Res / 杜比）只在账号确认有权益时才放行。
-        // 账号没加载（`None`）同样挡住：那时既取不到更高流，也记不下「没有更高档位」
-        // （`can_record_unavailable` 认不出权益），跑一轮只会整曲下一遍再丢掉。
-        if target_intent.requires_membership() && is_vip != Some(true) {
+        // P2 权益预检：需要会员的档位只在账号确认有权益时才放行（认不出权益也算不行）。
+        if sodam_core::quality::batch_upgrade_needs_confirmed_entitlement(&target_intent, is_vip) {
             let label =
                 crate::ui::player_bar::quality_label(target_intent.as_setting(), self.language);
             let warn = self.localized("「{}」音质需 VIP 会员权限", std::slice::from_ref(&label));

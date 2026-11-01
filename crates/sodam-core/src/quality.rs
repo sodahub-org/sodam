@@ -321,6 +321,18 @@ pub fn is_tier_below_selected(
     cache_needs_higher_stream(actual, label, target)
 }
 
+/// 批量升级是否要求先确认账号权益。
+///
+/// 设置页的禁用态与执行处的拦截必须同判：一处放行一处拒绝，按钮就是骗人的。
+/// 认不出权益（账号没加载，`is_vip == None`）也算不放行——那时既取不到会员档位的流，
+/// 也记不下「没有更高档位」（见 [`can_record_unavailable]`），跑一轮只会整曲下一遍再丢掉。
+pub fn batch_upgrade_needs_confirmed_entitlement(
+    intent: &QualityIntent,
+    is_vip: Option<bool>,
+) -> bool {
+    intent.requires_membership() && is_vip != Some(true)
+}
+
 /// 这个目标档位的「没有更高流」结论能否持久化。
 ///
 /// 账号信息只有一个 VIP 布尔：低于会员门槛的档位无需权益，无损（100）能由 VIP 确认；
@@ -680,6 +692,40 @@ mod tests {
         }
         assert!(!QualityIntent::Auto.requires_membership());
         assert!(!QualityIntent::parse("ultra").requires_membership());
+    }
+
+    /// 批量升级的权益闸：认不出账号（`None`）与「非会员」一样挡住会员档位，会员才放行；
+    /// 不依赖权益的档位与「自动」不受此限。设置页与执行处都读这一条。
+    #[test]
+    fn batch_upgrade_gate_opens_only_for_confirmed_vip() {
+        for tier in ["hires", "lossless", "dolby"] {
+            let intent = QualityIntent::parse(tier);
+            assert!(
+                batch_upgrade_needs_confirmed_entitlement(&intent, None),
+                "{tier}：账号没加载就白花流量，挡住"
+            );
+            assert!(
+                batch_upgrade_needs_confirmed_entitlement(&intent, Some(false)),
+                "{tier}：非会员挡住"
+            );
+            assert!(
+                !batch_upgrade_needs_confirmed_entitlement(&intent, Some(true)),
+                "{tier}：会员放行"
+            );
+        }
+        for tier in ["highest", "medium", "low"] {
+            let intent = QualityIntent::parse(tier);
+            for is_vip in [None, Some(false), Some(true)] {
+                assert!(
+                    !batch_upgrade_needs_confirmed_entitlement(&intent, is_vip),
+                    "{tier} 不依赖权益，{is_vip:?} 都要放行"
+                );
+            }
+        }
+        assert!(!batch_upgrade_needs_confirmed_entitlement(
+            &QualityIntent::Auto,
+            None
+        ));
     }
 
     /// 负结果只在能确认账号权益时落盘：非会员档位无需权益，无损需要 VIP，
