@@ -36,7 +36,10 @@ pub(crate) fn search_box(
     };
     let color = if empty {
         if header {
-            theme::text_faint()
+            gpui::Rgba {
+                a: 0.3,
+                ..theme::text()
+            }
         } else {
             theme::text_muted()
         }
@@ -66,10 +69,10 @@ pub(crate) fn search_box(
         .flex()
         .flex_row()
         .items_center()
-        .when(header, |this| this.gap(px(8.0)))
+        .when(header, |this| this.gap(px(6.0)).text_size(px(13.0)))
         .h(px(height))
-        .px(px(12.0))
-        .when(header, |this| this.rounded(px(16.0)))
+        .px(px(10.0))
+        .when(header, |this| this.rounded(px(12.0)))
         .when(!header, |this| this.rounded_md())
         .bg(if header {
             theme::surface_hover()

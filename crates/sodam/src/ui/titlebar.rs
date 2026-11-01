@@ -21,7 +21,7 @@ use gpui::prelude::*;
 #[cfg(target_os = "linux")]
 use gpui::MouseButton;
 use gpui::{
-    div, hsla, img, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
+    div, hsla, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
     WindowControlArea,
 };
 use std::{cell::Cell, rc::Rc};
@@ -31,7 +31,7 @@ use crate::ui::{icons, theme};
 /// 标题栏条高度（逻辑像素，与 Windows 惯例一致）。
 pub const STRIP_HEIGHT: f32 = 48.0;
 /// 单个标题栏按钮宽度。
-const BUTTON_WIDTH: f32 = 49.0;
+const BUTTON_WIDTH: f32 = 46.0;
 /// 控制图标边长。
 const GLYPH_SIZE: f32 = 12.0;
 /// 关闭按钮悬停色（Windows 惯例红）。
@@ -163,7 +163,7 @@ fn render_with_maximize_icon(
     }
 
     // 搜索框 → 账号区固定 15，与账号区内部的「SVIP → 头像」保持一致。
-    row = row.child(div().w(px(15.0)).h_full());
+    row = row.child(div().w(px(16.0)).h_full());
 
     if let Some(account) = extras.account {
         row = row.child(account_chip(
@@ -240,9 +240,10 @@ fn arrow_button(
 /// 账号区与窗口按钮之间的细分隔线。
 fn separator() -> impl IntoElement {
     div()
+        .flex_none()
         .w(px(1.0))
-        .h(px(20.0))
-        .mx(px(theme::space::SM))
+        .h(px(24.0))
+        .mr(px(8.0))
         .bg(theme::border())
 }
 
@@ -257,12 +258,10 @@ fn account_chip(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(15.0))
+        .gap(px(16.0))
         .h(px(STRIP_HEIGHT));
 
     if let Some(badge) = account.badge {
-        // SVIP 是官方字标（笔画是透明洞），用从原生截图里抠出的字标贴图；
-        // 其他档位没有对应字标，退回文字胶囊。
         let mut vip = div()
             .id("titlebar-vip")
             .cursor_pointer()
@@ -271,25 +270,46 @@ fn account_chip(
         if let Some(click) = on_vip_click {
             vip = vip.on_click(move |_, window, cx| click(window, cx));
         }
-        chip = chip.child(vip.child(if badge.as_ref() == "SVIP" {
-            img("icons/svip.png")
-                .w(px(50.5))
+        // 官方字标：SVIP / VIP 的路径直接从客户端 3.8.0 的 bundle 里取，
+        // 颜色用背景色，保持「字是洞」的观感。
+        let logo = match badge.as_ref() {
+            "SVIP" => Some(
+                svg()
+                    .path(icons::path("svip"))
+                    .w(px(36.25))
+                    .h(px(10.0)),
+            ),
+            "VIP" => Some(
+                svg()
+                    .path(icons::path("vip"))
+                    .w(px(26.0))
+                    .h(px(10.0)),
+            ),
+            _ => None,
+        };
+        chip = chip.child(vip.child(match logo {
+            Some(logo) => div()
                 .h(px(24.0))
-                .flex_none()
-                .into_any_element()
-        } else {
-            div()
-                .h(px(24.0))
-                .px(px(12.0))
-                .rounded(px(12.0))
+                .px(px(8.0))
+                .rounded(px(999.0))
                 .flex()
                 .items_center()
                 .bg(theme::surface_hover())
-                .text_size(px(11.0))
+                .text_color(theme::bg())
+                .child(logo)
+                .into_any_element(),
+            None => div()
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(999.0))
+                .flex()
+                .items_center()
+                .bg(theme::surface_hover())
+                .text_size(px(12.0))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme::text())
+                .text_color(theme::bg())
                 .child(badge)
-                .into_any_element()
+                .into_any_element(),
         }));
     }
 
@@ -298,7 +318,7 @@ fn account_chip(
         if let Some(click) = on_avatar_click {
             avatar = avatar.on_click(move |_, window, cx| click(window, cx));
         }
-        chip = chip.child(avatar.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0)));
+        chip = chip.child(avatar.child(crate::ui::artwork::cover(Some(path), 28.0, 999.0)));
     }
 
     chip
@@ -398,7 +418,7 @@ fn lyrics_button(
                 }))
                 .child(
                     svg()
-                        .path(icons::path("captions"))
+                        .path(icons::path("widget-toggle"))
                         .size(px(16.0))
                         .text_color(if active {
                             theme::bg()

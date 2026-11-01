@@ -109,6 +109,9 @@ macro_rules! icon_set {
 }
 
 icon_set!(
+    "svip",
+    "vip",
+    "widget-toggle",
     "house",
     "radio",
     "search",
