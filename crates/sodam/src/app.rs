@@ -446,6 +446,14 @@ pub struct Root {
     pub more_menu: Option<(sodam_core::models::TrackItem, gpui::Point<gpui::Pixels>)>,
     /// 「添加到歌单」的歌单选择菜单。
     pub add_menu: Option<(sodam_core::models::TrackItem, gpui::Point<gpui::Pixels>)>,
+    /// 评论面板。
+    pub comment_panel_open: bool,
+    pub comment_items: Vec<sodam_core::library::CommentItem>,
+    pub comment_cursor: String,
+    pub comment_has_more: bool,
+    pub comment_total: i64,
+    pub comment_loading: bool,
+    pub comment_track: Option<String>,
     /// 播放请求序号：每次 start_track +1。
     ///
     /// 作用：加载是异步的（下载 + 解密），如果用户在 A 加载途中换了 B，
@@ -607,6 +615,13 @@ impl Root {
             track_menu: None,
             more_menu: None,
             add_menu: None,
+            comment_panel_open: false,
+            comment_items: Vec::new(),
+            comment_cursor: String::new(),
+            comment_has_more: false,
+            comment_total: 0,
+            comment_loading: false,
+            comment_track: None,
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,
@@ -1830,6 +1845,9 @@ impl Render for Root {
             .when(self.add_menu.is_some(), |this| {
                 this.child(crate::views::add_to_playlist_menu(self, cx))
             })
+            .when(self.comment_panel_open, |this| {
+                this.child(crate::views::comment_panel(self, cx))
+            })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
@@ -1862,6 +1880,7 @@ impl Render for Root {
                                         root.track_menu = None;
                                         root.more_menu = None;
                                         root.add_menu = None;
+                                        root.comment_panel_open = false;
                                         root.quality_menu = None;
                                         root.account_menu_open = false;
                                         cx.notify();

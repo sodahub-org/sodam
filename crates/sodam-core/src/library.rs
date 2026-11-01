@@ -1407,3 +1407,124 @@ fn post_pc_json(
     }
     Ok(())
 }
+
+/// 一条评论。
+#[derive(Debug, Clone, Default)]
+pub struct CommentItem {
+    pub id: String,
+    pub user: String,
+    pub avatar: String,
+    pub content: String,
+    pub likes: i64,
+    pub replies: i64,
+    pub created_at: i64,
+}
+
+/// 一页评论。
+#[derive(Debug, Clone, Default)]
+pub struct CommentPage {
+    pub items: Vec<CommentItem>,
+    pub cursor: String,
+    pub has_more: bool,
+    pub total: i64,
+}
+
+/// 拉评论：`GET /luna/pc/comments`。
+pub fn list_comments(
+    session: &Session,
+    track_id: &str,
+    cursor: &str,
+    count: i64,
+) -> anyhow::Result<CommentPage> {
+    let mut params = vec![
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        ("device_id", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_millis()).unwrap_or_default().to_string()),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("group_id", track_id.to_string()),
+        ("group_type", "0".to_string()),
+        ("cursor", if cursor.is_empty() { "0".to_string() } else { cursor.to_string() }),
+        ("count", count.max(1).to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(b.0));
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("https://api.qishui.com/luna/pc/comments?{query}");
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Cookie", &session.soda().cookie())
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1")
+        .call()
+        .map_err(|err| anyhow::anyhow!("读取评论失败: {err}"))?;
+    let body = response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("读取评论失败: {err}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|err| anyhow::anyhow!("评论解析失败: {err}"))?;
+    if value.get("status_code").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+        let message = value
+            .pointer("/status_info/status_msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("{message}");
+    }
+    let items = value
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+        .map(|comments| {
+            comments
+                .iter()
+                .map(|comment| CommentItem {
+                    id: comment.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    user: comment
+                        .pointer("/user/nickname")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    avatar: comment
+                        .pointer("/user/medium_avatar_url/urls/0")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: comment
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    likes: comment.get("count_digged").and_then(|v| v.as_i64()).unwrap_or(0),
+                    replies: comment.get("count_reply").and_then(|v| v.as_i64()).unwrap_or(0),
+                    created_at: comment.get("time_created").and_then(|v| v.as_i64()).unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(CommentPage {
+        items,
+        cursor: value.get("cursor").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        has_more: value.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false),
+        total: value
+            .get("count")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
+}

@@ -466,6 +466,61 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 打开评论面板并拉第一页。
+    pub fn open_comments(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        self.comment_panel_open = true;
+        self.comment_items.clear();
+        self.comment_cursor = "0".to_string();
+        self.comment_has_more = false;
+        self.comment_total = self.comment_cache.get(&track.id).copied().unwrap_or(0);
+        self.comment_track = Some(track.id.clone());
+        self.comment_loading = true;
+        cx.notify();
+        self.fetch_comments(track.id, false, cx);
+    }
+
+    pub(crate) fn load_more_comments(&mut self, cx: &mut Context<Self>) {
+        if self.comment_loading || !self.comment_has_more {
+            return;
+        }
+        let Some(track_id) = self.comment_track.clone() else {
+            return;
+        };
+        self.comment_loading = true;
+        cx.notify();
+        self.fetch_comments(track_id, true, cx);
+    }
+
+    fn fetch_comments(&mut self, track_id: String, more: bool, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        let cursor = self.comment_cursor.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::list_comments(&session, &track_id, &cursor, 20)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.comment_loading = false;
+                match result {
+                    Ok(page) => {
+                        root.comment_total = page.total;
+                        root.comment_cursor = page.cursor;
+                        root.comment_has_more = page.has_more;
+                        if more {
+                            root.comment_items.extend(page.items);
+                        } else {
+                            root.comment_items = page.items;
+                        }
+                    }
+                    Err(err) => root.set_status("评论加载失败：{}", std::slice::from_ref(&err.to_string())),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 少推荐：把当前曲目提交给 /luna/track/dislike。
     pub fn dislike_track(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
         let settings = self.settings.clone();

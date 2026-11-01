@@ -1396,3 +1396,129 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     )
     .into_any_element()
 }
+
+/// 评论面板（只读列表 + 加载更多）。
+pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let items: Vec<AnyElement> = root
+        .comment_items
+        .iter()
+        .map(|comment| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .px(px(theme::space::MD))
+                .py(px(theme::space::SM))
+                .border_b_1()
+                .border_color(theme::border())
+                .child(
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_muted())
+                        .child(comment.user.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(comment.content.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(theme::space::MD))
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(format!("赞 {}", comment.likes))
+                        .when(comment.replies > 0, |this| {
+                            this.child(format!("回复 {}", comment.replies))
+                        }),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    gpui::deferred(
+        div()
+            .id("comment-panel")
+            .absolute()
+            .right(px(20.0))
+            .bottom(px(theme::PLAYER_H + 10.0))
+            .w(px(360.0))
+            .max_h(px(460.0))
+            .flex()
+            .flex_col()
+            .rounded(px(theme::radius::CARD))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(theme::space::MD))
+                    .py(px(theme::space::SM))
+                    .child(
+                        div()
+                            .text_size(theme::Text::Body.size())
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("评论 {}", root.comment_total)),
+                    )
+                    .child(
+                        div()
+                            .id("comment-close")
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .text_size(px(14.0))
+                            .text_color(theme::text_muted())
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.comment_panel_open = false;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("comment-list")
+                    .flex()
+                    .flex_col()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(root.comment_items.is_empty() && !root.comment_loading, |this| {
+                        this.child(empty_state("music", root.tr("还没有评论")))
+                    })
+                    .children(items)
+                    .when(root.comment_has_more, |this| {
+                        this.child(
+                            div()
+                                .id("comment-more")
+                                .py(px(theme::space::SM))
+                                .flex()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::accent())
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.load_more_comments(cx);
+                                }))
+                                .child(root.tr("加载更多").to_string()),
+                        )
+                    }),
+            ),
+    )
+    .with_priority(4)
+    .into_any_element()
+}

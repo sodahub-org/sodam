@@ -593,6 +593,12 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     div()
                         .id("bar-comment")
                         .relative()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            if let Some(track) = root.queue.current().cloned() {
+                                root.open_comments(track, cx);
+                            }
+                        }))
                         .size(px(32.0))
                         .flex()
                         .items_center()
