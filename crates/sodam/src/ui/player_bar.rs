@@ -499,6 +499,16 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     // 实际拉到的流音质（不是设置里的偏好档位）；是不是试听片段由布尔决定标注，
     // 不再从标签字符串里 `contains("试听")` —— 那样显示与状态就同一个事实两处真相。
     let mut quality = localized_quality(snapshot.quality.clone(), language);
+    // 官方按钮直接显示服务端档位名（去掉“音质”）：录音室 / 标准 / 较高 / 极高 / 无损 / 全景声
+    let quality_name = match snapshot.quality.to_ascii_lowercase().as_str() {
+        "hi_res" | "hires" | "hi-res" => "录音室".to_string(),
+        "medium" | "standard" => "标准".to_string(),
+        "higher" => "较高".to_string(),
+        "highest" => "极高".to_string(),
+        "lossless" => "无损".to_string(),
+        "spatial" => "全景声".to_string(),
+        _ => quality.clone(),
+    };
     if snapshot.preview {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
@@ -722,6 +732,56 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         }),
                 ),
         )
+        // 官方 .controls.left：评论 / 添加到歌单 / 少推荐 / 更多 + 时长
+        .child(
+            div()
+                .absolute()
+                .left(px(92.0))
+                .bottom(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    icon_button("bar-comment", "message-circle", theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
+                )
+                .child(
+                    icon_button("bar-add", "list-plus", theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
+                )
+                .child(
+                    icon_button("bar-dislike", "thumb-down", theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
+                )
+                .when(track.is_some(), |this| {
+                    this.child(
+                        icon_button("bar-more", "more-horizontal", theme::ICON, theme::text_muted())
+                            .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
+                                if let Some(track) = root.queue.current().cloned() {
+                                    root.queue_menu = None;
+                                    root.track_menu = Some(crate::app::TrackMenu {
+                                        track,
+                                        position: event.position(),
+                                    });
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                })
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text_muted())
+                        .child(format!(
+                            "{} / {}",
+                            snapshot.position_label(),
+                            snapshot.duration_label()
+                        )),
+                ),
+        )
         // 中：传输控制 + 进度
         .child(
             div()
@@ -831,7 +891,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             root.quality_menu = Some(event.position());
                             cx.notify();
                         }))
-                        .child(quality.clone()),
+                        .child(quality_name.clone()),
                 )
                 .child(
                     div()
@@ -851,12 +911,22 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .child(root.tr("音效").to_string()),
                 )
                 .child(
-                    icon_button("lyrics-toggle", "music", theme::ICON, theme::text_muted())
-                        .on_click(cx.listener(
-                            |root, _event: &ClickEvent, _window, cx| {
-                                root.open_playback(cx);
-                            },
-                        )),
+                    div()
+                        .id("lyrics-toggle")
+                        .size(px(32.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text_muted())
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.open_playback(cx);
+                        }))
+                        .child(root.tr("词").to_string()),
                 )
                 .when(!root.queue_origin.is_feed_like(), |bar| {
                     bar.child(
