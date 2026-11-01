@@ -615,7 +615,7 @@ pub(crate) fn quality_menu(
     let arrow_gap = 10.0;
     let menu_bottom_offset = (height - pill_top + arrow_gap).max(0.0);
     // 箭头宽 20：要让其中线对准胶囊中心，左边界 = 中心 - 10。
-    let arrow_x = (pill_center - menu_left - 10.0).clamp(12.0, menu_width - 32.0);
+    let arrow_x = (pill_center - menu_left - 9.0).clamp(12.0, menu_width - 32.0);
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST: AtomicU64 = AtomicU64::new(0);
@@ -656,8 +656,8 @@ pub(crate) fn quality_menu(
                     .child(
                         svg()
                             .path(icons::path("triangle-down"))
-                            .w(px(20.0))
-                            .h(px(10.0))
+                            .w(px(18.0))
+                            .h(px(9.0))
                             .text_color(surface),
                     ),
             ),
@@ -698,23 +698,31 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     // 不再从标签字符串里 `contains("试听")` —— 那样显示与状态就同一个事实两处真相。
     let mut quality = localized_quality(snapshot.quality.clone(), language);
     // 官方按钮直接显示服务端档位名（去掉“音质”）：录音室 / 标准 / 较高 / 极高 / 无损 / 全景声
-    let mut quality_name = match snapshot.quality.to_ascii_lowercase().as_str() {
-        "hi_res" | "hires" | "hi-res" => "录音室".to_string(),
-        "medium" | "standard" => "标准".to_string(),
-        "higher" => "较高".to_string(),
-        "highest" => "极高".to_string(),
-        "lossless" => "无损".to_string(),
-        "dolby" => "全景声".to_string(),
-        "spatial" => "全景声".to_string(),
-        _ => quality.clone(),
-    };
-    // 还没拿到实际流（加载/缓存缺失）时，标出用户选的目标档位，
-    // 避免胶囊里出现一个空白方块。
-    if quality_name.trim().is_empty() {
-        quality_name = official_quality_label(root.settings.quality_intent().as_setting())
-            .trim_end_matches("音质")
-            .to_string();
-    }
+    // 胶囊只显示稳定档位名，不显示码率：官方那颗按钮不会因为
+    // 「320k / 1594k」到达而突然变字。
+    let raw_quality = format!("{} {}", snapshot.quality, quality);
+    let quality_name = ["录音室", "全景声", "无损", "极高", "标准"]
+        .into_iter()
+        .find(|label| raw_quality.contains(label))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let raw = raw_quality.to_ascii_lowercase();
+            let label = if raw.contains("hi_res") || raw.contains("hires") {
+                "录音室"
+            } else if raw.contains("dolby") || raw.contains("spatial") {
+                "全景声"
+            } else if raw.contains("lossless") {
+                "无损"
+            } else if raw.contains("highest") || raw.contains("higher") {
+                "极高"
+            } else if raw.contains("medium") || raw.contains("standard") {
+                "标准"
+            } else {
+                official_quality_label(root.settings.quality_intent().as_setting())
+                    .trim_end_matches("音质")
+            };
+            label.to_string()
+        });
     if snapshot.preview {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }

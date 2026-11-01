@@ -276,6 +276,7 @@ fn separator() -> impl IntoElement {
         .flex_none()
         .w(px(1.0))
         .h(px(24.0))
+        .self_center()
         .mr(px(8.0))
         .bg(theme::border())
 }
