@@ -8,6 +8,12 @@ use std::time::{Duration, SystemTime};
 pub const DEFAULT_AUDIO_LIMIT_MB: u64 = 10 * 1024;
 const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// 「已确认没有更高档位」记录的有效期。
+///
+/// 曲库补档与会员权益变化都没有推送通知，永久保留一次探测结论会让那些曲目
+/// 再也不参与升级；30 天后重新问一次，代价最多是一次请求。
+pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 type Leases = HashMap<PathBuf, std::sync::Weak<PathBuf>>;
 fn leases() -> &'static Mutex<Leases> {
     static LEASES: OnceLock<Mutex<Leases>> = OnceLock::new();
@@ -182,14 +188,15 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
     Some((track_id.to_string(), tag.to_string()))
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}`，与实际字节数核对后给出
-/// （档位显示名，是否试听，实际档位分数）。
+/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}`，
+/// 与实际字节数核对后给出完整记录。
 ///
 /// 尺寸不符或档位为空一律返回 `None`。
-/// 第四个字段是实际档位分数，旧格式缺失时为 `None`。
+/// 第四到第六个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
+/// 不影响前三字段的命中判定。
 /// 旧缓存把 50 分档写作「标准」，这里按记录里的实际分数洗成当前显示名
 ///（50 分档是「流畅」、更低分是「省流」），只换档位前缀、保留码率，旧文件不必重下。
-pub fn parse_sidecar(text: &str, actual: u64) -> Option<(String, bool, Option<i64>)> {
+pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
     let mut fields = text.split('\t');
     let quality = fields.next()?.trim().to_string();
     let size = fields.next()?.trim().parse::<u64>().ok()?;
@@ -200,12 +207,135 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<(String, bool, Option<i6
         Some(flag) => (quality, flag.trim() == "1"),
         None => (quality.replace(" · 试听", ""), quality.contains("试听")),
     };
-    let rank = fields
+    let actual_rank = parse_rank(fields.next());
+    let checked_rank = parse_rank(fields.next());
+    let checked_at = fields
         .next()
-        .and_then(|value| value.trim().parse::<i64>().ok());
+        .and_then(|value| value.trim().parse::<u64>().ok());
     // 只改显示名，不动文件与分数：50 分档曾经叫「标准」，与 libresoda 的 standard(70) 撞名。
-    let quality = normalize_quality_label(&quality, rank);
-    Some((quality, preview, rank))
+    let quality = normalize_quality_label(&quality, actual_rank);
+    Some(SidecarMeta {
+        quality,
+        preview,
+        actual_rank,
+        checked_rank,
+        checked_at,
+    })
+}
+
+fn parse_rank(field: Option<&str>) -> Option<i64> {
+    field.and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+/// 一条 sidecar 记录。前四个字段是旧格式，后两个记录升级探测结果：
+/// 曾经向服务端要过哪个目标档位、以及什么时候确认没有更高流。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarMeta {
+    /// 档位显示文本（含码率，不含试听标记）
+    pub quality: String,
+    /// 是否为试听片段
+    pub preview: bool,
+    /// 实际档位分数（旧缓存缺失时为 `None`）
+    pub actual_rank: Option<i64>,
+    /// 上次探测时请求的目标档位分数
+    pub checked_rank: Option<i64>,
+    /// 上次探测时间（Unix 秒）
+    pub checked_at: Option<u64>,
+}
+
+impl SidecarMeta {
+    /// 仍然有效的「已确认没有更高档位」分数；没记录、过期或时钟回拨时返回 `None`。
+    ///
+    /// 过期后重新探测，避免服务端补档或会员权益变化后客户端永久不再尝试升级。
+    pub fn fresh_checked_rank(&self, now: u64) -> Option<i64> {
+        let (rank, checked_at) = (self.checked_rank?, self.checked_at?);
+        if now >= checked_at && now - checked_at < UPGRADE_CHECK_TTL.as_secs() {
+            Some(rank)
+        } else {
+            None
+        }
+    }
+}
+
+/// 当前时间（Unix 秒），用于判断探测记录是否仍在有效期内。
+pub(crate) fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// 已确认的记录是否覆盖本轮目标档位：记录的目标不低于本次目标，就不必再问。
+///
+/// 只问过较低档位、现在想升到更高档位时仍应探测——那次结论并不能代表更高档位。
+pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>) -> bool {
+    match (checked_rank, target_rank) {
+        (Some(checked), Some(target)) => checked >= target,
+        _ => false,
+    }
+}
+
+/// 在 sidecar 上记录「已经向服务端要过 `checked_rank` 档、没有更高流」。
+///
+/// 只应在确认性结果后调用：下载成功、拿到完整流、档位没有提升。
+/// 网络失败与试听回退都不写，它们会随网络或会员权益变化。
+///
+/// `expected_actual_rank` 与 sidecar 现有分数不一致时直接跳过——说明文件已经被
+/// 另一个写者替换，不能再把旧结论写到新文件上。调用方必须持有该文件的
+/// `download_lock`，避免与替换序列交错。
+pub(crate) fn record_upgrade_check(
+    sidecar_path: &Path,
+    expected_actual_rank: i64,
+    checked_rank: i64,
+    now: u64,
+) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(sidecar_path)?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let mut fields: Vec<&str> = trimmed.split('\t').collect();
+    if fields.len() < 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sidecar has fewer than three fields",
+        ));
+    }
+    if parse_rank(fields.get(3).copied()) != Some(expected_actual_rank) {
+        return Ok(());
+    }
+    // 前四个字段原样保留，丢掉旧的探测结论后重新写。
+    fields.truncate(4);
+    let content = format!(
+        "{}\t{}\t{}\t{}\t{checked_rank}\t{now}",
+        fields[0].trim(),
+        fields[1].trim(),
+        fields[2].trim(),
+        fields[3].trim(),
+    );
+    let tmp = sidecar_path.with_extension("quality.tmp");
+    if let Err(err) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    // 负结果只是可选优化：先备份旧 sidecar，替换失败就回滚，绝不把有效的
+    // 缓存元数据删掉换一条记录。备份名与 atomic_replace_cache 共用，二者都
+    // 由同一把 download_lock 串行化。
+    let backup = sidecar_path.with_extension("quality.old");
+    let _ = std::fs::remove_file(&backup);
+    let had_sidecar = sidecar_path.exists();
+    if had_sidecar {
+        if let Err(err) = std::fs::rename(sidecar_path, &backup) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp, sidecar_path) {
+        if had_sidecar {
+            let _ = std::fs::rename(&backup, sidecar_path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&backup);
+    Ok(())
 }
 
 /// 把旧 sidecar 里的档位名洗成当前显示名。
@@ -242,6 +372,8 @@ pub struct CachedAudioRecord {
     pub preview: bool,
     /// 实际档位分数（旧缓存缺失时为 None）
     pub actual_rank: Option<i64>,
+    /// 仍在有效期内、已确认没有更高档位的目标分数；过期记录不入此字段
+    pub checked_rank: Option<i64>,
     /// 本地文件字节数
     pub file_size: u64,
 }
@@ -259,14 +391,19 @@ impl CachedAudioRecord {
 
     /// 当前记录是否允许批量升级至目标档位。
     ///
-    /// 排除试听片段、已达到或超过目标的记录；同时受该缓存文件自身的 quality_tag 意图上限约束：
+    /// 排除试听片段、已达到或超过目标的记录，以及最近已经确认过「没有更高档位」的目标：
+    /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
+    /// 同时受该缓存文件自身的 quality_tag 意图上限约束：
     /// 例如用户在省流模式下缓存的 `-low.m4a`（上限 50），不会被冲高为无损（100），
     /// 以免后续省流播放时命中数十兆的庞大文件破坏省流意图。
     pub fn is_upgradeable_to(&self, target_rank: i64) -> bool {
         let within_cap = crate::quality::QualityIntent::parse(&self.quality_tag)
             .max_rank()
             .is_none_or(|cap| target_rank <= cap);
-        !self.preview && within_cap && self.is_below_target(target_rank)
+        !self.preview
+            && within_cap
+            && self.is_below_target(target_rank)
+            && !upgrade_check_covers(self.checked_rank, Some(target_rank))
     }
 }
 
@@ -275,23 +412,26 @@ pub fn read_cache_record(m4a_path: &Path) -> Option<CachedAudioRecord> {
     if m4a_path.extension().and_then(|ext| ext.to_str()) != Some("m4a") {
         return None;
     }
-    let meta = std::fs::metadata(m4a_path).ok()?;
-    if !meta.is_file() || meta.len() == 0 {
+    let file_meta = std::fs::metadata(m4a_path).ok()?;
+    if !file_meta.is_file() || file_meta.len() == 0 {
         return None;
     }
+    let file_size = file_meta.len();
     let stem = m4a_path.file_stem()?.to_str()?;
     let (track_id, quality_tag) = parse_audio_cache_stem(stem)?;
     let quality_path = m4a_path.with_extension("quality");
     let text = std::fs::read_to_string(&quality_path).ok()?;
-    let (quality_label, preview, actual_rank) = parse_sidecar(&text, meta.len())?;
+    let meta = parse_sidecar(&text, file_size)?;
+    let checked_rank = meta.fresh_checked_rank(now_epoch_secs());
     Some(CachedAudioRecord {
         track_id,
         quality_tag,
         path: m4a_path.to_owned(),
-        quality_label,
-        preview,
-        actual_rank,
-        file_size: meta.len(),
+        quality_label: meta.quality,
+        preview: meta.preview,
+        actual_rank: meta.actual_rank,
+        checked_rank,
+        file_size,
     })
 }
 
@@ -361,7 +501,7 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
     let single_est = estimated_single_track_bytes(target_rank);
 
     for record in records {
-        // 试听片段不计入可升级整曲，且受 quality_tag 意图上限约束
+        // 试听片段、超出意图上限、以及已确认无更高档位的记录都不计入升级。
         if record.is_upgradeable_to(target_rank) {
             count += 1;
             current_bytes = current_bytes.saturating_add(record.file_size);
@@ -571,48 +711,51 @@ mod tests {
 
         // 标准格式的 4 字段 sidecar
         let sidecar = "无损 871k\t1024\t0\t100";
-        assert_eq!(
-            parse_sidecar(sidecar, 1024),
-            Some(("无损 871k".into(), false, Some(100)))
-        );
+        let parsed = parse_sidecar(sidecar, 1024).unwrap();
+        assert_eq!(parsed.quality, "无损 871k");
+        assert!(!parsed.preview);
+        assert_eq!(parsed.actual_rank, Some(100));
+        assert_eq!(parsed.checked_rank, None);
+        assert_eq!(parsed.checked_at, None);
 
         // 试听标志为1
-        let preview_sidecar = "标准 128k\t500\t1\t50";
+        let preview = parse_sidecar("标准 128k\t500\t1\t50", 500).unwrap();
         assert_eq!(
-            parse_sidecar(preview_sidecar, 500),
-            Some(("流畅 128k".into(), true, Some(50))),
-            "旧缓存里的「标准」是 50 分档，读取时洗成「流畅」"
+            preview.quality, "流畅 128k",
+            "旧缓存里的「标准」按 50 分档洗名"
         );
+        assert!(preview.preview);
+        assert_eq!(preview.actual_rank, Some(50));
 
         // 尺寸不符返回None
         assert_eq!(parse_sidecar(sidecar, 999), None);
 
         // 旧3字段sidecar（缺档位分数）
-        let legacy_sidecar = "极高 320k\t2000\t0";
-        assert_eq!(
-            parse_sidecar(legacy_sidecar, 2000),
-            Some(("极高 320k".into(), false, None))
-        );
+        let legacy = parse_sidecar("极高 320k\t2000\t0", 2000).unwrap();
+        assert_eq!(legacy.quality, "极高 320k");
+        assert_eq!(legacy.actual_rank, None);
+        assert_eq!(legacy.checked_rank, None);
+
         // 没有分数时认不出具体档位，只把撞名的「标准」换成 50 分档的新名字。
-        assert_eq!(
-            parse_sidecar("标准 96k\t2000\t0", 2000),
-            Some(("流畅 96k".into(), false, None))
-        );
+        let legacy_low = parse_sidecar("标准 96k\t2000\t0", 2000).unwrap();
+        assert_eq!(legacy_low.quality, "流畅 96k");
 
         // 有分数就按分数洗：同一个旧「标准」在 50 分档叫流畅、在 20 分档叫省流。
-        assert_eq!(
-            parse_sidecar("标准 128k\t500\t0\t50", 500),
-            Some(("流畅 128k".into(), false, Some(50)))
-        );
-        assert_eq!(
-            parse_sidecar("标准 96k\t500\t0\t20", 500),
-            Some(("省流 96k".into(), false, Some(20)))
-        );
+        let low = parse_sidecar("标准 128k\t500\t0\t50", 500).unwrap();
+        assert_eq!(low.quality, "流畅 128k");
+        assert_eq!(low.actual_rank, Some(50));
+        let saver = parse_sidecar("标准 96k\t500\t0\t20", 500).unwrap();
+        assert_eq!(saver.quality, "省流 96k");
         // 旧「Hi-Res 无损」在 100 分档要降级写成「无损」，前缀按长度从长到短匹配。
-        assert_eq!(
-            parse_sidecar("Hi-Res 无损 871k\t500\t0\t100", 500),
-            Some(("无损 871k".into(), false, Some(100)))
-        );
+        let hi_res = parse_sidecar("Hi-Res 无损 871k\t500\t0\t100", 500).unwrap();
+        assert_eq!(hi_res.quality, "无损 871k");
+
+        // 第 5、6 字段：已探测目标档位与探测时间
+        let checked = parse_sidecar("极高 320k\t2000\t0\t80\t100\t1700000000", 2000);
+        let checked = checked.unwrap();
+        assert_eq!(checked.actual_rank, Some(80));
+        assert_eq!(checked.checked_rank, Some(100));
+        assert_eq!(checked.checked_at, Some(1_700_000_000));
     }
 
     #[test]
@@ -757,6 +900,7 @@ mod tests {
                 quality_label: "流畅 128k".into(),
                 preview: false,
                 actual_rank: Some(50),
+                checked_rank: None,
                 file_size: 4 * 1024 * 1024,
             },
             CachedAudioRecord {
@@ -766,6 +910,7 @@ mod tests {
                 quality_label: "试听 128k".into(),
                 preview: true,
                 actual_rank: Some(50),
+                checked_rank: None,
                 file_size: 1024 * 1024,
             },
         ];
@@ -784,6 +929,7 @@ mod tests {
             quality_label: "流畅 128k".into(),
             preview: false,
             actual_rank: Some(50),
+            checked_rank: None,
             file_size: 4 * 1024 * 1024,
         };
         // auto 无上限，actual 50 可以升级至 100
@@ -796,6 +942,7 @@ mod tests {
             quality_label: "流畅 128k".into(),
             preview: false,
             actual_rank: Some(20),
+            checked_rank: None,
             file_size: 4 * 1024 * 1024,
         };
         // low 标签上限为 50，不允许越级升级至 100（无损）或 80（极高）
@@ -813,10 +960,129 @@ mod tests {
             quality_label: "极高 320k".into(),
             preview: false,
             actual_rank: Some(50),
+            checked_rank: None,
             file_size: 10 * 1024 * 1024,
         };
         // lossless 标签上限为 100，实际为 50（曾发生降档），允许升级至 100
         assert!(lossless_downgraded.is_upgradeable_to(100));
+    }
+
+    /// #90：确认过「没有更高档位」的目标不再计入升级与预估，但更高目标仍可探测。
+    #[test]
+    fn checked_target_is_skipped_until_the_target_rises() {
+        let confirmed = CachedAudioRecord {
+            track_id: "1".into(),
+            quality_tag: "auto".into(),
+            path: PathBuf::from("1-auto.m4a"),
+            quality_label: "极高 320k".into(),
+            preview: false,
+            actual_rank: Some(80),
+            checked_rank: Some(100),
+            file_size: 10 * 1024 * 1024,
+        };
+        // 已经问过无损、确认没有更高流：同一个目标不再计入
+        assert!(!confirmed.is_upgradeable_to(100));
+        // 更高目标还没问过，仍要允许探测：历史结论不能代表更高档位
+        assert!(confirmed.is_upgradeable_to(110));
+
+        let low_confirmed = CachedAudioRecord {
+            actual_rank: Some(50),
+            checked_rank: Some(70),
+            ..confirmed.clone()
+        };
+        // 只确认过 70 档：再问 70 没有意义，问 80 仍应尝试
+        assert!(!low_confirmed.is_upgradeable_to(70));
+        assert!(low_confirmed.is_upgradeable_to(80));
+
+        let estimate = estimate_upgrade(&[confirmed], 100);
+        assert_eq!(estimate.upgradeable_count, 0);
+
+        assert!(upgrade_check_covers(Some(100), Some(100)));
+        assert!(!upgrade_check_covers(Some(70), Some(80)));
+        assert!(!upgrade_check_covers(None, Some(80)));
+        assert!(!upgrade_check_covers(Some(80), None));
+    }
+
+    /// 探测结论只在 30 天内有效，过期后重新探测。
+    #[test]
+    fn checked_rank_expires_after_ttl() {
+        let meta = SidecarMeta {
+            quality: "极高 320k".into(),
+            preview: false,
+            actual_rank: Some(80),
+            checked_rank: Some(100),
+            checked_at: Some(1_700_000_000),
+        };
+        assert_eq!(meta.fresh_checked_rank(1_700_000_001), Some(100));
+        let edge = 1_700_000_000 + UPGRADE_CHECK_TTL.as_secs() - 1;
+        assert_eq!(meta.fresh_checked_rank(edge), Some(100));
+        let expired = 1_700_000_000 + UPGRADE_CHECK_TTL.as_secs();
+        assert_eq!(meta.fresh_checked_rank(expired), None);
+        // 时钟回拨时无法判断新鲜度，按过期处理：多探一次比永久不探安全。
+        assert_eq!(meta.fresh_checked_rank(1_700_000_000 - 1), None);
+        // 缺时间戳的记录不参与跳过。
+        let no_time = SidecarMeta {
+            checked_at: None,
+            ..meta
+        };
+        assert_eq!(no_time.fresh_checked_rank(1_700_000_001), None);
+    }
+
+    /// 写回探测结论时保留原来的前四个字段，且不覆盖已被替换的文件。
+    #[test]
+    fn record_upgrade_check_preserves_fields_and_skips_changed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        record_upgrade_check(&sidecar, 80, 100, 1_700_000_000).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "极高 320k\t2000\t0\t80\t100\t1700000000");
+        let parsed = parse_sidecar(&text, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, Some(80));
+        assert_eq!(parsed.checked_rank, Some(100));
+        assert_eq!(parsed.checked_at, Some(1_700_000_000));
+
+        // 文件已经被别的写者换成另一档：旧结论不能盖到新文件上。
+        record_upgrade_check(&sidecar, 50, 110, 1_700_000_001).unwrap();
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
+
+        // 换一个更高目标重探后，记录被替换而不是叠加。
+        record_upgrade_check(&sidecar, 80, 110, 1_700_000_002).unwrap();
+        let updated = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(updated, "极高 320k\t2000\t0\t80\t110\t1700000002");
+
+        // 旧三字段没有实际档位，身份无法确认，跳过写入。
+        std::fs::write(&sidecar, "极高 320k\t2000\t0").unwrap();
+        record_upgrade_check(&sidecar, 80, 100, 1_700_000_003).unwrap();
+        let legacy = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(legacy, "极高 320k\t2000\t0");
+    }
+
+    /// 写回失败或字段不完整时只报错，不碰原 sidecar。
+    #[test]
+    fn record_upgrade_check_errors_without_touching_existing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.quality");
+        assert!(record_upgrade_check(&missing, 80, 100, 1).is_err());
+
+        let short = dir.path().join("short.quality");
+        std::fs::write(&short, "x\ty").unwrap();
+        assert!(record_upgrade_check(&short, 80, 100, 1).is_err());
+        assert_eq!(std::fs::read_to_string(&short).unwrap(), "x\ty");
+    }
+
+    /// 写回成功时清掉可能遗留的旧备份，不留下临时文件。
+    #[test]
+    fn record_upgrade_check_cleans_stale_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        let backup = dir.path().join("song-auto.quality.old");
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        std::fs::write(&backup, "stale").unwrap();
+        record_upgrade_check(&sidecar, 80, 100, 1_700_000_000).unwrap();
+        assert!(!backup.exists());
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "极高 320k\t2000\t0\t80\t100\t1700000000");
     }
 
     #[test]

@@ -66,6 +66,9 @@ impl std::fmt::Display for QualitySource {
 /// 「自动」的存储写法。空串按它读，新写入一律写它。
 pub const AUTO: &str = "auto";
 
+/// 需要会员权益的档位分数下限（无损、杜比及更高）。
+pub const MEMBERSHIP_MIN_RANK: i64 = 88;
+
 /// 设置页与播放条共用的档位顺序（从高到低，也是菜单里的展示顺序）。
 ///
 /// 新增档位时必须同时检查三处边界：[`TIERS`]、[`QualityIntent::label_key`] 与
@@ -152,7 +155,8 @@ impl QualityIntent {
     /// 仅用于批量升级这类会消耗流量的操作预检；单个播放档位仍允许用户选择，
     /// 实际能不能拿到由服务端按账号权益与曲目可用性决定。
     pub fn requires_membership(&self) -> bool {
-        self.max_rank().is_some_and(|rank| rank >= 88)
+        self.max_rank()
+            .is_some_and(|rank| rank >= MEMBERSHIP_MIN_RANK)
     }
 
     /// 档位的稳定中文名（i18n 的 key）；认不出的档位返回 `None`，由调用方原样显示。
@@ -258,6 +262,18 @@ pub fn is_below_target(actual: Option<i64>, target: i64) -> bool {
     match actual {
         Some(rank) => rank < target,
         None => false,
+    }
+}
+
+/// 这个目标档位的「没有更高流」结论能否持久化。
+///
+/// 账号信息只有一个 VIP 布尔：低于会员门槛的档位无需权益，无损（100）能由 VIP 确认；
+/// 杜比与 Hi-Res 需要更高等级，布尔分不清，宁可下次再探，也不能把权益不足写成曲库没有。
+pub fn can_record_unavailable(target_rank: Option<i64>, is_vip: Option<bool>) -> bool {
+    match target_rank {
+        Some(rank) if rank < MEMBERSHIP_MIN_RANK => true,
+        Some(rank) if preference_rank("lossless") == Some(rank) => is_vip == Some(true),
+        _ => false,
     }
 }
 
@@ -624,6 +640,21 @@ mod tests {
         }
         assert!(!QualityIntent::Auto.requires_membership());
         assert!(!QualityIntent::parse("ultra").requires_membership());
+    }
+
+    /// 负结果只在能确认账号权益时落盘：非会员档位无需权益，无损需要 VIP，
+    /// 更高档位无法由一个布尔确认，宁可下次再探。
+    #[test]
+    fn unavailable_results_only_recorded_with_confirmed_entitlement() {
+        assert!(can_record_unavailable(Some(50), None));
+        assert!(can_record_unavailable(Some(80), Some(false)));
+        assert!(can_record_unavailable(Some(100), Some(true)));
+        assert!(!can_record_unavailable(Some(100), Some(false)));
+        assert!(!can_record_unavailable(Some(100), None));
+        // Hi-Res 与杜比需要更高等级，VIP 布尔分不清，不写负结果。
+        assert!(!can_record_unavailable(Some(110), Some(true)));
+        assert!(!can_record_unavailable(Some(88), Some(true)));
+        assert!(!can_record_unavailable(None, Some(true)));
     }
 
     /// 显示名与降档判定必须同源：真实流样本上，徽章写的档位就是判定用的那一档。

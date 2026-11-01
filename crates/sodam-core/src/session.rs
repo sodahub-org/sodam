@@ -52,15 +52,15 @@ pub struct AccountInfo {
     pub avatar_url: String,
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}`，与实际字节数核对后给出
-/// （档位，是否试听，实际档位分数）。
-///
-/// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
-/// 所以尺寸不符或档位为空一律 miss，重下自愈。
-/// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
-/// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
-/// 第四个字段是实际档位分数，缺它说明缓存写入时还没记档位：视为未知（`None`），
-/// 不据此标记与所选不符，也不触发重新下载。
+/// 读取 sidecar 后、构造 [`CachedTrack`] 前的中间结果。
+struct CachedInfo {
+    path: std::path::PathBuf,
+    quality: String,
+    preview: bool,
+    quality_rank: Option<i64>,
+    checked_rank: Option<i64>,
+}
+
 impl Session {
     /// 当前音质**意图**对应的缓存标签。
     ///
@@ -70,10 +70,16 @@ impl Session {
         self.settings.quality_intent().cache_tag()
     }
 
-    fn cached_info(
-        &self,
-        track_id: &str,
-    ) -> Option<(std::path::PathBuf, String, bool, Option<i64>)> {
+    /// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}`，
+    /// 与实际字节数核对后给出完整记录。
+    ///
+    /// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
+    /// 所以尺寸不符或档位为空一律 miss，重下自愈。
+    /// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
+    /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
+    /// 第四到第六个字段后加：实际档位缺失时视为未知，不据此标记降档；
+    /// 第五、六个字段记录升级探测结论，过期记录不参与跳过判断。
+    fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
@@ -82,23 +88,31 @@ impl Session {
         let quality_path =
             crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
-        let (quality, preview, rank) = crate::cache::parse_sidecar(&text, actual)?;
-        Some((path, quality, preview, rank))
+        let meta = crate::cache::parse_sidecar(&text, actual)?;
+        let checked = meta.fresh_checked_rank(crate::cache::now_epoch_secs());
+        Some(CachedInfo {
+            path,
+            quality: meta.quality,
+            preview: meta.preview,
+            quality_rank: meta.actual_rank,
+            checked_rank: checked,
+        })
     }
 
     pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
-        let (path, quality, preview, rank) = self.cached_info(track_id)?;
+        let info = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
             .write(true)
-            .open(&path)
+            .open(&info.path)
             .and_then(|file| file.set_modified(std::time::SystemTime::now()));
         Some(CachedTrack {
-            path,
-            quality,
-            preview,
-            quality_rank: rank,
+            path: info.path,
+            quality: info.quality,
+            preview: info.preview,
+            quality_rank: info.quality_rank,
+            checked_rank: info.checked_rank,
             lease,
         })
     }
@@ -128,6 +142,10 @@ pub struct CachedTrack {
     /// 与所选是否相符是**每次读取时现算**的：用当前意图与这里的实际档位比较，
     /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
     pub quality_rank: Option<i64>,
+    /// 仍在有效期内、已确认没有更高档位的目标分数；`None` = 没问过或记录已过期。
+    ///
+    /// 只用于决定是否再发起升级，不改变降档提示：曲目确实还在低档位播放。
+    pub checked_rank: Option<i64>,
     pub(crate) lease: crate::cache::CacheLease,
 }
 
@@ -135,6 +153,19 @@ impl CachedTrack {
     /// 实际档位对应的显示名（见 [`crate::quality::tier_label`]；档位未知返回 `None`）。
     pub fn actual_tier(&self) -> Option<&'static str> {
         self.quality_rank.map(crate::quality::tier_label)
+    }
+
+    /// 命中缓存后是否还需要向服务端要更高档位。
+    ///
+    /// 实际档位已达目标、或最近已经确认过该目标没有更高流时，都不再请求。
+    pub fn needs_upgrade(
+        &self,
+        intent: &crate::quality::QualityIntent,
+        is_vip: Option<bool>,
+    ) -> bool {
+        let target_rank = crate::quality::target_rank(intent, is_vip);
+        crate::quality::is_tier_below_selected(self.quality_rank, intent, is_vip)
+            && !crate::cache::upgrade_check_covers(self.checked_rank, target_rank)
     }
 }
 
@@ -162,6 +193,59 @@ fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
 /// 截断，不应拒绝；真正的风险只有实际更少（连接提前断开的静默 EOF）。
 fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
+}
+
+/// 把「确认没有更高档位」写回 sidecar；失败不影响播放，下次再探。
+fn record_upgrade_check(
+    quality_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    actual_rank: i64,
+    checked_rank: i64,
+) {
+    // 与替换路径共用同一把写锁，避免结论落到并发替换后的新文件上。
+    let lock = crate::cache::download_lock(audio_path);
+    let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = crate::cache::record_upgrade_check(
+        quality_path,
+        actual_rank,
+        checked_rank,
+        crate::cache::now_epoch_secs(),
+    );
+}
+
+/// 确认性 miss：拿到完整流、档位可识别、目标存在、权益已确认，且实际档位低于目标。
+///
+/// 返回应写入 sidecar 的 `checked_rank`。试听回退、权益未确认、档位未知、目标未知或
+/// 实际已经达标都不写——这些结论会随账号权益或曲库变化，不能持久化。
+fn confirmed_miss_rank(
+    target_rank: Option<i64>,
+    actual_rank: i64,
+    preview: bool,
+    can_record: bool,
+) -> Option<i64> {
+    if preview || !can_record || actual_rank <= 0 {
+        return None;
+    }
+    let target = target_rank?;
+    (actual_rank < target).then_some(target)
+}
+
+/// 拼出 sidecar 内容；有探测结论时写第 5、6 字段。
+fn encode_sidecar(
+    quality: &str,
+    written: u64,
+    preview: bool,
+    actual_rank: i64,
+    checked_rank: Option<i64>,
+) -> String {
+    match checked_rank {
+        Some(rank) => format!(
+            "{quality}\t{written}\t{}\t{actual_rank}\t{rank}\t{}",
+            u8::from(preview),
+            crate::cache::now_epoch_secs(),
+        ),
+        None => format!("{quality}\t{written}\t{}\t{actual_rank}", u8::from(preview)),
+    }
 }
 
 /// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
@@ -305,6 +389,7 @@ impl Session {
     pub fn download_to_cache(
         &self,
         track: &crate::models::TrackItem,
+        account_is_vip: Option<bool>,
     ) -> Result<CachedTrack, crate::failure::PlaybackFailure> {
         use crate::failure::{classify, PlaybackFailure, RecoveryAction, Retryability, Stage};
 
@@ -332,6 +417,9 @@ impl Session {
         if let Some(cached) = self.cached_track(&track.id) {
             return Ok(cached);
         }
+        let intent = self.settings.quality_intent();
+        let target_rank = crate::quality::target_rank(&intent, account_is_vip);
+        let can_record_check = crate::quality::can_record_unavailable(target_rank, account_is_vip);
         let lease = crate::cache::CacheLease::acquire(&path);
 
         let song = libresoda::Song {
@@ -379,6 +467,10 @@ impl Session {
         let quality = describe_quality(&info);
         let preview = info.is_preview;
         let quality_rank = crate::quality::stream_rank(&info);
+        // 首次下载就已经知道服务端给不出目标的更高流时，直接落盘结论，
+        // 下次播放不必再完整下载一次来重复验证。
+        let checked_rank =
+            confirmed_miss_rank(target_rank, quality_rank, preview, can_record_check);
         // 这里只可能是无效旧缓存；Windows rename 不覆盖既有文件，先尝试移除。
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -392,14 +484,9 @@ impl Session {
                 err.to_string(),
             )
         })?;
-        std::fs::write(
-            &quality_path,
-            format!(
-                "{quality}\t{written}\t{}\t{quality_rank}",
-                u8::from(preview)
-            ),
-        )
-        .map_err(|err| {
+        let sidecar_content =
+            encode_sidecar(&quality, written, preview, quality_rank, checked_rank);
+        std::fs::write(&quality_path, sidecar_content).map_err(|err| {
             PlaybackFailure::new(
                 Stage::Unpack,
                 Retryability::Never,
@@ -415,6 +502,7 @@ impl Session {
             quality,
             preview,
             quality_rank: Some(quality_rank),
+            checked_rank,
             lease,
         })
     }
@@ -426,11 +514,14 @@ impl Session {
     ///
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
     /// * 若中途失败，清理临时文件，绝不破坏原有缓存；
-    /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存。
+    /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存；
+    /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
+    ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
     pub fn upgrade_cached_track(
         &self,
         track: &crate::models::TrackItem,
         target_intent: Option<&crate::quality::QualityIntent>,
+        account_is_vip: Option<bool>,
     ) -> Result<CachedTrack, crate::failure::PlaybackFailure> {
         use crate::failure::{classify, PlaybackFailure, RecoveryAction, Retryability, Stage};
 
@@ -454,14 +545,19 @@ impl Session {
 
         let default_intent = self.settings.quality_intent();
         let intent = target_intent.unwrap_or(&default_intent);
-        // 若为明确指定的 Tier，target_rank 不需要 VIP，避免冗余网络请求
+        // 明确指定 Tier 时目标分数与会员状态无关，但记录「没有更高档位」需要知道权益：
+        // 非会员请求无损失败并不代表曲库没有无损，买会员后必须重新尝试。
         let vip = match intent {
-            crate::quality::QualityIntent::Tier(_) => None,
+            crate::quality::QualityIntent::Tier(_) => account_is_vip,
             _ => self.is_vip().ok(),
         };
+        let target_rank = crate::quality::target_rank(intent, vip);
+        // 没有会员权益时拿不到更高档位，不能据此断言曲库没有；等权益确认后再记录。
+        let can_record_check = crate::quality::can_record_unavailable(target_rank, vip);
 
-        // 如果已有档位并不低于目标档位，直接复用已有缓存
-        if !crate::quality::is_tier_below_selected(current.quality_rank, intent, vip) {
+        // 如果已有档位并不低于目标档位，直接复用已有缓存。
+        // 最近已经确认过该目标没有更高流时同样不再请求，避免跨会话重复下载。
+        if !current.needs_upgrade(intent, vip) {
             return Ok(current);
         }
 
@@ -482,7 +578,7 @@ impl Session {
                 ));
             }
         };
-        if !crate::quality::is_tier_below_selected(current.quality_rank, intent, vip) {
+        if !current.needs_upgrade(intent, vip) {
             return Ok(current);
         }
 
@@ -538,18 +634,26 @@ impl Session {
         }
 
         let new_rank = crate::quality::stream_rank(&info);
+        // 成功拿到完整流但仍在目标之下，同样是确认性结论：服务端已给出它能给的最好档位。
+        let checked_rank =
+            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
         // 若新流档位并未高于旧档位，且未发生「由试听升级为整曲」，丢弃临时文件，保留旧文件
         if let Some(old_rank) = current.quality_rank {
             let is_improved = new_rank > old_rank || (current.preview && !info.is_preview);
             if !is_improved {
                 let _ = std::fs::remove_file(&part);
+                // 只有「拿到完整流、档位仍没提升」才是确认性结论。试听回退与下载失败
+                // 会随会员权益或网络变化，不能写成「没有更高档位」。
+                if let Some(checked_rank) = checked_rank {
+                    record_upgrade_check(&quality_path, &path, old_rank, checked_rank);
+                }
                 return Ok(current);
             }
         }
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
-        let sidecar_content = format!("{quality}\t{written}\t{}\t{new_rank}", u8::from(preview));
+        let sidecar_content = encode_sidecar(&quality, written, preview, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -575,6 +679,7 @@ impl Session {
             quality,
             preview,
             quality_rank: Some(new_rank),
+            checked_rank,
             lease: target_lease,
         })
     }
@@ -856,34 +961,32 @@ mod tests {
     /// 试听标记与旧 sidecar 的兼容：这条链一断，界面就会把整曲说成试听（或反之）。
     #[test]
     fn sidecar_reads_preview_flag_and_self_heals_legacy_label() {
-        let (quality, preview, rank) =
-            crate::cache::parse_sidecar("无损 871k\t2048\t1", 2048).unwrap();
-        assert_eq!(quality, "无损 871k");
-        assert!(preview);
-        assert_eq!(rank, None, "旧格式没有档位分数，视为未知");
-        let (_, preview, _) = crate::cache::parse_sidecar("无损 871k\t2048\t0", 2048).unwrap();
-        assert!(!preview);
+        let meta = crate::cache::parse_sidecar("无损 871k\t2048\t1", 2048).unwrap();
+        assert_eq!(meta.quality, "无损 871k");
+        assert!(meta.preview);
+        assert_eq!(meta.actual_rank, None, "旧格式没有档位分数，视为未知");
+        let meta = crate::cache::parse_sidecar("无损 871k\t2048\t0", 2048).unwrap();
+        assert!(!meta.preview);
         // 旧缓存没有第三个字段：试听拼在档位里，要读出来并洗回纯档位
-        let (quality, preview, _) = crate::cache::parse_sidecar("无损 · 试听\t2048", 2048).unwrap();
-        assert_eq!(quality, "无损");
-        assert!(preview);
-        let (quality, preview, _) = crate::cache::parse_sidecar("无损\t2048", 2048).unwrap();
-        assert_eq!(quality, "无损");
-        assert!(!preview);
+        let meta = crate::cache::parse_sidecar("无损 · 试听\t2048", 2048).unwrap();
+        assert_eq!(meta.quality, "无损");
+        assert!(meta.preview);
+        let meta = crate::cache::parse_sidecar("无损\t2048", 2048).unwrap();
+        assert_eq!(meta.quality, "无损");
+        assert!(!meta.preview);
         // 旧缓存把 50 分档写成「标准」：读取时洗成新显示名，不再与 standard(70) 撞名。
-        let (quality, _, rank) =
-            crate::cache::parse_sidecar("标准 128k\t2048\t0\t50", 2048).unwrap();
-        assert_eq!(quality, "流畅 128k");
-        assert_eq!(rank, Some(50));
+        let meta = crate::cache::parse_sidecar("标准 128k\t2048\t0\t50", 2048).unwrap();
+        assert_eq!(meta.quality, "流畅 128k");
+        assert_eq!(meta.actual_rank, Some(50));
     }
 
     /// 第四个字段（实际档位分数）能读出来；缺失或不是数字时一律未知。
     #[test]
     fn sidecar_reads_actual_rank_and_treats_missing_as_unknown() {
-        let (_, _, rank) = crate::cache::parse_sidecar("无损 871k\t2048\t0\t100", 2048).unwrap();
-        assert_eq!(rank, Some(100));
-        let (_, _, rank) = crate::cache::parse_sidecar("极高 320k\t2048\t0\tabc", 2048).unwrap();
-        assert_eq!(rank, None);
+        let meta = crate::cache::parse_sidecar("无损 871k\t2048\t0\t100", 2048).unwrap();
+        assert_eq!(meta.actual_rank, Some(100));
+        let meta = crate::cache::parse_sidecar("极高 320k\t2048\t0\tabc", 2048).unwrap();
+        assert_eq!(meta.actual_rank, None);
     }
 
     /// 尺寸对不上、档位为空、字段不齐一律 miss——半截文件不许冒充命中。
@@ -907,6 +1010,52 @@ mod tests {
         assert!(is_truncated_download(10_569_897, 10_569_896));
     }
 
+    /// 只有完整流、目标存在、权益已确认且实际低于目标时才写负结果。
+    #[test]
+    fn confirmed_miss_needs_full_stream_target_and_entitlement() {
+        assert_eq!(confirmed_miss_rank(Some(100), 80, false, true), Some(100));
+        assert_eq!(confirmed_miss_rank(Some(100), 100, false, true), None);
+        assert_eq!(confirmed_miss_rank(Some(100), 80, true, true), None);
+        assert_eq!(confirmed_miss_rank(Some(100), 80, false, false), None);
+        assert_eq!(confirmed_miss_rank(None, 80, false, true), None);
+        // 档位算不出来（未知，0 分）时不是确认性结论。
+        assert_eq!(confirmed_miss_rank(Some(100), 0, false, true), None);
+    }
+
+    /// 写出与解析必须用同一套字段布局，避免两边各改一处后错位。
+    #[test]
+    fn encode_sidecar_round_trips_through_parser() {
+        let plain = encode_sidecar("极高 320k", 2000, false, 80, None);
+        assert_eq!(plain, "极高 320k\t2000\t0\t80");
+        let plain_checked = crate::cache::parse_sidecar(&plain, 2000).unwrap();
+        assert_eq!(plain_checked.checked_rank, None);
+
+        let checked = encode_sidecar("极高 320k", 2000, false, 80, Some(100));
+        let parsed = crate::cache::parse_sidecar(&checked, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, Some(80));
+        assert_eq!(parsed.checked_rank, Some(100));
+        assert!(parsed.checked_at.is_some());
+    }
+
+    /// 命中缓存时，确认过的目标不再触发升级；目标提高后仍要重新探测。
+    #[test]
+    fn needs_upgrade_honours_confirmed_target() {
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("t.m4a"));
+        let track = |rank: i64, checked: Option<i64>| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: "test".into(),
+            preview: false,
+            quality_rank: Some(rank),
+            checked_rank: checked,
+            lease: lease.clone(),
+        };
+        let lossless = crate::quality::QualityIntent::parse("lossless");
+        assert!(track(80, None).needs_upgrade(&lossless, None));
+        assert!(!track(80, Some(100)).needs_upgrade(&lossless, None));
+        assert!(track(80, Some(70)).needs_upgrade(&lossless, None));
+        assert!(!track(100, None).needs_upgrade(&lossless, None));
+    }
+
     #[test]
     fn upgrade_cached_track_fails_fast_when_not_cached() {
         let session = Session::new(Settings::default());
@@ -914,7 +1063,9 @@ mod tests {
             id: "non-existent-track-999".into(),
             ..Default::default()
         };
-        let err = session.upgrade_cached_track(&track, None).unwrap_err();
+        let err = session
+            .upgrade_cached_track(&track, None, None)
+            .unwrap_err();
         assert_eq!(err.stage, crate::failure::Stage::Input);
         assert_eq!(err.retryability, crate::failure::Retryability::Never);
     }

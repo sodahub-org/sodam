@@ -70,6 +70,7 @@ impl Root {
         let log = log_outlet::enabled(LogLevel::Debug, LogTopic::Prefetch);
         let ahead = prefetch_ahead_count();
         let max_inflight = prefetch_concurrency().max(1);
+        let account_is_vip = self.account.as_ref().map(|a| a.vip);
         let candidates: Vec<TrackItem> = self
             .queue
             .peek_ahead(ahead)
@@ -145,7 +146,7 @@ impl Root {
             let track = next.clone();
             let work_track = track.clone();
             let result = cx.background_spawn(async move {
-                Session::new(settings).download_to_cache(&work_track)
+                Session::new(settings).download_to_cache(&work_track, account_is_vip)
             });
             cx.spawn(async move |this, cx| {
                 let outcome = result.await;
@@ -1345,9 +1346,11 @@ impl Root {
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         cx.notify();
         let settings = self.settings.clone();
+        let account_is_vip = self.account.as_ref().map(|a| a.vip);
         let work_track = track.clone();
-        let work = cx
-            .background_spawn(async move { Session::new(settings).download_to_cache(&work_track) });
+        let work = cx.background_spawn(async move {
+            Session::new(settings).download_to_cache(&work_track, account_is_vip)
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
@@ -2037,6 +2040,7 @@ impl Root {
         &mut self,
         track: TrackItem,
         intent: sodam_core::quality::QualityIntent,
+        account_is_vip: Option<bool>,
         cx: &mut Context<Self>,
     ) {
         let max_inflight = prefetch_concurrency().max(1);
@@ -2060,7 +2064,7 @@ impl Root {
         let track_clone = track.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            session.upgrade_cached_track(&track_clone, Some(&intent))
+            session.upgrade_cached_track(&track_clone, Some(&intent), account_is_vip)
         });
         let key_clone = key;
         let track_id = track.id.clone();
@@ -2178,7 +2182,7 @@ impl Root {
                 let upgrade_result = cx
                     .background_spawn(async move {
                         let session = Session::new(settings_clone);
-                        session.upgrade_cached_track(&track, Some(&target_clone))
+                        session.upgrade_cached_track(&track, Some(&target_clone), is_vip)
                     })
                     .await;
 
@@ -2887,6 +2891,7 @@ impl Root {
         cx.notify();
 
         let settings = self.settings.clone();
+        let account_is_vip = self.account.as_ref().map(|a| a.vip);
         let work_track = track.clone();
         // 单层预算：还要不要再来一次由**这次失败的分类**决定。
         // 之前是无条件 3 次线性退避，于是「这首已下架」「签名服务要求鉴权」这类
@@ -2903,7 +2908,7 @@ impl Root {
                 PlayBudget::default(),
                 trace.as_ref(),
                 std::time::Instant::now(),
-                |_| session.download_to_cache(&work_track),
+                |_| session.download_to_cache(&work_track, account_is_vip),
                 std::thread::sleep,
             );
             (result, was_cached)
@@ -2933,6 +2938,9 @@ impl Root {
                     Ok(cached) => {
                         let actual_rank = cached.quality_rank;
                         let actual_quality = cached.quality.clone();
+                        let intent = root.settings.quality_intent();
+                        let is_vip = root.account.as_ref().map(|a| a.vip);
+                        let needs_upgrade = was_cached && cached.needs_upgrade(&intent, is_vip);
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
@@ -2946,22 +2954,20 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
+                        // 命中缓存但档位低于目标，且没有确认过该目标无更高流时，后台升级。
+                        if needs_upgrade {
+                            root.spawn_background_cache_upgrade(
+                                track.clone(),
+                                intent.clone(),
+                                is_vip,
+                                cx,
+                            );
+                        }
                         // 与所选不符：低于和高于都用同一句格式说出两侧，不猜原因——
                         // 低于是「没有权益」与「这首没有该档位」返回值相同；高于是候选集里
                         // 没有等于或低于上限的流，服务端退回全量取最优（#82），但据此说
                         // 「这首只有更高档」是过头的：实测回退的全是试听片段。
                         // 通道走状态行，#94 之后它有渲染出口，这类事实不该打断用户。
-                        let intent = root.settings.quality_intent();
-                        let is_vip = root.account.as_ref().map(|a| a.vip);
-                        if was_cached
-                            && sodam_core::quality::is_tier_below_selected(
-                                actual_rank,
-                                &intent,
-                                is_vip,
-                            )
-                        {
-                            root.spawn_background_cache_upgrade(track.clone(), intent.clone(), cx);
-                        }
                         let mismatch =
                             sodam_core::quality::visible_tier_mismatch(&intent, actual_rank);
                         let selected_name = crate::ui::player_bar::quality_label(
