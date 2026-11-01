@@ -1498,10 +1498,28 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 })
                                 .child(root.tr("回复").to_string())
                                 .when(comment.replies > 0, |this| {
-                                    this.child(format!(
-                                        "— 展开 {} 条回复",
-                                        comment.replies
-                                    ))
+                                    let id = comment.id.clone();
+                                    this.child(
+                                        div()
+                                            .id(gpui::ElementId::Name(
+                                                format!("comment-expand-{}", comment.id).into(),
+                                            ))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(theme::accent()))
+                                            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                                                if root.expanded_comments.remove(&id) {
+                                                    cx.notify();
+                                                    return;
+                                                }
+                                                root.expanded_comments.insert(id.clone());
+                                                root.set_toast(
+                                                    "回复列表接口暂不可用（官方走独立评论服务）".to_string(),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }))
+                                            .child(format!("— 展开 {} 条回复", comment.replies)),
+                                    )
                                 }),
                         ),
                 )
@@ -1559,7 +1577,7 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .absolute()
             .right(px(0.0))
             .top(px(48.0))
-            .bottom(px(theme::PLAYER_H))
+            .bottom(px(0.0))
             .w(px(420.0))
             .flex()
             .flex_col()
