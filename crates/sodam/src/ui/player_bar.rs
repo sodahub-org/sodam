@@ -684,6 +684,13 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         "spatial" => "全景声".to_string(),
         _ => quality.clone(),
     };
+    // 还没拿到实际流（加载/缓存缺失）时，标出用户选的目标档位，
+    // 避免胶囊里出现一个空白方块。
+    if quality_name.trim().is_empty() {
+        quality_name = official_quality_label(root.settings.quality_intent().as_setting())
+            .trim_end_matches("音质")
+            .to_string();
+    }
     if snapshot.preview {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
