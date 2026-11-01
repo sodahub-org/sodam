@@ -597,12 +597,12 @@ pub(crate) fn quality_menu(
     let menu_top = (48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0)
         .min(height - theme::PLAYER_H - 48.0);
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
-    let menu_right = width - 108.0;
-    // 尺寸按官方 350 固定；右边框仍对齐循环图标右缘，左边框随窗宽回推。
-    let menu_width = 350.0;
-    let menu_left = (menu_right - menu_width).max(12.0);
+    // 菜单以音质胶囊为中心：宽度收窄后箭头仍正对胶囊中心。
+    let menu_width = 320.0;
+    let menu_left = (width - 271.5 - menu_width / 2.0).max(12.0);
     let pill_center = width - 271.5;
     let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
+    let _ = menu_right;
     let _ = position;
     gpui::deferred(
         div()
