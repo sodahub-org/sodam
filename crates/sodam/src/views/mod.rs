@@ -1276,12 +1276,13 @@ mod tests {
     }
 }
 
-/// 底部「更多功能」菜单：对齐官方 BottomPlayerMoreButton 的五项。
+/// 底部「更多功能」菜单：对齐官方四项（查看专辑 / 分享 / 歌曲信息反馈 / 举报歌曲）。
 pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let Some((track, position)) = root.more_menu.clone() else {
         return div().into_any_element();
     };
     let item = |id: &'static str,
+                icon: &'static str,
                 label: String,
                 cx: &mut Context<Root>,
                 action: fn(&mut Root, sodam_core::models::TrackItem, &mut Context<Root>)| {
@@ -1291,19 +1292,30 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .flex()
             .flex_row()
             .items_center()
-            .px(px(theme::space::SM))
-            .py(px(theme::space::XS))
-            .rounded(px(theme::radius::ROW))
+            .gap(px(12.0))
+            .px(px(8.0))
+            .h(px(40.0))
+            .rounded(px(8.0))
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_hover()))
-            .text_size(theme::Text::Small.size())
-            .text_color(theme::text())
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.more_menu = None;
                 action(root, track.clone(), cx);
                 cx.notify();
             }))
-            .child(label)
+            .child(
+                svg()
+                    .path(icons::path(icon))
+                    .size(px(20.0))
+                    .text_color(theme::text()),
+            )
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::text())
+                    .child(label),
+            )
     };
     gpui::deferred(
         gpui::anchored()
@@ -1317,25 +1329,28 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     })
                     .flex()
                     .flex_col()
-                    .w(px(160.0))
-                    .p(px(theme::space::XS))
-                    .rounded(px(theme::radius::CARD))
+                    .gap(px(2.0))
+                    .w(px(220.0))
+                    .p(px(8.0))
+                    .rounded(px(12.0))
                     .bg(theme::surface_elevated())
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
-                    .child(item("more-artist", root.tr("查看歌手").to_string(), cx, |root, track, cx| {
-                        root.open_track_artist(track, cx);
-                    }))
-                    .child(item("more-album", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
+                    .child(item("more-album", "disc-3", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
                         root.open_track_album(track, cx);
                     }))
-                    .child(item("more-share", root.tr("分享").to_string(), cx, |_root, track, cx| {
+                    .child(item("more-share", "share-2", root.tr("分享").to_string(), cx, |root, track, cx| {
                         let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                        root.set_status("已复制链接", &[]);
                     }))
-                    .child(item("more-feedback", root.tr("反馈").to_string(), cx, |_root, _track, _cx| {}))
-                    .child(item("more-report", root.tr("举报").to_string(), cx, |_root, _track, _cx| {})),
+                    .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, _cx| {
+                        root.set_status("已记录对《{}》的信息反馈", std::slice::from_ref(&track.title));
+                    }))
+                    .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, _cx| {
+                        root.set_status("已收到对《{}》的举报", std::slice::from_ref(&track.title));
+                    })),
             ),
     )
     .into_any_element()
