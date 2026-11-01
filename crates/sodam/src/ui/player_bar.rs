@@ -442,10 +442,10 @@ pub(crate) fn quality_menu(
     if svip {
         items.push(
             div()
-                .mx(px(12.0))
-                .my(px(8.0))
-                .px(px(12.0))
-                .py(px(10.0))
+                .mx(px(10.0))
+                .my(px(6.0))
+                .px(px(10.0))
+                .py(px(8.0))
                 .rounded(px(8.0))
                 .bg(gpui::rgb(0x3a3a2e))
                 .flex()
@@ -455,13 +455,13 @@ pub(crate) fn quality_menu(
                 .child(
                     svg()
                         .path(icons::path("svip"))
-                        .w(px(52.0))
-                        .h(px(14.0))
+                        .w(px(44.0))
+                        .h(px(12.0))
                         .text_color(gpui::rgb(0xffd98a)),
                 )
                 .child(
                     div()
-                        .text_size(px(15.0))
+                        .text_size(px(13.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(text_primary)
                         .child("权益生效中，尊享音质、音效特权"),
@@ -482,8 +482,8 @@ pub(crate) fn quality_menu(
                 .flex_row()
                 .items_center()
                 .h(px(62.0))
-                .px(px(12.0))
-                .py(px(6.0))
+                .px(px(10.0))
+                .py(px(4.0))
                 .cursor_pointer()
                 .hover(|style| style.bg(gpui::Rgba {
                     a: 0.1,
@@ -510,13 +510,13 @@ pub(crate) fn quality_menu(
                                 .when(option.svip, |this| {
                                     this.child(
                                         gpui::img("icons/spatial-quality-mini.png")
-                                            .w(px(22.0))
-                                            .h(px(17.0)),
+                                            .w(px(20.0))
+                                            .h(px(15.0)),
                                     )
                                 })
                                 .child(
                                     div()
-                                        .text_size(if option.svip { px(15.0) } else { px(14.0) })
+                                        .text_size(if option.svip { px(13.0) } else { px(12.0) })
                                         .font_weight(if option.svip {
                                             gpui::FontWeight::BOLD
                                         } else {
@@ -541,7 +541,7 @@ pub(crate) fn quality_menu(
                                             .child(
                                                 svg()
                                                     .path(icons::path("svip"))
-                                                    .w(px(28.0))
+                                                    .w(px(24.0))
                                                     .h(px(8.0))
                                                     .text_color(gpui::rgb(0xffd98a)),
                                             ),
@@ -555,7 +555,7 @@ pub(crate) fn quality_menu(
                                     .flex_row()
                                     .items_center()
                                     .gap(px(4.0))
-                                    .text_size(px(13.0))
+                                    .text_size(px(11.0))
                                     .text_color(text_secondary)
                                     .child(option.desc)
                                     .child(
@@ -571,7 +571,7 @@ pub(crate) fn quality_menu(
                     this.child(
                         svg()
                             .path(icons::path("check"))
-                            .size(px(16.0))
+                            .size(px(14.0))
                             .text_color(gpui::rgb(0xffffff)),
                     )
                 })
@@ -595,13 +595,13 @@ pub(crate) fn quality_menu(
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
     let _ = cover_left;
     // 弹层整体必须落在播放条上方，底部箭头才不会压进控制栏。
-    let menu_height = if svip { 372.0 } else { 300.0 };
+    let menu_height = if svip { 306.0 } else { 240.0 };
     let bar_top = height - theme::PLAYER_H;
     let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
     let menu_top = cover_center.min(bar_top - menu_height - 10.0).max(48.0);
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
     // 菜单以音质胶囊为中心：宽度收窄后箭头仍正对胶囊中心。
-    let menu_width = 320.0;
+    let menu_width = 280.0;
     let menu_left = (width - 271.5 - menu_width / 2.0).max(12.0);
     let pill_center = width - 271.5;
     let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
@@ -909,7 +909,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                 .items_center()
                                 .justify_center()
                                 .w(px(84.0))
-                                .h(px(48.0))
+                                .h(px(44.0))
                                 .rounded(px(100.0))
                                 .bg(gpui::Rgba { a: 0.05, ..theme::text() })
                                 .hover(|style| style.bg(gpui::Rgba { a: 0.1, ..theme::text() }))
