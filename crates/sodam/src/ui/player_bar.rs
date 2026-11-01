@@ -414,6 +414,7 @@ pub(crate) fn quality_menu(
     root: &Root,
     cx: &mut Context<Root>,
     position: gpui::Point<gpui::Pixels>,
+    viewport: gpui::Size<gpui::Pixels>,
 ) -> impl IntoElement {
     let playing = root.engine.snapshot().quality.to_ascii_lowercase();
     let current_key = if playing.is_empty() {
@@ -578,38 +579,54 @@ pub(crate) fn quality_menu(
         );
     }
 
-    // 官方菜单以音质按钮为锚点、箭头正对按钮：水平按菜单宽度居中，
-    // 垂直整体上移，让底部三角落在点击位置上方。
-    let menu_height = if svip { 5.0 * 62.0 + 104.0 } else { 5.0 * 62.0 };
-    let anchor_x = f32::from(position.x) - 190.0;
-    let anchor_y = (f32::from(position.y) - menu_height - 18.0).max(8.0);
+    // 官方锚点规则：左边框在封面右缘与歌词文字之间，上边框在封面上下中点，
+    // 右边框与循环图标右缘齐平，底部箭头对准音质胶囊中心。
+    let width = f32::from(viewport.width);
+    let height = f32::from(viewport.height);
+    let content_h = (height - 48.0 - theme::PLAYER_H).max(320.0);
+    let vh = (height - theme::PLAYER_H).max(360.0);
+    let mut cover = (vh * 0.40).min(width * 0.30);
+    let lyrics_w = (width * 0.30).clamp(300.0, 500.0);
+    let centered = (width - theme::SIDEBAR_W - 100.0).max(220.0);
+    let natural = cover + 50.0 + lyrics_w;
+    if natural > centered {
+        cover *= centered / natural;
+    }
+    let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
+    let menu_left = cover_left + cover + 25.0;
+    let menu_top = (48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0)
+        .min(height - theme::PLAYER_H - 48.0);
+    // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
+    let menu_right = width - 108.0;
+    let menu_width = (menu_right - menu_left).max(280.0);
+    let pill_center = width - 271.5;
+    let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
+    let _ = position;
     gpui::deferred(
-        gpui::anchored()
-            .snap_to_window()
-            .position(gpui::point(px(anchor_x), px(anchor_y)))
+        div()
+            .id("quality-menu")
+            .absolute()
+            .left(px(menu_left))
+            .top(px(menu_top))
+            .w(px(menu_width))
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .py(px(8.0))
+            .bg(surface)
+            .shadow_lg()
+            .occlude()
+            .child(div().relative().flex().flex_col().children(items))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
+                    .absolute()
+                    .left(px(arrow_x))
+                    .bottom(px(-6.0))
                     .child(
-                        div()
-                            .id("quality-menu")
-                            .flex()
-                            .flex_col()
-                            .w(px(380.0))
-                            .py(px(8.0))
-                            .rounded(px(8.0))
-                            .bg(surface)
-                            .shadow_lg()
-                            .children(items),
-                    )
-                    .child(
-                        div().flex().justify_center().child(
-                            svg()
-                                .path(icons::path("triangle-down"))
-                                .size(px(12.0))
-                                .text_color(surface),
-                        ),
+                        svg()
+                            .path(icons::path("triangle-down"))
+                            .size(px(12.0))
+                            .text_color(surface),
                     ),
             ),
     )

@@ -1869,7 +1869,7 @@ impl Render for Root {
                 this.child(crate::views::track_menu(self, cx))
             })
             .when_some(self.quality_menu, |this, position| {
-                this.child(ui::player_bar::quality_menu(self, cx, position))
+                this.child(ui::player_bar::quality_menu(self, cx, position, window.viewport_size()))
             })
             .when(
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),
