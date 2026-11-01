@@ -407,12 +407,16 @@ impl CachedAudioRecord {
         self.actual_rank.map(crate::quality::tier_label)
     }
 
-    /// 当前实际档位是否低于目标档位分数。
+    /// 这份缓存需不需要重新取一次更高的流。
     ///
-    /// 档位未知（旧三字段缓存）时不再算「不低于」：按 sidecar 的档位标签看能否证明达标，
-    /// 证明不了就当作需要重下（见 [`crate::quality::cache_is_below_target`]）。
-    pub fn is_below_target(&self, target_rank: i64) -> bool {
-        crate::quality::cache_is_below_target(self.actual_rank, &self.quality_label, target_rank)
+    /// 档位未知（旧三字段缓存）时不再算「不用重下」：按 sidecar 的档位标签看能否证明达标，
+    /// 证明不了就当作需要重下（见 [`crate::quality::cache_needs_higher_stream`]）。
+    pub fn needs_higher_stream(&self, target_rank: i64) -> bool {
+        crate::quality::cache_needs_higher_stream(
+            self.actual_rank,
+            &self.quality_label,
+            target_rank,
+        )
     }
 
     /// 当前记录是否允许批量升级至目标档位。
@@ -420,7 +424,7 @@ impl CachedAudioRecord {
     /// 排除试听片段、已达到或超过目标的记录，以及最近已经确认过「没有更高档位」的目标：
     /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
     /// 档位未知的旧缓存计入可升级——它证明不了自己达标；其中标签已证明达标的
-    /// （旧「无损」标签）由 [`CachedAudioRecord::is_below_target`] 挡掉，不白花流量。
+    /// （旧「无损」标签）由 [`CachedAudioRecord::needs_higher_stream`] 挡掉，不白花流量。
     /// 同时受该缓存文件自身的 quality_tag 意图上限约束：
     /// 例如用户在省流模式下缓存的 `-low.m4a`（上限 50），不会被冲高为无损（100），
     /// 以免后续省流播放时命中数十兆的庞大文件破坏省流意图。
@@ -430,7 +434,7 @@ impl CachedAudioRecord {
             .is_none_or(|cap| target_rank <= cap);
         !self.preview
             && within_cap
-            && self.is_below_target(target_rank)
+            && self.needs_higher_stream(target_rank)
             && !upgrade_check_covers(self.checked_rank, Some(target_rank))
     }
 }
@@ -867,13 +871,13 @@ mod tests {
         let song1 = records.iter().find(|r| r.track_id == "song1").unwrap();
         assert_eq!(song1.actual_rank, Some(50));
         assert_eq!(song1.actual_tier(), Some("流畅"));
-        assert!(song1.is_below_target(100));
-        assert!(!song1.is_below_target(50));
+        assert!(song1.needs_higher_stream(100));
+        assert!(!song1.needs_higher_stream(50));
 
         let song2 = records.iter().find(|r| r.track_id == "song2").unwrap();
         assert_eq!(song2.actual_rank, Some(100));
         assert_eq!(song2.actual_tier(), Some("无损"));
-        assert!(!song2.is_below_target(100));
+        assert!(!song2.needs_higher_stream(100));
 
         // 目标为无损（100）：song1 可升级，song2 不需升级
         let est_lossless = estimate_upgrade(&records, 100);

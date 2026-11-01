@@ -172,9 +172,11 @@ impl CachedTrack {
     /// 播放命中时是否值得**自动**发起后台升级。
     ///
     /// 与 [`Self::needs_upgrade`] 只差一种情形：档位未知的旧缓存，如果这次探测的结论
-    /// 根本没法写进 sidecar（权益未确认，见 `can_record_unavailable`），那就意味着
-    /// 每次播放都整曲重下一遍——自动路径担不起这种流量，索性不探。
-    /// 用户主动点的批量升级仍走 `needs_upgrade`：那一下是他自己同意花流量的。
+    /// 根本没法写进 sidecar（账号权益未确认，见 `can_record_unavailable`），那这个结论
+    /// 就留不下来——本会话内的去重（`cache_upgrade_attempted`）挡得住连续切歌，
+    /// 挡不住下次启动再来一遍。对存量缓存来说那等于每次启动都把这首歌整曲下一遍、
+    /// 再发现没有更高的流。自动路径不该替用户做这种决定；用户主动点的批量升级仍走
+    /// `needs_upgrade`，那一下是他自己同意花流量的。
     pub fn needs_auto_upgrade(
         &self,
         intent: &crate::quality::QualityIntent,

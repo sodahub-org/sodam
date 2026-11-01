@@ -267,8 +267,9 @@ pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> 
 /// 不是一个猜测。更低的标签证明不了任何下限：老边界里「极高」= 码率 ≥300
 /// （按当前刻度可能只有 70），「标准」横跨 1..65 好几种流，按显示名倒推分数就是把猜测当测量。
 ///
-/// 因此它只用来**抑制**一次注定没有收益的重下，不作为实际档位展示，
-/// 不参与降档判定、徽章与状态行——那些地方档位未知就说未知。
+/// 因此它只有两个用途，都是**不做**某件事：抑制一次注定没有收益的重下（升级判定），
+/// 以及拦住「拿一条不比它好的流把旧文件顶掉」（换文件判定，见 `session::is_better_stream`）。
+/// 它不作为实际档位展示，不参与降档判定、徽章与状态行——那些地方档位未知就说未知。
 /// 档名跟着 [`tier_label`] 走：改名时这条判定跟着变，不会悄悄失效。
 pub fn legacy_label_floor_rank(label: &str) -> Option<i64> {
     if !label.trim().starts_with(tier_label(100)) {
@@ -280,7 +281,7 @@ pub fn legacy_label_floor_rank(label: &str) -> Option<i64> {
 /// 旧 sidecar 的档位文本里记着的码率（kbps），如「极高 320k」→ 320；没写码率则 `None`。
 ///
 /// 这是当年 `describe_quality` 直接写进文件的原始数字，不是档位：档位未知时，它是唯一
-/// 能诚实回答「新取的流是不是比本地这份更差」的依据（见 `session::upgrade_cached_track`）。
+/// 能诚实回答「新取的流是不是比本地这份更差」的依据（用在 `session::is_better_stream`）。
 pub fn legacy_label_bitrate_kbps(label: &str) -> Option<i64> {
     let tail = label.trim().rsplit(' ').next()?;
     let digits = tail.trim_end_matches('k').trim_end_matches('K');
@@ -290,12 +291,12 @@ pub fn legacy_label_bitrate_kbps(label: &str) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|bitrate| *bitrate > 0)
 }
 
-/// 这份缓存是否低于目标：档位已知就比分数，未知（旧三字段）只看标签能否证明已达目标。
+/// 这份缓存要不要重新取一次更高的流：档位已知就比分数，未知（旧三字段）看标签能否证明已达目标。
 ///
-/// 未知不再算「不低于」（#89 要修的就是这一条）：既然证明不了达标，就重下一次，
+/// 未知不再算「不用重下」（#89 要修的就是这一条）：既然证明不了达标，就重下一次，
 /// 取完流会把实际档位写进 sidecar，之后走已知分支。唯一例外是标签已经证明达标，
 /// 那次重下注定没有收益。
-pub fn cache_is_below_target(actual: Option<i64>, label: &str, target: i64) -> bool {
+pub fn cache_needs_higher_stream(actual: Option<i64>, label: &str, target: i64) -> bool {
     match actual {
         Some(rank) => rank < target,
         None => !legacy_label_floor_rank(label).is_some_and(|floor| floor >= target),
@@ -307,7 +308,7 @@ pub fn cache_is_below_target(actual: Option<i64>, label: &str, target: i64) -> b
 /// * 所选为具体档位：实际档位低于该档位即为真；
 /// * 所选为「自动」且为 VIP：实际档位低于无损（100）即为真（非会员时期缓存的低档流在会员后可升级）；
 /// * 实际档位未知（旧三字段缓存）时看 `label`：标签证明不了达标就要重下
-///   （见 [`cache_is_below_target`]），不再一律判「不需要升级」。
+///   （见 [`cache_needs_higher_stream`]），不再一律判「不需要升级」。
 pub fn is_tier_below_selected(
     actual: Option<i64>,
     label: &str,
@@ -317,7 +318,7 @@ pub fn is_tier_below_selected(
     let Some(target) = target_rank(intent, is_vip) else {
         return false;
     };
-    cache_is_below_target(actual, label, target)
+    cache_needs_higher_stream(actual, label, target)
 }
 
 /// 这个目标档位的「没有更高流」结论能否持久化。
@@ -842,11 +843,11 @@ mod tests {
         assert_eq!(target_rank(&auto, Some(false)), None);
         assert_eq!(target_rank(&auto, None), None);
 
-        assert!(cache_is_below_target(Some(70), "无损 871k", 100));
-        assert!(!cache_is_below_target(Some(100), "流畅 128k", 100));
-        assert!(!cache_is_below_target(Some(110), "流畅 128k", 100));
+        assert!(cache_needs_higher_stream(Some(70), "无损 871k", 100));
+        assert!(!cache_needs_higher_stream(Some(100), "流畅 128k", 100));
+        assert!(!cache_needs_higher_stream(Some(110), "流畅 128k", 100));
         // 档位未知时按标签判定，不再恒为 false（#89 修的就是这一条）
-        assert!(cache_is_below_target(None, "极高 320k", 100));
+        assert!(cache_needs_higher_stream(None, "极高 320k", 100));
     }
 
     /// #89：档位未知的旧缓存要能参与升级，只有标签证明达标才抑制重下。
@@ -855,18 +856,18 @@ mod tests {
         // 未知 + 证明不了下限 → 重下（旧行为是恒 false，存量缓存永远不参与升级）
         for label in ["极高 320k", "标准 128k", "流畅 128k", "较高 256k", "未知"] {
             assert!(
-                cache_is_below_target(None, label, 100),
+                cache_needs_higher_stream(None, label, 100),
                 "档位未知的「{label}」不能假装已达目标"
             );
         }
         // 未知 + 标签证明至少无损 → 目标不高于无损时不必重下（注定没有收益的一次流量）
-        assert!(!cache_is_below_target(None, "无损 871k", 100));
-        assert!(!cache_is_below_target(None, "无损 871k", 80));
+        assert!(!cache_needs_higher_stream(None, "无损 871k", 100));
+        assert!(!cache_needs_higher_stream(None, "无损 871k", 80));
         // 但 Hi-Res 目标（110）仍然要探：标签只证明到无损，无损标签里也混过 110 的流
-        assert!(cache_is_below_target(None, "无损 871k", 110));
+        assert!(cache_needs_higher_stream(None, "无损 871k", 110));
         // 已知分数时标签不参与判定，仍按分数比
-        assert!(!cache_is_below_target(Some(100), "流畅 128k", 100));
-        assert!(cache_is_below_target(Some(70), "无损 871k", 100));
+        assert!(!cache_needs_higher_stream(Some(100), "流畅 128k", 100));
+        assert!(cache_needs_higher_stream(Some(70), "无损 871k", 100));
     }
 
     /// 旧标签的下限只认「无损」：更低的标签在两代旧刻度里边界不同，证不出分数。
