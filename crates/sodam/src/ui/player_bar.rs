@@ -498,7 +498,7 @@ pub(crate) fn quality_menu(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(1.0))
+                        .gap(px(0.0))
                         .flex_1()
                         .min_w(px(0.0))
                         .child(
@@ -517,7 +517,7 @@ pub(crate) fn quality_menu(
                                 .child(
                                     div()
                                         .text_size(if option.svip { px(13.0) } else { px(12.0) })
-                                        .line_height(px(15.0))
+                                        .line_height(px(14.0))
                                         .font_weight(if option.svip {
                                             gpui::FontWeight::BOLD
                                         } else {
@@ -557,7 +557,7 @@ pub(crate) fn quality_menu(
                                     .items_center()
                                     .gap(px(4.0))
                                     .text_size(px(11.0))
-                                    .line_height(px(13.0))
+                                    .line_height(px(12.0))
                                     .text_color(text_secondary)
                                     .child(option.desc)
                                     .child(
