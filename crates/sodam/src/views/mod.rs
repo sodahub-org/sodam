@@ -15,6 +15,7 @@ use crate::ui::theme::ThemeKind;
 
 pub use login::login_modal;
 pub mod login;
+pub mod me;
 pub mod lyrics;
 pub mod scenes;
 pub mod search;
@@ -783,7 +784,8 @@ pub(crate) fn back_button(cx: &mut Context<Root>) -> AnyElement {
 fn subtitle_for(root: &Root) -> String {
     let logged_in = !root.settings.cookie.trim().is_empty();
     match root.nav {
-        // 搜索页有自己的标题，不走 page_header，因此没有副标题
+        // 搜索页 / 我的主页有自己的标题，不走 page_header，因此没有副标题
+        Nav::Me => String::new(),
         Nav::Search => String::new(),
         Nav::Liked => {
             if !logged_in {
@@ -1084,6 +1086,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
             None => loading_state(root.tr("正在准备推荐队列…")),
         },
         Nav::Scenes => scenes::scenes_view(root, cx),
+        Nav::Me => me::me_view(root, cx),
         Nav::Search => search::search_page(root, window, cx, !root.header_owns_search),
         Nav::Liked => div()
             .flex()

@@ -14,6 +14,7 @@ fn icon_name(nav: Nav) -> &'static str {
     match nav {
         Nav::Home => "house",
         Nav::Scenes => "radio",
+        Nav::Me => "user",
         Nav::Search => "search",
         Nav::Liked => "heart",
         Nav::Library => "list-music",

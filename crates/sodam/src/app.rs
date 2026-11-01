@@ -111,6 +111,7 @@ use crate::views;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Nav {
     Home,
+    Me,
     Scenes,
     Search,
     Liked,
@@ -126,6 +127,7 @@ impl Root {
     pub fn nav_display_label(&self, nav: Nav) -> String {
         let label = match nav {
             Nav::Home => self.tr("推荐"),
+            Nav::Me => self.tr("我的"),
             Nav::Scenes => self.tr("听歌模式"),
             Nav::Search => self.tr("搜索"),
             Nav::Liked => self.tr("我喜欢的音乐"),
@@ -1874,7 +1876,7 @@ fn account_menu(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
             false,
             |root, cx| {
                 root.account_menu_open = false;
-                root.set_nav(Nav::Settings, cx);
+                root.set_nav(Nav::Me, cx);
             },
         ))
         .child(account_menu_item(

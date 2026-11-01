@@ -705,23 +705,29 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .collect(),
             );
             let mut track_index = 0usize;
+            // 官方搜索结果：整组一张浅色圆角卡，左右各留 32，组标题 18/500。
             div()
                 .flex()
                 .flex_col()
-                .gap(px(theme::space::XS))
-                .p(px(theme::space::SM))
-                .rounded(px(theme::radius::CARD))
-                .bg(theme::surface())
-                .border_1()
-                .border_color(theme::border())
+                .gap(px(0.0))
+                .mx(px(32.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .bg(gpui::Rgba {
+                    a: 0.05,
+                    ..theme::text()
+                })
                 .when(!group.title.is_empty(), |this| {
                     this.child(
                         div()
-                            .px(px(theme::space::MD))
-                            .pt(px(theme::space::XS))
-                            .text_size(theme::Text::Small.size())
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text_muted())
+                            .px(px(16.0))
+                            .py(px(8.0))
+                            .text_size(px(18.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(gpui::Rgba {
+                                a: 0.85,
+                                ..theme::text()
+                            })
                             .child(group.title.clone()),
                     )
                 })
