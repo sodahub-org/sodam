@@ -85,12 +85,19 @@ export default class SodamLyricsExtension extends Extension {
         // 尺寸全部按顶栏实际高度推导：顶栏多高、字号和间距就多大，不会撑出栏外。
         const H = Math.max(24, Math.round(
             Main.panel.height || Main.layoutManager.panelBox.height || 32));
-        const titleSize = Math.max(8, Math.round(H * 0.28));
-        const lyricSize = Math.max(10, Math.round(H * 0.35));
-        const coverSize = Math.max(14, Math.round(H * 0.6));
-        const iconSize = Math.max(10, Math.round(H * 0.36));
-        const playSize = Math.max(12, Math.round(H * 0.44));
-        const textWidth = TEXT_LINES * lyricSize;
+        // 官方任务栏 pill 的基准：40 高、标题 10/500、歌词 11/600、文本区 128、
+        // 封面 28、按钮 32（播放键 48 宽）、间距 10。顶栏比 40 矮时按比例缩控件，
+        // 字号保持官方值，避免越缩越小。
+        const scale = Math.min(1, H / 40);
+        const titleSize = 10;
+        const lyricSize = 11;
+        const textWidth = 128;
+        const coverSize = Math.max(16, Math.round(28 * scale));
+        const buttonSize = Math.max(20, Math.round(32 * scale));
+        const iconSize = Math.min(20, Math.max(12, buttonSize - 8));
+        const playWidth = Math.max(28, Math.round(48 * scale));
+        const playHeight = buttonSize;
+        const gap = Math.max(6, Math.round(10 * scale));
         const pillHeight = H - 4;
         this._textWidth = textWidth;
 
@@ -101,7 +108,7 @@ export default class SodamLyricsExtension extends Extension {
         const pill = new St.BoxLayout({
             style_class: 'sodam-lyrics-pill',
             orientation: Clutter.Orientation.HORIZONTAL,
-            style: `background-color: rgba(246,243,238,0.96); border-radius: ${Math.round(pillHeight / 2)}px; padding: 0 ${Math.round(H * 0.16)}px; spacing: ${Math.round(H * 0.34)}px;`,
+            style: `background-color: rgba(246,243,238,0.96); border-radius: 8px; padding: 0 10px 0 10px; spacing: ${gap}px;`,
         });
 
         // 封面 + 歌名 · 歌词：整块可点，唤起主窗口。
@@ -157,8 +164,11 @@ export default class SodamLyricsExtension extends Extension {
         });
         this._textBox.add_child(this._titleClip);
         this._textBox.add_child(this._lyricClip);
-        this._titleLabel.set_style(`font-size: ${titleSize}px; color: ${MUTED};`);
-        this._lyricLabel.set_style(`font-size: ${lyricSize}px; color: ${INK};`);
+        // 官方 pill：歌名 50% 前景、歌词 90%（已唱部分），字重 500/600。
+        this._titleLabel.set_style(
+            `font-size: ${titleSize}px; font-weight: 500; color: ${MUTED};`);
+        this._lyricLabel.set_style(
+            `font-size: ${lyricSize}px; font-weight: 600; color: ${INK};`);
         this._textBox.set_style('spacing: 0px;');
         this._coverBin = new St.Bin({
             style_class: 'sodam-lyrics-cover-bin',
@@ -178,14 +188,16 @@ export default class SodamLyricsExtension extends Extension {
         });
 
         this._prevButton = this._buildButton('skip-back.svg',
-            () => this._callMpris('Previous'), iconSize);
+            () => this._callMpris('Previous'), iconSize, buttonSize);
         this._playButton = this._buildButton('play.svg',
-            () => this._callMpris('PlayPause'), playSize);
-        this._playButton.set_style(`background-color: rgba(58,55,51,0.08); border-radius: 999px; padding: ${Math.round(playSize * 0.34)}px;`);
+            () => this._callMpris('PlayPause'), iconSize);
+        this._playButton.set_style(
+            `width: ${playWidth}px; height: ${playHeight}px; padding: 0; ` +
+            'background-color: rgba(58,55,51,0.07); border-radius: 999px;');
         this._nextButton = this._buildButton('skip-forward.svg',
-            () => this._callMpris('Next'), iconSize);
+            () => this._callMpris('Next'), iconSize, buttonSize);
         this._likeButton = this._buildButton('heart.svg',
-            () => this._callLyrics('ToggleLiked'), iconSize);
+            () => this._callLyrics('ToggleLiked'), iconSize, buttonSize);
 
         pill.add_child(this._info);
         pill.add_child(this._prevButton);
@@ -202,7 +214,7 @@ export default class SodamLyricsExtension extends Extension {
         return Gio.File.new_for_path(GLib.build_filenamev([this.path, 'icons', name]));
     }
 
-    _buildButton(iconFile, onClick, iconSize) {
+    _buildButton(iconFile, onClick, iconSize, buttonSize) {
         const icon = new St.Icon({
             gicon: new Gio.FileIcon({file: this._iconFile(iconFile)}),
             icon_size: iconSize,
@@ -212,7 +224,7 @@ export default class SodamLyricsExtension extends Extension {
             style_class: 'sodam-lyrics-button',
             child: icon,
             y_align: Clutter.ActorAlign.CENTER,
-            style: `padding: ${Math.round(iconSize * 0.22)}px;`,
+            style: `width: ${buttonSize}px; height: ${buttonSize}px; padding: 0;`,
         });
         button.connect('clicked', onClick);
         return button;

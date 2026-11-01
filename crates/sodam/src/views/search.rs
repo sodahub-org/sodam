@@ -580,7 +580,7 @@ fn artist_row(root: &Root, artist: &ArtistItem, cx: &mut Context<Root>) -> AnyEl
         .flex_row()
         .items_center()
         .gap(px(theme::space::MD))
-        .h(px(72.0))
+        .h(px(66.0))
         .px(px(theme::space::MD))
         .rounded(px(theme::radius::ROW))
         .cursor_pointer()
@@ -651,7 +651,7 @@ fn album_row(root: &Root, album: &AlbumItem, cx: &mut Context<Root>) -> AnyEleme
         .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
             root.open_album_page(item.clone(), cx);
         }))
-        .child(cover(cover_path, 52.0, theme::radius::ART))
+        .child(cover(cover_path, 50.0, theme::radius::ART))
         .child(
             div()
                 .flex_1()

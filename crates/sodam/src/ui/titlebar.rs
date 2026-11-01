@@ -277,13 +277,15 @@ fn account_chip(
                 svg()
                     .path(icons::path("svip"))
                     .w(px(36.25))
-                    .h(px(10.0)),
+                    .h(px(10.0))
+                    .text_color(theme::text()),
             ),
             "VIP" => Some(
                 svg()
                     .path(icons::path("vip"))
                     .w(px(26.0))
-                    .h(px(10.0)),
+                    .h(px(10.0))
+                    .text_color(theme::text()),
             ),
             _ => None,
         };

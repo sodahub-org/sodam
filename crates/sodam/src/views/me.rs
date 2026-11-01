@@ -15,9 +15,9 @@ pub(crate) fn me_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         account.nickname.clone()
     };
     let badge = if account.vip_stage == "svip" {
-        Some(svg().path(icons::path("svip")).w(px(36.25)).h(px(10.0)))
+        Some(svg().path(icons::path("svip")).w(px(36.25)).h(px(10.0)).text_color(theme::text()))
     } else if account.vip {
-        Some(svg().path(icons::path("vip")).w(px(26.0)).h(px(10.0)))
+        Some(svg().path(icons::path("vip")).w(px(26.0)).h(px(10.0)).text_color(theme::text()))
     } else {
         None
     };
