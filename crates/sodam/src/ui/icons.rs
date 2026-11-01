@@ -17,6 +17,10 @@ const IMAGES: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/brand/sodam-logo.png"),
     ),
     (
+        "svip",
+        include_bytes!("../../assets/icons/svip.png"),
+    ),
+    (
         "familiar-mode",
         include_bytes!("../../assets/icons/familiar-mode.png"),
     ),

@@ -21,7 +21,7 @@ use gpui::prelude::*;
 #[cfg(target_os = "linux")]
 use gpui::MouseButton;
 use gpui::{
-    div, hsla, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
+    div, hsla, img, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
     WindowControlArea,
 };
 use std::{cell::Cell, rc::Rc};
@@ -248,7 +248,15 @@ fn account_chip(
         .hover(|style| style.bg(theme::surface_hover()));
 
     if let Some(badge) = account.badge {
-        chip = chip.child(
+        // SVIP 是官方字标（笔画是透明洞），用从原生截图里抠出的字标贴图；
+        // 其他档位没有对应字标，退回文字胶囊。
+        chip = chip.child(if badge.as_ref() == "SVIP" {
+            img("icons/svip.png")
+                .w(px(50.5))
+                .h(px(24.0))
+                .flex_none()
+                .into_any_element()
+        } else {
             div()
                 .h(px(24.0))
                 .px(px(12.0))
@@ -258,11 +266,10 @@ fn account_chip(
                 .bg(theme::surface_hover())
                 .text_size(px(11.0))
                 .font_weight(gpui::FontWeight::BOLD)
-                // 原生是「抠字」：字是透明洞，颜色跟随底下的界面；
-                // 这里用背景色画字，效果等同于在纯色底上开洞。
-                .text_color(theme::bg())
-                .child(badge),
-        );
+                .text_color(theme::text())
+                .child(badge)
+                .into_any_element()
+        });
     }
 
     if let Some(path) = account.avatar {
