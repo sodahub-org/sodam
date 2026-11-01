@@ -1634,7 +1634,9 @@ fn track_info_left(
         .left(px(20.0))
         .top(px(0.0))
         .bottom(px(0.0))
-        .w(px(420.0))
+        // 右边界止于中间传输控件左侧，绝不盖住「上一首」。
+        .right(gpui::relative(0.5))
+        .mr(px(150.0))
         .flex()
         .flex_row()
         .items_center()
@@ -1655,14 +1657,62 @@ fn track_info_left(
                 .flex_col()
                 .gap(px(6.0))
                 .min_w(px(0.0))
-                .child(
+                .child({
+                    // 歌名+歌手超长时向左滚动（官方行为）。
+                    let title_len = track.title.chars().count() as f32;
+                    let artist_len = track.artist.chars().count() as f32;
+                    let estimated = title_len * 15.0 + artist_len * 12.0 + 28.0;
+                    let long = estimated > 300.0;
+                    let offset = if long {
+                        use std::sync::Mutex;
+                        use std::time::Instant;
+                        static MARQUEE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+                        let mut guard = MARQUEE.lock().unwrap_or_else(|e| e.into_inner());
+                        let started = match guard.as_ref() {
+                            Some((id, at)) if id == &track.id => *at,
+                            _ => {
+                                *guard = Some((track.id.clone(), Instant::now()));
+                                Instant::now()
+                            }
+                        };
+                        drop(guard);
+                        let elapsed = started.elapsed().as_secs_f32();
+                        let span = estimated + 60.0;
+                        -((elapsed * 34.0) % span)
+                    } else {
+                        0.0
+                    };
                     div()
-                        .truncate()
-                        .text_size(px(15.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme::text())
-                        .child(format!("{} – {}", track.title, track.artist)),
-                )
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .ml(px(offset))
+                                .whitespace_nowrap()
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(track.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(gpui::Rgba {
+                                            a: 0.45,
+                                            ..theme::text()
+                                        })
+                                        .child(format!("– {}", track.artist)),
+                                ),
+                        )
+                })
                 .child(
                     div()
                         .flex()
