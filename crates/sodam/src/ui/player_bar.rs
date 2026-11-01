@@ -1694,7 +1694,8 @@ fn track_info_left(
                     if long {
                         // 用实测文本宽度算周期，否则两份文本在循环接缝处会错开、
                         // 看起来就是一顿一顿的跳。
-                        let measured = root.marquee_width.get();
+                        // 宽度取整：亚像素抖动会让 duration 每帧变化，动画看起来发抖。
+                        let measured = root.marquee_width.get().round();
                         let width = if measured > 1.0 { measured } else { estimated };
                         let span = width + 24.0;
                         let seconds = (span / 40.0).max(3.0);
