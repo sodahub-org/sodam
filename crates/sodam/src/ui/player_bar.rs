@@ -614,113 +614,9 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                         }))
                                         .child(title),
                                 )
-                                .child(
-                                    div()
-                                        .id("player-like")
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .self_center()
-                                        .size(px(theme::size::CONTROL_SM))
-                                        .rounded(px(theme::radius::PILL))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(theme::surface_hover()))
-                                        .on_click(cx.listener({
-                                            let like_track = track.clone();
-                                            move |root, _event: &ClickEvent, _window, cx| {
-                                                if let Some(track) = like_track.clone() {
-                                                    root.toggle_like(track, cx);
-                                                }
-                                            }
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(icons::path(if liked {
-                                                    "heart-filled"
-                                                } else {
-                                                    "heart"
-                                                }))
-                                                .size(px(theme::ICON_SM))
-                                                .text_color(if liked {
-                                                    theme::accent()
-                                                } else {
-                                                    theme::text_muted()
-                                                }),
-                                        ),
-                                ),
+                                
                         )
-                        .child(
-                            // 左侧曲目信息：歌手 · 时间，后面接**实际拉到的流音质**
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::space::SM))
-                                .min_w(px(0.0))
-                                .child(
-                                    div()
-                                        .id("player-artist-link")
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .cursor_pointer()
-                                        .text_size(theme::Text::Small.size())
-                                        .text_color(theme::text_muted())
-                                        .hover(|style| style.text_color(theme::accent()))
-                                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(cx.listener({
-                                            move |root, _event: &ClickEvent, _window, cx| {
-                                                if let Some(track) = artist_link_track.as_ref() {
-                                                    root.open_track_artist(track.clone(), cx);
-                                                }
-                                            }
-                                        }))
-                                        .child(detail),
-                                )
-                                .when(!quality.is_empty(), |this| {
-                                    // 徽章是音质入口：显示**实际**档位，点开选的是**意图**。
-                                    this.child(
-                                        div()
-                                            .id("player-quality")
-                                            .flex_none()
-                                            .px(px(theme::space::SM))
-                                            .py(px(1.0))
-                                            .rounded(px(theme::radius::PILL))
-                                            .bg(theme::surface_elevated())
-                                            .border_1()
-                                            .border_color(if downgraded {
-                                                theme::warning()
-                                            } else {
-                                                theme::surface_elevated()
-                                            })
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(theme::surface_hover()))
-                                            .text_size(theme::Text::Tiny.size())
-                                            .text_color(if downgraded {
-                                                theme::warning()
-                                            } else {
-                                                theme::accent()
-                                            })
-                                            // 徽章没有 flex 容器：两个 child 会上下堆叠成两行，
-                                            // 在固定高度的播放条里把文字挤出可视区，所以合成一段。
-                                            // 用短词「降档」而不是整句：徽章只有几厘米宽，
-                                            // 拼成「Lower tier Lossless」这类长句会被挤断。
-                                            .child(if downgraded {
-                                                format!("{}·{}", root.tr("降档"), quality)
-                                            } else {
-                                                quality.clone()
-                                            })
-                                            .on_click(cx.listener(
-                                                |root, event: &ClickEvent, _window, cx| {
-                                                    root.quality_menu = Some(event.position());
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    )
-                                }),
-                        )
+                        
                         .when(!error.is_empty(), |this| {
                             this.child(
                                 div()
@@ -737,7 +633,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
             div()
                 .absolute()
                 .left(px(92.0))
-                .bottom(px(6.0))
+                .top(px(46.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -747,7 +643,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
                 )
                 .child(
-                    icon_button("bar-add", "list-plus", theme::ICON, theme::text_muted())
+                    icon_button("bar-add", "add-to-playlist", theme::ICON, theme::text_muted())
                         .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
                 )
                 .child(
@@ -756,7 +652,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 )
                 .when(track.is_some(), |this| {
                     this.child(
-                        icon_button("bar-more", "more-horizontal", theme::ICON, theme::text_muted())
+                        icon_button("bar-more", "three-points-vertical", theme::ICON, theme::text_muted())
                             .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
                                 if let Some(track) = root.queue.current().cloned() {
                                     root.queue_menu = None;
@@ -928,14 +824,12 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         }))
                         .child(root.tr("词").to_string()),
                 )
-                .when(!root.queue_origin.is_feed_like(), |bar| {
-                    bar.child(
-                        icon_button("play-mode", mode_icon, theme::ICON, theme::text_muted())
-                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                                root.cycle_play_mode(cx);
-                            })),
-                    )
-                })
+                .child(
+                    icon_button("play-mode", mode_icon, theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.cycle_play_mode(cx);
+                        })),
+                )
                 .child(
                     div()
                         .id("volume-anchor")
