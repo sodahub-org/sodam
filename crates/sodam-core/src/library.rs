@@ -1373,13 +1373,40 @@ pub fn append_track_to_playlist(
     post_pc_json(session, "/luna/pc/me/playlist/media/append", &body)
 }
 
+/// 发表评论：`POST /luna/pc/comments/create`。
+pub fn create_comment(session: &Session, track_id: &str, text: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "group_id": track_id,
+        "text": text,
+        "group_type": 0,
+    });
+    post_pc_json(session, "/luna/pc/comments/create", &body)
+}
+
+/// 评论点赞 / 取消：`POST /luna/pc/comments/action`。
+pub fn like_comment(
+    session: &Session,
+    track_id: &str,
+    comment_id: &str,
+    liked: bool,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "comment_id": comment_id,
+        "reply_id": "",
+        "group_id": track_id,
+        "type": if liked { 1 } else { 0 },
+        "scene_name": "comment_panel",
+    });
+    post_pc_json(session, "/luna/pc/comments/action", &body)
+}
+
 fn post_pc_json(
     session: &Session,
     path: &str,
     body: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let url = format!("https://api.qishui.com{path}");
-    let response = ureq::post(&url)
+    let mut request = ureq::post(&url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Cookie", &session.soda().cookie())
         .set("content-type", "application/json")
@@ -1390,7 +1417,14 @@ fn post_pc_json(
         )
         .set("x-luna-background-type", "foreground")
         .set("x-luna-is-background-req", "0")
-        .set("x-luna-is-local-user", "1")
+        .set("x-luna-is-local-user", "1");
+    // 写接口（评论/点赞/歌单追加）要客户端签名头，读接口不校验。
+    if let Some(credentials) = session.soda().app_credentials() {
+        for (name, value) in credentials.headers() {
+            request = request.set(name, &value);
+        }
+    }
+    let response = request
         .send_string(&body.to_string())
         .map_err(|err| anyhow::anyhow!("请求失败: {err}"))?;
     let text = response

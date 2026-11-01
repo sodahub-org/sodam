@@ -1430,7 +1430,21 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .gap(px(theme::space::MD))
                         .text_size(theme::Text::Tiny.size())
                         .text_color(theme::text_faint())
-                        .child(format!("赞 {}", comment.likes))
+                        .child(
+                            div()
+                                .id(gpui::ElementId::Name(
+                                    format!("comment-like-{}", comment.id).into(),
+                                ))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(theme::accent()))
+                                .on_click(cx.listener({
+                                    let id = comment.id.clone();
+                                    move |root, _event: &ClickEvent, _window, cx| {
+                                        root.like_comment(id.clone(), true, cx);
+                                    }
+                                }))
+                                .child(format!("赞 {}", comment.likes)),
+                        )
                         .when(comment.replies > 0, |this| {
                             this.child(format!("回复 {}", comment.replies))
                         }),

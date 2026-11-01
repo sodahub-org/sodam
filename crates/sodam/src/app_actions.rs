@@ -479,6 +479,32 @@ impl Root {
         self.fetch_comments(track.id, false, cx);
     }
 
+    /// 点赞/取消点赞一条评论（本地先回显）。
+    pub fn like_comment(&mut self, comment_id: String, liked: bool, cx: &mut Context<Self>) {
+        if let Some(comment) = self.comment_items.iter_mut().find(|item| item.id == comment_id) {
+            comment.likes = (comment.likes + if liked { 1 } else { -1 }).max(0);
+        }
+        cx.notify();
+        let Some(track_id) = self.comment_track.clone() else {
+            return;
+        };
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::like_comment(&session, &track_id, &comment_id, liked)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            if let Err(err) = result {
+                let _ = this.update(cx, |root, cx| {
+                    root.set_status("评论操作失败：{}", std::slice::from_ref(&err.to_string()));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn load_more_comments(&mut self, cx: &mut Context<Self>) {
         if self.comment_loading || !self.comment_has_more {
             return;
