@@ -111,27 +111,6 @@ impl Root {
         .detach();
     }
 
-    /// 输入停顿 350ms 后自动搜当前内容（退格同样触发），和官方一致。
-    pub(crate) fn schedule_auto_search(&mut self, cx: &mut Context<Self>) {
-        self.search_seq += 1;
-        let seq = self.search_seq;
-        if self.search_field.text().trim().is_empty() {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(350)).await;
-            let _ = this.update(cx, |root, cx| {
-                if root.search_seq == seq
-                    && !root.searching
-                    && !root.search_field.text().trim().is_empty()
-                {
-                    root.run_search(cx);
-                }
-            });
-        })
-        .detach();
-    }
-
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
         self.search_sug_open = false;
         let keyword = self.search_field.text().trim().to_string();

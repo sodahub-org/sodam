@@ -483,6 +483,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                             format!("lyric-line-{index}").into(),
                         ))
                         .cursor_pointer()
+                        .p(px(6.0))
+                        .rounded(px(8.0))
+                        .hover(|style| style.bg(theme::surface_hover()))
                         .on_click(cx.listener(
                             move |root, _event: &ClickEvent, _window, cx| {
                                 root.seek_seconds(seek_to);

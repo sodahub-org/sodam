@@ -138,7 +138,6 @@ impl Root {
             // 但内容没变，不该再发一次搜索。
             if self.search_field.text() != before {
                 self.schedule_search_suggest(cx);
-                self.schedule_auto_search(cx);
             }
             self.search_fit_caret_in_view(window);
             cx.notify();
@@ -149,7 +148,6 @@ impl Root {
     pub(crate) fn text_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_field.undo() {
             self.schedule_search_suggest(cx);
-            self.schedule_auto_search(cx);
             self.search_fit_caret_in_view(window);
             cx.notify();
         }
@@ -158,7 +156,6 @@ impl Root {
     pub(crate) fn text_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_field.redo() {
             self.schedule_search_suggest(cx);
-            self.schedule_auto_search(cx);
             self.search_fit_caret_in_view(window);
             cx.notify();
         }

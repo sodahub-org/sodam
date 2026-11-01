@@ -134,10 +134,8 @@ pub(crate) fn search_box(
                 // 单击定位插入点、双击选词、三击全选（Chromium 的单行框三击就是全选）。
                 let changed =
                     root.search_pointer_down(event.position.x, event.click_count, window);
-                // 和官方一致：再次点搜索框会用当前内容立即搜一次。
-                if !root.search_field.text().trim().is_empty() {
-                    root.run_search(cx);
-                }
+                // 和官方一致：点搜索框只刷新联想下拉，不直接搜索。
+                root.schedule_search_suggest(cx);
                 if changed {
                     cx.notify();
                 }
