@@ -506,11 +506,26 @@ pub(crate) fn quality_menu(
                                 .flex_row()
                                 .items_center()
                                 .gap(px(4.0))
+                                .when(option.svip, |this| {
+                                    this.child(
+                                        gpui::img("icons/spatial-quality-mini.png")
+                                            .w(px(22.0))
+                                            .h(px(17.0)),
+                                    )
+                                })
                                 .child(
                                     div()
-                                        .text_size(px(14.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(text_primary)
+                                        .text_size(if option.svip { px(15.0) } else { px(14.0) })
+                                        .font_weight(if option.svip {
+                                            gpui::FontWeight::BOLD
+                                        } else {
+                                            gpui::FontWeight::MEDIUM
+                                        })
+                                        .text_color(if option.svip {
+                                            gpui::rgb(0xffe3a3)
+                                        } else {
+                                            text_primary
+                                        })
                                         .child(option.title),
                                 )
                                 .when(option.svip, |this| {

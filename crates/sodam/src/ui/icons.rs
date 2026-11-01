@@ -36,6 +36,10 @@ const IMAGES: &[(&str, &[u8])] = &[
         "fresh-mode-dark",
         include_bytes!("../../assets/icons/fresh-mode-dark.png"),
     ),
+    (
+        "spatial-quality-mini",
+        include_bytes!("../../assets/icons/spatial-quality-mini.png"),
+    ),
 ];
 
 macro_rules! icon_set {
