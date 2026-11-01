@@ -415,6 +415,10 @@ pub struct Root {
     pub played_history: Vec<String>,
     /// 设置页里的登录 modal 是否展开。
     pub login_modal_open: bool,
+    /// 顶栏头像下拉菜单。
+    pub(crate) account_menu_open: bool,
+    /// 退出登录二次确认。
+    pub(crate) logout_confirm_open: bool,
     /// 队列右键菜单：被点中的行下标与鼠标位置。
     pub queue_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// 音质菜单锚点：播放条徽章被点中时的鼠标位置（`None` = 菜单关着）。
@@ -575,6 +579,8 @@ impl Root {
             queue_origin: QueueOrigin::None,
             played_history: Vec::new(),
             login_modal_open: false,
+            account_menu_open: false,
+            logout_confirm_open: false,
             queue_menu: None,
             quality_menu: None,
             track_menu: None,
@@ -1366,7 +1372,10 @@ impl Root {
     /// 是否有弹层开着（右键菜单或档位菜单）。遮罩与关闭逻辑只看这一处，
     /// 加第四个菜单时不必再改两个地方。
     pub(crate) fn any_menu_open(&self) -> bool {
-        self.queue_menu.is_some() || self.track_menu.is_some() || self.quality_menu.is_some()
+        self.queue_menu.is_some()
+            || self.track_menu.is_some()
+            || self.quality_menu.is_some()
+            || self.account_menu_open
     }
 
     /// 普通操作反馈：只进入底部状态行，不触发全局 message。
@@ -1746,7 +1755,8 @@ impl Render for Root {
                     }));
                     extras.on_account_click = Some(Box::new(move |_window, cx| {
                         account_root.update(cx, |root, cx| {
-                            root.set_nav(Nav::Settings, cx);
+                            root.account_menu_open = !root.account_menu_open;
+                            cx.notify();
                         });
                     }));
                 }
@@ -1762,6 +1772,12 @@ impl Render for Root {
                     },
                     extras,
                 ))
+            })
+            .when(self.account_menu_open, |this| {
+                this.child(account_menu(self, cx))
+            })
+            .when(self.logout_confirm_open, |this| {
+                this.child(logout_confirm(self, cx))
             })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
@@ -1794,6 +1810,7 @@ impl Render for Root {
                                         root.queue_menu = None;
                                         root.track_menu = None;
                                         root.quality_menu = None;
+                                        root.account_menu_open = false;
                                         cx.notify();
                                     }
                                 }),
@@ -1828,4 +1845,200 @@ impl Render for Root {
         }
         element
     }
+}
+
+/// 顶栏头像下拉菜单：我的 / 设置 / 会员中心 / 退出登录。
+fn account_menu(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let menu = div()
+        .id("account-menu")
+        .absolute()
+        .top(px(ui::titlebar::STRIP_HEIGHT + 4.0))
+        .right(px(195.0))
+        .w(px(200.0))
+        .flex()
+        .flex_col()
+        .py(px(4.0))
+        .rounded(px(8.0))
+        .bg(theme::surface_elevated())
+        .border_1()
+        .border_color(theme::border())
+        .shadow_lg()
+        .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+            cx.stop_propagation();
+        })
+        .child(account_menu_item(
+            cx,
+            "account-menu-me",
+            "user",
+            root.tr("我的"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.set_nav(Nav::Settings, cx);
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-settings",
+            "settings",
+            root.tr("设置"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.set_nav(Nav::Settings, cx);
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-vip",
+            "crown",
+            root.tr("会员中心"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                // 官方在这里弹应用内 VIP 窗；网页版会员页先作为占位。
+                cx.open_url("https://qishui.douyin.com/");
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-logout",
+            "log-out",
+            root.tr("退出登录"),
+            true,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.logout_confirm_open = true;
+                cx.notify();
+            },
+        ));
+    gpui::deferred(menu).with_priority(2).into_any_element()
+}
+
+/// 单条菜单项：40 高、左右 12、图标 20、文字 14。
+fn account_menu_item(
+    cx: &mut Context<Root>,
+    id: &'static str,
+    icon: &'static str,
+    label: &str,
+    danger: bool,
+    action: impl Fn(&mut Root, &mut Context<Root>) + 'static,
+) -> gpui::AnyElement {
+    let color = if danger {
+        theme::danger()
+    } else {
+        gpui::Rgba {
+            a: 0.85,
+            ..theme::text()
+        }
+    };
+    div()
+        .id(id)
+        .h(px(40.0))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .text_size(px(14.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(color)
+        .hover(|style| style.bg(theme::surface_hover()).text_color(theme::text()))
+        .on_click(cx.listener(move |root, _event, _window, cx| action(root, cx)))
+        .child(
+            gpui::svg()
+                .path(ui::icons::path(icon))
+                .size(px(20.0))
+                .text_color(color),
+        )
+        .child(label.to_string())
+        .into_any_element()
+}
+
+/// 退出登录二次确认。
+fn logout_confirm(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let cancel = div()
+        .id("logout-cancel")
+        .h(px(36.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .rounded(px(8.0))
+        .bg(theme::surface_hover())
+        .text_size(px(14.0))
+        .text_color(theme::text())
+        .cursor_pointer()
+        .on_click(cx.listener(|root, _event, _window, cx| {
+            root.logout_confirm_open = false;
+            cx.notify();
+        }))
+        .child(root.tr("取消").to_string());
+
+    let confirm = div()
+        .id("logout-confirm")
+        .h(px(36.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .rounded(px(8.0))
+        .bg(theme::danger())
+        .text_size(px(14.0))
+        .text_color(gpui::white())
+        .cursor_pointer()
+        .on_click(cx.listener(|root, _event, _window, cx| {
+            root.logout_confirm_open = false;
+            root.logout(cx);
+        }))
+        .child(root.tr("退出登录").to_string());
+
+    gpui::deferred(
+        div()
+            .id("logout-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(gpui::rgba(0x00000066))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|root, _event, _window, cx| {
+                root.logout_confirm_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(320.0))
+                    .p(px(24.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.0))
+                    .rounded(px(12.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(root.tr("确认退出登录吗？").to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(cancel)
+                            .child(confirm),
+                    ),
+            ),
+    )
+    .with_priority(3)
+    .into_any_element()
 }

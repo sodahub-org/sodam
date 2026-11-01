@@ -109,6 +109,9 @@ macro_rules! icon_set {
 }
 
 icon_set!(
+    "user",
+    "log-out",
+    "crown",
     "svip",
     "vip",
     "widget-toggle",
