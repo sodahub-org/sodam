@@ -12,6 +12,7 @@ import Cairo from 'gi://cairo';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
@@ -25,6 +26,10 @@ const MPRIS_IFACE = 'org.mpris.MediaPlayer2.Player';
 const LYRICS_NAME = 'org.sodahub.SodaM';
 const LYRICS_PATH = '/org/sodahub/SodaM/Lyrics';
 const LYRICS_IFACE = 'org.sodahub.SodaM.Lyrics';
+
+// 文本区固定 12 个歌词字的宽度（与官方客户端一致）：不随歌词长短伸缩。
+const LYRIC_FONT_SIZE = 13;
+const TEXT_WIDTH = 12 * LYRIC_FONT_SIZE;
 
 export default class SodamLyricsExtension extends Extension {
     enable() {
@@ -63,6 +68,7 @@ export default class SodamLyricsExtension extends Extension {
             Gio.bus_unwatch_name(this._ownerWatcher);
             this._ownerWatcher = null;
         }
+        this._stopMarquee();
         this._dropProxies();
         if (this._indicator) {
             this._indicator.destroy();
@@ -94,16 +100,44 @@ export default class SodamLyricsExtension extends Extension {
             icon_size: 18,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        // 歌名在上、歌词在下，两行都固定 TEXT_WIDTH 宽：歌词再长也不改变顶栏占位。
         this._titleLabel = new St.Label({
             style_class: 'sodam-lyrics-title',
             text: 'SodaM',
+            x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        this._titleLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        this._titleClip = new St.Bin({
+            style_class: 'sodam-lyrics-text-clip',
+            clip_to_allocation: true,
+            width: TEXT_WIDTH,
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        this._titleClip.set_child(this._titleLabel);
+
         this._lyricLabel = new St.Label({
             style_class: 'sodam-lyrics-line',
             text: '',
+            x_align: Clutter.ActorAlign.START,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        this._lyricClip = new St.Bin({
+            style_class: 'sodam-lyrics-text-clip',
+            clip_to_allocation: true,
+            width: TEXT_WIDTH,
+            x_align: Clutter.ActorAlign.START,
+        });
+        this._lyricClip.set_child(this._lyricLabel);
+
+        this._textBox = new St.BoxLayout({
+            style_class: 'sodam-lyrics-text',
+            orientation: Clutter.Orientation.VERTICAL,
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._textBox.add_child(this._titleClip);
+        this._textBox.add_child(this._lyricClip);
         this._coverBin = new St.Bin({
             style_class: 'sodam-lyrics-cover-bin',
             clip_to_allocation: true,
@@ -111,8 +145,7 @@ export default class SodamLyricsExtension extends Extension {
         });
         this._coverBin.set_child(this._cover);
         this._info.add_child(this._coverBin);
-        this._info.add_child(this._titleLabel);
-        this._info.add_child(this._lyricLabel);
+        this._info.add_child(this._textBox);
         // 单击唤起主窗口；按住拖动则跟随指针，松手按离哪边近贴哪边。
         this._info.connect('button-press-event', (actor, event) => {
             if (event.get_button() !== 1)
@@ -373,6 +406,73 @@ export default class SodamLyricsExtension extends Extension {
         }
     }
 
+    /// 歌词超出固定宽度时横向走马灯：走到尾停一下、滑回开头、再继续。
+    _updateMarquee() {
+        this._stopMarquee();
+        if (!this._lyricLabel.text)
+            return;
+        // 文本刚设好时 Pango 还没排版，等一个空闲帧再量宽度。
+        this._marqueeIdle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._marqueeIdle = 0;
+            const natural = this._lyricLabel.get_preferred_width(-1)[1];
+            const overflow = Math.ceil(natural - TEXT_WIDTH);
+            if (overflow > 4)
+                this._scrollMarquee(overflow);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _scrollMarquee(overflow) {
+        const forward = Math.max(2500, Math.round((overflow / 28) * 1000));
+        this._lyricTransition(-overflow, forward, Clutter.AnimationMode.LINEAR, () => {
+            if (this._marqueePause)
+                return;
+            this._marqueePause = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1400, () => {
+                this._marqueePause = 0;
+                const back = Math.min(1200, Math.round(forward / 2));
+                this._lyricTransition(0, back, Clutter.AnimationMode.EASE_OUT_QUAD, () => {
+                    if (this._marqueePause)
+                        return;
+                    this._marqueePause = GLib.timeout_add(
+                        GLib.PRIORITY_DEFAULT, 1400, () => {
+                            this._marqueePause = 0;
+                            this._scrollMarquee(overflow);
+                            return GLib.SOURCE_REMOVE;
+                        });
+                });
+            });
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _lyricTransition(target, duration, mode, onDone) {
+        this._lyricLabel.remove_transition('sodam-marquee');
+        const transition = new Clutter.PropertyTransition({
+            'property-name': 'translation-x',
+            'from': this._lyricLabel.translation_x,
+            'to': target,
+            'duration': duration,
+            'progress-mode': mode,
+        });
+        transition.connect('completed', onDone);
+        this._lyricLabel.add_transition('sodam-marquee', transition);
+    }
+
+    _stopMarquee() {
+        if (this._marqueeIdle) {
+            GLib.source_remove(this._marqueeIdle);
+            this._marqueeIdle = 0;
+        }
+        if (this._marqueePause) {
+            GLib.source_remove(this._marqueePause);
+            this._marqueePause = 0;
+        }
+        if (this._lyricLabel) {
+            this._lyricLabel.remove_transition('sodam-marquee');
+            this._lyricLabel.translation_x = 0;
+        }
+    }
+
     _render() {
         if (!this._indicator)
             return;
@@ -381,8 +481,12 @@ export default class SodamLyricsExtension extends Extension {
         this._indicator.visible = this._sodaMRunning && this._state.barVisible &&
             this._state.title !== '';
         this._titleLabel.text = this._state.title || 'SodaM';
-        this._lyricLabel.text = this._state.lyric ||
+        const lyricText = this._state.lyric ||
             (this._state.hasLyrics ? '' : '没有可用歌词');
+        if (this._lyricLabel.text !== lyricText) {
+            this._lyricLabel.text = lyricText;
+            this._updateMarquee();
+        }
 
         if (this._state.artUrl && this._state.artUrl !== this._coverUrl) {
             this._coverUrl = this._state.artUrl;

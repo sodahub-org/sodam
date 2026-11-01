@@ -141,29 +141,33 @@ fn start_tray_service(
             }
 
             tick += 1;
-            if tick % 5 == 0 {
+            // 托盘文字 500ms 同步一次就够；歌词要跟唱，100ms 一帧才不显得慢半拍。
+            let sync_tray = tick % 5 == 0;
+            {
                 let now = cx.update(|cx| {
                     app.update(cx, |root, _cx| {
                         let snapshot = root.engine.snapshot();
                         let track = root.queue.current();
-                        let title = if snapshot.track_id.is_empty() {
-                            "SodaM".to_string()
-                        } else {
-                            snapshot.title.clone()
-                        };
-                        let subtitle = if snapshot.track_id.is_empty() {
-                            root.tr("就绪").to_string()
-                        } else {
-                            track.map(|track| track.artist.clone()).unwrap_or_default()
-                        };
-                        sync(tray::TrayState {
-                            language: root.language,
-                            title,
-                            subtitle,
-                            playing: snapshot.playing,
-                            has_track: !snapshot.track_id.is_empty(),
-                            cover_path: track.and_then(|track| root.cover_of(&track.cover)),
-                        });
+                        if sync_tray {
+                            let title = if snapshot.track_id.is_empty() {
+                                "SodaM".to_string()
+                            } else {
+                                snapshot.title.clone()
+                            };
+                            let subtitle = if snapshot.track_id.is_empty() {
+                                root.tr("就绪").to_string()
+                            } else {
+                                track.map(|track| track.artist.clone()).unwrap_or_default()
+                            };
+                            sync(tray::TrayState {
+                                language: root.language,
+                                title,
+                                subtitle,
+                                playing: snapshot.playing,
+                                has_track: !snapshot.track_id.is_empty(),
+                                cover_path: track.and_then(|track| root.cover_of(&track.cover)),
+                            });
+                        }
                         // 顺手发布给系统媒体面板（内容没变时 publish 内部会跳过）。
                         media::NowPlaying {
                             track_id: snapshot.track_id.clone(),
