@@ -330,6 +330,9 @@ pub struct Root {
     /// 切音质后重载当前曲目要恢复的进度与播放状态。
     pub quality_resume: Option<(f64, bool)>,
     /// 音质胶囊的实际屏幕区域（由 canvas 每帧写入，菜单用它精确定位）。
+    /// 信息块跑马灯：是否需要逐帧刷新、以及刷新循环是否已在跑。
+    pub marquee_needed: std::rc::Rc<std::cell::Cell<bool>>,
+    pub marquee_ticking: std::rc::Rc<std::cell::Cell<bool>>,
     pub quality_bounds:
         std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量弹层的开合状态。
@@ -683,6 +686,8 @@ impl Root {
             artist_ids: std::collections::HashMap::new(),
             toast: None,
             quality_resume: None,
+            marquee_needed: std::rc::Rc::new(std::cell::Cell::new(false)),
+            marquee_ticking: std::rc::Rc::new(std::cell::Cell::new(false)),
             quality_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             volume_open: false,
             volume_inside: false,

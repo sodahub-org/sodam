@@ -674,6 +674,7 @@ pub(crate) fn quality_menu(
 
 /// 渲染播放条。
 pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
+    root.marquee_needed.set(false);
     let language = root.language;
     let snapshot = root.engine.snapshot();
     let loading = root.pending_track.is_some();
@@ -805,7 +806,9 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 ),
         )
         // 官方 .controls.left：评论 / 添加到歌单 / 少推荐 / 更多 + 时长
-        .child(
+        // 只在播放页出现；非播放页换成下面的信息块（直接不渲染，避免盖色差）。
+        .when(root.nav == crate::app::Nav::Lyrics, |this| {
+        this.child(
             div()
                 .absolute()
                 .left(px(20.0))
@@ -921,6 +924,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         )),
                 ),
         )
+        })
         // 非播放页：左侧换成官方的「封面 + 歌名-歌手 + 操作图标」，
         // 盖住上面那排纯控制图标（截图核对过：此时不显示时长）。
         .when(root.nav != crate::app::Nav::Lyrics, |this| {
@@ -1641,8 +1645,6 @@ fn track_info_left(
         .flex_row()
         .items_center()
         .gap(px(12.0))
-        .bg(theme::bg())
-        .occlude()
         .child(
             div()
                 .id("bar-track-cover")
@@ -1663,6 +1665,28 @@ fn track_info_left(
                     let artist_len = track.artist.chars().count() as f32;
                     let estimated = title_len * 15.0 + artist_len * 12.0 + 28.0;
                     let long = estimated > 300.0;
+                    if long {
+                        root.marquee_needed.set(true);
+                        if !root.marquee_ticking.get() {
+                            root.marquee_ticking.set(true);
+                            let needed = root.marquee_needed.clone();
+                            let ticking = root.marquee_ticking.clone();
+                            cx.spawn(async move |this, cx| loop {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(16))
+                                    .await;
+                                if !needed.get() {
+                                    ticking.set(false);
+                                    break;
+                                }
+                                if this.update(cx, |_root, cx| cx.notify()).is_err() {
+                                    ticking.set(false);
+                                    break;
+                                }
+                            })
+                            .detach();
+                        }
+                    }
                     let offset = if long {
                         use std::sync::Mutex;
                         use std::time::Instant;
