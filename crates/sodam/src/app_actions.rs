@@ -466,6 +466,17 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 跳到指定秒数：点歌词行时用。
+    pub fn seek_seconds(&mut self, seconds: f64) {
+        let snapshot = self.engine.snapshot();
+        if snapshot.duration_seconds <= 0.0 {
+            return;
+        }
+        let target = seconds.clamp(0.0, snapshot.duration_seconds);
+        self.engine.seek(target);
+        self.align_lyrics_to_position(target);
+    }
+
     /// 把歌词对齐到指定播放位置。
     ///
     /// 切歌与拖动进度都走这里：立刻算出当前句并滚动过去，

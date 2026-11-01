@@ -242,13 +242,30 @@ fn track_row(
             },
         )
         .child(
+            // 序号：悬停整行时变成播放图标，和官方一致。
             div()
                 .w(px(COL_INDEX))
                 .flex_none()
-                .text_size(theme::Text::Small.size())
-                .text_color(theme::text_faint())
-                .group_hover(TRACK_GROUP, |style| style.text_color(theme::accent()))
-                .child(format!("{}", index + 1)),
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_faint())
+                        .group_hover(TRACK_GROUP, |style| style.opacity(0.0))
+                        .child(format!("{}", index + 1)),
+                )
+                .child(
+                    svg()
+                        .path(icons::path("play"))
+                        .absolute()
+                        .size(px(12.0))
+                        .opacity(0.0)
+                        .text_color(theme::text())
+                        .group_hover(TRACK_GROUP, |style| style.opacity(1.0)),
+                ),
         )
         .child({
             // 爱心：空心 = 未收藏，实心（强调色）= 已收藏；点一下切换

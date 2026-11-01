@@ -477,7 +477,18 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                     } else {
                         LyricReveal::None
                     };
+                    let seek_to = line.start_seconds;
                     div()
+                        .id(gpui::ElementId::Name(
+                            format!("lyric-line-{index}").into(),
+                        ))
+                        .cursor_pointer()
+                        .on_click(cx.listener(
+                            move |root, _event: &ClickEvent, _window, cx| {
+                                root.seek_seconds(seek_to);
+                                cx.notify();
+                            },
+                        ))
                         .w_full()
                         // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
                         // 会被折行文本吃掉，折成两行时间距就变成 0。

@@ -323,6 +323,8 @@ pub struct Root {
     pub search_sug_open: bool,
     pub search_sug_index: usize,
     pub(crate) search_sug_seq: u64,
+    /// 输入后自动搜索的序号（和联想请求共用一次编辑的先后）。
+    pub(crate) search_seq: u64,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
@@ -632,6 +634,7 @@ impl Root {
             search_sug_open: false,
             search_sug_index: 0,
             search_sug_seq: 0,
+            search_seq: 0,
             search_drag_by_word: false,
             search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1274,6 +1277,7 @@ impl EntityInputHandler for Root {
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
         self.schedule_search_suggest(cx);
+        self.schedule_auto_search(cx);
         cx.notify();
     }
 
@@ -1295,6 +1299,7 @@ impl EntityInputHandler for Root {
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
         self.schedule_search_suggest(cx);
+        self.schedule_auto_search(cx);
         cx.notify();
     }
 

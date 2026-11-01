@@ -134,6 +134,10 @@ pub(crate) fn search_box(
                 // 单击定位插入点、双击选词、三击全选（Chromium 的单行框三击就是全选）。
                 let changed =
                     root.search_pointer_down(event.position.x, event.click_count, window);
+                // 和官方一致：再次点搜索框会用当前内容立即搜一次。
+                if !root.search_field.text().trim().is_empty() {
+                    root.run_search(cx);
+                }
                 if changed {
                     cx.notify();
                 }
@@ -300,6 +304,9 @@ pub(crate) fn search_box(
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
                     .children(root.search_sug.iter().enumerate().map(|(index, item)| {
                         let selected = index == root.search_sug_index;
                         let item = item.clone();

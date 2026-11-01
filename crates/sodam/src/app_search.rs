@@ -8,6 +8,7 @@ use sodam_core::models::{AlbumDetail, AlbumItem, ArtistDetail, ArtistItem, Searc
 use sodam_core::session::Session;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{Nav, Root};
 
@@ -105,6 +106,27 @@ impl Root {
                 root.search_sug_index = 0;
                 root.search_sug_open = !root.search_sug.is_empty();
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 输入停顿 350ms 后自动搜当前内容（退格同样触发），和官方一致。
+    pub(crate) fn schedule_auto_search(&mut self, cx: &mut Context<Self>) {
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        if self.search_field.text().trim().is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(350)).await;
+            let _ = this.update(cx, |root, cx| {
+                if root.search_seq == seq
+                    && !root.searching
+                    && !root.search_field.text().trim().is_empty()
+                {
+                    root.run_search(cx);
+                }
             });
         })
         .detach();
