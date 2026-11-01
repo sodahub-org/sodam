@@ -1692,7 +1692,11 @@ fn track_info_left(
                             )
                     };
                     if long {
-                        let span = estimated + 24.0;
+                        // 用实测文本宽度算周期，否则两份文本在循环接缝处会错开、
+                        // 看起来就是一顿一顿的跳。
+                        let measured = root.marquee_width.get();
+                        let width = if measured > 1.0 { measured } else { estimated };
+                        let span = width + 24.0;
                         let seconds = (span / 40.0).max(3.0);
                         div()
                             .flex_1()
@@ -1704,7 +1708,22 @@ fn track_info_left(
                                     .flex_row()
                                     .items_center()
                                     .whitespace_nowrap()
-                                    .child(copy())
+                                    .child({
+                                        let slot = root.marquee_width.clone();
+                                        div()
+                                            .relative()
+                                            .child(copy())
+                                            .child(
+                                                canvas(
+                                                    move |bounds: gpui::Bounds<gpui::Pixels>, _w, _cx| {
+                                                        slot.set(f32::from(bounds.size.width));
+                                                    },
+                                                    |_b, _s, _w, _c| {},
+                                                )
+                                                .absolute()
+                                                .size_full(),
+                                            )
+                                    })
                                     .child(div().ml(px(24.0)).child(copy()))
                                     .with_animation(
                                         "bar-track-marquee",
