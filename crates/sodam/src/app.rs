@@ -322,6 +322,8 @@ pub struct Root {
     pub chorus_cache: std::collections::HashMap<String, f64>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
+    /// 静音前的音量，用于再次点击恢复。
+    pub volume_before_mute: f32,
     /// 搜索联想词与下拉状态。
     pub search_sug: Vec<sodam_core::library::SearchSuggestion>,
     pub search_sug_open: bool,
@@ -636,6 +638,7 @@ impl Root {
             header_owns_search: false,
             chorus_cache: std::collections::HashMap::new(),
             volume_open: false,
+            volume_before_mute: 0.8,
             search_sug: Vec::new(),
             search_sug_open: false,
             search_sug_index: 0,

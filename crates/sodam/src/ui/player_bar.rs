@@ -41,7 +41,7 @@ fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     div()
         .id("volume-popover")
         .absolute()
-        .left(px(50.0))
+        .left(gpui::relative(0.5))
         .ml(px(-20.0))
         .bottom(px(40.0))
         .w(px(40.0))
@@ -86,11 +86,12 @@ fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .child(
                     div()
                         .absolute()
-                        .left(px(-3.0))
+                        .left(px(-4.0))
                         .bottom(gpui::relative(volume))
-                        .size(px(10.0))
+                        .mb(px(-5.0))
+                        .size(px(12.0))
                         .rounded_full()
-                        .bg(theme::text()),
+                        .bg(gpui::rgb(0xFFFFFF)),
                 )
                 .child(
                     canvas(
@@ -846,7 +847,14 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 )
                 .child(
                     div()
+                        .id("volume-anchor")
                         .relative()
+                        .on_hover(cx.listener(
+                            |root, hovered: &bool, _window, cx| {
+                                root.volume_open = *hovered;
+                                cx.notify();
+                            },
+                        ))
                         .child(
                             icon_button(
                                 "volume",
@@ -860,12 +868,18 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             )
                             .on_click(cx.listener(
                                 |root, _event: &ClickEvent, _window, cx| {
-                                    root.volume_open = !root.volume_open;
+                                    root.toggle_mute();
                                     cx.notify();
                                 },
                             )),
                         )
-                        .when(root.volume_open, |this| this.child(volume_popover(root, cx))),
+                        .when(root.volume_open, |this| {
+                            this.child(
+                                gpui::deferred(volume_popover(root, cx))
+                                    .with_priority(6)
+                                    .into_any_element(),
+                            )
+                        }),
                 )
                 .when(!root.queue_origin.is_feed_like(), |bar| {
                     bar.child(

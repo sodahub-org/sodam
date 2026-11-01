@@ -466,6 +466,21 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 音量图标点击：静音 / 恢复。
+    pub fn toggle_mute(&mut self) {
+        if self.settings.volume > 0.01 {
+            self.volume_before_mute = self.settings.volume;
+            self.set_volume(0.0);
+        } else {
+            let restored = if self.volume_before_mute > 0.01 {
+                self.volume_before_mute
+            } else {
+                0.8
+            };
+            self.set_volume(restored);
+        }
+    }
+
     /// 跳到指定秒数：点歌词行时用。
     pub fn seek_seconds(&mut self, seconds: f64) {
         let snapshot = self.engine.snapshot();
