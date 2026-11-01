@@ -56,7 +56,7 @@ pub(crate) fn me_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     .flex()
                                     .items_center()
                                     .bg(theme::surface_hover())
-                                    .text_color(theme::bg())
+                                    .text_color(theme::text())
                                     .child(logo),
                             )
                         }),

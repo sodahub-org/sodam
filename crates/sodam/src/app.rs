@@ -318,6 +318,11 @@ pub struct Root {
     pub search_field: TextField,
     /// 自绘标题栏是否承担了搜索框：是的话搜索页不再重复画一个输入框。
     pub(crate) header_owns_search: bool,
+    /// 搜索联想词与下拉状态。
+    pub search_sug: Vec<String>,
+    pub search_sug_open: bool,
+    pub search_sug_index: usize,
+    pub(crate) search_sug_seq: u64,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
@@ -623,6 +628,10 @@ impl Root {
             lyrics_request_seq: 0,
             search_field: TextField::default(),
             header_owns_search: false,
+            search_sug: Vec::new(),
+            search_sug_open: false,
+            search_sug_index: 0,
+            search_sug_seq: 0,
             search_drag_by_word: false,
             search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1264,6 +1273,7 @@ impl EntityInputHandler for Root {
         self.search_field.replace(range, text);
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
+        self.schedule_search_suggest(cx);
         cx.notify();
     }
 
@@ -1284,6 +1294,7 @@ impl EntityInputHandler for Root {
         self.search_field.replace_and_mark(range, new_text);
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
+        self.schedule_search_suggest(cx);
         cx.notify();
     }
 

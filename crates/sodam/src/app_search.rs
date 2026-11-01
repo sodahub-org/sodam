@@ -15,6 +15,8 @@ impl Root {
     pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_field.set_text(query);
         self.search_field.set_caret(self.search_field.len());
+        self.search_sug_open = false;
+        self.search_sug_index = 0;
         self.run_search(cx);
     }
 
@@ -64,7 +66,38 @@ impl Root {
     }
 
     /// 触发搜索：网络调用放在 GPUI 的后台执行器上，结果回灌后 `notify` 重绘。
+    /// 输入变化时拉联想词：序号校验保证只有最后一次请求会写回。
+    pub(crate) fn schedule_search_suggest(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_field.text().trim().to_string();
+        self.search_sug_seq += 1;
+        let seq = self.search_sug_seq;
+        if query.is_empty() {
+            self.search_sug.clear();
+            self.search_sug_open = false;
+            return;
+        }
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::search_suggest(&session, &query).unwrap_or_default()
+        });
+        cx.spawn(async move |this, cx| {
+            let words = work.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.search_sug_seq != seq {
+                    return;
+                }
+                root.search_sug = words;
+                root.search_sug_index = 0;
+                root.search_sug_open = !root.search_sug.is_empty();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.search_sug_open = false;
         let keyword = self.search_field.text().trim().to_string();
         if keyword.is_empty() {
             self.set_status("先输入关键词再回车", &[]);

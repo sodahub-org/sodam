@@ -295,7 +295,7 @@ fn account_chip(
                 .flex()
                 .items_center()
                 .bg(theme::surface_hover())
-                .text_color(theme::bg())
+                .text_color(theme::text())
                 .child(logo)
                 .into_any_element(),
             None => div()

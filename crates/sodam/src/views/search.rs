@@ -69,7 +69,45 @@ pub(crate) fn search_box(
         .flex()
         .flex_row()
         .items_center()
-        .when(header, |this| this.gap(px(6.0)).text_size(px(13.0)))
+        .when(header, |this| {
+            this.gap(px(6.0))
+                .text_size(px(13.0))
+                .on_key_down(cx.listener(
+                    |root, event: &gpui::KeyDownEvent, _window, cx| {
+                        if !root.search_sug_open || root.search_sug.is_empty() {
+                            return;
+                        }
+                        let len = root.search_sug.len();
+                        match event.keystroke.key.as_str() {
+                            "down" => {
+                                root.search_sug_index = (root.search_sug_index + 1) % len;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            "up" => {
+                                root.search_sug_index =
+                                    (root.search_sug_index + len - 1) % len;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            "enter" => {
+                                if let Some(word) =
+                                    root.search_sug.get(root.search_sug_index).cloned()
+                                {
+                                    root.run_history_search(word, cx);
+                                }
+                                cx.stop_propagation();
+                            }
+                            "escape" => {
+                                root.search_sug_open = false;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    },
+                ))
+        })
         .h(px(height))
         .px(px(10.0))
         .when(header, |this| this.rounded(px(12.0)))
@@ -246,6 +284,79 @@ pub(crate) fn search_box(
                     .size_full(),
                 ),
         )
+        .when(header && root.search_sug_open, |this| {
+            this.child(
+                div()
+                    .id("search-sug")
+                    .absolute()
+                    .top(px(36.0))
+                    .left(px(0.0))
+                    .w(px(320.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .children(root.search_sug.iter().enumerate().map(|(index, word)| {
+                        let selected = index == root.search_sug_index;
+                        let word = word.clone();
+                        let click_word = word.clone();
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("search-sug-{index}").into(),
+                            ))
+                            .h(px(40.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .cursor_pointer()
+                            .when(selected, |this| {
+                                this.bg(gpui::Rgba {
+                                    a: 0.1,
+                                    ..theme::text()
+                                })
+                            })
+                            .hover(|style| {
+                                style.bg(gpui::Rgba {
+                                    a: 0.06,
+                                    ..theme::text()
+                                })
+                            })
+                            .on_click(cx.listener(
+                                move |root, _event: &ClickEvent, _window, cx| {
+                                    root.run_history_search(click_word.clone(), cx);
+                                },
+                            ))
+                            .child(
+                                svg()
+                                    .path(icons::path("search"))
+                                    .size(px(20.0))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if selected {
+                                        gpui::Rgba {
+                                            a: 0.85,
+                                            ..theme::text()
+                                        }
+                                    } else {
+                                        gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        }
+                                    })
+                                    .child(word),
+                            )
+                    })),
+            )
+        })
 }
 
 /// 数字缩写：官方搜索里的“2442.2万人关注”。
@@ -730,6 +841,60 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             })
                             .child(group.title.clone()),
                     )
+                })
+                .when(group.can_view_all, |this| {
+                    let scope = match group.id.as_str() {
+                        "tracks" => Some(SearchScope::Tracks),
+                        "artists" => Some(SearchScope::Artists),
+                        "albums" => Some(SearchScope::Albums),
+                        "playlists" => Some(SearchScope::Playlists),
+                        _ => None,
+                    };
+                    match scope {
+                        Some(scope) => this.child(
+                            div()
+                                .id(gpui::ElementId::Name(
+                                    format!("search-view-all-{}", group.id).into(),
+                                ))
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(gpui::Rgba {
+                                        a: 0.05,
+                                        ..theme::text()
+                                    })
+                                })
+                                .on_click(cx.listener(
+                                    move |root, _event: &ClickEvent, _window, cx| {
+                                        root.set_search_tab(scope, cx);
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        })
+                                        .child(root.localized(
+                                            "查看所有{}",
+                                            &[group.title.clone()],
+                                        )),
+                                )
+                                .child(
+                                    svg()
+                                        .path(icons::path("chevron-right"))
+                                        .size(px(24.0))
+                                        .text_color(theme::text_muted()),
+                                ),
+                        ),
+                        None => this,
+                    }
                 })
                 .children(group.entries.iter().map(|entry| match entry {
                     SearchEntry::Track(track) => {

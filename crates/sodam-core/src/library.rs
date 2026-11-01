@@ -772,6 +772,27 @@ fn scoped_results(
 }
 
 /// 官方搜索页：综合 / 歌曲 / 音乐人 / 专辑 / 歌单。
+/// 搜索联想词（官方 `/luna/pc/sug`）。
+pub fn search_suggest(session: &Session, keyword: &str) -> anyhow::Result<Vec<String>> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value = libresoda::soda::search::suggest(session.soda(), keyword)
+        .map_err(|err| wrap_err("搜索联想失败", err))?;
+    let words = value
+        .get("sugs")
+        .and_then(|sugs| sugs.as_array())
+        .map(|sugs| {
+            sugs.iter()
+                .filter_map(|item| item.get("suggestion").and_then(|v| v.as_str()))
+                .map(|word| word.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(words)
+}
+
 pub fn search(
     session: &Session,
     keyword: &str,
