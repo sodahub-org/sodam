@@ -1740,6 +1740,10 @@ impl Render for Root {
                         badge: Some(gpui::SharedString::from(badge)),
                         avatar: self.cover_of(&info.avatar_url),
                     });
+                    extras.on_vip_click = Some(Box::new(|_window, cx| {
+                        // 占位：官方会员页地址要等逆向客户端确认。
+                        cx.open_url("https://qishui.douyin.com/");
+                    }));
                     extras.on_account_click = Some(Box::new(move |_window, cx| {
                         account_root.update(cx, |root, cx| {
                             root.set_nav(Nav::Settings, cx);

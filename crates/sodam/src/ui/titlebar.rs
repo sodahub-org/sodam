@@ -63,6 +63,9 @@ pub struct HeaderExtras {
     pub nav: Option<NavArrows>,
     pub search: Option<AnyElement>,
     pub account: Option<HeaderAccount>,
+    /// 点 SVIP 胶囊：打开会员购买页。
+    pub on_vip_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    /// 点头像：弹出账号菜单。
     pub on_account_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -72,6 +75,7 @@ impl Default for HeaderExtras {
             nav: None,
             search: None,
             account: None,
+            on_vip_click: None,
             on_account_click: None,
         }
     }
@@ -162,7 +166,11 @@ fn render_with_maximize_icon(
     row = row.child(div().w(px(15.0)).h_full());
 
     if let Some(account) = extras.account {
-        row = row.child(account_chip(account, extras.on_account_click.take()));
+        row = row.child(account_chip(
+            account,
+            extras.on_vip_click.take(),
+            extras.on_account_click.take(),
+        ));
     }
 
     row = row
@@ -241,7 +249,8 @@ fn separator() -> impl IntoElement {
 /// 账号区：会员徽章（SVIP / VIP / 开通 VIP）+ 头像，整块可点进设置。
 fn account_chip(
     account: HeaderAccount,
-    on_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    on_vip_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+    on_avatar_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
 ) -> impl IntoElement {
     let mut chip = div()
         .id("titlebar-account")
@@ -249,14 +258,20 @@ fn account_chip(
         .flex_row()
         .items_center()
         .gap(px(15.0))
-        .h(px(STRIP_HEIGHT))
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::surface_hover()));
+        .h(px(STRIP_HEIGHT));
 
     if let Some(badge) = account.badge {
         // SVIP 是官方字标（笔画是透明洞），用从原生截图里抠出的字标贴图；
         // 其他档位没有对应字标，退回文字胶囊。
-        chip = chip.child(if badge.as_ref() == "SVIP" {
+        let mut vip = div()
+            .id("titlebar-vip")
+            .cursor_pointer()
+            .flex()
+            .items_center();
+        if let Some(click) = on_vip_click {
+            vip = vip.on_click(move |_, window, cx| click(window, cx));
+        }
+        chip = chip.child(vip.child(if badge.as_ref() == "SVIP" {
             img("icons/svip.png")
                 .w(px(50.5))
                 .h(px(24.0))
@@ -275,15 +290,15 @@ fn account_chip(
                 .text_color(theme::text())
                 .child(badge)
                 .into_any_element()
-        });
+        }));
     }
 
     if let Some(path) = account.avatar {
-        chip = chip.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0));
-    }
-
-    if let Some(callback) = on_click {
-        chip = chip.on_click(move |_, window, cx| callback(window, cx));
+        let mut avatar = div().id("titlebar-avatar").cursor_pointer();
+        if let Some(click) = on_avatar_click {
+            avatar = avatar.on_click(move |_, window, cx| click(window, cx));
+        }
+        chip = chip.child(avatar.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0)));
     }
 
     chip
@@ -377,7 +392,10 @@ fn lyrics_button(
                 .w(px(22.0))
                 .h(px(18.0))
                 .rounded(px(8.0))
-                .when(active, |this| this.bg(theme::surface_hover()))
+                .when(active, |this| this.bg(gpui::Rgba {
+                    a: 1.0,
+                    ..gpui::rgb(0xB5B5C6)
+                }))
                 .child(
                     svg()
                         .path(icons::path("captions"))

@@ -72,13 +72,13 @@ pub(crate) fn search_box(
         .when(header, |this| this.rounded(px(16.0)))
         .when(!header, |this| this.rounded_md())
         .bg(if header {
-            theme::surface_elevated()
+            theme::surface_hover()
         } else {
             theme::surface()
         })
         .border_1()
         .border_color(if header {
-            theme::border()
+            theme::surface_hover()
         } else if focused {
             theme::accent()
         } else {
@@ -204,6 +204,24 @@ pub(crate) fn search_box(
                                 );
                                 window.paint_quad(quad);
                             }
+                            if focused {
+                                use std::sync::OnceLock;
+                                use std::time::Instant;
+                                static BLINK_START: OnceLock<Instant> = OnceLock::new();
+                                let start = *BLINK_START.get_or_init(Instant::now);
+                                let phase = (start.elapsed().as_millis() % 1060) as f32 / 1060.0;
+                                if phase < 0.5 {
+                                    let caret = gpui::fill(
+                                        gpui::Bounds::new(
+                                            gpui::point(bounds.origin.x + caret_x, top),
+                                            gpui::size(crate::app::CARET_WIDTH, line_height),
+                                        ),
+                                        theme::accent(),
+                                    );
+                                    window.paint_quad(caret);
+                                }
+                                window.request_animation_frame();
+                            }
                             if let Some(line) = &line {
                                 let _ = line.paint(
                                     gpui::point(bounds.origin.x - scroll, top),
@@ -213,16 +231,6 @@ pub(crate) fn search_box(
                                     window,
                                     cx,
                                 );
-                            }
-                            if focused {
-                                let caret = gpui::fill(
-                                    gpui::Bounds::new(
-                                        gpui::point(bounds.origin.x + caret_x, top),
-                                        gpui::size(crate::app::CARET_WIDTH, line_height),
-                                    ),
-                                    theme::accent(),
-                                );
-                                window.paint_quad(caret);
                             }
                             window.handle_input(
                                 &input_focus,
