@@ -921,6 +921,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         )),
                 ),
         )
+        // 非播放页：左侧换成官方的「封面 + 歌名-歌手 + 操作图标」，
+        // 盖住上面那排纯控制图标（截图核对过：此时不显示时长）。
+        .when(root.nav != crate::app::Nav::Lyrics, |this| {
+            this.child(track_info_left(root, &track, cx))
+        })
         // 中：传输控制 + 进度
         .child(
             div()
@@ -1602,4 +1607,155 @@ mod tests {
             );
         }
     }
+}
+
+/// 非播放页的左侧信息块：封面 + 歌名/歌手 + 收藏/评论/添加/少推荐/更多。
+fn track_info_left(
+    root: &Root,
+    track: &Option<sodam_core::models::TrackItem>,
+    cx: &mut Context<Root>,
+) -> impl IntoElement {
+    let Some(track) = track.clone() else {
+        return div().into_any_element();
+    };
+    let cover_path = root.cover_of(&track.cover);
+    let liked = root.liked_ids.contains(&track.id);
+    let count = root.comment_cache.get(&track.id).copied().unwrap_or(0);
+    let open = {
+        let track = track.clone();
+        move |root: &mut Root, _e: &ClickEvent, _w: &mut gpui::Window, cx: &mut Context<Root>| {
+            let _ = &track;
+            root.open_playback(cx);
+        }
+    };
+
+    div()
+        .absolute()
+        .left(px(20.0))
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .w(px(420.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .bg(theme::bg())
+        .occlude()
+        .child(
+            div()
+                .id("bar-track-cover")
+                .flex_none()
+                .cursor_pointer()
+                .on_click(cx.listener(open))
+                .child(crate::ui::artwork::cover(cover_path, 56.0, 8.0)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(format!("{} – {}", track.title, track.artist)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(16.0))
+                        .child({
+                            let t = track.clone();
+                            icon_button(
+                                "bar-track-like",
+                                if liked { "heart-filled" } else { "heart" },
+                                theme::ICON,
+                                if liked {
+                                    theme::accent()
+                                } else {
+                                    theme::text_muted()
+                                },
+                            )
+                            .on_click(cx.listener(move |root, _e: &ClickEvent, _w, cx| {
+                                root.toggle_like(t.clone(), cx);
+                            }))
+                        })
+                        .child({
+                            let t = track.clone();
+                            div()
+                                .id("bar-track-comment")
+                                .relative()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |root, _e: &ClickEvent, _w, cx| {
+                                    root.open_comments(t.clone(), cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(icons::path("comment-bubble"))
+                                        .size(px(theme::ICON))
+                                        .text_color(theme::text_muted()),
+                                )
+                                .when(count > 0, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-7.0))
+                                            .right(px(-14.0))
+                                            .w(px(22.0))
+                                            .h(px(12.0))
+                                            .flex()
+                                            .justify_end()
+                                            .child(
+                                                div()
+                                                    .px(px(2.0))
+                                                    .h(px(12.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(theme::surface_hover())
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_size(px(9.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme::text_muted())
+                                                    .child(count.to_string()),
+                                            ),
+                                    )
+                                })
+                        })
+                        .child({
+                            let t = track.clone();
+                            icon_button("bar-track-add", "note-plus", theme::ICON, theme::text_muted())
+                                .on_click(cx.listener(move |root, event: &ClickEvent, _w, cx| {
+                                    root.load_playlists(cx);
+                                    root.add_menu = Some((t.clone(), event.position()));
+                                    cx.notify();
+                                }))
+                        })
+                        .child({
+                            let t = track.clone();
+                            icon_button("bar-track-dislike", "thumb-down", theme::ICON, theme::text_muted())
+                                .on_click(cx.listener(move |root, _e: &ClickEvent, _w, cx| {
+                                    root.dislike_track(t.clone(), cx);
+                                }))
+                        })
+                        .child({
+                            let t = track.clone();
+                            icon_button(
+                                "bar-track-more",
+                                "three-points-vertical",
+                                theme::ICON,
+                                theme::text_muted(),
+                            )
+                            .on_click(cx.listener(move |root, event: &ClickEvent, _w, cx| {
+                                root.more_menu = Some((t.clone(), event.position()));
+                                cx.notify();
+                            }))
+                        }),
+                ),
+        )
+        .into_any_element()
 }
