@@ -816,6 +816,97 @@ pub fn search_suggest(
     Ok(words)
 }
 
+
+/// 查询串转义（PC 搜索的参数里可能带空格/中文）。
+fn encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 官方 PC 搜索：`GET /luna/pc/search/{search_type}`。
+///
+/// 和 Android 接口相比，它会带上 `search_id / search_method / from_search_id /
+/// search_scene` 这些官方客户端必带的参数，用于服务端做会话级排序和埋点。
+pub fn search_pc(
+    session: &Session,
+    keyword: &str,
+    search_type: &str,
+    cursor: &str,
+    from_search_id: &str,
+) -> anyhow::Result<SearchResults> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(SearchResults::default());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let search_id = format!(
+        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+        (now >> 32) as u32,
+        (now >> 16) as u16,
+        (now as u16) & 0x0fff,
+        ((now >> 4) as u16) & 0x0fff,
+        now as u64 & 0xffff_ffff_ffff
+    );
+    let params = [
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        ("device_id", now.to_string()),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("q", keyword.to_string()),
+        ("cursor", cursor.to_string()),
+        ("search_id", search_id),
+        ("search_method", String::new()),
+        ("debug_params", String::new()),
+        ("from_search_id", from_search_id.to_string()),
+        ("search_scene", String::new()),
+        ("scene_name", String::new()),
+    ];
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("https://api.qishui.com/luna/pc/search/{search_type}?{query}");
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Cookie", &session.soda().cookie())
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1")
+        .call()
+        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))?;
+    let body = response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))?;
+    raw_search_results(keyword, body.as_bytes())
+}
+
 pub fn search(
     session: &Session,
     keyword: &str,
@@ -823,12 +914,7 @@ pub fn search(
 ) -> anyhow::Result<SearchResults> {
     let soda = session.soda();
     match scope {
-        SearchScope::All => {
-            let body = soda
-                .fetch_search_all_body(keyword, 1, 30)
-                .map_err(|err| wrap_err("综合搜索失败", err))?;
-            raw_search_results(keyword, &body)
-        }
+        SearchScope::All => search_pc(session, keyword, "all", "0", ""),
         SearchScope::Tracks => {
             let tracks = session.search(keyword)?;
             Ok(scoped_results(
