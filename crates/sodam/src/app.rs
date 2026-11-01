@@ -1718,7 +1718,13 @@ impl Render for Root {
                         }),
                     });
                     extras.search = Some(
-                        crate::views::search::search_box(self, window, cx, 32.0)
+                        crate::views::search::search_box(
+                            self,
+                            window,
+                            cx,
+                            32.0,
+                            crate::views::search::SearchStyle::Header,
+                        )
                             .into_any_element(),
                     );
                 }

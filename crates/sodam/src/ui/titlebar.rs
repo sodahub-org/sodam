@@ -29,11 +29,11 @@ use std::{cell::Cell, rc::Rc};
 use crate::ui::{icons, theme};
 
 /// 标题栏条高度（逻辑像素，与 Windows 惯例一致）。
-pub const STRIP_HEIGHT: f32 = 64.0;
+pub const STRIP_HEIGHT: f32 = 48.0;
 /// 单个标题栏按钮宽度。
-const BUTTON_WIDTH: f32 = 52.0;
+const BUTTON_WIDTH: f32 = 49.0;
 /// 控制图标边长。
-const GLYPH_SIZE: f32 = 14.0;
+const GLYPH_SIZE: f32 = 12.0;
 /// 关闭按钮悬停色（Windows 惯例红）。
 const CLOSE_HOVER: Hsla = hsla(4.0 / 360.0, 0.83, 0.49, 1.0);
 /// 拖拽阈值（逻辑像素）：移动超过它才把指针交给合成器移动窗口。
@@ -146,9 +146,8 @@ fn render_with_maximize_icon(
         row = row.child(
             div()
                 .flex_none()
-                .w(px(280.0))
+                .w(px(237.0))
                 .h(px(STRIP_HEIGHT))
-                .px(px(theme::space::SM))
                 .flex()
                 .flex_col()
                 .justify_center()
@@ -248,13 +247,13 @@ fn account_chip(
     if let Some(badge) = account.badge {
         chip = chip.child(
             div()
-                .h(px(28.0))
-                .px(px(12.0))
-                .rounded(px(14.0))
+                .h(px(24.0))
+                .px(px(10.0))
+                .rounded(px(12.0))
                 .flex()
                 .items_center()
                 .bg(theme::surface_hover())
-                .text_size(px(12.0))
+                .text_size(px(11.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme::text())
                 .child(badge),
@@ -262,7 +261,7 @@ fn account_chip(
     }
 
     if let Some(path) = account.avatar {
-        chip = chip.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0));
+        chip = chip.child(crate::ui::artwork::cover(Some(path), 24.0, 999.0));
     }
 
     if let Some(callback) = on_click {
@@ -340,10 +339,10 @@ fn lyrics_button(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(36.0))
-        .h(px(36.0))
+        .w(px(28.0))
+        .h(px(28.0))
         .mx(px(theme::space::XS))
-        .rounded(px(10.0))
+        .rounded(px(8.0))
         .hover(move |style| {
             if active {
                 style
@@ -364,7 +363,7 @@ fn lyrics_button(
                 .child(
                     svg()
                         .path(icons::path("captions"))
-                        .size(px(18.0))
+                        .size(px(16.0))
                         .text_color(if active {
                             theme::text()
                         } else {

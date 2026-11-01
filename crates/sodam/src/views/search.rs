@@ -2,13 +2,22 @@
 
 use super::*;
 use gpui::{MouseMoveEvent, MouseUpEvent};
+/// 搜索框的两种外观：页面内的大输入框、标题栏里的紧凑款。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchStyle {
+    Page,
+    Header,
+}
+
 /// 搜索框：单击定位、拖拽扩选、双击选词、三击全选；按键走 keymap + action（见 `app_text`）。
 pub(crate) fn search_box(
     root: &Root,
     window: &Window,
     cx: &mut Context<Root>,
     height: f32,
+    style: SearchStyle,
 ) -> impl IntoElement {
+    let header = style == SearchStyle::Header;
     let focused = root.search_focus.is_focused(window);
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
@@ -17,7 +26,11 @@ pub(crate) fn search_box(
     // `line.paint`，因为只有这样才能跟着 `scroll_x` 走，而且它和光标、选区用的是
     // 同一条 ShapedLine —— 三者不会互相错位。
     let flow_text = if empty {
-        root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
+        if header {
+            root.tr("歌手、歌曲或专辑名").to_string()
+        } else {
+            root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
+        }
     } else {
         String::new()
     };
@@ -49,12 +62,20 @@ pub(crate) fn search_box(
         .flex()
         .flex_row()
         .items_center()
+        .when(header, |this| this.gap(px(8.0)))
         .h(px(height))
-        .px_3()
-        .rounded_md()
-        .bg(theme::surface())
+        .px(px(12.0))
+        .when(header, |this| this.rounded(px(16.0)))
+        .when(!header, |this| this.rounded_md())
+        .bg(if header {
+            theme::surface_hover()
+        } else {
+            theme::surface()
+        })
         .border_1()
-        .border_color(if focused {
+        .border_color(if header {
+            theme::surface_hover()
+        } else if focused {
             theme::accent()
         } else {
             theme::border()
@@ -131,6 +152,15 @@ pub(crate) fn search_box(
         .on_action(cx.listener(Root::text_redo))
         .on_action(cx.listener(Root::text_submit))
         .on_action(cx.listener(Root::text_cancel))
+        .when(header, |this| {
+            this.child(
+                svg()
+                    .path(icons::path("search"))
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme::text_muted()),
+            )
+        })
         .child(
             // 26 = 占位文案的行盒高度，也是原来那条 4 + 18 + 4 的光标几何所暗示的高度；
             // 显式定高之后，真实文本改由 canvas 绘制，盒子才不会塌成 0。
@@ -846,7 +876,7 @@ pub(crate) fn search_page(
         .min_h(px(0.0))
         .gap(px(theme::space::MD))
         .when(show_input, |this| {
-            this.child(search_box(root, window, cx, 38.0))
+            this.child(search_box(root, window, cx, 38.0, SearchStyle::Page))
         })
         .when(show_history, |this| {
             this.child(search_history_panel(root, cx))
