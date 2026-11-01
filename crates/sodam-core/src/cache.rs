@@ -531,7 +531,8 @@ pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
 /// 评估将已有缓存批量升级到指定档位所需流量与容量变化。
 ///
 /// `unknown_rank_count` 统计的是**档位未知的旧缓存有多少**，与本轮能不能升无关：
-/// 界面要说「发现 X 首」，不能在它们被目标档位或探测记录抑制之后就当作不存在（#89）。
+/// 界面要把「有 X 首缓存根本不知道是什么档」如实报出来，不能在它们被目标档位或探测记录
+/// 抑制之后就当作不存在（#89）。试听片段不报——它本来就不参与升级，报了也没法处理。
 pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> UpgradeEstimate {
     let mut count = 0usize;
     let mut unknown_rank_count = 0usize;

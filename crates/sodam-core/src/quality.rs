@@ -325,7 +325,7 @@ pub fn is_tier_below_selected(
 ///
 /// 设置页的禁用态与执行处的拦截必须同判：一处放行一处拒绝，按钮就是骗人的。
 /// 认不出权益（账号没加载，`is_vip == None`）也算不放行——那时既取不到会员档位的流，
-/// 也记不下「没有更高档位」（见 [`can_record_unavailable]`），跑一轮只会整曲下一遍再丢掉。
+/// 也记不下「没有更高档位」（见 [`can_record_unavailable`]），跑一轮只会整曲下一遍再丢掉。
 pub fn batch_upgrade_needs_confirmed_entitlement(
     intent: &QualityIntent,
     is_vip: Option<bool>,
