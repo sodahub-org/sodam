@@ -594,8 +594,11 @@ pub(crate) fn quality_menu(
     }
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
     let _ = cover_left;
-    let menu_top = (48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0)
-        .min(height - theme::PLAYER_H - 48.0);
+    // 弹层整体必须落在播放条上方，底部箭头才不会压进控制栏。
+    let menu_height = if svip { 384.0 } else { 312.0 };
+    let bar_top = height - theme::PLAYER_H;
+    let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
+    let menu_top = cover_center.min(bar_top - menu_height - 10.0).max(48.0);
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
     // 菜单以音质胶囊为中心：宽度收窄后箭头仍正对胶囊中心。
     let menu_width = 320.0;
