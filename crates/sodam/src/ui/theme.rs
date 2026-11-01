@@ -388,7 +388,7 @@ pub fn lyric_dim() -> Rgba {
     )
 }
 
-/// 警示色：message 的 warning 级别，以及「需要留意」的状态标识（如降档徽章）使用；
+/// 警示色：message 的 warning 级别，以及「需要留意」的状态标识（如与所选不符的档位徽章）使用；
 /// 不替代主色，也不用于普通按钮。
 pub fn warning() -> Rgba {
     if is_dark() {

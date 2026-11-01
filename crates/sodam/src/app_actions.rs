@@ -12,6 +12,7 @@ use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
+use sodam_core::quality::TierMismatch;
 use sodam_core::session::Session;
 use sodam_core::Settings;
 use std::collections::HashSet;
@@ -2945,12 +2946,11 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
-                        // 降档：实际低于所选时如实说出两边，不猜原因——取流那一段在
-                        // 「账号没有权益」与「这首没有该档位」下返回值相同，没有字段能分开。
-                        // 实际档位标签由核心层按中文档位名生成，英文界面要过一遍翻译。
-                        // 两边显示名相同时不提示，避免「所选 X，实际 X」这种读反的句子；
-                        // 分数拆档后真实降档都会落在不同名字上，这条是将来改表时的护栏。
-                        // 走全局提示而不是 `status`：后者没有渲染（见 #40）。
+                        // 与所选不符：低于和高于都用同一句格式说出两侧，不猜原因——
+                        // 低于是「没有权益」与「这首没有该档位」返回值相同；高于是候选集里
+                        // 没有等于或低于上限的流，服务端退回全量取最优（#82），但据此说
+                        // 「这首只有更高档」是过头的：实测回退的全是试听片段。
+                        // 通道走状态行，#94 之后它有渲染出口，这类事实不该打断用户。
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
                         if was_cached
@@ -2962,23 +2962,27 @@ impl Root {
                         {
                             root.spawn_background_cache_upgrade(track.clone(), intent.clone(), cx);
                         }
-                        if sodam_core::quality::is_visible_downgrade(&intent, actual_rank) {
-                            let message = root.localized(
-                                "已降档：所选 {}，实际 {}",
-                                &[
-                                    crate::ui::player_bar::quality_label(
-                                        intent.as_setting(),
-                                        root.language,
-                                    ),
-                                    crate::ui::player_bar::localized_quality(
-                                        actual_quality,
-                                        root.language,
-                                    ),
-                                ],
-                            );
-                            root.notify_warning_once("quality-downgraded", message);
-                        } else {
-                            root.set_status("播放中：{}", std::slice::from_ref(&track.title));
+                        let mismatch =
+                            sodam_core::quality::visible_tier_mismatch(&intent, actual_rank);
+                        let selected_name = crate::ui::player_bar::quality_label(
+                            intent.as_setting(),
+                            root.language,
+                        );
+                        let actual_name =
+                            crate::ui::player_bar::localized_quality(actual_quality, root.language);
+                        let both = [selected_name, actual_name];
+                        // 三条文案都写状态行，字面量留在 `.set_status(` 后面，
+                        // 好让 i18n 守卫 `every_static_ui_key_has_an_english_entry` 扫到。
+                        match mismatch {
+                            Some(TierMismatch::Below) => {
+                                root.set_status("已降档：所选 {}，实际 {}", &both);
+                            }
+                            Some(TierMismatch::Above) => {
+                                root.set_status("高于所选：所选 {}，实际 {}", &both);
+                            }
+                            None => {
+                                root.set_status("播放中：{}", std::slice::from_ref(&track.title));
+                            }
                         }
                         // 开播后立刻预取下一首，切歌时基本是秒开
                         root.spawn_prefetch(cx);

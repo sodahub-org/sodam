@@ -40,7 +40,7 @@ pub struct PlaybackSnapshot {
     pub quality: String,
     /// 实际档位分数（与取流筛选同一刻度）；`None` = 未知（旧缓存没记）。
     ///
-    /// 界面拿它和用户选的意图比较得出「是否降档」——结论不落盘，每次现算。
+    /// 界面拿它和用户选的意图比较得出「是否相符」（低于或高于所选）——结论不落盘，每次现算。
     pub quality_rank: Option<i64>,
     /// 当前曲目是不是**试听片段**（不是整曲流）。界面用它显示持续标识，
     /// 不再从 `quality` 字符串里猜——「三十秒就切歌」的真相只能在这里表达。
@@ -95,7 +95,7 @@ enum Command {
         path: PathBuf,
         /// 这次实际拉到的流音质（显示用）
         quality: String,
-        /// 实际档位分数（降档判定用）
+        /// 实际档位分数（与意图比对用）
         quality_rank: Option<i64>,
         /// 这次拿到的是试听片段还是整曲
         preview: bool,
