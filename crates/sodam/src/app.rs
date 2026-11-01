@@ -320,6 +320,8 @@ pub struct Root {
     pub(crate) header_owns_search: bool,
     /// 每首歌的高潮点（秒），进队列后异步补齐。
     pub chorus_cache: std::collections::HashMap<String, f64>,
+    /// 音量弹层的开合状态。
+    pub volume_open: bool,
     /// 搜索联想词与下拉状态。
     pub search_sug: Vec<sodam_core::library::SearchSuggestion>,
     pub search_sug_open: bool,
@@ -404,7 +406,8 @@ pub struct Root {
     /// 进度条轨道在窗口里的位置（画布测量，鼠标事件据此换算 seek 位置）。
     pub progress_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量轨道在窗口里的位置（画布测量，鼠标事件据此换算音量）。
-    pub volume_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// 竖向音量弹层的轨道 bounds。
+    pub volume_pop_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 打开中的歌单（点卡片后展示曲目）。
     pub open_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
     pub loading_playlist: bool,
@@ -632,6 +635,7 @@ impl Root {
             search_field: TextField::default(),
             header_owns_search: false,
             chorus_cache: std::collections::HashMap::new(),
+            volume_open: false,
             search_sug: Vec::new(),
             search_sug_open: false,
             search_sug_index: 0,
@@ -710,7 +714,7 @@ impl Root {
                 Settings::config_path(),
             ),
             progress_track_bounds: Arc::new(Mutex::new(None)),
-            volume_track_bounds: Arc::new(Mutex::new(None)),
+            volume_pop_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
             prefetch_failed: HashMap::new(),
             prefetch_patrol: 0,

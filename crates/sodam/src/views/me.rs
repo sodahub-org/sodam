@@ -22,7 +22,7 @@ pub(crate) fn me_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         None
     };
 
-    let mut header = div()
+    let header = div()
         .flex()
         .flex_row()
         .items_center()

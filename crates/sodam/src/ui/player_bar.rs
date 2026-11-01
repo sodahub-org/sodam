@@ -14,24 +14,98 @@ use crate::ui::artwork::{cover, icon_button};
 use crate::ui::{icons, theme};
 
 /// 内联音量条宽度与滑块直径。
-const VOLUME_TRACK_W: f32 = 96.0;
-const VOLUME_THUMB: f32 = 11.0;
 /// 档位菜单宽度：最宽的一项是「自动」加它的说明，200 足够且不挤压播放条。
 const QUALITY_MENU_W: f32 = 200.0;
 
-fn transport_button(
-    id: &'static str,
-    icon: &'static str,
-    size: f32,
-    cx: &mut Context<Root>,
-    action: fn(&mut Root, &mut Context<Root>),
-) -> impl IntoElement {
-    icon_button(id, icon, size, theme::text_muted()).on_click(cx.listener(
-        move |root, _event: &ClickEvent, _window, cx| {
-            action(root, cx);
-            cx.notify();
-        },
-    ))
+
+/// 官方音量弹层：点音量图标后在上方弹出的竖向滑条。
+fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
+    let volume = root.settings.volume;
+    let slot = root.volume_pop_bounds.clone();
+    let apply = move |y: f32, root: &mut Root, cx: &mut Context<Root>| {
+        let bounds = slot.lock().ok().and_then(|value| *value);
+        let Some(bounds) = bounds else { return };
+        let top = f32::from(bounds.origin.y);
+        let height = f32::from(bounds.size.height);
+        if height <= 1.0 {
+            return;
+        }
+        let ratio = ((top + height - y) / height).clamp(0.0, 1.0);
+        root.set_volume(ratio);
+        cx.notify();
+    };
+    let apply_down = apply.clone();
+    let apply_move = apply.clone();
+    let slot_canvas = root.volume_pop_bounds.clone();
+
+    div()
+        .id("volume-popover")
+        .absolute()
+        .right(px(20.0))
+        .bottom(px(theme::PLAYER_H))
+        .mb(px(8.0))
+        .w(px(40.0))
+        .h(px(140.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(12.0))
+        .bg(theme::surface_elevated())
+        .border_1()
+        .border_color(theme::border())
+        .shadow_lg()
+        .child(
+            div()
+                .relative()
+                .w(px(4.0))
+                .h(px(96.0))
+                .rounded_full()
+                .bg(theme::surface_hover())
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |root, event: &MouseDownEvent, _window, cx| {
+                        apply_down(f32::from(event.position.y), root, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _window, cx| {
+                    if event.dragging() {
+                        apply_move(f32::from(event.position.y), root, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(gpui::relative(volume))
+                        .rounded_full()
+                        .bg(theme::accent()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-3.0))
+                        .bottom(gpui::relative(volume))
+                        .ml(px(-3.0))
+                        .size(px(10.0))
+                        .rounded_full()
+                        .bg(theme::text()),
+                )
+                .child(
+                    canvas(
+                        move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
+                            if let Ok(mut guard) = slot_canvas.lock() {
+                                *guard = Some(bounds);
+                            }
+                        },
+                        |_bounds, _state, _window, _cx| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                ),
+        )
 }
 
 /// 官方控制栏的宽按钮：前后各 64×48，播放键 84×48。
@@ -66,100 +140,7 @@ fn wide_transport_button(
         )
 }
 
-/// 内联音量滑条：细轨道 + 强调色已播段 + 圆形滑块，点或拖都能调。
-fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
-    let volume = root.settings.volume;
-    let filled = (VOLUME_TRACK_W - VOLUME_THUMB) * volume;
-    let bounds_slot = root.volume_track_bounds.clone();
-    let apply = move |x: f32, root: &mut Root, cx: &mut Context<Root>| {
-        let left = bounds_slot
-            .lock()
-            .ok()
-            .and_then(|value| value.map(|rect| f32::from(rect.left())))
-            .unwrap_or(0.0);
-        let ratio = ((x - left) / VOLUME_TRACK_W).clamp(0.0, 1.0);
-        root.set_volume(ratio);
-        cx.notify();
-    };
-    let apply_down = apply.clone();
-    let apply_move = apply.clone();
-    let slot_for_canvas = root.volume_track_bounds.clone();
-
-    div()
-        .relative()
-        .flex()
-        .items_center()
-        .h(px(16.0))
-        .w(px(VOLUME_TRACK_W))
-        .flex_none()
-        .child(
-            div()
-                .absolute()
-                .top(px(6.5))
-                .left(px(0.0))
-                .w(px(VOLUME_TRACK_W))
-                .h(px(3.0))
-                .rounded(px(2.0))
-                .bg(theme::surface_hover()),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px(6.5))
-                .left(px(0.0))
-                .w(px(filled + VOLUME_THUMB / 2.0))
-                .h(px(3.0))
-                .rounded(px(2.0))
-                .bg(theme::accent()),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px((16.0 - VOLUME_THUMB) / 2.0))
-                .left(px(filled))
-                .size(px(VOLUME_THUMB))
-                .rounded_full()
-                .bg(theme::text()),
-        )
-        .child(
-            // 用 canvas 记录轨道在窗口里的位置，鼠标 x 才能换算成比例
-            canvas(
-                move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
-                    if let Ok(mut guard) = slot_for_canvas.lock() {
-                        *guard = Some(bounds);
-                    }
-                },
-                |_bounds, _state, _window, _cx| {},
-            )
-            .absolute()
-            .size_full(),
-        )
-        .child(
-            div()
-                .id("volume-track")
-                .absolute()
-                .size_full()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |root, event: &MouseDownEvent, _window, cx| {
-                        apply_down(f32::from(event.position.x), root, cx);
-                    }),
-                )
-                .on_mouse_move(
-                    cx.listener(move |root, event: &MouseMoveEvent, _window, cx| {
-                        if event.pressed_button == Some(MouseButton::Left) {
-                            apply_move(f32::from(event.position.x), root, cx);
-                        }
-                    }),
-                ),
-        )
-}
-
-/// 进度条：拖动过程中只更新预览（不 seek），**松手才真正跳转**。
-///
-/// 之前是「每移动一次就 try_seek 一次」，解码器被反复打断，
-/// 听起来像变速/鬼畜；sonora 的做法也是拖动预览、松手提交。
+/// 官方音量弹层：点音量图标后在上方弹出的竖向滑条。
 const PROGRESS_GROUP: &str = "player-progress";
 
 fn progress_bar(
@@ -561,6 +542,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .right(px(0.0))
                 .child(progress_bar(root, progress, chorus, loading, cx)),
         )
+        .when(root.volume_open, |this| this.child(volume_popover(root, cx)))
         // 左：封面 + 标题/歌手/进度文案
         .child(
             // 官方：track 绝对定位在左，left 20、宽 50vw-150（这里用 50% 近似）。
@@ -830,6 +812,19 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .justify_end()
                 .gap(px(12.0))
                 .flex_shrink(1.0)
+                // 官方 BottomPlayerDurationIndicator：当前 / 总时长
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text_muted())
+                        .child(format!(
+                            "{} / {}",
+                            snapshot.position_label(),
+                            snapshot.duration_label()
+                        )),
+                )
                 .child(
                     icon_button(
                         "volume",
@@ -843,12 +838,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     )
                     .on_click(cx.listener(
                         |root, _event: &ClickEvent, _window, cx| {
-                            root.toggle_mute();
+                            root.volume_open = !root.volume_open;
                             cx.notify();
                         },
                     )),
                 )
-                .child(volume_slider(root, cx))
                 .when(!root.queue_origin.is_feed_like(), |bar| {
                     bar.child(
                         // 播放模式：列表循环 / 单曲循环 / 随机播放，点击轮换。

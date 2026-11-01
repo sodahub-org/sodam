@@ -636,7 +636,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .w(px(lyrics_width))
             .max_w(px(500.0))
             .min_w(px(300.0))
-            .h_full()
+            // 官方歌词区和左侧「封面 + 歌曲信息」同高（lyrics-container
+            // align-self: stretch），不是铺满整页。
+            .h(px(cover_size + 110.0))
             .flex_none()
             .min_h(px(0.0))
             .child(if root.loading_lyrics {

@@ -509,13 +509,6 @@ impl Root {
         self.persist_playback_preferences();
     }
 
-    /// 静音 / 恢复。以设置中的即时值判断，快速连点不依赖音频线程的回执时机。
-    pub fn toggle_mute(&mut self) {
-        self.settings.toggle_mute();
-        self.engine.set_volume(self.settings.volume);
-        self.persist_playback_preferences();
-    }
-
     pub(crate) fn set_cache_limit_mb(&mut self, mb: u64, cx: &mut Context<Self>) {
         self.settings.audio_cache_limit_mb = mb.clamp(1024, 1024 * 1024);
         self.persist_playback_preferences();
