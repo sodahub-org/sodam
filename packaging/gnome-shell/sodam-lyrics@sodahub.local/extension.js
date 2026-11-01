@@ -28,8 +28,11 @@ const LYRICS_PATH = '/org/sodahub/SodaM/Lyrics';
 const LYRICS_IFACE = 'org.sodahub.SodaM.Lyrics';
 
 // 文本区固定 12 个歌词字的宽度（与官方客户端一致）：不随歌词长短伸缩。
-const LYRIC_FONT_SIZE = 13;
-const TEXT_WIDTH = 12 * LYRIC_FONT_SIZE;
+const TEXT_LINES = 12;
+// 原生 pill 的配色：浅底、深字，与顶栏主题无关。
+const INK = '#1f1d1a';
+const MUTED = '#6f6a64';
+const ICON_INK = '#3a3733';
 
 export default class SodamLyricsExtension extends Extension {
     enable() {
@@ -79,6 +82,18 @@ export default class SodamLyricsExtension extends Extension {
     // ── 顶栏 pill ───────────────────────────────────────────────────────────
 
     _buildIndicator() {
+        // 尺寸全部按顶栏实际高度推导：顶栏多高、字号和间距就多大，不会撑出栏外。
+        const H = Math.max(24, Math.round(
+            Main.panel.height || Main.layoutManager.panelBox.height || 32));
+        const titleSize = Math.max(8, Math.round(H * 0.28));
+        const lyricSize = Math.max(10, Math.round(H * 0.35));
+        const coverSize = Math.max(14, Math.round(H * 0.6));
+        const iconSize = Math.max(10, Math.round(H * 0.36));
+        const playSize = Math.max(12, Math.round(H * 0.44));
+        const textWidth = TEXT_LINES * lyricSize;
+        const pillHeight = H - 4;
+        this._textWidth = textWidth;
+
         this._indicator = new PanelMenu.Button(0.0, 'SodaM 桌面歌词', true);
         this._indicator.add_style_class_name('sodam-lyrics-indicator');
         this._indicator.hide();
@@ -86,6 +101,7 @@ export default class SodamLyricsExtension extends Extension {
         const pill = new St.BoxLayout({
             style_class: 'sodam-lyrics-pill',
             orientation: Clutter.Orientation.HORIZONTAL,
+            style: `background-color: rgba(246,243,238,0.96); border-radius: ${Math.round(pillHeight / 2)}px; padding: 0 ${Math.round(H * 0.16)}px; spacing: ${Math.round(H * 0.34)}px;`,
         });
 
         // 封面 + 歌名 · 歌词：整块可点，唤起主窗口。
@@ -94,13 +110,14 @@ export default class SodamLyricsExtension extends Extension {
             orientation: Clutter.Orientation.HORIZONTAL,
             reactive: true,
             track_hover: true,
+            style: `spacing: ${Math.round(H * 0.16)}px; padding: 0 ${Math.round(H * 0.04)}px;`,
         });
         this._cover = new St.Icon({
             style_class: 'sodam-lyrics-cover',
-            icon_size: 18,
+            icon_size: coverSize,
             y_align: Clutter.ActorAlign.CENTER,
         });
-        // 歌名在上、歌词在下，两行都固定 TEXT_WIDTH 宽：歌词再长也不改变顶栏占位。
+        // 歌名在上、歌词在下，两行都固定 12 字宽：歌词再长也不改变顶栏占位。
         this._titleLabel = new St.Label({
             style_class: 'sodam-lyrics-title',
             text: 'SodaM',
@@ -111,8 +128,9 @@ export default class SodamLyricsExtension extends Extension {
         this._titleClip = new St.Bin({
             style_class: 'sodam-lyrics-text-clip',
             clip_to_allocation: true,
-            width: TEXT_WIDTH,
+            width: textWidth,
             x_align: Clutter.ActorAlign.CENTER,
+            style: `height: ${titleSize + 3}px;`,
         });
         this._titleClip.set_child(this._titleLabel);
 
@@ -125,8 +143,9 @@ export default class SodamLyricsExtension extends Extension {
         this._lyricClip = new St.Bin({
             style_class: 'sodam-lyrics-text-clip',
             clip_to_allocation: true,
-            width: TEXT_WIDTH,
+            width: textWidth,
             x_align: Clutter.ActorAlign.START,
+            style: `height: ${lyricSize + 3}px;`,
         });
         this._lyricClip.set_child(this._lyricLabel);
 
@@ -138,10 +157,14 @@ export default class SodamLyricsExtension extends Extension {
         });
         this._textBox.add_child(this._titleClip);
         this._textBox.add_child(this._lyricClip);
+        this._titleLabel.set_style(`font-size: ${titleSize}px; color: ${MUTED};`);
+        this._lyricLabel.set_style(`font-size: ${lyricSize}px; color: ${INK};`);
+        this._textBox.set_style('spacing: 0px;');
         this._coverBin = new St.Bin({
             style_class: 'sodam-lyrics-cover-bin',
             clip_to_allocation: true,
             y_align: Clutter.ActorAlign.CENTER,
+            style: `border-radius: ${Math.round(coverSize * 0.22)}px;`,
         });
         this._coverBin.set_child(this._cover);
         this._info.add_child(this._coverBin);
@@ -155,13 +178,14 @@ export default class SodamLyricsExtension extends Extension {
         });
 
         this._prevButton = this._buildButton('skip-back.svg',
-            () => this._callMpris('Previous'));
+            () => this._callMpris('Previous'), iconSize);
         this._playButton = this._buildButton('play.svg',
-            () => this._callMpris('PlayPause'));
+            () => this._callMpris('PlayPause'), playSize);
+        this._playButton.set_style(`background-color: rgba(58,55,51,0.08); border-radius: 999px; padding: ${Math.round(playSize * 0.34)}px;`);
         this._nextButton = this._buildButton('skip-forward.svg',
-            () => this._callMpris('Next'));
+            () => this._callMpris('Next'), iconSize);
         this._likeButton = this._buildButton('heart.svg',
-            () => this._callLyrics('ToggleLiked'));
+            () => this._callLyrics('ToggleLiked'), iconSize);
 
         pill.add_child(this._info);
         pill.add_child(this._prevButton);
@@ -178,16 +202,17 @@ export default class SodamLyricsExtension extends Extension {
         return Gio.File.new_for_path(GLib.build_filenamev([this.path, 'icons', name]));
     }
 
-    _buildButton(iconFile, onClick) {
+    _buildButton(iconFile, onClick, iconSize) {
         const icon = new St.Icon({
             gicon: new Gio.FileIcon({file: this._iconFile(iconFile)}),
-            icon_size: 16,
+            icon_size: iconSize,
             style_class: 'sodam-lyrics-button-icon',
         });
         const button = new St.Button({
             style_class: 'sodam-lyrics-button',
             child: icon,
             y_align: Clutter.ActorAlign.CENTER,
+            style: `padding: ${Math.round(iconSize * 0.22)}px;`,
         });
         button.connect('clicked', onClick);
         return button;
@@ -415,7 +440,7 @@ export default class SodamLyricsExtension extends Extension {
         this._marqueeIdle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             this._marqueeIdle = 0;
             const natural = this._lyricLabel.get_preferred_width(-1)[1];
-            const overflow = Math.ceil(natural - TEXT_WIDTH);
+            const overflow = Math.ceil(natural - this._textWidth);
             if (overflow > 4)
                 this._scrollMarquee(overflow);
             return GLib.SOURCE_REMOVE;

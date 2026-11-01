@@ -11,42 +11,32 @@
 }
 
 .sodam-lyrics-info:hover {
-  background-color: rgba(255, 255, 255, 0.12);
+  background-color: rgba(58, 55, 51, 0.08);
 }
 
 .sodam-lyrics-cover {
   border-radius: 6px;
 }
 
-/* 文本块：歌名在上、歌词在下，宽度由 JS 固定为 12 个歌词字。 */
-.sodam-lyrics-text {
-  spacing: 1px;
-}
-
-/* 歌名：淡色、居中、比歌词小一号。 */
+/* 字号与颜色由 JS 按顶栏高度写入内联样式，这里只留字重。 */
 .sodam-lyrics-title {
   font-weight: 500;
-  font-size: 10px;
-  opacity: 0.55;
 }
 
-/* 歌词：主色，字号大于歌名；超宽由 JS 走马灯。 */
 .sodam-lyrics-line {
-  font-size: 13px;
-  opacity: 1;
+  font-weight: 400;
 }
 
 .sodam-lyrics-button {
   border-radius: 999px;
-  padding: 3px;
 }
 
 .sodam-lyrics-button:hover {
-  background-color: rgba(255, 255, 255, 0.14);
+  background-color: rgba(58, 55, 51, 0.1);
 }
 
 .sodam-lyrics-button:active {
-  background-color: rgba(255, 255, 255, 0.22);
+  background-color: rgba(58, 55, 51, 0.18);
 }
 
 .sodam-lyrics-cover-bin {
