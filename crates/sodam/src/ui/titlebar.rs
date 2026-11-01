@@ -278,14 +278,14 @@ fn account_chip(
                     .path(icons::path("svip"))
                     .w(px(36.25))
                     .h(px(10.0))
-                    .text_color(theme::text()),
+                    .text_color(theme::bg()),
             ),
             "VIP" => Some(
                 svg()
                     .path(icons::path("vip"))
                     .w(px(26.0))
                     .h(px(10.0))
-                    .text_color(theme::text()),
+                    .text_color(theme::bg()),
             ),
             _ => None,
         };
@@ -309,7 +309,7 @@ fn account_chip(
                 .bg(theme::surface_hover())
                 .text_size(px(12.0))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme::bg())
+                .text_color(theme::text())
                 .child(badge)
                 .into_any_element(),
         }));

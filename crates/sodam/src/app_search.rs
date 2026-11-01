@@ -12,6 +12,20 @@ use std::sync::Arc;
 use super::{Nav, Root};
 
 impl Root {
+    /// 联想项点击：有歌单实体就直接进歌单，否则按文本搜索。
+    pub fn apply_search_suggestion(
+        &mut self,
+        item: sodam_core::library::SearchSuggestion,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_sug_open = false;
+        if let Some(playlist_id) = item.playlist_id {
+            self.open_playlist(playlist_id, None, cx);
+        } else {
+            self.run_history_search(item.text, cx);
+        }
+    }
+
     pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_field.set_text(query);
         self.search_field.set_caret(self.search_field.len());

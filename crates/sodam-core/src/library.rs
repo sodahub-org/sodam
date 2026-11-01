@@ -772,8 +772,19 @@ fn scoped_results(
 }
 
 /// 官方搜索页：综合 / 歌曲 / 音乐人 / 专辑 / 歌单。
+/// 一条搜索联想：文本 + 可直达的歌单/音乐人 id。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchSuggestion {
+    pub text: String,
+    pub playlist_id: Option<String>,
+    pub artist_id: Option<String>,
+}
+
 /// 搜索联想词（官方 `/luna/pc/sug`）。
-pub fn search_suggest(session: &Session, keyword: &str) -> anyhow::Result<Vec<String>> {
+pub fn search_suggest(
+    session: &Session,
+    keyword: &str,
+) -> anyhow::Result<Vec<SearchSuggestion>> {
     let keyword = keyword.trim();
     if keyword.is_empty() {
         return Ok(Vec::new());
@@ -785,8 +796,20 @@ pub fn search_suggest(session: &Session, keyword: &str) -> anyhow::Result<Vec<St
         .and_then(|sugs| sugs.as_array())
         .map(|sugs| {
             sugs.iter()
-                .filter_map(|item| item.get("suggestion").and_then(|v| v.as_str()))
-                .map(|word| word.to_string())
+                .filter_map(|item| {
+                    let text = item.get("suggestion")?.as_str()?.to_string();
+                    Some(SearchSuggestion {
+                        text,
+                        playlist_id: item
+                            .pointer("/entity/playlist/id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        artist_id: item
+                            .pointer("/entity/artist/id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();

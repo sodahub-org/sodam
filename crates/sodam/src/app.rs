@@ -319,7 +319,7 @@ pub struct Root {
     /// 自绘标题栏是否承担了搜索框：是的话搜索页不再重复画一个输入框。
     pub(crate) header_owns_search: bool,
     /// 搜索联想词与下拉状态。
-    pub search_sug: Vec<String>,
+    pub search_sug: Vec<sodam_core::library::SearchSuggestion>,
     pub search_sug_open: bool,
     pub search_sug_index: usize,
     pub(crate) search_sug_seq: u64,

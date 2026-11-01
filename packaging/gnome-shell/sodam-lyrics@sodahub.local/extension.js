@@ -108,7 +108,7 @@ export default class SodamLyricsExtension extends Extension {
         const pill = new St.BoxLayout({
             style_class: 'sodam-lyrics-pill',
             orientation: Clutter.Orientation.HORIZONTAL,
-            style: `background-color: rgba(246,243,238,0.96); border-radius: 8px; padding: 0 10px 0 10px; spacing: ${gap}px;`,
+            style: `background-color: transparent; border-radius: 8px; padding: 0 10px 0 10px; spacing: ${gap}px;`,
         });
 
         // 封面 + 歌名 · 歌词：整块可点，唤起主窗口。

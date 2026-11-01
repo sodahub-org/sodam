@@ -91,10 +91,10 @@ pub(crate) fn search_box(
                                 cx.stop_propagation();
                             }
                             "enter" => {
-                                if let Some(word) =
+                                if let Some(item) =
                                     root.search_sug.get(root.search_sug_index).cloned()
                                 {
-                                    root.run_history_search(word, cx);
+                                    root.apply_search_suggestion(item, cx);
                                 }
                                 cx.stop_propagation();
                             }
@@ -300,10 +300,10 @@ pub(crate) fn search_box(
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
-                    .children(root.search_sug.iter().enumerate().map(|(index, word)| {
+                    .children(root.search_sug.iter().enumerate().map(|(index, item)| {
                         let selected = index == root.search_sug_index;
-                        let word = word.clone();
-                        let click_word = word.clone();
+                        let item = item.clone();
+                        let click_item = item.clone();
                         div()
                             .id(gpui::ElementId::Name(
                                 format!("search-sug-{index}").into(),
@@ -328,7 +328,7 @@ pub(crate) fn search_box(
                             })
                             .on_click(cx.listener(
                                 move |root, _event: &ClickEvent, _window, cx| {
-                                    root.run_history_search(click_word.clone(), cx);
+                                    root.apply_search_suggestion(click_item.clone(), cx);
                                 },
                             ))
                             .child(
@@ -352,7 +352,7 @@ pub(crate) fn search_box(
                                             ..theme::text()
                                         }
                                     })
-                                    .child(word),
+                                    .child(item.text.clone()),
                             )
                     })),
             )
