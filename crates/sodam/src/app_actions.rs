@@ -2968,10 +2968,8 @@ impl Root {
                             intent.as_setting(),
                             root.language,
                         );
-                        let actual_name = crate::ui::player_bar::localized_quality(
-                            actual_quality,
-                            root.language,
-                        );
+                        let actual_name =
+                            crate::ui::player_bar::localized_quality(actual_quality, root.language);
                         let both = [selected_name, actual_name];
                         // 三条文案都写状态行，字面量留在 `.set_status(` 后面，
                         // 好让 i18n 守卫 `every_static_ui_key_has_an_english_entry` 扫到。
