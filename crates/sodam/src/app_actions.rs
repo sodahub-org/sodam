@@ -466,6 +466,28 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 顶部轻提示，2 秒后自动消失。
+    pub fn set_toast(&mut self, text: String, cx: &mut Context<Self>) {
+        self.toast = Some((text, std::time::Instant::now()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                if root
+                    .toast
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed().as_secs() >= 2)
+                {
+                    root.toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 打开评论面板并拉第一页。
     pub fn open_comments(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
         self.comment_panel_open = true;
@@ -1546,12 +1568,18 @@ impl Root {
         });
         cx.spawn(async move |this, cx| {
             let value = work.await;
-            if let Some((seconds, comments)) = value {
+            if let Some(extras) = value {
                 let _ = this.update(cx, |root, cx| {
-                    if seconds > 0.0 {
-                        root.chorus_cache.insert(id.clone(), seconds);
+                    if extras.chorus_seconds > 0.0 {
+                        root.chorus_cache.insert(id.clone(), extras.chorus_seconds);
                     }
-                    root.comment_cache.insert(id, comments);
+                    root.comment_cache.insert(id.clone(), extras.comments);
+                    if !extras.album_id.is_empty() {
+                        root.album_ids.insert(id.clone(), extras.album_id);
+                    }
+                    if !extras.artist_id.is_empty() {
+                        root.artist_ids.insert(id.clone(), extras.artist_id);
+                    }
                     cx.notify();
                 });
             }

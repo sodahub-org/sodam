@@ -917,12 +917,20 @@ fn pc_search_body_with(
 }
 
 /// 取某首歌的高潮点与评论数（`chorus.start` 秒、`stats.count_comment`）。
+#[derive(Debug, Clone, Default)]
+pub struct TrackExtras {
+    pub chorus_seconds: f64,
+    pub comments: i64,
+    pub album_id: String,
+    pub artist_id: String,
+}
+
 pub fn track_extras(
     session: &Session,
     track_id: &str,
     title: &str,
     artist: &str,
-) -> Option<(f64, i64)> {
+) -> Option<TrackExtras> {
     let keyword = format!("{title} {artist}");
     let keyword = keyword.trim();
     if keyword.is_empty() || track_id.is_empty() {
@@ -975,7 +983,20 @@ pub fn track_extras(
                 .and_then(|count| count.as_i64())
                 .unwrap_or(0);
             if start > 0.0 || comments > 0 {
-                return Some((start / 1000.0, comments));
+                return Some(TrackExtras {
+                    chorus_seconds: start / 1000.0,
+                    comments,
+                    album_id: track
+                        .pointer("/album/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    artist_id: track
+                        .pointer("/artists/0/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
             }
         }
     }

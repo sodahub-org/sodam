@@ -322,6 +322,11 @@ pub struct Root {
     pub chorus_cache: std::collections::HashMap<String, f64>,
     /// 每首歌的评论数。
     pub comment_cache: std::collections::HashMap<String, i64>,
+    /// 曲目补齐的专辑 / 音乐人 id（列表数据缺字段时兜底）。
+    pub album_ids: std::collections::HashMap<String, String>,
+    pub artist_ids: std::collections::HashMap<String, String>,
+    /// 顶部轻提示（分享/反馈/举报等即时回执）。
+    pub toast: Option<(String, std::time::Instant)>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
     /// 静音前的音量，用于再次点击恢复。
@@ -664,6 +669,9 @@ impl Root {
             header_owns_search: false,
             chorus_cache: std::collections::HashMap::new(),
             comment_cache: std::collections::HashMap::new(),
+            album_ids: std::collections::HashMap::new(),
+            artist_ids: std::collections::HashMap::new(),
+            toast: None,
             volume_open: false,
             volume_before_mute: 0.8,
             search_sug: Vec::new(),
@@ -1850,6 +1858,9 @@ impl Render for Root {
             })
             .when(self.comment_panel_open, |this| {
                 this.child(crate::views::comment_panel(self, cx))
+            })
+            .when_some(self.toast.clone(), |this, (text, _at)| {
+                this.child(crate::views::toast_overlay(text, cx))
             })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))

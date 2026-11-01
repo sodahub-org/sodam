@@ -1343,13 +1343,13 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .child(item("more-share", "share-2", root.tr("分享").to_string(), cx, |root, track, cx| {
                         let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
-                        root.set_status("已复制链接", &[]);
+                        root.set_toast("已复制链接".to_string(), cx);
                     }))
-                    .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, _cx| {
-                        root.set_status("已记录对《{}》的信息反馈", std::slice::from_ref(&track.title));
+                    .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, cx| {
+                        root.set_toast(format!("已记录对《{}》的信息反馈", track.title), cx);
                     }))
-                    .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, _cx| {
-                        root.set_status("已收到对《{}》的举报", std::slice::from_ref(&track.title));
+                    .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, cx| {
+                        root.set_toast(format!("已收到对《{}》的举报", track.title), cx);
                     })),
             ),
     )
@@ -1574,5 +1574,35 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             ),
     )
     .with_priority(4)
+    .into_any_element()
+}
+
+/// 顶部居中的轻提示。
+pub fn toast_overlay(text: String, _cx: &mut Context<Root>) -> AnyElement {
+    gpui::deferred(
+        div()
+            .absolute()
+            .top(px(64.0))
+            .left(gpui::relative(0.5))
+            .ml(px(-120.0))
+            .w(px(240.0))
+            .flex()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .text_size(theme::Text::Small.size())
+                    .text_color(theme::text())
+                    .child(text),
+            ),
+    )
+    .with_priority(8)
     .into_any_element()
 }

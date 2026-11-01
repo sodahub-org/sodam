@@ -358,12 +358,17 @@ impl Root {
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
-        if track.album_id.is_empty() {
+        let album_id = if track.album_id.is_empty() {
+            self.album_ids.get(&track.id).cloned().unwrap_or_default()
+        } else {
+            track.album_id.clone()
+        };
+        if album_id.is_empty() {
             return;
         }
         self.open_album_page(
             AlbumItem {
-                id: track.album_id,
+                id: album_id,
                 title: track.album,
                 cover: track.cover,
                 ..Default::default()
@@ -378,12 +383,17 @@ impl Root {
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
-        if track.artist_id.is_empty() {
+        let artist_id = if track.artist_id.is_empty() {
+            self.artist_ids.get(&track.id).cloned().unwrap_or_default()
+        } else {
+            track.artist_id.clone()
+        };
+        if artist_id.is_empty() {
             return;
         }
         self.open_artist_page(
             ArtistItem {
-                id: track.artist_id,
+                id: artist_id,
                 name: track.artist,
                 ..Default::default()
             },
