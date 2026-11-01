@@ -454,6 +454,8 @@ pub struct Root {
     pub comment_total: i64,
     pub comment_loading: bool,
     pub comment_track: Option<String>,
+    /// 本地点赞过的评论（用于切换与失败回滚）。
+    pub comment_liked: std::collections::HashSet<String>,
     /// 播放请求序号：每次 start_track +1。
     ///
     /// 作用：加载是异步的（下载 + 解密），如果用户在 A 加载途中换了 B，
@@ -622,6 +624,7 @@ impl Root {
             comment_total: 0,
             comment_loading: false,
             comment_track: None,
+            comment_liked: std::collections::HashSet::new(),
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,

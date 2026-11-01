@@ -479,8 +479,14 @@ impl Root {
         self.fetch_comments(track.id, false, cx);
     }
 
-    /// 点赞/取消点赞一条评论（本地先回显）。
-    pub fn like_comment(&mut self, comment_id: String, liked: bool, cx: &mut Context<Self>) {
+    /// 点赞/取消点赞一条评论（本地先回显，失败回滚）。
+    pub fn like_comment(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        let liked = !self.comment_liked.contains(&comment_id);
+        if liked {
+            self.comment_liked.insert(comment_id.clone());
+        } else {
+            self.comment_liked.remove(&comment_id);
+        }
         if let Some(comment) = self.comment_items.iter_mut().find(|item| item.id == comment_id) {
             comment.likes = (comment.likes + if liked { 1 } else { -1 }).max(0);
         }
@@ -489,14 +495,26 @@ impl Root {
             return;
         };
         let settings = self.settings.clone();
+        let work_comment = comment_id.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            sodam_core::library::like_comment(&session, &track_id, &comment_id, liked)
+            sodam_core::library::like_comment(&session, &track_id, &work_comment, liked)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             if let Err(err) = result {
                 let _ = this.update(cx, |root, cx| {
+                    // 回滚本地状态
+                    if liked {
+                        root.comment_liked.remove(&comment_id);
+                    } else {
+                        root.comment_liked.insert(comment_id.clone());
+                    }
+                    if let Some(comment) =
+                        root.comment_items.iter_mut().find(|item| item.id == comment_id)
+                    {
+                        comment.likes = (comment.likes + if liked { -1 } else { 1 }).max(0);
+                    }
                     root.set_status("评论操作失败：{}", std::slice::from_ref(&err.to_string()));
                     cx.notify();
                 });

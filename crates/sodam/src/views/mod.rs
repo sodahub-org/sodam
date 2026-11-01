@@ -1440,7 +1440,7 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                 .on_click(cx.listener({
                                     let id = comment.id.clone();
                                     move |root, _event: &ClickEvent, _window, cx| {
-                                        root.like_comment(id.clone(), true, cx);
+                                        root.like_comment(id.clone(), cx);
                                     }
                                 }))
                                 .child(format!("赞 {}", comment.likes)),
