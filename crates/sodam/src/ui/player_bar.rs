@@ -482,7 +482,7 @@ pub(crate) fn quality_menu(
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(32.0))
+                .h(px(40.0))
                 .px(px(10.0))
                 .py(px(0.0))
                 .cursor_pointer()
@@ -499,7 +499,7 @@ pub(crate) fn quality_menu(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(0.0))
+                        .gap(px(2.0))
                         .flex_1()
                         .min_w(px(0.0))
                         .child(
@@ -518,7 +518,7 @@ pub(crate) fn quality_menu(
                                 .child(
                                     div()
                                         .text_size(if option.svip { px(13.0) } else { px(12.0) })
-                                        .line_height(px(14.0))
+                                        .line_height(px(16.0))
                                         .font_weight(if option.svip {
                                             gpui::FontWeight::BOLD
                                         } else {
@@ -558,7 +558,7 @@ pub(crate) fn quality_menu(
                                     .items_center()
                                     .gap(px(4.0))
                                     .text_size(px(11.0))
-                                    .line_height(px(12.0))
+                                    .line_height(px(14.0))
                                     .text_color(text_secondary)
                                     .child(option.desc)
                                     .child(
@@ -598,7 +598,7 @@ pub(crate) fn quality_menu(
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
     let _ = cover_left;
     // 弹层整体必须落在播放条上方，底部箭头才不会压进控制栏。
-    let menu_height = if svip { 218.0 } else { 168.0 };
+    let menu_height = if svip { 276.0 } else { 216.0 };
     let bar_top = height - theme::PLAYER_H;
     let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
