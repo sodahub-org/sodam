@@ -442,6 +442,8 @@ pub struct Root {
     pub quality_menu: Option<gpui::Point<gpui::Pixels>>,
     /// 搜索/歌单/我喜欢等歌曲行右键菜单。
     pub track_menu: Option<TrackMenu>,
+    /// 底部「更多」专属菜单（官方 5 项）。
+    pub more_menu: Option<(sodam_core::models::TrackItem, gpui::Point<gpui::Pixels>)>,
     /// 播放请求序号：每次 start_track +1。
     ///
     /// 作用：加载是异步的（下载 + 解密），如果用户在 A 加载途中换了 B，
@@ -601,6 +603,7 @@ impl Root {
             queue_menu: None,
             quality_menu: None,
             track_menu: None,
+            more_menu: None,
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,
@@ -1401,6 +1404,7 @@ impl Root {
     pub(crate) fn any_menu_open(&self) -> bool {
         self.queue_menu.is_some()
             || self.track_menu.is_some()
+            || self.more_menu.is_some()
             || self.quality_menu.is_some()
             || self.account_menu_open
     }
@@ -1816,6 +1820,9 @@ impl Render for Root {
             .when(self.logout_confirm_open, |this| {
                 this.child(logout_confirm(self, cx))
             })
+            .when(self.more_menu.is_some(), |this| {
+                this.child(crate::views::more_menu(self, cx))
+            })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
@@ -1846,6 +1853,7 @@ impl Render for Root {
                                     if root.any_menu_open() {
                                         root.queue_menu = None;
                                         root.track_menu = None;
+                                        root.more_menu = None;
                                         root.quality_menu = None;
                                         root.account_menu_open = false;
                                         cx.notify();

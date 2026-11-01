@@ -620,26 +620,44 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .cursor_pointer()
                         .hover(|style| style.bg(theme::surface_hover()))
                         .child(
-                            svg()
-                                .path(icons::path("comment-bubble"))
+                            div()
+                                .relative()
                                 .size(px(20.0))
-                                .text_color(theme::text_muted()),
-                        )
-                        .when(count > 0, |this| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .top(px(1.0))
-                                    .right(px(0.0))
-                                    .text_size(px(10.0))
-                                    .text_color(theme::text_muted())
-                                    .child(if count >= 10_000 {
+                                .child(
+                                    svg()
+                                        .path(icons::path("comment-bubble"))
+                                        .size(px(20.0))
+                                        .text_color(theme::text_muted()),
+                                )
+                                .when(count > 0, |this| {
+                                    let label = if count >= 10_000 {
                                         format!("{:.1}w", count as f64 / 10_000.0)
                                     } else {
                                         count.to_string()
-                                    }),
-                            )
-                        })
+                                    };
+                                    let align_right = label.chars().count() > 4;
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-4.5))
+                                            .right(px(-17.0))
+                                            .w(px(24.0))
+                                            .h(px(13.0))
+                                            .flex()
+                                            .when(align_right, |this| this.justify_end())
+                                            .child(
+                                                div()
+                                                    .px(px(2.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(theme::surface_hover())
+                                                    .text_size(px(9.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme::text_muted())
+                                                    .child(label),
+                                            ),
+                                    )
+                                }),
+                        )
                 })
                 .child(
                     icon_button("bar-add", "note-plus", theme::ICON, theme::text_muted())
@@ -655,10 +673,8 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
                                 if let Some(track) = root.queue.current().cloned() {
                                     root.queue_menu = None;
-                                    root.track_menu = Some(crate::app::TrackMenu {
-                                        track,
-                                        position: event.position(),
-                                    });
+                                    root.track_menu = None;
+                                    root.more_menu = Some((track, event.position()));
                                     cx.notify();
                                 }
                             })),

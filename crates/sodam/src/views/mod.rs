@@ -1275,3 +1275,68 @@ mod tests {
         }
     }
 }
+
+/// 底部「更多功能」菜单：对齐官方 BottomPlayerMoreButton 的五项。
+pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let Some((track, position)) = root.more_menu.clone() else {
+        return div().into_any_element();
+    };
+    let item = |id: &'static str,
+                label: String,
+                cx: &mut Context<Root>,
+                action: fn(&mut Root, sodam_core::models::TrackItem, &mut Context<Root>)| {
+        let track = track.clone();
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(theme::space::SM))
+            .py(px(theme::space::XS))
+            .rounded(px(theme::radius::ROW))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .text_size(theme::Text::Small.size())
+            .text_color(theme::text())
+            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.more_menu = None;
+                action(root, track.clone(), cx);
+                cx.notify();
+            }))
+            .child(label)
+    };
+    gpui::deferred(
+        gpui::anchored()
+            .snap_to_window()
+            .position(point(position.x, position.y))
+            .child(
+                div()
+                    .id("more-menu")
+                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .flex()
+                    .flex_col()
+                    .w(px(160.0))
+                    .p(px(theme::space::XS))
+                    .rounded(px(theme::radius::CARD))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .child(item("more-artist", root.tr("查看歌手").to_string(), cx, |root, track, cx| {
+                        root.open_track_artist(track, cx);
+                    }))
+                    .child(item("more-album", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
+                        root.open_track_album(track, cx);
+                    }))
+                    .child(item("more-share", root.tr("分享").to_string(), cx, |_root, track, cx| {
+                        let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    }))
+                    .child(item("more-feedback", root.tr("反馈").to_string(), cx, |_root, _track, _cx| {}))
+                    .child(item("more-report", root.tr("举报").to_string(), cx, |_root, _track, _cx| {})),
+            ),
+    )
+    .into_any_element()
+}
