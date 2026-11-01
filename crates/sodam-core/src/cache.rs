@@ -489,7 +489,8 @@ pub fn list_cached_audio(audio_dir: &Path) -> Vec<CachedAudioRecord> {
 pub struct UpgradeEstimate {
     /// 能够升级的曲目数
     pub upgradeable_count: usize,
-    /// 可升级曲目里档位未知的旧缓存数（`upgradeable_count` 的一部分，需整曲重下）
+    /// 扫到的档位未知的旧缓存数（非试听，与能否升级无关）：设置页要如实说出「发现 X 首」，
+    /// 哪怕这一轮它们都被抑制了。
     pub unknown_rank_count: usize,
     /// 可升级曲目当前所占字节总数
     pub current_bytes: u64,
@@ -528,6 +529,9 @@ pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
 }
 
 /// 评估将已有缓存批量升级到指定档位所需流量与容量变化。
+///
+/// `unknown_rank_count` 统计的是**档位未知的旧缓存有多少**，与本轮能不能升无关：
+/// 界面要说「发现 X 首」，不能在它们被目标档位或探测记录抑制之后就当作不存在（#89）。
 pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> UpgradeEstimate {
     let mut count = 0usize;
     let mut unknown_rank_count = 0usize;
@@ -536,14 +540,13 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
     let single_est = estimated_single_track_bytes(target_rank);
 
     for record in records {
+        // 试听片段不计入未知档位的提示：它本来就不参与升级，报了也没法处理。
+        if record.actual_rank.is_none() && !record.preview {
+            unknown_rank_count += 1;
+        }
         // 试听片段、超出意图上限、以及已确认无更高档位的记录都不计入升级。
         if record.is_upgradeable_to(target_rank) {
             count += 1;
-            // 档位未知的旧缓存单独计一笔：界面要说清这几首是「重下才知道是什么档」，
-            // 不是「已知比目标低」。
-            if record.actual_rank.is_none() {
-                unknown_rank_count += 1;
-            }
             current_bytes = current_bytes.saturating_add(record.file_size);
             estimated_new_bytes = estimated_new_bytes.saturating_add(single_est);
         }
@@ -822,8 +825,11 @@ mod tests {
             4000,
         );
 
+        // 档位未知，且是试听片段：本来就不能参与升级，也不该报给用户。
+        write_cached(dir.path(), "7004-auto", "极高 320k\t500\t1", 500);
+
         let records = list_cached_audio(dir.path());
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 4);
         let checked = records
             .iter()
             .find(|r| r.track_id == "7003")
@@ -837,13 +843,16 @@ mod tests {
         // 目标无损（100）：只有证明不了达标、也没确认过的那首进入升级。
         let est = estimate_upgrade(&records, 100);
         assert_eq!(est.upgradeable_count, 1);
-        assert_eq!(est.unknown_rank_count, 1);
+        assert_eq!(
+            est.unknown_rank_count, 3,
+            "发现的未知档位与本轮能不能升无关（试听那段不报）"
+        );
         assert_eq!(est.current_bytes, 3000);
 
         // 目标 Hi-Res 无损（110）：无损标签只证明到 100，三首都要重新探。
         let est_hires = estimate_upgrade(&records, 110);
         assert_eq!(est_hires.upgradeable_count, 3);
-        assert_eq!(est_hires.unknown_rank_count, 3, "三首都没有记录的档位分数");
+        assert_eq!(est_hires.unknown_rank_count, 3);
     }
 
     #[test]

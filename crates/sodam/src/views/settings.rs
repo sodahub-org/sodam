@@ -1112,10 +1112,25 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .children(batch_tier_rows),
                         )
                         .child({
-                            let mut legacy_note = None;
+                            // 档位未知的旧缓存另起一行（#89）：这几首不是「已知比目标低」，是旧版本
+                            // 没记档位。被权益挡住、或这一轮全都抑制掉了，也要照样报出来——
+                            // 「没有可升级的缓存歌曲」在这种存量下就不是实话（P5 的原话）。
+                            let legacy_note = if root.batch_upgrading {
+                                None
+                            } else {
+                                root.batch_upgrade_estimate
+                                    .as_ref()
+                                    .filter(|estimate| estimate.unknown_rank_count > 0)
+                                    .map(|estimate| {
+                                        root.localized(
+                                            "发现 {} 首档位未知的旧缓存，需整曲重下",
+                                            &[estimate.unknown_rank_count.to_string()],
+                                        )
+                                    })
+                            };
                             let estimate_text = if batch_upgrade_blocked_by_vip {
                                 root.localized(
-                                    "「{}」音质需 VIP 会员权限，当前账号无法升级",
+                                    "「{}」音质需 VIP 会员权限，当前账号未确认该权益",
                                     std::slice::from_ref(&batch_target_label),
                                 )
                             } else if root.batch_upgrading {
@@ -1139,14 +1154,6 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     } else {
                                         format!("-{}", human_bytes((-delta) as u64))
                                     };
-                                    // 档位未知的旧缓存另起一行（#89）：这几首不是「已知比目标低」，
-                                    // 是旧版本没记档位，重下一遍才知道是什么档。
-                                    if estimate.unknown_rank_count > 0 {
-                                        legacy_note = Some(root.localized(
-                                            "其中 {} 首是档位未知的旧缓存，需整曲重下",
-                                            &[estimate.unknown_rank_count.to_string()],
-                                        ));
-                                    }
                                     root.localized(
                                         "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}",
                                         &[

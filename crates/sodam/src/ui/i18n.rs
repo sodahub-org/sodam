@@ -498,8 +498,8 @@ impl Language {
             "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}" => {
                 "{} songs can be upgraded · Est. traffic {} · Storage change {}"
             }
-            "其中 {} 首是档位未知的旧缓存，需整曲重下" => {
-                "{} of them are legacy caches with no recorded quality tier and need a full re-download"
+            "发现 {} 首档位未知的旧缓存，需整曲重下" => {
+                "{} legacy caches have no recorded quality tier and need a full re-download"
             }
             "正在计算升级预估…" => "Estimating upgrade…",
             "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
@@ -510,8 +510,8 @@ impl Language {
                 "Cache upgrade complete: upgraded {} songs, {} skipped or no higher quality"
             }
             "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
-            "「{}」音质需 VIP 会员权限，当前账号无法升级" => {
-                "\"{}\" quality requires VIP membership; current account cannot upgrade"
+            "「{}」音质需 VIP 会员权限，当前账号未确认该权益" => {
+                "\"{}\" quality requires VIP membership; that entitlement isn't confirmed for the current account"
             }
             "诊断日志" => "Diagnostic Logs",
             "默认记录在本机，用于排查播放问题；「清空缓存」不会删除它们" => {
