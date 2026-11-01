@@ -539,6 +539,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
 
     div()
         .relative()
+        .occlude()
         .flex()
         .flex_row()
         .items_center()

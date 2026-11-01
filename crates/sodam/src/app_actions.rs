@@ -2933,6 +2933,7 @@ impl Root {
         self.play_seq = self.play_seq.wrapping_add(1);
         let request_seq = self.play_seq;
         self.pending_track = Some(track.clone());
+        self.load_chorus(&track, cx);
         self.pending_engine_load = None;
         self.progress_preview = None;
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
