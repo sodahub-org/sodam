@@ -8,14 +8,20 @@
 
 use std::ffi::c_void;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_lite::future;
 use gpui::{App, Task};
 use mpris_server::{Metadata, PlaybackStatus, Player, Time, TrackId};
+use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
 use tokio::sync::mpsc;
 
 use super::{Command, NowPlaying, BUS_NAME, DESKTOP_ENTRY, DISPLAY_NAME};
+
+/// 注册失败后的首次重试间隔；之后指数退避到这个上限。
+const REGISTER_RETRY: Duration = Duration::from_secs(5);
+const REGISTER_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// 发布到 MPRIS 上的一次变更，按发送顺序应用。
 enum Update {
@@ -54,7 +60,7 @@ impl LyricsInterface {
     fn current_line(&self) -> String {
         self.state
             .lock()
-            .map(|s| s.current.clone())
+            .map(|state| state.current.clone())
             .unwrap_or_default()
     }
 
@@ -63,26 +69,29 @@ impl LyricsInterface {
     fn next_line(&self) -> String {
         self.state
             .lock()
-            .map(|s| s.next.clone())
+            .map(|state| state.next.clone())
             .unwrap_or_default()
     }
 
     /// 当前曲目是否有歌词（区分「加载中」与「没有歌词」）。
     #[zbus(property)]
     fn has_lyrics(&self) -> bool {
-        self.state.lock().map(|s| s.has_lyrics).unwrap_or(false)
+        self.state
+            .lock()
+            .map(|state| state.has_lyrics)
+            .unwrap_or(false)
     }
 
     /// 当前曲目是否已收藏。
     #[zbus(property)]
     fn liked(&self) -> bool {
-        self.state.lock().map(|s| s.liked).unwrap_or(false)
+        self.state.lock().map(|state| state.liked).unwrap_or(false)
     }
 
     /// 桌面歌词条是否显示（由 SodaM 标题栏的开关控制）。
     #[zbus(property)]
     fn bar_visible(&self) -> bool {
-        self.state.lock().map(|s| s.visible).unwrap_or(true)
+        self.state.lock().map(|state| state.visible).unwrap_or(true)
     }
 
     /// 设置桌面歌词条是否显示；扩展或标题栏开关都可以调。
@@ -109,7 +118,7 @@ impl LyricsPublisher {
         let state = std::sync::Arc::new(std::sync::Mutex::new(LyricsState::default()));
         let interface_state = state.clone();
         let _task = cx.spawn(async move |_| {
-            let connection = zbus::connection::Builder::session()
+            let builder = zbus::connection::Builder::session()
                 .and_then(|builder| builder.name(LYRICS_BUS))
                 .and_then(|builder| {
                     builder.serve_at(
@@ -120,26 +129,47 @@ impl LyricsPublisher {
                         },
                     )
                 });
-            let connection = match connection {
+            let connection = match builder {
                 Ok(builder) => match builder.build().await {
                     Ok(connection) => connection,
                     Err(error) => {
-                        eprintln!("[lyrics] 无法注册桌面歌词接口：{error}");
+                        let detail = error.to_string();
+                        log_event(
+                            LogLevel::Warn,
+                            LogTopic::Media,
+                            "lyrics_interface_failed",
+                            &[("stage", "build"), ("detail", detail.as_str())],
+                        );
                         return;
                     }
                 },
                 Err(error) => {
-                    eprintln!("[lyrics] 无法注册桌面歌词接口：{error}");
+                    let detail = error.to_string();
+                    log_event(
+                        LogLevel::Warn,
+                        LogTopic::Media,
+                        "lyrics_interface_failed",
+                        &[("stage", "setup"), ("detail", detail.as_str())],
+                    );
                     return;
                 }
             };
-            let Ok(interface) = connection
+            let interface = match connection
                 .object_server()
                 .interface::<_, LyricsInterface>(LYRICS_PATH)
                 .await
-            else {
-                eprintln!("[lyrics] 无法取得桌面歌词接口引用");
-                return;
+            {
+                Ok(interface) => interface,
+                Err(error) => {
+                    let detail = error.to_string();
+                    log_event(
+                        LogLevel::Warn,
+                        LogTopic::Media,
+                        "lyrics_interface_failed",
+                        &[("stage", "lookup"), ("detail", detail.as_str())],
+                    );
+                    return;
+                }
             };
             while let Some(next) = receiver.recv().await {
                 {
@@ -185,23 +215,60 @@ impl Controls {
     ) -> Result<Self> {
         let (updates, mut receiver) = mpsc::unbounded_channel();
         let lyrics_commands = commands.clone();
-        let _server = cx.spawn(async move |_| {
-            let player = match build(commands).await {
-                Ok(player) => player,
-                Err(error) => {
-                    eprintln!("[media] 无法注册 MPRIS：{error}");
+        let _server = cx.spawn(async move |cx| {
+            // 抢总线名可能失败：上一个实例还没退出、或者同时开了两个 sodam。
+            // 之前失败就直接放弃，于是"第二个启动的实例永远没有 MPRIS"，
+            // 媒体键和桌面挂件全用它——这里改成失败后退避重试。
+            let mut backoff = REGISTER_RETRY;
+            loop {
+                let player = match build(commands.clone()).await {
+                    Ok(player) => player,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        let retry_s = backoff.as_secs().to_string();
+                        log_event(
+                            LogLevel::Warn,
+                            LogTopic::Media,
+                            "register_failed",
+                            &[("detail", detail.as_str()), ("retry_s", retry_s.as_str())],
+                        );
+                        cx.background_executor().timer(backoff).await;
+                        backoff = (backoff * 2).min(REGISTER_RETRY_MAX);
+                        continue;
+                    }
+                };
+                backoff = REGISTER_RETRY;
+
+                let apply = async {
+                    while let Some(update) = receiver.recv().await {
+                        if let Err(error) = apply(&player, update).await {
+                            let detail = error.to_string();
+                            log_event(
+                                LogLevel::Warn,
+                                LogTopic::Media,
+                                "publish_failed",
+                                &[("detail", detail.as_str())],
+                            );
+                        }
+                    }
+                };
+                // 两个 future 都要一直跑：`run()` 服务请求，`apply` 应用应用侧的状态。
+                future::zip(player.run(), apply).await;
+
+                // 更新通道已关闭 = 应用侧丢掉了 Controls，没必要再重连。
+                if receiver.is_closed() {
                     return;
                 }
-            };
-            let apply = async {
-                while let Some(update) = receiver.recv().await {
-                    if let Err(error) = apply(&player, update).await {
-                        eprintln!("[media] MPRIS 发布失败：{error}");
-                    }
-                }
-            };
-            // 两个 future 都要一直跑：`run()` 服务请求，`apply` 应用应用侧的状态。
-            future::zip(player.run(), apply).await;
+                // 否则是 D-Bus 连接断了（会话重启等），退避后重新注册。
+                let retry_s = backoff.as_secs().to_string();
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::Media,
+                    "connection_lost",
+                    &[("retry_s", retry_s.as_str())],
+                );
+                cx.background_executor().timer(backoff).await;
+            }
         });
         Ok(Self {
             updates,

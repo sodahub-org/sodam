@@ -13,6 +13,7 @@ use libresoda::{ApplogIdentity, MediaPlayed, PlayAction, PlayEndReason, Soda};
 
 use crate::audio::PlaybackSnapshot;
 use crate::config::Settings;
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
 use crate::session::Session;
 
 /// 单次观察的最大计时间隔（毫秒）。系统睡眠 / 卡顿后的巨大会话被截断，
@@ -366,7 +367,7 @@ fn effective_identity(soda: &Soda, identity: &ApplogIdentity) -> ApplogIdentity 
     effective
 }
 
-/// 给日志用的上报结果描述（`SODAM_REPORT_LOG=1` 时打印），带上服务端回包摘要。
+/// 给日志用的上报结果描述（`report` 话题的 DEBUG 行），带上服务端回包摘要。
 fn describe(result: libresoda::Result<serde_json::Value>) -> String {
     match result {
         Ok(value) => {
@@ -383,9 +384,12 @@ fn describe(result: libresoda::Result<serde_json::Value>) -> String {
 }
 
 fn log_report(kind: &str, track_id: &str, result: &str) {
-    if std::env::var("SODAM_REPORT_LOG").is_ok() {
-        eprintln!("[report] {kind} track={track_id} -> {result}");
-    }
+    log_event(
+        LogLevel::Debug,
+        LogTopic::Report,
+        "report_result",
+        &[("kind", kind), ("track_id", track_id), ("result", result)],
+    );
 }
 
 /// 在后台线程里构造会话并执行上报；失败只记录，不影响播放。

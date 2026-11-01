@@ -12,6 +12,12 @@
   </p>
   <p>音乐能力由 <a href="https://github.com/sodahub-org/libresoda">libresoda</a> 提供；应用签名服务可对接
     <a href="https://github.com/sodahub-org/libmssdk">libmssdk</a>。</p>
+  <p><a href="https://sodahub-org.github.io/sodam/"><strong>官网</strong></a> ·
+    <a href="https://sodahub-org.github.io/sodam/install.html">安装说明</a> ·
+    <a href="https://sodahub-org.github.io/sodam/llm.html">让 AI 帮我装</a> ·
+    <a href="https://sodahub-org.github.io/sodam/changelog.html">更新日志</a> ·
+    <a href="https://sodahub-org.github.io/sodam/developers.html">开发者文档</a> ·
+    <a href="PRIVACY.md">隐私政策</a></p>
   <p>
     <a href="https://linux.do/t/topic/2921819">
       <img src="docs/img/linux-do.svg" width="22" alt="LINUX DO">
@@ -20,8 +26,11 @@
   </p>
 </div>
 
-SodaM 面向 Linux / macOS / Windows 桌面，重点做四件事：**接近官方客户端的操作手感、稳定的本地播放体验、
+SodaM 是**汽水音乐的第三方桌面客户端**，面向 Linux / macOS / Windows，用 GPUI 原生渲染，
+强调**高性能、低占用、高颜值**。重点做四件事：**接近官方客户端的操作手感、稳定的本地播放体验、
 会员账号的无损音质播放，以及干净自适应的主题系统**。
+
+> 非官方项目：由社区开发维护，与汽水音乐官方无关；账号登录与曲库仍来自汽水音乐官方服务。
 
 <div align="center">
   <img src="docs/img/main/1.jpg" width="880" alt="SodaM 主界面预览 1">
@@ -31,26 +40,18 @@ SodaM 面向 Linux / macOS / Windows 桌面，重点做四件事：**接近官�
   <img src="docs/img/main/2.jpg" width="880" alt="SodaM 主界面预览 2">
 </div>
 
+<div align="center">
+
 ### 维护者与贡献者
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <a href="https://github.com/zephyr-cheung">
-        <img src="https://avatars.githubusercontent.com/u/221658147?v=4" width="72" alt="ZephyrCheung"><br />
-        <strong>ZephyrCheung</strong><br />
-        Maintainer
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/aBER0724">
-        <img src="https://avatars.githubusercontent.com/u/69146982?v=4" width="72" alt="aBER0724"><br />
-        <strong>aBER0724</strong><br />
-        Contributor
-      </a>
-    </td>
-  </tr>
-</table>
+想参与开发？先读 [CONTRIBUTING.md](CONTRIBUTING.md)（构建脚本、开发约定、提交与发布流程），
+提 issue 请用[模板](https://github.com/sodahub-org/sodam/issues/new/choose)。
+
+<a href="https://github.com/sodahub-org/sodam/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=sodahub-org/sodam" alt="SodaM contributors" loading="lazy">
+</a>
+
+</div>
 
 ### 平台支持
 
@@ -85,7 +86,7 @@ SodaM 面向 Linux / macOS / Windows 桌面，重点做四件事：**接近官�
 ### 播放与队列
 
 - 本地播放引擎：播放 / 暂停、上一首 / 下一首、拖动进度、音量控制
-- 顺序、随机、单曲循环等队列模式
+- 列表循环、单曲循环、随机播放三种模式，随进度自动跟随并跨启动保留
 - 正在播放曲目在歌单列表中保持高亮
 - 播放队列分为「已播放 / 正在播放 / 接下来」
 - 队列与歌单中的歌曲支持右键菜单、下一首播放、收藏切换
@@ -192,7 +193,15 @@ scripts/run.sh
 | `QISHUI_SIGNER_URL` | 签名服务 `/sign` 地址 |
 | `QISHUI_SIGNER_TOKEN` | 签名服务 Bearer Token |
 | `SODA_DEVICE_ID` / `SODA_IID` / `SODA_FP` | 设备身份；覆盖时必须与签名器一致 |
-| `SODAM_QUALITY` | `best` / `lossless` / `highest` / `medium` / `low` |
+| `SODAM_QUALITY` | 音质意图：`auto` / `best` / `hires` / `lossless` / `dolby` / `highest` / `medium` / `low` |
+| `SODAM_PLAYER_LOG` / `SODAM_PREFETCH_LOG` / `SODAM_REPORT_LOG` | 把对应日志话题（`player` / `prefetch` / `report`）提到 `DEBUG` |
+| `SODAM_SCENE_LOG` / `SODAM_THEME_LOG` / `SODAM_COVER_LOG` / `SODAM_FRAME_LOG` | 同上，这四个都归 `app` 话题 |
+
+音质偏好只表达**意图**：「自动」= 不设上限，由服务端按账号权益与单曲可用档位收敛，
+实际拿到哪一档由播放条徽章如实显示。选具体档位时从**下一首**开始生效，当前曲目不重载。
+
+日志默认按 `INFO` 记录在本机。设置页「诊断 → 详细日志」可把六个话题全部提到 `DEBUG`，
+即时生效、重启保持；环境变量与这个开关是并集——两边都只能记更多，不存在谁覆盖谁。
 
 SodaM 默认内置一个公共签名服务，未部署 `libmssdk` 的用户也可以直接使用。
 可以在设置页或环境变量中替换为自己的签名服务。
@@ -208,6 +217,9 @@ SodaM 默认内置一个公共签名服务，未部署 `libmssdk` 的用户也�
   正在下载、等待装载或正在播放的文件受保护，可能暂时超过上限，释放后再清理。
 - 「清空缓存」在后台递归清理音频、封面及封面原图；正在使用的音频和近期下载临时文件
   会保留。中断下载遗留的临时文件超过 24 小时后可被清理。
+- 音频缓存按**音质意图**命名：选「自动」时同一首歌始终命中同一个文件，所以开通会员后
+  旧歌仍播缓存里那一档，想按新权益重取需清空缓存或换一首。选具体档位时，切档后新曲目
+  按新档位另存一份。
 
 以下是显式覆盖项，不受上面“只补全空字段”的规则限制：
 
@@ -231,7 +243,7 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 
 ## Arch Linux 下载安装
 
-SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.2.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.2.8)。
+SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.3.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.7)。
 
 ### 1. 确认系统架构
 
@@ -249,7 +261,7 @@ mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
 arch=$(uname -m)
-version=0.2.8
+version=0.3.7
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -260,7 +272,7 @@ grep "sodam-${version}-1-${arch}\.pkg\.tar\.zst$" SHA256SUMS | sha256sum -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.2.8-1-x86_64.pkg.tar.zst: OK
+sodam-0.3.7-1-x86_64.pkg.tar.zst: OK
 ```
 
 ### 3. 安装
@@ -283,10 +295,32 @@ sodam
 
 后续升级时，从 [Releases](https://github.com/sodahub-org/sodam/releases/latest) 下载新版本的对应架构包，并再次执行 `sudo pacman -U` 即可。
 
+### 方式二：自建 pacman 源（推荐，可直接升级）
+
+每个版本会把官方构建的包打成 pacman 仓库并发布到 GitHub Pages，
+加上一行配置就能用 `pacman` 安装、随 `pacman -Syu` 升级：
+
+```ini
+# /etc/pacman.conf 末尾
+[sodam]
+SigLevel = Optional TrustAll
+Server = https://sodahub-org.github.io/sodam/$arch
+```
+
+```bash
+sudo pacman -Sy sodam          # 首次安装
+sudo pacman -Syu               # 之后随系统一起升级
+```
+
+仓库地址：<https://sodahub-org.github.io/sodam/>（含 `x86_64` 与 `aarch64`）。
+
+说明：包由 GitHub Actions 从源码构建，内容与 Release 里的 `.pkg.tar.zst` 一致，**未做 GPG 签名**，
+所以配置的是 `Optional TrustAll`；如需更严格校验请用上面的 `pacman -U` + `SHA256SUMS` 方式。
+
 ## macOS 下载安装（Apple Silicon）
 
 macOS 版已在 Apple Silicon（M 系列）真机实测。当前版本为
-[`v0.2.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.2.8)，两种安装方式任选。
+[`v0.3.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.7)，两种安装方式任选。
 
 ### 方式一：Homebrew（推荐，预编译 `.app`）
 
@@ -314,7 +348,7 @@ Homebrew 按架构要求拦下。安装后如仍被 Gatekeeper 拦截，用下�
 mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
-version=0.2.8
+version=0.3.7
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -325,7 +359,7 @@ grep "sodam-${version}-macos-aarch64\.zip$" SHA256SUMS | shasum -a 256 -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.2.8-macos-aarch64.zip: OK
+sodam-0.3.7-macos-aarch64.zip: OK
 ```
 
 #### 2. 安装
@@ -362,14 +396,14 @@ open -a SodaM
 
 Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Setup 安装包
 （按用户安装，无需管理员权限），当前版本为
-[`v0.2.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.2.8)。
+[`v0.3.7`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.7)。
 
 ### 1. 下载并校验
 
 ```powershell
 mkdir C:\sodam-install; cd C:\sodam-install
 
-$version = "0.2.8"
+$version = "0.3.7"
 $base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
 
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>让 AI 帮我装 · SodaM</title>
+<meta name="description" content="把这段说明复制给你的 AI 助手，让它判断系统并带你完成 SodaM 安装。">
+<meta name="theme-color" content="#0d0f10">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="assets/logo.svg">
+<link rel="stylesheet" href="assets/style.css">
+<!-- 主题初始化必须放在 <head> 里同步执行：首屏绘制前把 data-theme 落到 <html> 上，避免闪白/闪黑 -->
+<script src="assets/theme.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="index.html">
+      <img src="assets/logo.svg" alt="SodaM">
+      <span>SodaM <small>汽水音乐第三方客户端</small></span>
+    </a>
+    <nav>
+      <a href="install.html">安装</a>
+      <a href="changelog.html">更新日志</a>
+      <a href="llm.html" aria-current="page">让 AI 帮我装</a>
+      <a href="developers.html">开发者</a>
+      <a href="https://github.com/sodahub-org/sodam">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap doc">
+  <div class="hero">
+    <h1>让 AI 帮你装</h1>
+    <p class="lead">
+      不想读文档？把下面整段说明复制给任意支持终端操作的 AI 助手（Claude Code、Cursor、
+      Codex、Kimi 等），它会先识别你的系统，再给出并执行对应的安装步骤。
+    </p>
+    <div class="cta">
+      <button class="btn primary" data-copy="#llm-prompt">复制完整说明</button>
+      <a class="btn ghost" href="install.html">我自己装</a>
+    </div>
+    <p class="meta">说明里已经包含版本号、各平台命令和排错方法，粘贴后不需要再补充背景。</p>
+  </div>
+
+  <section>
+    <h2>复制这段给 AI</h2>
+    <p class="sub">下面整块内容就是提示词，点「复制完整说明」即可。</p>
+
+    <div class="code">
+      <header>
+        <span>SodaM 安装提示词</span>
+        <button class="copy" data-copy="#llm-prompt">复制完整说明</button>
+      </header>
+<pre id="llm-prompt">你是一名熟悉 Linux / macOS / Windows 的桌面软件安装助手，请帮我在**当前这台机器**上安装 SodaM 并验证它能正常启动。
+
+## 关于 SodaM
+- 汽水音乐的第三方桌面客户端（非官方），基于 GPUI + Rust 构建，强调高性能、低占用；仓库：https://github.com/sodahub-org/sodam
+- 官网安装说明：https://sodahub-org.github.io/sodam/install.html
+- 最新版本：<span data-version>—</span>（如果这里不是具体版本号，请以 GitHub Releases 页面显示的最新版为准）
+- Release 资产命名规则：
+  - Linux：sodam-&lt;version&gt;-1-x86_64.pkg.tar.zst / sodam-&lt;version&gt;-1-aarch64.pkg.tar.zst
+  - macOS（仅 Apple Silicon）：sodam-&lt;version&gt;-macos-aarch64.zip
+  - Windows（x64）：sodam-&lt;version&gt;-windows-x64-setup.exe
+  - 每个 Release 都附 SHA256SUMS
+
+## 你的任务
+1. 先检测我的系统与架构（uname -a / sw_vers / systeminfo，或等价命令），并报告结果。
+2. 按平台选择安装方式，**优先用包管理器**：
+   - Arch Linux / Arch Linux ARM（有 pacman）：
+     推荐加项目维护的 pacman 源到 /etc/pacman.conf 末尾：
+         [sodam]
+         SigLevel = Optional TrustAll
+         Server = https://sodahub-org.github.io/sodam/$arch
+     然后 `sudo pacman -Sy sodam`。
+     我如果不想改 pacman.conf，就退回：下载 .pkg.tar.zst + SHA256SUMS，校验后 `sudo pacman -U`。
+   - macOS（必须 Apple Silicon）：
+     优先 `brew install --cask sodahub-org/tap/sodam`；
+     没有 Homebrew 就下载 .zip，解压后把 SodaM.app 放进 /Applications，并说明 Gatekeeper 的放行步骤。
+   - Windows：
+     下载 sodam-&lt;version&gt;-windows-x64-setup.exe，说明如何用 PowerShell 校验 SHA256、如何静默/交互安装，以及 SmartScreen 提示怎么处理。
+   - 其它 Linux 发行版：
+     目前只发布 pacman 包，请告诉我这一步需要从源码构建（Rust 1.85+，scripts/build.sh），先征求我同意再动手。
+3. 每一步执行前先说明**你要运行什么、为什么**；涉及 sudo、修改系统配置、写入 /etc 的操作必须先让我确认。
+4. 安装完成后验证：
+   - 检查包管理器里已注册（pacman -Qi sodam / brew list --cask sodam / 安装目录存在）
+   - 启动一次应用（可能需要在图形会话里运行，不要在纯 SSH 会话里强行启动 GUI）
+   - 报告应用版本、可执行文件路径、配置与缓存目录位置
+5. 如果失败，按顺序排查并告诉我结论：
+   网络/代理是否可达 github.com 与 githubusercontent.com、依赖是否齐全（alsa-lib、dbus、fontconfig、freetype2、libxkbcommon、libxcb）、
+   架构是否匹配（arm64 vs x86_64）、是否有旧的同名包冲突、SELinux/防火墙是否拦截。
+6. 最后给我一份简短总结：装了什么版本、装在哪里、怎么启动、怎么卸载、怎么升级。
+
+## 约束
+- 不要向我索要账号 Cookie、登录 Token 或抓包数据；SodaM 的登录是在应用内扫码完成的。
+- 不要执行与安装无关的清理操作（不要 rm -rf、不要重装系统包、不要改无关配置）。
+- 遇到不确定的步骤，先停下来问我，不要猜测。
+- 所有命令请给出完整可复制的形式（包含 sudo 与否），并说明预期输出。
+
+现在开始：先检测我的系统环境，然后给出你的安装计划，等我确认后再执行。</pre>
+    </div>
+
+    <div class="note">
+      建议把这段直接粘给<strong>能执行命令的助手</strong>（Claude Code、Codex CLI、Cursor、Warp 等）；
+      普通聊天窗口也能用，它会改成「给我命令我自己粘贴」的形式。
+    </div>
+  </section>
+
+  <section>
+    <h2>怎么用</h2>
+    <ol>
+      <li>点上面的「复制完整说明」。</li>
+      <li>打开你的 AI 助手，粘贴，发送。</li>
+      <li>它检测完环境给出计划后，按提示确认（涉及 sudo 的步骤它应该先问你）。</li>
+      <li>装完后让它跑一次验证，确认能启动并且版本号正确。</li>
+    </ol>
+    <p class="lead-inline">
+      如果助手要求你提供系统信息，把 <code>uname -a</code>（Linux/macOS）或 <code>systeminfo</code>
+      （Windows）的输出贴给它就够了。
+    </p>
+  </section>
+
+  <section>
+    <h2>安全提示</h2>
+    <ul>
+      <li>安装包来自 <a href="https://github.com/sodahub-org/sodam/releases">GitHub Releases</a>，每个版本附 <code>SHA256SUMS</code>，可以让 AI 帮你校验。</li>
+      <li>Linux 的 pacman 源未做 GPG 签名，所以用 <code>Optional TrustAll</code>；要更严格就改用 <code>pacman -U</code> + SHA256 校验。</li>
+      <li>任何要求你关闭杀毒软件、粘贴账号密码或执行 <code>curl | bash</code> 的建议都要先停下来问我。</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap row">
+    <span>© SodaM · AGPL-3.0-or-later</span>
+    <a href="https://github.com/sodahub-org/sodam">源码</a>
+    <a href="install.html">安装说明</a>
+    <a href="developers.html">开发者文档</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

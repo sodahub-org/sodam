@@ -14,25 +14,27 @@
 ## 目录
 
 ```text
-crates/sodam-core/       领域层：配置 / 会话 / 队列 / 音乐库 / 播放引擎（不依赖 GPUI）
+crates/sodam-core/src/   领域层：配置 / 会话 / 队列 / 音乐库 / 播放引擎（不依赖 GPUI）
   config.rs              配置读写 + 环境变量补全
   session.rs             配置 → libresoda Soda（Cookie、签名器、音质）
   library.rs             推荐、听歌模式、搜索、歌单、收藏、艺人/专辑数据
   models.rs              TrackItem / PlaylistItem / ArtistItem / AlbumItem / SceneItem
   queue.rs               播放队列与播放模式
   audio.rs               rodio 播放线程
-crates/sodam/            GPUI 应用
+crates/sodam/src/        GPUI 应用
   main.rs                入口、窗口、托盘启动
   app.rs                 Root 状态、输入法、渲染入口
   app_actions.rs         播放、队列、收藏、歌单、推荐、封面、设置动作
   app_search.rs          搜索、艺人页、专辑页动作
+  app_text.rs            搜索框编辑键的 actions、键位绑定与处理器
   tray.rs                StatusNotifier 托盘
-  ui/                    theme、sidebar、player_bar、artwork、icons、i18n
+  ui/                    theme、sidebar、player_bar、artwork、icons、i18n、text_field
   views/                 Discover、Scenes、Search、Artist、Album、Library、Lyrics、Settings
 docs/ARCHITECTURE.md     架构与线程模型
 docs/ROADMAP.md          当前状态与剩余工作
 docs/UI-SPEC.md          UI 约束与主题规范
 packaging/arch/          Arch Linux PKGBUILD 与 desktop 文件
+packaging/windows/       Windows 安装器脚本与本机验收注意事项
 ```
 
 ## 硬性约定
@@ -42,8 +44,8 @@ packaging/arch/          Arch Linux PKGBUILD 与 desktop 文件
    `cx.background_spawn` 或专用线程，结果回 UI 后 `cx.notify()`。
 3. **状态只有一处**：播放、队列、导航、设置都由 `Root` 或 `sodam-core` 模型持有；
    UI 只读状态、生成元素、派发动作。
-4. **错误不 panic**：网络/配置错误写入 `Root::status` 或页面提示；只有启动期不可恢复
-   错误才允许 panic。
+4. **错误不 panic**：网络/配置错误写入状态行（`Root::status_line`，见 `set_status_text`）
+   或页面提示；只有启动期不可恢复错误才允许 panic。
 5. **凭据不入库、不入日志**：Cookie、签名 Token、抓包签名头、真实设备指纹禁止提交或打印。
 6. **UI 改动必须真机验证**：使用 `scripts/run.sh` 启动确认，不能只过 `cargo check`。
 7. **提交前必须跑** `scripts/check.sh`（check + fmt + clippy + test，并带资源护栏）。
@@ -59,7 +61,8 @@ packaging/arch/          Arch Linux PKGBUILD 与 desktop 文件
 1. 使用 `scripts/check.sh` / `scripts/build.sh` / `scripts/run.sh`；
 2. 编译时不运行 GUI，运行 GUI 时不编译；
 3. 大改后优先 `scripts/check.sh`，不要无护栏反复全量 release 编译；
-4. 卡顿时先看 `journalctl -k | grep -iE "drm|flip_done|oom"`。
+4. 卡顿时先看 `journalctl -k | grep -iE "drm|flip_done|oom"`；
+5. 明确禁止本地编译时，至少跑 `scripts/check.sh --fmt-only`，编译与测试交给远端 CI。
 
 ## 与 libresoda 的接口
 

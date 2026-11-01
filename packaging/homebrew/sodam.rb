@@ -1,6 +1,6 @@
 cask "sodam" do
-  version "0.2.8"
-  sha256 "49aa3d1e82d68137ff3beafd047c92596b75b0974fc16c2b6e3bb7bf1bad8fa2"
+  version "0.3.7"
+  sha256 "e2232afab9876e2ab0a5d491663bb011a64fe0bae2a6e1fc35f6379fdb94c710"
 
   url "https://github.com/sodahub-org/sodam/releases/download/v#{version}/sodam-#{version}-macos-aarch64.zip"
   name "SodaM"

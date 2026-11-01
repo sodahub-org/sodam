@@ -1,5 +1,6 @@
 //! 搜索、音乐人和专辑详情相关动作。
 
+use super::{REMOTE_TEXT, RETRY_TEXT, SAVE_TEXT};
 use gpui::prelude::*;
 use gpui::Context;
 use sodam_core::library::SearchScope;
@@ -11,9 +12,60 @@ use std::sync::Arc;
 use super::{Nav, Root};
 
 impl Root {
+    pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_field.set_text(query);
+        self.search_field.set_caret(self.search_field.len());
+        self.run_search(cx);
+    }
+
+    pub fn remove_search_history(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.settings.remove_search_history(index) {
+            let _ = self.settings.save();
+        }
+        cx.notify();
+    }
+
+    pub fn clear_search_history(&mut self, cx: &mut Context<Self>) {
+        self.settings.clear_search_history();
+        match self.settings.save() {
+            Ok(()) => self.set_status_text(self.tr("搜索历史已清空")),
+            Err(err) => {
+                self.notify_error_once(
+                    "search-history-save-failed",
+                    self.failure_text("清空搜索历史失败", &err, RETRY_TEXT),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_search_history(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.settings.search_history_is_enabled();
+        self.settings.set_search_history_enabled(enabled);
+        match self.settings.save() {
+            Ok(()) => {
+                let status = self
+                    .tr(if enabled {
+                        "搜索历史已开启"
+                    } else {
+                        "搜索历史已关闭，记录已清空"
+                    })
+                    .to_string();
+                self.set_status_text(status);
+            }
+            Err(err) => {
+                self.notify_error_once(
+                    "search-history-save-failed",
+                    self.failure_text("保存搜索历史设置失败", &err, SAVE_TEXT),
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// 触发搜索：网络调用放在 GPUI 的后台执行器上，结果回灌后 `notify` 重绘。
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
-        let keyword = self.search_input.trim().to_string();
+        let keyword = self.search_field.text().trim().to_string();
         if keyword.is_empty() {
             self.set_status("先输入关键词再回车", &[]);
             cx.notify();
@@ -22,11 +74,14 @@ impl Root {
         if self.searching {
             return;
         }
+        if self.settings.record_search(&keyword) {
+            let _ = self.settings.save();
+        }
         let scope = self.search_tab;
         let settings = self.settings.clone();
         self.searching = true;
         self.search_keyword = keyword.clone();
-        self.status = self.localized("正在搜索「{}」…", std::slice::from_ref(&keyword));
+        self.set_status_text(self.localized("正在搜索「{}」…", std::slice::from_ref(&keyword)));
         cx.notify();
 
         let work_keyword = keyword.clone();
@@ -39,13 +94,14 @@ impl Root {
                 root.searching = false;
                 match result {
                     Ok(results) => {
-                        root.status = root.localized(
+                        let message = root.localized(
                             "「{}」共 {} 条结果",
                             &[
                                 results.keyword.to_string(),
                                 results.total_count().to_string(),
                             ],
                         );
+                        root.set_status_text(message);
                         root.results = Arc::new(results.all_tracks());
                         root.search_results = results;
                         let covers: Vec<String> = root
@@ -75,7 +131,8 @@ impl Root {
                         root.ensure_covers(&covers, cx);
                     }
                     Err(err) => {
-                        root.status = root.localized("搜索失败：{err}", &[err.to_string()]);
+                        let message = root.failure_text("搜索失败", &err, REMOTE_TEXT);
+                        root.notify_error_once("search-failed", message);
                         root.results = Arc::new(Vec::new());
                         root.search_results = SearchResults {
                             keyword,
@@ -95,7 +152,7 @@ impl Root {
             return;
         }
         self.search_tab = tab;
-        if self.search_input.trim().is_empty() {
+        if self.search_field.text().trim().is_empty() {
             cx.notify();
         } else {
             self.run_search(cx);
@@ -146,7 +203,8 @@ impl Root {
                         root.set_status("音乐人已加载", &[]);
                     }
                     Err(err) => {
-                        root.status = root.localized("读取音乐人失败：{err}", &[err.to_string()])
+                        let message = root.failure_text("读取音乐人失败", &err, REMOTE_TEXT);
+                        root.notify_error_once("artist-load-failed", message);
                     }
                 }
                 cx.notify();
@@ -232,8 +290,9 @@ impl Root {
                         root.set_status("音乐人歌曲已加载", &[]);
                     }
                     Err(err) => {
-                        root.status =
-                            root.localized("加载更多音乐人歌曲失败：{err}", &[err.to_string()])
+                        let message =
+                            root.failure_text("加载更多音乐人歌曲失败", &err, REMOTE_TEXT);
+                        root.notify_warning_once("artist-more-failed", message);
                     }
                 }
                 cx.notify();
@@ -314,10 +373,12 @@ impl Root {
                         root.ensure_covers(&covers, cx);
                         root.open_album = Some(detail);
                         root.album_detail_list.reset(track_count + 1);
-                        root.status = root.localized("专辑共 {} 首", &[track_count.to_string()]);
+                        let message = root.localized("专辑共 {} 首", &[track_count.to_string()]);
+                        root.set_status_text(message);
                     }
                     Err(err) => {
-                        root.status = root.localized("读取专辑失败：{err}", &[err.to_string()])
+                        let message = root.failure_text("读取专辑失败", &err, REMOTE_TEXT);
+                        root.notify_error_once("album-load-failed", message);
                     }
                 }
                 cx.notify();

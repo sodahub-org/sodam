@@ -1,0 +1,120 @@
+name: pages
+
+# 一次部署两样东西到 GitHub Pages：
+#   1. 官网（website/ 目录：首页、安装说明、让 AI 装、更新日志、开发者文档）
+#   2. pacman 源（/x86_64、/aarch64：repo-add 生成的仓库目录 + 包）
+#
+# 触发方式：
+#   * push 到 main 且改到 website / mkrepo.sh / 本工作流 → 重建官网（包仍取最新 Release）
+#   * 发版后由 release.yml 调用（带 tag）→ 同时刷新 pacman 源
+#   * workflow_dispatch -f tag=v0.2.9 → 手动补跑
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag，例如 v0.2.9'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（留空用最新 Release）'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'packaging/arch/mkrepo.sh'
+      - '.github/workflows/pages.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: 构建并发布官网 + pacman 源
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确定要打包的 Release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "使用 Release: ${tag:-（无，只发布官网）}"
+
+      - name: 下载 Release 里的 pacman 包
+        if: steps.rel.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'sodam-*.pkg.tar.zst' --dir dist || true
+          ls -lh dist || true
+
+      - name: 生成 pacman 仓库目录（archlinux 容器内 repo-add）
+        if: steps.rel.outputs.tag != ''
+        run: |
+          mkdir -p public
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/public:/public" \
+            -v "$PWD/packaging/arch/mkrepo.sh:/mkrepo.sh:ro" \
+            archlinux:base bash -c '
+              set -euo pipefail
+              command -v repo-add >/dev/null || pacman -Sy --noconfirm pacman
+              bash /mkrepo.sh /dist /public'
+          echo "pacman 源内容："
+          find public -type f | sort
+
+      - name: 拷贝官网
+        run: |
+          mkdir -p public
+          cp -r website/. public/
+
+      - name: 生成 releases.json 与 pacman.conf 片段
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" \
+            --jq '[.[] | select(.draft == false) | {tag: .tag_name, name: .name, date: .published_at, body: .body}]' \
+            > public/releases.json
+          echo "更新日志条数：$(python3 -c 'import json;print(len(json.load(open("public/releases.json"))))')"
+
+          printf '%s\n' \
+            '[sodam]' \
+            'SigLevel = Optional TrustAll' \
+            'Server = https://sodahub-org.github.io/sodam/$arch' \
+            > public/pacman.conf.snippet
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 上传站点产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: 发布到 GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

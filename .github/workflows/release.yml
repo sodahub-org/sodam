@@ -203,3 +203,14 @@ jobs:
             release/SHA256SUMS
           draft: false
           prerelease: false
+
+  pages:
+    name: Publish site + pacman repo
+    needs: [github-release]
+    uses: ./.github/workflows/pages.yml
+    with:
+      tag: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

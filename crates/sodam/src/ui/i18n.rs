@@ -56,8 +56,13 @@ impl Language {
         if language.is_zh() {
             return key;
         }
-        #[allow(unreachable_patterns)]
-        match key {
+        Self::english_text(key).unwrap_or(key)
+    }
+
+    /// 英文词典查表；`None` 表示没有这一条，界面会回退中文原文。
+    #[allow(unreachable_patterns)]
+    fn english_text(key: &str) -> Option<&'static str> {
+        Some(match key {
             "推荐" => "Discover",
             "听歌模式" => "Listening Modes",
             "搜索" => "Search",
@@ -76,37 +81,39 @@ impl Language {
             "推荐队列" => "Recommendation queue",
             "请先在「设置 → 账户」扫码登录" => "Sign in with QR code in Settings → Account.",
             "语言已切换为中文" => "Language switched to Chinese",
-            "语言已切换，但保存失败：{err}" => "Language switched, but saving failed: {err}",
             "就绪" => "Ready",
-            "创建二维码失败：{err}" => "Failed to create QR code: {err}",
-            "二维码编码失败：{err}" => "Failed to encode QR code: {err}",
             "等待扫码…" => "Waiting for scan…",
-            "轮询异常（会自动重试）：{err}" => "Polling error (retrying): {err}",
-            "登录成功但保存失败：{err}" => "Signed in, but saving failed: {err}",
             "已打开二次验证窗口，请在其中完成验证" => {
                 "Second-verification window opened. Complete the verification there."
-            }
-            "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
-                "Failed to open the verification window: {err}. Export a cookie from the official client instead."
             }
             "正在播放的曲目不能从队列移除，可直接点「下一首」" => {
                 "The playing track can't be removed from the queue. Use Next instead."
             }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "账号" => "Account",
-            "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {}",
-            "音质偏好保存失败：{err}" => "Failed to save audio quality: {err}",
-            "读取账号信息失败：{err}" => "Failed to load account: {err}",
             "主题已切换为{}" => "Theme switched to {}",
             "浅色" => "Light",
             "深色" => "Dark",
-            "主题已切换，但保存失败：{err}" => "Theme switched, but saving failed: {err}",
+            "窗口" => "Window",
+            "Linux 下是否自绘最小化 / 最大化 / 关闭按钮" => {
+                "Whether SodaM draws its own minimize / maximize / close buttons on Linux"
+            }
+            "自动（跟随桌面）" => "Auto (follow desktop)",
+            "由桌面是否要求客户端自绘决定：GNOME 等显示，Hyprland 等平铺桌面不显示" => {
+                "Decided by whether the desktop asks apps to draw their own decorations: shown on GNOME, hidden on tiling desktops like Hyprland"
+            }
+            "总是显示" => "Always show",
+            "即使桌面自己不管窗口，也显示最小化 / 最大化 / 关闭按钮" => {
+                "Draw the buttons even when the desktop manages windows itself"
+            }
+            "不显示" => "Never show",
+            "完全交给桌面管理窗口，不画任何按钮" => {
+                "Leave window management entirely to the desktop"
+            }
+            "窗口按钮：自动（跟随桌面）" => "Window controls: auto (follow desktop)",
+            "窗口按钮：总是显示" => "Window controls: always shown",
+            "窗口按钮：不显示" => "Window controls: hidden",
             "主题已恢复为跟随系统" => "Theme restored to system",
-            "已切换为跟随系统，但保存失败：{err}" => "Switched to system theme, but saving failed: {err}",
-            "已用系统默认应用打开配置文件" => "Opened config with the default app",
-            "打开配置文件失败：{err}" => "Failed to open config: {err}",
-            "已在浏览器打开 GitHub 仓库" => "Opened GitHub repository",
-            "打开 GitHub 仓库失败：{err}" => "Failed to open GitHub repository: {err}",
             "「{}」没有可用歌词" => "No lyrics available for {}",
             "「{}」歌词已加载" => "Lyrics loaded for {}",
             "已切换到{}队列" => "Switched to {} queue",
@@ -114,34 +121,41 @@ impl Language {
             "正在加载更多探索歌单…" => "Loading more discovery playlists…",
             "没有更多探索歌单" => "No more discovery playlists",
             "探索歌单已追加 {added} 张" => "Added {} discovery playlists",
-            "读取听歌模式失败：{err}" => "Failed to load listening modes: {err}",
             "正在加载「{}」队列…" => "Loading {} queue…",
-            "加载听歌模式队列失败：{err}" => "Failed to load listening-mode queue: {err}",
             "推荐" => "Discover",
-            "加载推荐队列失败：{err}" => "Failed to load recommendation queue: {err}",
             "正在加载电台「{}」…" => "Loading {} radio…",
             "电台「{}」没有可播放曲目" => "Radio {} has no playable tracks",
-            "加载电台失败：{err}" => "Failed to load radio: {err}",
             "歌单「{}」没有可播放曲目" => "Playlist {} has no playable tracks",
-            "加载歌单失败：{err}" => "Failed to load playlist: {err}",
             "推荐队列已追加 {added} 首" => "Added {} recommendation tracks",
-            "加载更多推荐失败：{err}" => "Failed to load more recommendations: {err}",
             "已退出登录" => "Signed out",
-            "已退出，但保存配置失败：{err}" => "Signed out, but saving failed: {err}",
-            "读取歌单失败：{err}" => "Failed to load playlist: {err}",
             "已收藏：{}" => "Liked: {}",
             "已取消收藏：{}" => "Unliked: {}",
-            "读取收藏失败：{err}" => "Failed to load liked music: {err}",
             "已入队：{title}" => "Queued: {title}",
             "搜索歌单共 {count} 首" => "Search playlist: {} tracks",
-            "读取搜索歌单失败：{err}" => "Failed to load search playlist: {err}",
             "下一首将播放：{title}" => "Play next: {}",
             "播放中" => "Playing",
             "已暂停" => "Paused",
-            "拉流失败" => "Stream failed",
-            "「{}」拉流失败：{err}" => "Stream failed for {}: {err}",
-            "连续 3 首拉流失败，已暂停（检查网络或签名服务）" => "Paused after 3 stream failures. Check network or signer.",
-            "保存失败：{err}" => "Save failed: {err}",
+            "试听" => "Preview",
+            "地址解析（含签名）" => "stream resolution",
+            "音频体传输" => "audio transfer",
+            "网络传输" => "network transfer",
+            "解密落盘" => "unpacking",
+            "参数" => "input",
+            "连续 3 首没播出来，已暂停" => "Paused after 3 tracks failed.",
+            "暂时连不上，检查网络后重试。" => "Can't connect. Check your network and retry.",
+            "出现了一点问题，检查网络后重试。" => "Something went wrong. Check your network.",
+            "出现了一点问题，请重试。" => "Something went wrong. Try again.",
+            "没能保存，检查磁盘空间后重试。" => "Couldn't save. Check your disk space.",
+            "登录已过期，请重新登录。" => "Sign-in expired. Sign in again.",
+            "这首歌暂时放不出来。签名服务不可用，可在设置里更换。" => {
+                "This song can't play now. Change the signer service in Settings."
+            }
+            "这首歌暂时放不出来。" => "This song can't play now.",
+            "这首歌在你的账号下无法播放。" => "Your account can't play this song.",
+            "本地缓存写入失败，检查磁盘空间。" => "Cache write failed. Check disk space.",
+            "打开验证窗口失败，请改用官方客户端导出 Cookie。" => {
+                "Couldn't open the verification window. Export your cookie from the official app instead."
+            }
             "暂停" => "Pause",
             "播放" => "Play",
             "上一首" => "Previous Track",
@@ -165,23 +179,30 @@ impl Language {
             }
             "快捷键已更新" => "Shortcut updated",
             "快捷键已恢复默认" => "Shortcut reset to default",
+            "聚焦搜索框" => "Focus the search box",
+            "徽标键由系统占用，请换个组合键" => {
+                "The Windows/Super key belongs to the system — pick another combination"
+            }
+            "这个键无法作为快捷键，请换个组合键" => {
+                "This key can't be used as a shortcut — pick another combination"
+            }
+            "这一行的按键无法解析，未生效" => {
+                "This row's key can't be parsed, so it is not bound"
+            }
+            "该组合键已被「{}」占用" => "Shortcut already used by \"{}\"",
+            "该组合键由 macOS 菜单保留，不能绑定" => "Reserved by the macOS menu",
             "未在播放" => "Nothing playing",
             "「{}」共 {} 条结果" => "{}: {} results",
-            "读取音乐人失败：{err}" => "Failed to load artist: {err}",
-            "加载更多音乐人歌曲失败：{err}" => "Failed to load more artist tracks: {err}",
-            "读取专辑失败：{err}" => "Failed to load album: {err}",
-            "回车搜索歌曲、歌手或专辑" => "Press Enter to search songs, artists or albums",
             "来自汽水的推荐" => "Recommended for you",
             "按场景选歌" => "Choose by scene",
             "音乐人详情" => "Artist Details",
             "专辑详情" => "Album Details",
             "我喜欢的音乐" => "Liked Music",
             "{} 首 · {}" => "{} tracks · {}",
-            "搜索歌曲 / 歌手（点这里后输入，回车搜索）" => "Search songs / artists (click, type, press Enter)",
+            "搜索歌曲、歌手、专辑或歌单" => "Search songs, artists, albums or playlists",
             "亿" => "B",
             "万" => "K",
             "{}人关注 · {}首歌" => "{} followers · {} songs",
-            "回车搜索歌曲、音乐人、专辑或歌单" => "Search songs, artists, albums or playlists",
             "{} 首" => "{} tracks",
             "用户 {} · {}" => "User {} · {}",
             "语言已恢复为跟随系统" => "Language restored to system",
@@ -197,18 +218,28 @@ impl Language {
                 "Language pinned; switch anytime"
             }
             "扫码登录" => "QR Login",
-            "封顶无损；单曲没有无损时自动降级" => {
-                "Up to lossless; downgrades automatically"
+            "优先 Hi-Res 无损；没有可用档位时由服务端回退" => {
+                "Prefer Hi-Res lossless; the service falls back when unavailable"
             }
-            "封顶极高（≈320k）" => "Up to high (≈320k)",
-            "封顶较高" => "Up to medium",
+            "优先无损；没有可用无损时由服务端回退" => {
+                "Prefer lossless; the service falls back when unavailable"
+            }
+            "优先杜比全景声；没有可用档位时由服务端回退" => {
+                "Prefer Dolby Atmos; the service falls back when unavailable"
+            }
+            "优先极高（≈320k）；没有可用档位时由服务端回退" => {
+                "Prefer high (≈320k); the service falls back when unavailable"
+            }
+            "优先较高；没有可用档位时由服务端回退" => {
+                "Prefer medium; the service falls back when unavailable"
+            }
+            "优先流畅（≈128k）；没有可用档位时由服务端回退" => {
+                "Prefer low (≈128k); the service falls back when unavailable"
+            }
             "正在准备推荐队列…" => "Preparing recommendations…",
             "正在准备播放…" => "Preparing playback…",
             "正在创建二维码…" => "Creating QR code…",
             "正在播放" => "Now Playing",
-            "搜索歌曲 / 歌手（点这里后输入，回车搜索）" => {
-                "Search songs / artists (click, type, press Enter)"
-            }
             "综合" => "All",
             "歌曲" => "Songs",
             "歌单" => "Playlists",
@@ -258,32 +289,52 @@ impl Language {
             "当前跟随系统偏好，手动选择后会固定主题" => {
                 "Following system; choose a theme to pin it"
             }
-            "深色" => "Dark",
-            "浅色" => "Light",
             "语言" => "Language",
             "跟随系统" => "System",
             "音质偏好" => "Audio Quality",
-            "按账号权益和单曲实际可用的档位择优" => {
-                "Choose the best usable tier for your account and each track"
+            "音质已设为 {}，从下一首生效" => "Quality set to {}; applies from the next track",
+            "音质：从下一首生效" => "Quality: applies from the next track",
+            "已降档：所选 {}，实际 {}" => "Lower tier than selected: chose {}, got {}",
+            "降档" => "Lower",
+            "不设上限，按账号权益和单曲可用档位取最高" => {
+                "No cap; uses the best tier your account and each track allow"
             }
-            "当前账号是 VIP：登录时默认无损，单曲没有无损会自动降级" => {
-                "VIP account: lossless by default; downgrades automatically when unavailable"
+            "自动 = 取当前账号能拿到的最高档，单曲没有该档位时自动降一档" => {
+                "Auto = the best tier your account can get; steps down one tier when a track lacks it"
             }
-            "当前账号非 VIP：默认自动，取免费档里实际可用的最高一档" => {
-                "Non-VIP account: Auto by default; uses the best free tier available"
+            "若不是你选的，点「自动」即可恢复跟随账号权益" => {
+                "Not your choice? Pick Auto to follow your account again"
+            }
+            "当前档位由程序推导，点「自动」即可恢复跟随账号权益" => {
+                "Current tier was automatically derived; pick Auto to follow your account again"
+            }
+            "当前档位由手动选择" => "Current tier was manually selected",
+            "手动选择" => "Manual",
+            "程序推导" => "Derived",
+            "来源未知" => "Unknown",
+            "已缓存的歌曲会保持原来的档位；想按新权益重取，清空缓存或换一首" => {
+                "Cached songs keep their original tier; clear the cache or switch tracks to refetch"
             }
             "自动" => "Auto",
+            "Hi-Res 无损" => "Hi-Res Lossless",
+            "Hi-Res" => "Hi-Res",
+            "杜比全景声" => "Dolby Atmos",
             "无损" => "Lossless",
             "极高" => "High",
             "较高" => "Medium",
-            "标准" => "Low",
+            "流畅" => "Low",
             "省流" => "Data saver",
+            "未知" => "Unknown",
             "缓存" => "Cache",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
                 "Total {} ({} songs {}, {} covers {})"
             }
             "清除歌曲缓存" => "Clear Song Cache",
             "其他" => "Other",
+            "维护者" => "Maintainer",
+            "贡献者" => "Contributors",
+            "正在加载贡献者…" => "Loading contributors…",
+            "加载失败，点击重试" => "Failed to load. Click to retry.",
             "签名服务：{}" => "Signer: {}",
             "（未配置）" => "(not configured)",
             "配置：{}" => "Config: {}",
@@ -329,37 +380,18 @@ impl Language {
             "推荐队列" => "Recommendation queue",
             "请先在「设置 → 账户」扫码登录" => "Sign in with QR code in Settings → Account.",
             "语言已切换为中文" => "Language switched to Chinese",
-            "语言已切换，但保存失败：{err}" => "Language switched, but saving failed: {err}",
             "就绪" => "Ready",
-            "创建二维码失败：{err}" => "Failed to create QR code: {err}",
-            "二维码编码失败：{err}" => "Failed to encode QR code: {err}",
             "等待扫码…" => "Waiting for scan…",
-            "轮询异常（会自动重试）：{err}" => "Polling error (retrying): {err}",
-            "登录成功但保存失败：{err}" => "Signed in, but saving failed: {err}",
             "已打开二次验证窗口，请在其中完成验证" => {
                 "Second-verification window opened. Complete the verification there."
-            }
-            "打开二次验证窗口失败：{err}，请改用官方客户端导出 Cookie" => {
-                "Failed to open the verification window: {err}. Export a cookie from the official client instead."
             }
             "正在播放的曲目不能从队列移除，可直接点「下一首」" => {
                 "The playing track can't be removed from the queue. Use Next instead."
             }
             "已登录：{}（{}）" => "Signed in: {} ({})",
             "非 VIP" => "Non-VIP",
-            "{}；音质已按权益自动设为 {quality}" => "{}; quality set to {quality}",
-            "音质偏好保存失败：{err}" => "Failed to save audio quality: {err}",
-            "读取账号信息失败：{err}" => "Failed to load account: {err}",
             "主题已切换为{}" => "Theme switched to {}",
-            "浅色" => "light",
-            "深色" => "dark",
-            "主题已切换，但保存失败：{err}" => "Theme switched, but saving failed: {err}",
             "主题已恢复为跟随系统" => "Theme restored to system",
-            "已切换为跟随系统，但保存失败：{err}" => "Switched to system theme, but saving failed: {err}",
-            "已用系统默认应用打开配置文件" => "Opened config with the default app",
-            "打开配置文件失败：{err}" => "Failed to open config: {err}",
-            "已在浏览器打开 GitHub 仓库" => "Opened GitHub repository",
-            "打开 GitHub 仓库失败：{err}" => "Failed to open GitHub repository: {err}",
             "正在读取「{}」歌词…" => "Loading lyrics for “{}”…",
             "「{}」没有可用歌词" => "No lyrics available for “{}”",
             "「{}」歌词已加载" => "Lyrics loaded for “{}”",
@@ -368,32 +400,27 @@ impl Language {
             "正在加载更多探索歌单…" => "Loading more discovery playlists…",
             "没有更多探索歌单" => "No more discovery playlists",
             "探索歌单已追加 {} 张" => "Added {} discovery playlists",
-            "读取听歌模式失败：{err}" => "Failed to load listening modes: {err}",
             "「{}」队列" => "{} queue",
             "正在加载「{}」队列…" => "Loading {} queue…",
-            "加载听歌模式队列失败：{err}" => "Failed to load listening-mode queue: {err}",
             "已准备播放：{}" => "Ready to play: {}",
-            "加载推荐队列失败：{err}" => "Failed to load recommendation queue: {err}",
             "「{}」电台" => "{} radio",
             "正在加载电台「{}」…" => "Loading radio “{}”…",
             "电台「{}」没有可播放曲目" => "Radio “{}” has no playable tracks",
-            "加载电台失败：{err}" => "Failed to load radio: {err}",
             "正在加载歌单「{}」…" => "Loading playlist “{}”…",
             "歌单「{}」没有可播放曲目" => "Playlist “{}” has no playable tracks",
-            "加载歌单失败：{err}" => "Failed to load playlist: {err}",
             "推荐队列已追加 {} 首" => "Added {} recommendation tracks",
-            "加载更多推荐失败：{err}" => "Failed to load more recommendations: {err}",
             "已退出登录" => "Signed out",
-            "已退出，但保存配置失败：{err}" => "Signed out, but saving failed: {err}",
             "共 {} 个歌单" => "{} playlists",
             "已收藏：{}" => "Liked: {}",
             "已取消收藏：{}" => "Unliked: {}",
             "我喜欢的音乐：{} 首" => "Liked Music: {} tracks",
-            "读取收藏失败：{err}" => "Failed to load liked music: {err}",
             "已入队：{}" => "Queued: {}",
+            "播放模式：{}" => "Play mode: {}",
+            "列表循环" => "Loop queue",
+            "单曲循环" => "Repeat one",
+            "随机播放" => "Shuffle",
             "正在读取歌单「{}」…" => "Loading playlist “{}”…",
             "搜索歌单共 {} 首" => "Search playlist: {} tracks",
-            "读取搜索歌单失败：{err}" => "Failed to load search playlist: {err}",
             "下一首将播放：{}" => "Play next: {}",
             "歌单" => "Playlist",
             "歌单共 {} 首" => "Playlist: {} tracks",
@@ -401,19 +428,22 @@ impl Language {
             "已暂停" => "Paused",
             "正在准备播放：{}…" => "Preparing playback: {}…",
             "播放中：{}" => "Playing: {}",
-            "「{}」拉流失败：{err}" => "Stream failed for “{}”: {err}",
-            "连续 3 首拉流失败，已暂停（检查网络或签名服务）" => "Paused after 3 stream failures. Check network or signer.",
-            "保存失败：{err}" => "Save failed: {err}",
             "先输入关键词再回车" => "Type a keyword and press Enter",
+            "搜索历史" => "Search History",
+            "仅保存在本机，最多保留 10 条；关闭后会清空记录" => {
+                "Stored only on this device. Keeps up to 10 entries. Turning it off clears the history."
+            }
+            "保存搜索历史" => "Save search history",
+            "已保存 {} 条搜索历史" => "{} saved searches",
+            "搜索历史已清空" => "Search history cleared",
+            "搜索历史已开启" => "Search history enabled",
+            "搜索历史已关闭，记录已清空" => "Search history disabled; history cleared",
+            "清空" => "Clear",
             "正在搜索「{}」…" => "Searching “{}”…",
             "「{}」共 {} 条结果" => "“{}”: {} results",
-            "搜索失败：{err}" => "Search failed: {err}",
             "音乐人已加载" => "Artist loaded",
-            "读取音乐人失败：{err}" => "Failed to load artist: {err}",
             "音乐人歌曲已加载" => "Artist tracks loaded",
-            "加载更多音乐人歌曲失败：{err}" => "Failed to load more artist tracks: {err}",
             "专辑共 {} 首" => "Album: {} tracks",
-            "读取专辑失败：{err}" => "Failed to load album: {err}",
             "暂停" => "Pause",
             "播放" => "Play",
             "上一首" => "Previous Track",
@@ -427,9 +457,7 @@ impl Language {
             "播放队列 · {} 首" => "Play Queue · {} tracks",
             "我的音乐" => "My Music",
             "会话 {}…" => "Session {}…",
-            "登录失败：{err}" => "Sign-in failed: {err}",
             "搜索中…" => "Searching…",
-            "回车搜索歌曲、歌手或专辑" => "Press Enter to search songs, artists or albums",
             "{} 条结果" => "{} results",
             "未登录：先在「登录」页扫码" => "Sign in with QR code first",
             "正在读取…" => "Loading…",
@@ -440,7 +468,6 @@ impl Language {
             "按场景选歌" => "Choose by scene",
             "音乐人详情" => "Artist Details",
             "专辑详情" => "Album Details",
-            "搜索歌曲 / 歌手（点这里后输入，回车搜索）" => "Search songs / artists (click, type, press Enter)",
             "亿" => "B",
             "万" => "K",
             "综合" => "All",
@@ -448,7 +475,6 @@ impl Language {
             "专辑" => "Albums",
             "{}人关注 · {}首歌" => "{} followers · {} songs",
             "搜索" => "Search",
-            "回车搜索歌曲、音乐人、专辑或歌单" => "Search songs, artists, albums or playlists",
             "电台" => "Radio",
             "正在加载…" => "Loading…",
             "加载更多探索歌单（当前 {} 张）" => "Load More Playlists ({} loaded)",
@@ -461,7 +487,53 @@ impl Language {
             "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留" => "Older songs are removed automatically; files in use are kept until released",
             "清空缓存" => "Clear Cache",
             "正在清理…" => "Clearing…",
-            "保存播放设置失败：{err}" => "Failed to save playback settings: {err}",
+            "批量升级缓存" => "Batch Upgrade Cache",
+            "将已有低档位缓存重新拉取为更高音质，失败不会损坏旧缓存" => {
+                "Re-fetch cached audio at a higher quality without affecting existing files on failure"
+            }
+            "所有缓存歌曲均已达到或超过该档位" => {
+                "All cached songs are already at or above this quality"
+            }
+            "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}" => {
+                "{} songs can be upgraded · Est. traffic {} · Storage change {}"
+            }
+            "正在计算升级预估…" => "Estimating upgrade…",
+            "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
+            "批量升级" => "Batch Upgrade",
+            "正在升级…" => "Upgrading…",
+            "缓存升级完成：共升级 {} 首歌曲" => "Cache upgrade complete: upgraded {} songs",
+            "缓存升级完成：成功升级 {} 首，{} 首跳过或无更高档位" => {
+                "Cache upgrade complete: upgraded {} songs, {} skipped or no higher quality"
+            }
+            "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
+            "「{}」音质需 VIP 会员权限，当前账号无法升级" => {
+                "\"{}\" quality requires VIP membership; current account cannot upgrade"
+            }
+            "诊断日志" => "Diagnostic Logs",
+            "默认记录在本机，用于排查播放问题；「清空缓存」不会删除它们" => {
+                "Stored on this device to help diagnose playback problems; Clear Cache never removes them"
+            }
+            "日志目录：{}" => "Log directory: {}",
+            "日志可能含接口地址（查询串已移除），请勿公开上传" => {
+                "Logs may contain service URLs (query strings removed). Don't upload them publicly."
+            }
+            "详细日志" => "Detailed Logs",
+            "多记播放、预取与界面耗时等调试信息；仍不含 Cookie、签名与查询串" => {
+                "Record more playback, prefetch and frame-time detail; still no cookies, signatures or query strings"
+            }
+            "已开启详细日志：六个话题都会记到 DEBUG，重启后保持" => {
+                "Detailed logs on: all six topics record at DEBUG and stay on after restart"
+            }
+            "已关闭详细日志：回到 INFO，环境变量仍然有效" => {
+                "Detailed logs off: back to INFO; environment variables still apply"
+            }
+            "打开日志目录" => "Open Log Folder",
+            "清除诊断日志" => "Clear Diagnostic Logs",
+            "正在清除…" => "Clearing…",
+            "已清除诊断日志" => "Diagnostic logs cleared",
+            "清除诊断日志失败，文件可能被其他程序占用" => {
+                "Couldn't clear diagnostic logs. Another program may be using the files."
+            }
             "音频输出长时间无响应，请重试播放" => "Audio output stopped responding. Try playing again.",
             "音频线程已退出，请重启应用" => "The audio worker stopped. Please restart the app.",
             "签名服务：{}" => "Signer: {}",
@@ -481,6 +553,7 @@ impl Language {
             "没有更多探索歌单" => "No more discovery playlists",
             "读取听歌模式失败：" => "Failed to load listening modes: ",
             "正在加载推荐队列…" => "Loading recommendation queue…",
+            "推荐队列还在加载，稍等一下…" => "Recommendations are still loading. One moment…",
             "加载推荐队列失败：" => "Failed to load recommendation queue: ",
             "加载电台失败：" => "Failed to load radio queue: ",
             "正在加载更多推荐…" => "Loading more recommendations…",
@@ -493,9 +566,6 @@ impl Language {
             "队列是空的：先去搜索或打开一张歌单" => {
                 "Queue is empty. Search or open a playlist."
             }
-            "连续 3 首拉流失败，已暂停（检查网络或签名服务）" => {
-                "Paused after 3 stream failures. Check network or signer."
-            }
             "SodaM" => "SodaM",
             "正在搜索…" => "Searching…",
             "从队列移除" => "Remove from Queue",
@@ -503,10 +573,51 @@ impl Language {
             "当前跟随系统语言；手动选择后会固定语言" => {
                 "Following system; choose a language to pin it"
             }
-            "{}；音质已按权益自动设为 {}" => "{}; quality set to {}",
-            "收藏失败：{err}" => "Failed to update liked music: {err}",
-            _ => key,
+            _ => return None,
+        })
+    }
+
+    /// 引擎错误文案的查表入口。
+    ///
+    /// 单独一张表是因为形状不同：`PlaybackSnapshot::error` 是运行时 `String`，而
+    /// [`Self::text`] 的键是编译期 `&'static str`；放宽 `text` 的签名会连带
+    /// `status_label` 等一批函数的返回类型，属于别人家的代码，不在本改动里。
+    /// 表里的键必须与 `sodam-core/src/audio.rs` 写进快照的说法逐字一致。
+    pub fn engine_error(self, message: &str) -> String {
+        if self.resolved().is_zh() {
+            return message.to_string();
         }
+        let english = match message {
+            "音频播放没能启动，请重启应用。" => {
+                "Audio playback couldn't start. Restart the app."
+            }
+            "音频线程已退出，请重启应用" => {
+                "The audio worker stopped. Please restart the app."
+            }
+            "音频输出中断了。" => "Audio output stopped.",
+            "找不到可用的音频设备。" => "No audio device is available.",
+            "音频设备不可用，请重新播放。" => {
+                "The audio device is unavailable. Press play to try again."
+            }
+            "音频输出长时间无响应，请重试播放" => {
+                "Audio output stopped responding. Try playing again."
+            }
+            "切换音频设备后没能继续播放。" => {
+                "Playback didn't resume after switching the audio device."
+            }
+            "这首歌的文件读不出来，请重新播放。" => {
+                "This song's file can't be read. Press play to try again."
+            }
+            "当前曲目没有可重新打开的缓存" => {
+                "The current track has no cached file to reopen"
+            }
+            "音频源不支持后退/跳转" => {
+                "This track can't seek backward or jump to a position"
+            }
+            "还没有可播放的曲目" => "Nothing to play yet",
+            _ => message,
+        };
+        english.to_string()
     }
 }
 
@@ -613,5 +724,235 @@ pub fn scene_mode_text(language: Language, sub_queue_type: &str, fallback: &str)
         "sweet_girl" => "Sweet Girl".to_string(),
         "travel" => "Travel".to_string(),
         _ => fallback.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// 这几条的英文由调用点自己拼，词典里故意没有。
+    const CALL_SITE_ONLY: &[&str] = &[
+        "Shortcut reset to default",
+        "Shortcut updated",
+        "该组合键已用于「{}」，不能绑定",
+    ];
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 取出 `needle`（如 `.tr(`）后紧跟的字符串字面量；允许换行缩进。
+    fn literal_keys<'a>(source: &'a str, needle: &str) -> Vec<&'a str> {
+        let mut keys = Vec::new();
+        let mut index = 0;
+        while let Some(found) = source[index..].find(needle) {
+            let after_needle = index + found + needle.len();
+            let rest = &source[after_needle..];
+            let trimmed = rest.trim_start();
+            let skipped = rest.len() - trimmed.len();
+            let Some(body) = trimmed.strip_prefix('"') else {
+                index = after_needle;
+                continue;
+            };
+            let Some(end) = body.find('"') else {
+                break;
+            };
+            let key = &body[..end];
+            if !key.chars().any(|c| matches!(c, '\\' | '\n' | '\r')) {
+                keys.push(key);
+            }
+            index = after_needle + skipped + end + 2;
+        }
+        keys
+    }
+
+    /// 从 `start`（开括号之后）按顶层逗号切分参数；字符串字面量整体跳过。
+    fn call_arguments(source: &str, start: usize) -> Option<Vec<&str>> {
+        let bytes = source.as_bytes();
+        let mut args = Vec::new();
+        let mut depth = 0usize;
+        let mut arg_start = start;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'\\' => i += 2,
+                            b'"' => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    continue;
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' => {
+                    if depth == 0 {
+                        args.push(&source[arg_start..i]);
+                        return Some(args);
+                    }
+                    depth -= 1;
+                }
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    args.push(&source[arg_start..i]);
+                    arg_start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// 取出 `needle`（如 `.failure_text(`）调用的第 `index` 个参数；只接受纯字符串字面量。
+    fn nth_argument_literal<'a>(source: &'a str, needle: &str, index: usize) -> Vec<&'a str> {
+        let mut keys = Vec::new();
+        let mut search = 0;
+        while let Some(found) = source[search..].find(needle) {
+            let after_needle = search + found + needle.len();
+            if let Some(arg) =
+                call_arguments(source, after_needle).and_then(|args| args.get(index).copied())
+            {
+                let arg = arg.trim();
+                let literal = arg
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .filter(|body| !body.chars().any(|c| matches!(c, '\\' | '"' | '\n' | '\r')));
+                if let Some(body) = literal {
+                    keys.push(body);
+                }
+            }
+            search = after_needle;
+        }
+        keys
+    }
+
+    /// `failure_text` 的第三个参数才是用户可见文案；常量参数不参与字典检查。
+    #[test]
+    fn failure_text_visible_literal_is_scanned() {
+        let source = r#"
+            let a = root.failure_text("上下文", &err, "可见文案");
+            let b = root.failure_text("上下文", &err, RETRY_TEXT);
+            let c = root.failure_text(
+                "多行上下文",
+                &err,
+                "多行可见文案",
+            );
+        "#;
+        assert_eq!(
+            nth_argument_literal(source, ".failure_text(", 2),
+            vec!["可见文案", "多行可见文案"]
+        );
+    }
+
+    /// 英文界面的静态文案必须都能在词典里查到，否则会静默回退中文。
+    #[test]
+    fn every_static_ui_key_has_an_english_entry() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        assert!(files.len() > 20, "没扫到源码文件，扫描逻辑可能已失效");
+
+        let mut scanned = 0;
+        let mut missing = Vec::new();
+        for file in files {
+            if file.ends_with("ui/i18n.rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let mut keys = literal_keys(&source, ".tr(");
+            keys.extend(literal_keys(&source, ".localized("));
+            keys.extend(nth_argument_literal(&source, ".failure_text(", 2));
+            for key in keys {
+                scanned += 1;
+                if Language::english_text(key).is_none() && !CALL_SITE_ONLY.contains(&key) {
+                    missing.push(format!("{}: {key}", file.display()));
+                }
+            }
+        }
+
+        assert!(scanned > 100, "没扫到 UI 文案，扫描逻辑可能已失效");
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "英文词典缺少这些 key：\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// 确保音质档位的显示名都有英文翻译，避免核心层新增档位后英文界面露出中文。
+    #[test]
+    fn quality_tier_labels_have_english_entries() {
+        use std::collections::BTreeSet;
+
+        use sodam_core::quality::{tier_label, QualityIntent, TIERS, TIER_LABELS};
+
+        let mut keys: Vec<&'static str> =
+            vec![QualityIntent::Auto.label_key().expect("自动必须有显示名")];
+        keys.extend(
+            TIERS
+                .iter()
+                .filter_map(|tier| QualityIntent::parse(tier).label_key()),
+        );
+
+        // 遍历完整分数区间，确保 `tier_label` 没有产出 `TIER_LABELS` 之外的档名；
+        // 同时把实际值域与清单对齐，新增档名时漏登记会在这里失败。
+        let mut seen = BTreeSet::new();
+        for rank in -10..=1000 {
+            let label = tier_label(rank);
+            assert!(
+                TIER_LABELS.contains(&label),
+                "tier_label({rank}) = {label} 未登记到 TIER_LABELS"
+            );
+            seen.insert(label);
+        }
+        let expected: BTreeSet<_> = TIER_LABELS.into_iter().collect();
+        assert_eq!(seen, expected, "TIER_LABELS 与 tier_label 的值域不一致");
+        keys.extend(TIER_LABELS);
+
+        for key in keys {
+            assert!(
+                Language::english_text(key).is_some(),
+                "英文词典缺少音质档位的翻译：{key}"
+            );
+        }
+    }
+
+    /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。
+    #[test]
+    fn quality_source_label_keys_have_english_entries() {
+        use sodam_core::quality::QualitySource;
+        for source in [
+            QualitySource::Unknown,
+            QualitySource::User,
+            QualitySource::Derived,
+        ] {
+            assert!(
+                Language::english_text(source.label_key()).is_some(),
+                "英文词典缺少 QualitySource::{} 的翻译：{}",
+                source.as_str(),
+                source.label_key()
+            );
+        }
     }
 }

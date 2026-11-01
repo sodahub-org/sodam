@@ -52,22 +52,28 @@ pub struct AccountInfo {
     pub avatar_url: String,
 }
 
+/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}`，与实际字节数核对后给出
+/// （档位，是否试听，实际档位分数）。
+///
+/// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
+/// 所以尺寸不符或档位为空一律 miss，重下自愈。
+/// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
+/// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
+/// 第四个字段是实际档位分数，缺它说明缓存写入时还没记档位：视为未知（`None`），
+/// 不据此标记降档，也不触发重新下载。
 impl Session {
-    /// 当前音质偏好对应的缓存标签（`auto` 表示未指定）。
+    /// 当前音质**意图**对应的缓存标签。
+    ///
+    /// 缓存按意图命名，所以「自动」下同一首歌始终命中同一个文件：
+    /// 权益升级后仍会先播到非会员时期缓存下来的档位，直到清空缓存或换意图。
     fn quality_tag(&self) -> String {
-        let value = self.settings.quality.trim().to_ascii_lowercase();
-        if value.is_empty() {
-            "auto".to_string()
-        } else {
-            value
-        }
+        self.settings.quality_intent().cache_tag()
     }
 
-    /// 命中有效缓存：文件存在，且 sidecar 记录的字节数与实际一致。
-    /// 只检查「非空文件」会让被截断的半截下载永久冒充有效缓存，
-    /// 表现为同一首歌每次都从中间开始/中途跳下一首。
-    /// 旧格式 sidecar（只有音质、没记大小）视为 miss：重下一次完成自愈。
-    fn cached_info(&self, track_id: &str) -> Option<(std::path::PathBuf, String)> {
+    fn cached_info(
+        &self,
+        track_id: &str,
+    ) -> Option<(std::path::PathBuf, String, bool, Option<i64>)> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
@@ -76,19 +82,14 @@ impl Session {
         let quality_path =
             crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
-        let mut fields = text.split('\t');
-        let quality = fields.next()?.trim().to_string();
-        let size = fields.next()?.trim().parse::<u64>().ok()?;
-        if size != actual || quality.is_empty() {
-            return None;
-        }
-        Some((path, quality))
+        let (quality, preview, rank) = crate::cache::parse_sidecar(&text, actual)?;
+        Some((path, quality, preview, rank))
     }
 
-    fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
+    pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
         let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
-        let (path, quality) = self.cached_info(track_id)?;
+        let (path, quality, preview, rank) = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -96,6 +97,8 @@ impl Session {
         Some(CachedTrack {
             path,
             quality,
+            preview,
+            quality_rank: rank,
             lease,
         })
     }
@@ -112,37 +115,44 @@ impl Session {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedTrack {
     pub path: std::path::PathBuf,
-    /// 人类可读的实际音质（例：`无损 871k` / `极高 320k`）。
+    /// 人类可读的实际音质（例：`无损 871k` / `极高 320k`），**不含试听标记**。
     pub quality: String,
+    /// 这次拿到的是不是**试听片段**而不是整曲流。
+    ///
+    /// 它不是失败——播放确实成功了——但它解释了一个最常见的困惑：
+    /// 「为什么三十秒就切歌了」。签名服务不可用或账号没有整曲权益时都会走到这里，
+    /// 而且上游是**静默**降级的（返回 `Ok`），所以这个布尔必须一路带到界面。
+    pub preview: bool,
+    /// 这条流的档位分数（与取流筛选同一套刻度）；`None` = 旧缓存没记，未知。
+    ///
+    /// 降档是**每次读取时现算**的：用当前意图与这里的实际档位比较，
+    /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
+    pub quality_rank: Option<i64>,
     pub(crate) lease: crate::cache::CacheLease,
 }
 
+impl CachedTrack {
+    /// 实际档位对应的显示名（见 [`crate::quality::tier_label`]；档位未知返回 `None`）。
+    pub fn actual_tier(&self) -> Option<&'static str> {
+        self.quality_rank.map(crate::quality::tier_label)
+    }
+}
+
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
+///
+/// 档位名走 [`crate::quality::tier_label`]，与降档判定共用 libresoda 的那套刻度；
+/// 这里只负责补上码率。两个函数各按各的边界算，就会出现「徽章显示极高、
+/// 降档判定却按较高比」这种自相矛盾的显示。
 fn describe_quality(info: &libresoda::soda::types::DownloadInfo) -> String {
     let bitrate = info.bitrate.max(0) / 1000;
-    let lossless = libresoda::soda::quality::is_lossless(info)
-        || info.format.eq_ignore_ascii_case("flac")
-        || info.quality.to_ascii_lowercase().contains("lossless");
-    let tier = if lossless {
-        "无损"
-    } else if bitrate >= 300 {
-        "极高"
-    } else if bitrate >= 192 {
-        "较高"
-    } else if bitrate > 0 {
-        "标准"
-    } else {
-        "未知"
-    };
-    let mut label = if bitrate > 0 {
+    let tier = crate::quality::tier_label(crate::quality::stream_rank(info));
+    // 只描述档位，不描述时长：**是不是试听片段由 `CachedTrack::preview` 作为布尔传递**。
+    // 把 `· 试听` 拼进标签会让下游靠 `contains("试听")` 猜状态，那是我们刚消灭的东西。
+    if bitrate > 0 {
         format!("{tier} {bitrate}k")
     } else {
         tier.to_string()
-    };
-    if info.is_preview {
-        label.push_str(" · 试听");
     }
-    label
 }
 
 /// 下载是否被截断：只看「实际字节数是否少于服务端声明」。
@@ -176,8 +186,10 @@ impl Session {
             let provider = HttpSignature::new(url).with_token(settings.signer_token.trim());
             pumpkin.set_signature_provider(Arc::new(provider));
         }
-        if !settings.quality.trim().is_empty() {
-            pumpkin.set_quality_preference(settings.quality.trim());
+        // 「自动」= 不设上限，交给服务端按权益与曲目可用性收敛；
+        // 只有具体档位才需要把上限告诉 libresoda。
+        if let crate::quality::QualityIntent::Tier(tier) = settings.quality_intent() {
+            pumpkin.set_quality_preference(tier);
         }
         // 登录必须走签名页（等价上游 Meting-API 的 signQishuiRequest）：本地直连护照接口
         // 会一路 error_code=7，且确认后的登录态只能由签名页的浏览器会话承接。
@@ -281,49 +293,40 @@ impl Session {
         self.apply(settings)
     }
 
-    /// 按账号权益挑能用的最高档音质：
-    ///
-    /// * VIP：`lossless`（无损封顶；单曲没有无损时按档位从高到低择优）
-    /// * 非 VIP：`""`（自动，取免费档里实际可用的最高一档）
-    ///
-    /// 用户手动设过 `quality` 时不覆盖（返回 `None`）。
-    pub fn auto_quality_for(vip: bool) -> &'static str {
-        if vip {
-            // 无损封顶，但单曲没有无损时会往下降级匹配
-            "lossless"
-        } else {
-            // "auto" 是显式值（和「未设置」区分开），否则每次登录都会被重写
-            "auto"
-        }
-    }
-
-    /// 刷新音质偏好：未手动指定时按 VIP 情况自动选。
-    pub fn refresh_quality(&mut self, vip: bool) -> anyhow::Result<Option<String>> {
-        if !self.settings.quality.trim().is_empty() {
-            return Ok(None);
-        }
-        let quality = Self::auto_quality_for(vip).to_string();
-        let mut settings = self.settings.clone();
-        settings.quality = quality.clone();
-        self.apply(settings)?;
-        Ok(Some(quality))
-    }
-
     /// 把曲目下载并**解密**到本地缓存，返回文件路径（已存在则直接复用）。
     ///
     /// libresoda 的 `download` 会处理加密流（VIP 整曲需要签名服务）。
+    ///
+    /// 失败返回 [`PlaybackFailure`]（阶段 + 可否重试 + 修复动作），不再压成一句
+    /// 「下载失败」：一次播放请求串着地址解析、签名、音频体传输、解密落盘四类失败，
+    /// 把它们混在一起既误导归因，也让永久错误白烧重试次数。
+    /// 相位归因有上限：`download_with_info` 内部同时做了前三件事，
+    /// 所以那一段的失败只能靠 `classify` 从 `SodaError` 的形态尽量还原。
     pub fn download_to_cache(
         &self,
         track: &crate::models::TrackItem,
-    ) -> anyhow::Result<CachedTrack> {
+    ) -> Result<CachedTrack, crate::failure::PlaybackFailure> {
+        use crate::failure::{classify, PlaybackFailure, RecoveryAction, Retryability, Stage};
+
         let dir = crate::audio::cache_dir();
-        std::fs::create_dir_all(&dir).map_err(|err| anyhow::anyhow!("创建缓存目录失败: {err}"))?;
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            PlaybackFailure::new(
+                Stage::Unpack,
+                Retryability::Never,
+                RecoveryAction::FreeSpace,
+                err.to_string(),
+            )
+        })?;
         // 缓存文件名带音质档位：切换音质后自然 miss，重新拉对应档位的流
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
         let path = dir.join(format!("{0}-{tag}.m4a", track.id));
-        // sidecar 记录「音质标签 + 实际字节数」，用于命中时的大小校验。
+        // sidecar 记录「音质标签 + 实际字节数 + 是否试听」，用于命中时的大小校验。
         let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+        // 快速路径：若当前已有有效缓存命中，直接返回，无需排队等待锁
+        if let Some(cached) = self.cached_track(&track.id) {
+            return Ok(cached);
+        }
         let download_lock = crate::cache::download_lock(&path);
         let _writer = download_lock.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(cached) = self.cached_track(&track.id) {
@@ -344,6 +347,7 @@ impl Session {
         };
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
         // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
+        // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
         let part = dir.join(part_file_name(&track.id, &tag));
         let _part_lease = crate::cache::CacheLease::acquire(&part);
         let info = self
@@ -351,7 +355,7 @@ impl Session {
             .download_with_info(&song, &part)
             .map_err(|err| {
                 let _ = std::fs::remove_file(&part);
-                anyhow::anyhow!("下载失败: {err}")
+                classify(&err)
             })?;
 
         // 完整性校验：只拒绝「比服务端声明更少」的截断下载（静默 EOF 时可能发生）。
@@ -360,30 +364,218 @@ impl Session {
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if written == 0 || is_truncated_download(info.size, written) {
             let _ = std::fs::remove_file(&part);
-            anyhow::bail!(
-                "下载不完整（至少需要 {} 字节，实际 {written} 字节）",
-                info.size
-            );
+            // 截断就是「传输没跑完」，属于典型的可重试；报成 Unpack 会把人引向磁盘问题。
+            return Err(PlaybackFailure::new(
+                Stage::Transfer,
+                Retryability::Transient,
+                RecoveryAction::Nothing,
+                format!(
+                    "音频体传输不完整（至少需要 {} 字节，实际 {written} 字节）",
+                    info.size
+                ),
+            ));
         }
 
         let quality = describe_quality(&info);
+        let preview = info.is_preview;
+        let quality_rank = crate::quality::stream_rank(&info);
         // 这里只可能是无效旧缓存；Windows rename 不覆盖既有文件，先尝试移除。
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
         std::fs::rename(&part, &path).map_err(|err| {
             let _ = std::fs::remove_file(&part);
-            anyhow::anyhow!("缓存落盘失败: {err}")
+            PlaybackFailure::new(
+                Stage::Unpack,
+                Retryability::Never,
+                RecoveryAction::FreeSpace,
+                err.to_string(),
+            )
         })?;
-        std::fs::write(&quality_path, format!("{quality}\t{written}"))
-            .context("保存音频缓存校验信息失败")?;
+        std::fs::write(
+            &quality_path,
+            format!(
+                "{quality}\t{written}\t{}\t{quality_rank}",
+                u8::from(preview)
+            ),
+        )
+        .map_err(|err| {
+            PlaybackFailure::new(
+                Stage::Unpack,
+                Retryability::Never,
+                RecoveryAction::FreeSpace,
+                err.to_string(),
+            )
+        })?;
         // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
         // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
         crate::mem::release_malloc_pressure();
         Ok(CachedTrack {
             path,
             quality,
+            preview,
+            quality_rank: Some(quality_rank),
             lease,
+        })
+    }
+
+    /// 升级单首已缓存曲目的音频流到指定意图。
+    ///
+    /// 在后台拉取新流到临时文件，拉取并校验成功后通过 [`crate::cache::atomic_replace_cache`]
+    /// 原子替换旧文件。
+    ///
+    /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
+    /// * 若中途失败，清理临时文件，绝不破坏原有缓存；
+    /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存。
+    pub fn upgrade_cached_track(
+        &self,
+        track: &crate::models::TrackItem,
+        target_intent: Option<&crate::quality::QualityIntent>,
+    ) -> Result<CachedTrack, crate::failure::PlaybackFailure> {
+        use crate::failure::{classify, PlaybackFailure, RecoveryAction, Retryability, Stage};
+
+        let dir = crate::audio::cache_dir();
+        let tag = self.quality_tag();
+        let path = dir.join(format!("{0}-{tag}.m4a", track.id));
+        let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+
+        // 若本地缓存原本就不存在，拒绝升级（升级只针对已有缓存曲目）
+        let current = match self.cached_track(&track.id) {
+            Some(c) => c,
+            None => {
+                return Err(PlaybackFailure::new(
+                    Stage::Input,
+                    Retryability::Never,
+                    RecoveryAction::Nothing,
+                    "track is not in local cache",
+                ));
+            }
+        };
+
+        let default_intent = self.settings.quality_intent();
+        let intent = target_intent.unwrap_or(&default_intent);
+        // 若为明确指定的 Tier，target_rank 不需要 VIP，避免冗余网络请求
+        let vip = match intent {
+            crate::quality::QualityIntent::Tier(_) => None,
+            _ => self.is_vip().ok(),
+        };
+
+        // 如果已有档位并不低于目标档位，直接复用已有缓存
+        if !crate::quality::is_tier_below_selected(current.quality_rank, intent, vip) {
+            return Ok(current);
+        }
+
+        // 串行化升级操作并获取租约：
+        // 升级使用独立锁，不与普通点播播放竞争同把锁，确保升级进行中同一曲目重播秒开
+        let upgrade_lock = crate::cache::download_lock(&path.with_extension("upgrade-lock"));
+        let _writer = upgrade_lock.lock().unwrap_or_else(|err| err.into_inner());
+
+        // 获取锁后重读当前缓存，防止并发升级已将其提升
+        let current = match self.cached_track(&track.id) {
+            Some(c) => c,
+            None => {
+                return Err(PlaybackFailure::new(
+                    Stage::Input,
+                    Retryability::Never,
+                    RecoveryAction::Nothing,
+                    "track was removed from local cache before upgrade lock",
+                ));
+            }
+        };
+        if !crate::quality::is_tier_below_selected(current.quality_rank, intent, vip) {
+            return Ok(current);
+        }
+
+        let target_lease = crate::cache::CacheLease::acquire(&path);
+
+        let song = libresoda::Song {
+            id: track.id.clone(),
+            name: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration: track.duration_seconds,
+            source: libresoda::model::SOURCE_SODA.to_string(),
+            link: format!("https://www.qishui.com/track/{}", track.id),
+            extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
+            ..Default::default()
+        };
+
+        let part = dir.join(part_file_name(&track.id, &tag));
+        let _part_lease = crate::cache::CacheLease::acquire(&part);
+
+        // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
+        let info = if let crate::quality::QualityIntent::Tier(tier) = intent {
+            let mut upgrade_settings = self.settings.clone();
+            upgrade_settings.quality = tier.clone();
+            let upgrade_session = Session::new(upgrade_settings);
+            upgrade_session.pumpkin.download_with_info(&song, &part)
+        } else {
+            self.pumpkin.download_with_info(&song, &part)
+        }
+        .map_err(|err| {
+            let _ = std::fs::remove_file(&part);
+            classify(&err)
+        })?;
+
+        let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+        if written == 0 || is_truncated_download(info.size, written) {
+            let _ = std::fs::remove_file(&part);
+            return Err(PlaybackFailure::new(
+                Stage::Transfer,
+                Retryability::Transient,
+                RecoveryAction::Nothing,
+                format!(
+                    "升级音频体传输不完整（至少需要 {} 字节，实际 {written} 字节）",
+                    info.size
+                ),
+            ));
+        }
+
+        // 核心安全护栏：试听流绝不允许覆盖已有非试听整曲缓存（即便试听流档位分数更高）
+        if info.is_preview && !current.preview {
+            let _ = std::fs::remove_file(&part);
+            return Ok(current);
+        }
+
+        let new_rank = crate::quality::stream_rank(&info);
+        // 若新流档位并未高于旧档位，且未发生「由试听升级为整曲」，丢弃临时文件，保留旧文件
+        if let Some(old_rank) = current.quality_rank {
+            let is_improved = new_rank > old_rank || (current.preview && !info.is_preview);
+            if !is_improved {
+                let _ = std::fs::remove_file(&part);
+                return Ok(current);
+            }
+        }
+
+        let quality = describe_quality(&info);
+        let preview = info.is_preview;
+        let sidecar_content = format!("{quality}\t{written}\t{}\t{new_rank}", u8::from(preview));
+
+        // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
+        // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
+        // 锁序为「先 upgrade-lock，后 download-lock」，绝不构成环死锁。
+        let file_lock = crate::cache::download_lock(&path);
+        let _replace_guard = file_lock.lock().unwrap_or_else(|err| err.into_inner());
+
+        crate::cache::atomic_replace_cache(&part, &path, &quality_path, &sidecar_content).map_err(
+            |err| {
+                let _ = std::fs::remove_file(&part);
+                PlaybackFailure::new(
+                    Stage::Unpack,
+                    Retryability::Never,
+                    RecoveryAction::FreeSpace,
+                    err.to_string(),
+                )
+            },
+        )?;
+
+        crate::mem::release_malloc_pressure();
+        Ok(CachedTrack {
+            path,
+            quality,
+            preview,
+            quality_rank: Some(new_rank),
+            lease: target_lease,
         })
     }
 
@@ -392,6 +584,16 @@ impl Session {
         self.settings.volume = settings.volume;
         self.settings.volume_before_mute = settings.volume_before_mute;
         self.settings.audio_cache_limit_mb = settings.audio_cache_limit_mb;
+        // 播放模式也要同步：登录成功、改音质都会用 `settings()` 整体回填
+        // `root.settings`，漏掉这一项就会把用户刚切的模式覆盖回旧值。
+        self.settings.play_mode = settings.play_mode;
+        // 详细日志同理：登录走 `apply_login_cookie` → `apply` 会把会话里的副本整体落盘，
+        // 副本漏掉这一项就会把用户刚打开的开关写回 false，重启后失效。
+        self.settings.detailed_logs = settings.detailed_logs;
+        // 音质与偏好来源同步：主路径 `set_quality` 已整体 `session.apply`，此处做防御性
+        // 冗余兜底，确保在其他触发偏好落盘的分支上会话副本也与外部一致。
+        self.settings.quality = settings.quality.clone();
+        self.settings.quality_source = settings.quality_source;
     }
 
     pub fn settings(&self) -> &Settings {
@@ -584,6 +786,115 @@ mod tests {
         assert_eq!(session.settings().quality, "lossless");
     }
 
+    /// 重建会话不写音质配置：登录/换 Cookie 之后「自动」仍然是自动，
+    /// 否则会员状态一变，档位就再也跟不上。
+    #[test]
+    fn rebuilding_session_leaves_quality_setting_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Settings::default().save_to(&path).unwrap();
+
+        // 模拟「读配置 → 建会话 → 登录后回填设置 → 再建会话」这一整圈
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.quality, crate::quality::AUTO);
+        let mut session = Session::new(loaded);
+        let mut after_login = session.settings().clone();
+        after_login.cookie = "sessionid_ss=x".into();
+        session.update_playback_preferences(&after_login);
+        let rebuilt = Session::new(session.settings().clone());
+
+        assert_eq!(
+            rebuilt.settings().quality,
+            crate::quality::AUTO,
+            "登录后不得被固化成具体档位"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""quality": "auto""#),
+            "配置文件里的自动是 auto 这一种写法：{text}"
+        );
+    }
+
+    /// 偏好同步带上详细日志，并防御性同步音质意图与来源，确保会话副本时刻一致。
+    #[test]
+    fn playback_preferences_sync_carries_detailed_logs_and_defensively_syncs_quality() {
+        use crate::quality::QualitySource;
+
+        let mut session = Session::new(Settings::default());
+        let mut current = session.settings().clone();
+        current.detailed_logs = true;
+        current.quality = "lossless".into();
+        current.quality_source = QualitySource::User;
+        session.update_playback_preferences(&current);
+
+        assert!(
+            session.settings().detailed_logs,
+            "同步后会话副本要带上用户刚打开的详细日志开关"
+        );
+        assert_eq!(session.settings().quality, "lossless");
+        assert_eq!(session.settings().quality_source, QualitySource::User);
+    }
+
+    /// 缓存标签按意图取：自动与空串同一个文件，换档位就换路径。
+    #[test]
+    fn cache_tag_follows_quality_intent() {
+        let auto = Session::new(Settings::default());
+        let blank = Session::new(Settings {
+            quality: "  ".into(),
+            ..Default::default()
+        });
+        assert_eq!(auto.quality_tag(), "auto");
+        assert_eq!(blank.quality_tag(), "auto");
+
+        let explicit = Session::new(Settings {
+            quality: "Lossless".into(),
+            ..Default::default()
+        });
+        assert_eq!(explicit.quality_tag(), "lossless");
+    }
+
+    /// 试听标记与旧 sidecar 的兼容：这条链一断，界面就会把整曲说成试听（或反之）。
+    #[test]
+    fn sidecar_reads_preview_flag_and_self_heals_legacy_label() {
+        let (quality, preview, rank) =
+            crate::cache::parse_sidecar("无损 871k\t2048\t1", 2048).unwrap();
+        assert_eq!(quality, "无损 871k");
+        assert!(preview);
+        assert_eq!(rank, None, "旧格式没有档位分数，视为未知");
+        let (_, preview, _) = crate::cache::parse_sidecar("无损 871k\t2048\t0", 2048).unwrap();
+        assert!(!preview);
+        // 旧缓存没有第三个字段：试听拼在档位里，要读出来并洗回纯档位
+        let (quality, preview, _) = crate::cache::parse_sidecar("无损 · 试听\t2048", 2048).unwrap();
+        assert_eq!(quality, "无损");
+        assert!(preview);
+        let (quality, preview, _) = crate::cache::parse_sidecar("无损\t2048", 2048).unwrap();
+        assert_eq!(quality, "无损");
+        assert!(!preview);
+        // 旧缓存把 50 分档写成「标准」：读取时洗成新显示名，不再与 standard(70) 撞名。
+        let (quality, _, rank) =
+            crate::cache::parse_sidecar("标准 128k\t2048\t0\t50", 2048).unwrap();
+        assert_eq!(quality, "流畅 128k");
+        assert_eq!(rank, Some(50));
+    }
+
+    /// 第四个字段（实际档位分数）能读出来；缺失或不是数字时一律未知。
+    #[test]
+    fn sidecar_reads_actual_rank_and_treats_missing_as_unknown() {
+        let (_, _, rank) = crate::cache::parse_sidecar("无损 871k\t2048\t0\t100", 2048).unwrap();
+        assert_eq!(rank, Some(100));
+        let (_, _, rank) = crate::cache::parse_sidecar("极高 320k\t2048\t0\tabc", 2048).unwrap();
+        assert_eq!(rank, None);
+    }
+
+    /// 尺寸对不上、档位为空、字段不齐一律 miss——半截文件不许冒充命中。
+    #[test]
+    fn sidecar_rejects_mismatched_or_empty_records() {
+        assert!(crate::cache::parse_sidecar("无损 871k\t2047\t0", 2048).is_none());
+        assert!(crate::cache::parse_sidecar("\t2048\t0", 2048).is_none());
+        assert!(crate::cache::parse_sidecar("无损 871k\tabc\t0", 2048).is_none());
+        assert!(crate::cache::parse_sidecar("无损 871k", 2048).is_none());
+    }
+
     #[test]
     fn truncation_check_rejects_only_short_downloads() {
         // 服务端未声明大小：无从判定截断，放行
@@ -594,5 +905,17 @@ mod tests {
         assert!(!is_truncated_download(10_569_897, 10_660_358));
         // 截断：实际少于声明
         assert!(is_truncated_download(10_569_897, 10_569_896));
+    }
+
+    #[test]
+    fn upgrade_cached_track_fails_fast_when_not_cached() {
+        let session = Session::new(Settings::default());
+        let track = crate::TrackItem {
+            id: "non-existent-track-999".into(),
+            ..Default::default()
+        };
+        let err = session.upgrade_cached_track(&track, None).unwrap_err();
+        assert_eq!(err.stage, crate::failure::Stage::Input);
+        assert_eq!(err.retryability, crate::failure::Retryability::Never);
     }
 }

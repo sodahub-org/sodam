@@ -100,9 +100,9 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
                     .text_size(theme::Text::Small.size())
                     .text_color(theme::text_muted())
                     .child(match &root.login {
-                        LoginState::Failed(err) => root
-                            .language
-                            .textf("登录失败：{err}", std::slice::from_ref(err)),
+                        // 失败文案在写入 LoginState 前已经本地化。这里不能再套
+                        // 「登录失败：{err}」，否则会显示成「登录失败：出现了一点问题…」。
+                        LoginState::Failed(err) => err.clone(),
                         _ => root.tr("已登录").to_string(),
                     }),
             )

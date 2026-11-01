@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+// 搜索框按键分发（动作 + 键位绑定），见 app_text.rs。
+mod app_text;
 // 托盘：Linux 走 ksni/SNI，macOS 走 NSStatusItem，见 tray.rs。
 mod tray;
 mod ui;
@@ -13,6 +15,8 @@ mod views;
 mod media;
 // 播放控制快捷键（可重绑），见 shortcuts.rs。
 mod shortcuts;
+// 单实例防护：第二次启动只把已有窗口提到前台，见 single_instance.rs。
+mod single_instance;
 // macOS 菜单栏与标准快捷键（⌘Q/⌘M/⌘W），见 menus.rs。
 #[cfg(target_os = "macos")]
 mod menus;
@@ -217,7 +221,40 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     cx.activate(true);
 }
 
+/// 第二个实例启动时发来的「把窗口提到前台」请求。
+///
+/// socket 监听在独立线程，这里用轮询把信号搬到 UI 线程 —— 不能在渲染线程上
+/// 阻塞 `recv()`，200ms 的延迟对这个操作完全够用。
+fn start_single_instance_service(
+    activations: std::sync::mpsc::Receiver<()>,
+    app: Entity<app::Root>,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| loop {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(200))
+            .await;
+        while activations.try_recv().is_ok() {
+            cx.update(|cx| show_window(cx, &app));
+        }
+    })
+    .detach();
+}
+
 fn main() {
+    // 单实例：第二次启动不再开第二个窗口，只把已在跑的窗口提到前台。
+    // Secondary 时已经代为请求前台，本进程直接退出（静默，符合 issue #14）。
+    let instance = single_instance::acquire();
+    let single_instance::Instance::Primary {
+        _guard,
+        activations,
+    } = instance
+    else {
+        return;
+    };
+
+    sodam_core::log_outlet::init();
+
     gpui_platform::application()
         .with_assets(ui::icons::Assets)
         .with_quit_mode(gpui::QuitMode::Explicit)
@@ -261,6 +298,10 @@ fn main() {
                             tray.title = state.title;
                             tray.subtitle = state.subtitle;
                             tray.playing = state.playing;
+                            // 之前漏了这两个：菜单顶部「正在播放」那行由 has_track 决定，
+                            // 不同步的话播着歌也一直显示「未在播放」。
+                            tray.has_track = state.has_track;
+                            tray.cover_path = state.cover_path.clone();
                         });
                     }
                 };
@@ -270,6 +311,8 @@ fn main() {
 
                 start_tray_service(tray_rx, app.clone(), cx, sync);
             }
+
+            start_single_instance_service(activations, app.clone(), cx);
 
             cx.activate(true);
         });

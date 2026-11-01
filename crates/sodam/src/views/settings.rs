@@ -1,7 +1,11 @@
 //! 右侧内容区路由与共享列表组件。
 
 use super::*;
+use crate::app::SAVE_TEXT;
 use crate::ui::i18n::Language;
+#[cfg(target_os = "linux")]
+use sodam_core::config::TitlebarMode;
+use std::sync::Arc;
 
 /// 字节 → 人类可读（KB / MB / GB）。
 fn human_bytes(bytes: u64) -> String {
@@ -169,31 +173,430 @@ fn account_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
-pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
-    let options = [
+/// Linux 专属：窗口控制按钮的显示策略。
+///
+/// 只有 Linux 需要这个开关：Windows 一定会去掉系统标题栏、macOS 用系统红绿灯，
+/// 其它平台直接返回空，不占布局。
+#[cfg(target_os = "linux")]
+fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyElement> {
+    let current = TitlebarMode::from_key(&root.settings.titlebar);
+    let rows: Vec<AnyElement> = [
         (
-            "auto",
-            root.tr("自动"),
-            root.tr("按账号权益和单曲实际可用的档位择优"),
+            TitlebarMode::Auto,
+            root.tr("自动（跟随桌面）"),
+            root.tr("由桌面是否要求客户端自绘决定：GNOME 等显示，Hyprland 等平铺桌面不显示"),
         ),
         (
-            "lossless",
-            root.tr("无损"),
-            root.tr("封顶无损；单曲没有无损时自动降级"),
+            TitlebarMode::Always,
+            root.tr("总是显示"),
+            root.tr("即使桌面自己不管窗口，也显示最小化 / 最大化 / 关闭按钮"),
         ),
-        ("highest", root.tr("极高"), root.tr("封顶极高（≈320k）")),
-        ("medium", root.tr("较高"), root.tr("封顶较高")),
-        ("low", root.tr("标准"), root.tr("省流")),
-    ];
-    let current = {
-        let value = root.settings.quality.trim();
-        if value.is_empty() {
-            "auto"
-        } else {
-            value
+        (
+            TitlebarMode::Never,
+            root.tr("不显示"),
+            root.tr("完全交给桌面管理窗口，不画任何按钮"),
+        ),
+    ]
+    .into_iter()
+    .map(|(mode, title, hint)| {
+        let chosen = mode == current;
+        div()
+            .id(gpui::ElementId::Name(
+                format!("titlebar-set-{}", mode.key()).into(),
+            ))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(theme::space::LG))
+            .px(px(theme::space::MD))
+            .py(px(theme::space::SM))
+            .rounded(px(theme::radius::ROW))
+            .cursor_pointer()
+            .when(chosen, |this| this.bg(theme::surface_selected()))
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.settings.titlebar = mode.key().to_string();
+                if let Err(err) = root.settings.save() {
+                    let message = root.failure_text("窗口按钮已切换，但保存失败", &err, SAVE_TEXT);
+                    root.notify_error_once("titlebar-save-failed", message);
+                } else {
+                    let status = match mode {
+                        TitlebarMode::Auto => root.tr("窗口按钮：自动（跟随桌面）").to_string(),
+                        TitlebarMode::Always => root.tr("窗口按钮：总是显示").to_string(),
+                        TitlebarMode::Never => root.tr("窗口按钮：不显示").to_string(),
+                    };
+                    root.set_status_text(status);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(theme::Text::Body.size())
+                            .text_color(if chosen {
+                                theme::text()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::Text::Small.size())
+                            .text_color(theme::text_muted())
+                            .child(hint),
+                    ),
+            )
+            .when(chosen, |this| {
+                this.child(
+                    svg()
+                        .path(icons::path("check"))
+                        .size(px(theme::ICON))
+                        .text_color(theme::accent()),
+                )
+            })
+            .into_any_element()
+    })
+    .collect();
+
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::space::XS))
+            .child(
+                div()
+                    .text_size(theme::Text::Large.size())
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child(root.tr("窗口")),
+            )
+            .child(
+                div()
+                    .text_size(theme::Text::Small.size())
+                    .text_color(theme::text_muted())
+                    .child(root.tr("Linux 下是否自绘最小化 / 最大化 / 关闭按钮")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme::space::XS))
+                    .children(rows),
+            )
+            .into_any_element(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn window_controls_section(_root: &Root, _cx: &mut Context<Root>) -> Option<AnyElement> {
+    None
+}
+
+fn search_history_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let enabled = root.settings.search_history_is_enabled();
+    let count = root.settings.search_history.len();
+    let mut section = div()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::XS))
+        .child(
+            div()
+                .text_size(theme::Text::Large.size())
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text())
+                .child(root.tr("搜索历史")),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(root.tr("仅保存在本机，最多保留 10 条；关闭后会清空记录")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::space::LG))
+                .px(px(theme::space::MD))
+                .py(px(theme::space::SM))
+                .rounded(px(theme::radius::ROW))
+                .bg(theme::surface())
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(root.tr("保存搜索历史")),
+                )
+                .child(crate::ui::switch::render(
+                    "search-history-toggle",
+                    enabled,
+                    |root, _window, cx| root.toggle_search_history(cx),
+                    cx,
+                )),
+        );
+
+    if count > 0 {
+        section = section.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(theme::space::MD))
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(root.localized("已保存 {} 条搜索历史", &[count.to_string()])),
+                )
+                .child(
+                    div()
+                        .id("settings-search-history-clear")
+                        .cursor_pointer()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::accent())
+                        .hover(|style| style.text_color(theme::text()))
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.clear_search_history(cx);
+                        }))
+                        .child(root.tr("清空")),
+                ),
+        );
+    }
+
+    section.into_any_element()
+}
+
+/// 设置页 → 诊断区块的一行开关：左侧标题与说明，右侧是既有的 switch 组件。
+fn log_toggle_row(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .bg(theme::surface())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.0))
+                .flex_1()
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(root.tr("详细日志")),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_muted())
+                        .child(
+                            root.tr(
+                                "多记播放、预取与界面耗时等调试信息；仍不含 Cookie、签名与查询串",
+                            ),
+                        ),
+                ),
+        )
+        .child(crate::ui::switch::render(
+            "detailed-logs-toggle",
+            root.settings.detailed_logs,
+            |root, _window, cx| {
+                let enabled = !root.settings.detailed_logs;
+                root.set_detailed_logs(enabled, cx);
+            },
+            cx,
+        ))
+        .into_any_element()
+}
+
+/// 与「缓存」刻意分开：日志在数据目录，`清空缓存` 不碰它（见 #53）。
+fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let log_dir = sodam_core::log_outlet::log_dir();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::SM))
+        .child(
+            div()
+                .text_size(theme::Text::Large.size())
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text())
+                .child(root.tr("诊断日志")),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(root.tr("默认记录在本机，用于排查播放问题；「清空缓存」不会删除它们")),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(root.localized("日志目录：{}", &[log_dir.display().to_string()])),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_faint())
+                .child(root.tr("日志可能含接口地址（查询串已移除），请勿公开上传")),
+        )
+        .child(log_toggle_row(root, cx))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(theme::space::SM))
+                .children([
+                    div()
+                        .id("open-log-directory")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(theme::size::CONTROL))
+                        .w(px(140.0))
+                        .rounded(px(theme::radius::ROW))
+                        .bg(theme::surface_elevated())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text())
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.open_log_directory(cx);
+                        }))
+                        .child(root.tr("打开日志目录"))
+                        .into_any_element(),
+                    div()
+                        .id("clear-diagnostic-logs")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(theme::size::CONTROL))
+                        .w(px(140.0))
+                        .rounded(px(theme::radius::ROW))
+                        .bg(theme::surface_elevated())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text())
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            root.clear_diagnostic_logs(cx);
+                        }))
+                        .child(if root.log_clearing {
+                            root.tr("正在清除…")
+                        } else {
+                            root.tr("清除诊断日志")
+                        })
+                        .into_any_element(),
+                ]),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyElement {
+    // 档位与名称都从核心层派生（`TIERS` + `label_key`），这里只保留每档的说明文案：
+    // 否则往 `TIERS` 加一档时，设置页会静默少一项。
+    // 档位是“上限”而不是“目标”：libresoda 在没有任何候选低于上限时，会回退成全部候选
+    //（实际可能比所选更高），所以这里说“优先 / 由服务端回退”，不承诺“只降一档”。
+    let hint_key = |value: &str| -> &'static str {
+        match value {
+            "hires" => "优先 Hi-Res 无损；没有可用档位时由服务端回退",
+            "lossless" => "优先无损；没有可用无损时由服务端回退",
+            "dolby" => "优先杜比全景声；没有可用档位时由服务端回退",
+            "highest" => "优先极高（≈320k）；没有可用档位时由服务端回退",
+            "medium" => "优先较高；没有可用档位时由服务端回退",
+            "low" => "优先流畅（≈128k）；没有可用档位时由服务端回退",
+            _ => "不设上限，按账号权益和单曲可用档位取最高",
         }
     };
-    let vip = root.account.as_ref().map(|info| info.vip).unwrap_or(false);
+    let language = root.language;
+    let label_for = |value: &str| crate::ui::player_bar::quality_label(value, language);
+    let options: Vec<(&str, String)> = std::iter::once(sodam_core::quality::AUTO)
+        .chain(sodam_core::quality::TIERS)
+        .map(|value| (value, label_for(value)))
+        .collect();
+    // 批量升级同样从 `TIERS` 派生，避免播放档位能选、批量升级却少几档。
+    let batch_tiers: Vec<(&str, String)> = sodam_core::quality::TIERS
+        .into_iter()
+        .map(|tier| (tier, label_for(tier)))
+        .collect();
+    // 先建行再交给 `children`：在 `children(map(...))` 里直接展开会让 rustfmt 反复改缩进。
+    let batch_tier_rows: Vec<AnyElement> = batch_tiers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (tier, label))| {
+            let is_selected = root.batch_upgrade_target
+                == sodam_core::quality::QualityIntent::Tier(tier.to_string());
+            div()
+                .id(("batch-upgrade-tier", index))
+                .h(px(theme::size::CONTROL_SM))
+                .px(px(theme::space::MD))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::radius::ROW))
+                .bg(if is_selected {
+                    theme::surface_selected()
+                } else {
+                    theme::surface_elevated()
+                })
+                .hover(|style| style.bg(theme::surface_hover()))
+                .cursor_pointer()
+                .text_size(theme::Text::Small.size())
+                .child(label)
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    if !root.batch_upgrading {
+                        root.set_batch_upgrade_target(
+                            sodam_core::quality::QualityIntent::Tier(tier.to_string()),
+                            cx,
+                        );
+                    }
+                }))
+                .into_any_element()
+        })
+        .collect();
+    let batch_target = root.batch_upgrade_target.clone();
+    let batch_target_label = label_for(batch_target.as_setting());
+    let batch_upgrade_blocked_by_vip =
+        batch_target.requires_membership() && root.account.as_ref().is_some_and(|a| !a.vip);
+    // 勾选的是**意图**；配置里的空串是历史写法，按「自动」显示。
+    let current = root.settings.quality_intent().as_setting().to_string();
+
+    // 来源提示与徽章：区分用户手动选择、程序推导与未知来源。
+    // 在全新未配置的「自动」项上（Unknown + Auto）不展示徽章，避免新用户误解。
+    let (source_badge, source_hint) =
+        match (root.settings.quality_source, root.settings.quality_intent()) {
+            (sodam_core::quality::QualitySource::Derived, _) => (
+                Some(root.tr("程序推导")),
+                Some(root.tr("当前档位由程序推导，点「自动」即可恢复跟随账号权益")),
+            ),
+            (
+                sodam_core::quality::QualitySource::Unknown,
+                sodam_core::quality::QualityIntent::Auto,
+            ) => (None, None),
+            (sodam_core::quality::QualitySource::Unknown, _) => (
+                Some(root.tr("来源未知")),
+                Some(root.tr("若不是你选的，点「自动」即可恢复跟随账号权益")),
+            ),
+            (sodam_core::quality::QualitySource::User, _) => (
+                Some(root.tr("手动选择")),
+                Some(root.tr("当前档位由手动选择")),
+            ),
+        };
 
     let theme_rows: Vec<AnyElement> = [
         (None, root.tr("跟随系统")),
@@ -279,8 +682,9 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 
     let rows: Vec<AnyElement> = options
         .iter()
-        .map(|(value, title, hint)| {
+        .map(|(value, title)| {
             let chosen = *value == current;
+            let hint = root.tr(hint_key(value));
             let value = value.to_string();
             div()
                 .id(gpui::ElementId::Name(format!("quality-set-{value}").into()))
@@ -305,19 +709,40 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .flex_col()
                         .child(
                             div()
-                                .text_size(theme::Text::Body.size())
-                                .text_color(if chosen {
-                                    theme::text()
-                                } else {
-                                    theme::text_muted()
-                                })
-                                .child(title.to_string()),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::space::SM))
+                                .child(
+                                    div()
+                                        .text_size(theme::Text::Body.size())
+                                        .text_color(if chosen {
+                                            theme::text()
+                                        } else {
+                                            theme::text_muted()
+                                        })
+                                        .child(title.clone()),
+                                )
+                                .when(chosen, |this| {
+                                    this.when_some(source_badge, |this, badge| {
+                                        this.child(
+                                            div()
+                                                .text_size(theme::Text::Tiny.size())
+                                                .text_color(theme::text_muted())
+                                                .px(px(6.0))
+                                                .py(px(1.0))
+                                                .rounded(px(theme::radius::PILL))
+                                                .bg(theme::surface_hover())
+                                                .child(badge),
+                                        )
+                                    })
+                                }),
                         )
                         .child(
                             div()
                                 .text_size(theme::Text::Tiny.size())
                                 .text_color(theme::text_faint())
-                                .child(hint.to_string()),
+                                .child(hint),
                         ),
                 )
                 .when(chosen, |this| {
@@ -432,12 +857,21 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     root.language = Language::system_locale();
                                     root.language_follows_system = true;
                                     root.settings.language = "auto".to_string();
-                                    let _ = root.settings.save();
-                                    root.status = if root.language.is_zh() {
-                                        root.tr("语言已恢复为跟随系统").to_string()
+                                    if let Err(err) = root.settings.save() {
+                                        let message = root.failure_text(
+                                            "语言已恢复为跟随系统，但保存失败",
+                                            &err,
+                                            SAVE_TEXT,
+                                        );
+                                        root.notify_error_once("language-save-failed", message);
                                     } else {
-                                        "Language restored to system".to_string()
-                                    };
+                                        let status = if root.language.is_zh() {
+                                            root.tr("语言已恢复为跟随系统").to_string()
+                                        } else {
+                                            "Language restored to system".to_string()
+                                        };
+                                        root.set_status_text(status);
+                                    }
                                     // macOS 菜单栏的标题也要跟着换语言。
                                     #[cfg(target_os = "macos")]
                                     crate::menus::refresh(cx, root.language);
@@ -468,6 +902,8 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .collect::<Vec<_>>(),
             ),
         )
+        .child(search_history_section(root, cx))
+        .children(window_controls_section(root, cx))
         .child(
             div()
                 .flex()
@@ -484,13 +920,27 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     div()
                         .text_size(theme::Text::Small.size())
                         .text_color(theme::text_muted())
-                        .child(if vip {
-                            root.tr("当前账号是 VIP：登录时默认无损，单曲没有无损会自动降级")
-                                .to_string()
-                        } else {
-                            root.tr("当前账号非 VIP：默认自动，取免费档里实际可用的最高一档")
-                                .to_string()
-                        }),
+                        .child(
+                            root.tr("自动 = 取当前账号能拿到的最高档，单曲没有该档位时自动降一档"),
+                        ),
+                )
+                .children(source_hint.map(|hint| {
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(hint)
+                }))
+                .child(
+                    // 缓存按意图命名：自动档下同一首歌永远命中同一个文件，所以权益变了
+                    // 也不会在旧曲上生效。这是主流客户端的一致行为，必须提前说明。
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(
+                            root.tr(
+                                "已缓存的歌曲会保持原来的档位；想按新权益重取，清空缓存或换一首",
+                            ),
+                        ),
                 ),
         )
         .child(
@@ -626,7 +1076,121 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             root.tr("清空缓存")
                         }),
                 )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme::space::XS))
+                        .mt(px(theme::space::SM))
+                        .child(
+                            div()
+                                .text_size(theme::Text::Large.size())
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child(root.tr("批量升级缓存")),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text_muted())
+                                .child(
+                                    root.tr(
+                                        "将已有低档位缓存重新拉取为更高音质，失败不会损坏旧缓存",
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(theme::space::SM))
+                                .children(batch_tier_rows),
+                        )
+                        .child({
+                            let estimate_text = if batch_upgrade_blocked_by_vip {
+                                root.localized(
+                                    "「{}」音质需 VIP 会员权限，当前账号无法升级",
+                                    std::slice::from_ref(&batch_target_label),
+                                )
+                            } else if root.batch_upgrading {
+                                root.localized(
+                                    "正在升级 ({} / {})…",
+                                    &[
+                                        root.batch_upgrade_progress.done.to_string(),
+                                        root.batch_upgrade_progress.total.to_string(),
+                                    ],
+                                )
+                            } else if let Some(estimate) = &root.batch_upgrade_estimate {
+                                if estimate.upgradeable_count == 0 {
+                                    root.tr("所有缓存歌曲均已达到或超过该档位").to_string()
+                                } else {
+                                    let delta = estimate.net_disk_delta_bytes();
+                                    let delta_str = if delta >= 0 {
+                                        format!("+{}", human_bytes(delta as u64))
+                                    } else {
+                                        format!("-{}", human_bytes((-delta) as u64))
+                                    };
+                                    root.localized(
+                                        "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}",
+                                        &[
+                                            estimate.upgradeable_count.to_string(),
+                                            human_bytes(estimate.estimated_traffic_bytes),
+                                            delta_str,
+                                        ],
+                                    )
+                                }
+                            } else {
+                                root.tr("正在计算升级预估…").to_string()
+                            };
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text_muted())
+                                .child(estimate_text)
+                        })
+                        .child({
+                            let upgradeable = root
+                                .batch_upgrade_estimate
+                                .as_ref()
+                                .map_or(0, |e| e.upgradeable_count);
+                            let can_upgrade = !root.batch_upgrading
+                                && !batch_upgrade_blocked_by_vip
+                                && upgradeable > 0;
+                            let mut btn = div()
+                                .id("batch-upgrade")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(theme::size::CONTROL))
+                                .w(px(140.0))
+                                .rounded(px(theme::radius::ROW))
+                                .text_size(theme::Text::Small.size());
+
+                            if can_upgrade {
+                                btn = btn
+                                    .bg(theme::accent())
+                                    .text_color(theme::accent_foreground())
+                                    .cursor_pointer()
+                                    .hover(|style| style.opacity(0.9))
+                                    .on_click(cx.listener(
+                                        |root, _event: &ClickEvent, _window, cx| {
+                                            root.start_batch_upgrade(cx);
+                                        },
+                                    ));
+                            } else {
+                                btn = btn
+                                    .bg(theme::surface_elevated())
+                                    .text_color(theme::text_faint());
+                            }
+
+                            btn.child(if root.batch_upgrading {
+                                root.tr("正在升级…")
+                            } else {
+                                root.tr("批量升级")
+                            })
+                        }),
+                )
         })
+        .child(diagnostic_log_section(root, cx))
         .child(
             div()
                 .flex()
@@ -718,63 +1282,157 @@ pub(crate) fn settings_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         )
         .child({
             let repository = env!("CARGO_PKG_REPOSITORY");
+            let contributors = root.contributors_image.clone();
+            root.ensure_contributors(cx);
             div()
                 .id("about-footer")
                 .flex()
-                .flex_row()
-                .items_center()
+                .flex_col()
                 .gap(px(theme::space::MD))
-                .px(px(theme::space::MD))
-                .py(px(theme::space::SM))
+                .p(px(theme::space::MD))
                 .rounded(px(theme::radius::CARD))
                 .bg(theme::surface_elevated())
                 .border_1()
                 .border_color(theme::border())
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::surface_hover()))
-                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                    root.open_github_repository(cx);
-                }))
-                .child(
-                    img("icons/sodam-logo.svg")
-                        .size(px(36.0))
-                        .flex_none()
-                        .rounded(px(theme::radius::ROW))
-                        .object_fit(ObjectFit::Cover),
-                )
                 .child(
                     div()
-                        .flex_1()
                         .flex()
-                        .flex_col()
-                        .min_w(px(0.0))
-                        .gap(px(theme::space::XS))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::space::MD))
                         .child(
-                            div()
-                                .text_size(theme::Text::Small.size())
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme::text())
-                                .child(format!("SodaM v{}", env!("CARGO_PKG_VERSION"))),
+                            img("icons/sodam-logo.svg")
+                                .size(px(36.0))
+                                .flex_none()
+                                .rounded(px(theme::radius::ROW))
+                                .object_fit(ObjectFit::Cover),
                         )
                         .child(
                             div()
-                                .truncate()
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::text_muted())
-                                .child(format!("GitHub: {repository}")),
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .min_w(px(0.0))
+                                .gap(px(theme::space::XS))
+                                .child(
+                                    div()
+                                        .text_size(theme::Text::Small.size())
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(format!("SodaM v{}", env!("CARGO_PKG_VERSION"))),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(theme::Text::Tiny.size())
+                                        .text_color(theme::text_muted())
+                                        .child(format!("GitHub: {repository}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::Text::Tiny.size())
+                                        .text_color(theme::text_faint())
+                                        .child(format!(
+                                            "{} · {}",
+                                            root.tr("维护者"),
+                                            "ZephyrCheung"
+                                        )),
+                                ),
                         )
                         .child(
                             div()
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::text_faint())
-                                .child("Author: ZephyrCheung"),
+                                .id("open-repository")
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(theme::size::CONTROL_SM))
+                                .px(px(theme::space::MD))
+                                .rounded(px(theme::radius::ROW))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.open_github_repository(cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(icons::path("chevron-right"))
+                                        .size(px(theme::ICON_SM))
+                                        .text_color(theme::text_faint()),
+                                ),
                         ),
                 )
                 .child(
-                    svg()
-                        .path(icons::path("chevron-right"))
-                        .size(px(theme::ICON_SM))
-                        .text_color(theme::text_faint()),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme::space::SM))
+                        .pt(px(theme::space::SM))
+                        .border_t_1()
+                        .border_color(theme::border())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(theme::Text::Small.size())
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(root.tr("贡献者")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::Text::Tiny.size())
+                                        .text_color(theme::text_faint())
+                                        .child("contrib.rocks"),
+                                ),
+                        )
+                        .child(if let Some(image) = contributors {
+                            div()
+                                .flex()
+                                .w_full()
+                                .justify_center()
+                                .child(
+                                    img(Arc::clone(&image))
+                                        .w_full()
+                                        .h(px(64.0))
+                                        .object_fit(ObjectFit::Contain),
+                                )
+                                .into_any_element()
+                        } else if root.contributors_failed {
+                            div()
+                                .id("retry-contributors")
+                                .h(px(64.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(theme::radius::ROW))
+                                .bg(theme::surface_hover())
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.85))
+                                .text_size(theme::Text::Tiny.size())
+                                .text_color(theme::text_muted())
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.ensure_contributors(cx);
+                                }))
+                                .child(root.tr("加载失败，点击重试"))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .h(px(64.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(theme::radius::ROW))
+                                .bg(theme::surface_hover())
+                                .text_size(theme::Text::Tiny.size())
+                                .text_color(theme::text_faint())
+                                .child(root.tr("正在加载贡献者…"))
+                                .into_any_element()
+                        }),
                 )
         })
         .into_any_element()

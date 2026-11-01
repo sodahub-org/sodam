@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SodaM — 高性能的汽水音乐第三方桌面客户端</title>
+<meta name="description" content="SodaM 是开源的汽水音乐第三方桌面客户端，基于 GPUI + Rust 原生渲染：高性能、低占用、界面干净，支持 Linux、macOS 与 Windows。">
+<meta name="theme-color" content="#0d0f10">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="assets/logo.svg">
+<link rel="stylesheet" href="assets/style.css">
+<!-- 主题初始化必须放在 <head> 里同步执行：首屏绘制前把 data-theme 落到 <html> 上，避免闪白/闪黑 -->
+<script src="assets/theme.js"></script>
+<meta property="og:type" content="website">
+<meta property="og:title" content="SodaM — 高性能的汽水音乐第三方桌面客户端">
+<meta property="og:description" content="汽水音乐的第三方桌面客户端，GPUI + Rust 原生渲染：高性能、低占用、高颜值。">
+<meta property="og:image" content="assets/shot-1.jpg">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="index.html">
+      <img src="assets/logo.svg" alt="SodaM">
+      <span>SodaM <small>汽水音乐第三方客户端</small></span>
+    </a>
+    <nav>
+      <a href="install.html">安装</a>
+      <a href="changelog.html">更新日志</a>
+      <a href="llm.html">让 AI 帮我装</a>
+      <a href="developers.html">开发者</a>
+      <a href="https://github.com/sodahub-org/sodam">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <img class="logo-big" src="assets/logo.svg" alt="SodaM logo">
+    <h1>高性能的汽水音乐<br>第三方桌面客户端</h1>
+    <p class="lead">
+      SodaM 是 <strong>汽水音乐</strong> 的第三方客户端，用 <strong>GPUI + Rust</strong> 原生渲染 ——
+      <strong>高性能、低占用、高颜值</strong>。操作手感对齐官方客户端，同时把本地缓存、
+      无损播放和主题做到了更舒服的程度；Linux / macOS / Windows 都能用。
+    </p>
+    <p class="chips">
+      <span>GPUI 原生渲染</span><span>低内存占用</span><span>启动快</span><span>自适应深色主题</span>
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="install.html">开始安装</a>
+      <a class="btn" href="llm.html">让 AI 帮我装</a>
+      <a class="btn ghost" href="changelog.html">更新日志</a>
+    </div>
+    <p class="meta">
+      当前版本 <code data-version>—</code> ·
+      开源 AGPL-3.0 · <a href="https://github.com/sodahub-org/sodam">GitHub</a>
+    </p>
+    <p class="meta subtle">
+      非官方项目：SodaM 由社区开发维护，与汽水音乐官方无关；账号与曲库仍来自汽水音乐官方服务。
+    </p>
+  </div>
+
+  <section>
+    <div class="wrap">
+      <h2>界面</h2>
+      <p class="sub">原生渲染、跟随系统主题，封面与歌词都是为桌面优化的布局。</p>
+      <div class="shots">
+        <img src="assets/shot-1.jpg" alt="SodaM 主界面">
+        <img src="assets/shot-2.jpg" alt="SodaM 播放与歌词界面">
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <h2>特性</h2>
+      <p class="sub">日常听歌真正用得上的那几件事。</p>
+      <div class="grid">
+        <div class="card">
+          <span class="tag">高性能</span>
+          <h3>GPUI 原生渲染，不是套壳网页</h3>
+          <p>Rust + GPUI 直接调用系统窗口与 GPU：启动快、滚动和动画不掉帧，中英文输入法都是原生手感。</p>
+        </div>
+        <div class="card">
+          <span class="tag">低占用</span>
+          <h3>单进程，没有额外常驻</h3>
+          <p>一个进程跑完界面与播放，关窗驻留托盘；没有 Electron 运行时、没有后台服务、没有遥测。</p>
+        </div>
+        <div class="card">
+          <span class="tag">高颜值</span>
+          <h3>干净的自适应主题</h3>
+          <p>深色主题跟随系统外观，播放页按封面取色生成氛围背景，歌词与封面布局按桌面尺寸优化。</p>
+        </div>
+        <div class="card">
+          <span class="tag">播放</span>
+          <h3>无损音质与本地缓存</h3>
+          <p>解密后的音频落本地缓存，可设上限自动淘汰；切歌不再等网络，弱网也稳。</p>
+        </div>
+        <div class="card">
+          <span class="tag">跟随系统</span>
+          <h3>切换输出设备自动跟随</h3>
+          <p>播放中把默认输出从音响换成耳机，2 秒内切过去并从原位置续播，不用重启。</p>
+        </div>
+        <div class="card">
+          <span class="tag">功能</span>
+          <h3>推荐流 · 听歌模式 · 搜索</h3>
+          <p>推荐流、场景电台、搜索、歌单、我喜欢的音乐、艺人/专辑页都能用，按官方接口取数。</p>
+        </div>
+        <div class="card">
+          <span class="tag">集成</span>
+          <h3>系统媒体键与桌面挂件</h3>
+          <p>MPRIS（Linux）、macOS Now Playing、Windows SMTC 都已接入，键位和挂件直接可控。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="download">
+    <div class="wrap">
+      <h2>下载</h2>
+      <p class="sub">选择你的平台；完整的校验、卸载与疑难排查见 <a href="install.html">安装说明</a>。</p>
+      <div class="grid">
+
+        <div class="card" data-platform="linux">
+          <h3>Linux</h3>
+          <p>提供 <code>x86_64</code> 与 <code>aarch64</code> 的 pacman 包，并维护一个可直接升级的 pacman 源。</p>
+          <div class="links">
+            <a class="btn small primary" href="install.html#linux">安装方法</a>
+            <a class="btn small ghost" data-download="linux" href="https://github.com/sodahub-org/sodam/releases/latest">下载 .pkg.tar.zst</a>
+          </div>
+        </div>
+
+        <div class="card" data-platform="macos">
+          <h3>macOS（Apple Silicon）</h3>
+          <p>Homebrew Cask 一行安装，也可以直接下载 <code>.app</code> 压缩包。</p>
+          <div class="links">
+            <a class="btn small primary" href="install.html#macos">安装方法</a>
+            <a class="btn small ghost" data-download="macos" href="https://github.com/sodahub-org/sodam/releases/latest">下载 .zip</a>
+          </div>
+        </div>
+
+        <div class="card" data-platform="windows">
+          <h3>Windows（x64）</h3>
+          <p>按用户安装的安装包，不需要管理员权限，自带开始菜单快捷方式。</p>
+          <div class="links">
+            <a class="btn small primary" href="install.html#windows">安装方法</a>
+            <a class="btn small ghost" data-download="windows" href="https://github.com/sodahub-org/sodam/releases/latest">下载安装包</a>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <h2>30 秒装好</h2>
+      <p class="sub">Arch Linux（含 Arch Linux ARM）可以直接加源，之后随 <code>pacman -Syu</code> 升级。</p>
+
+      <div class="code">
+        <header><span>/etc/pacman.conf 末尾</span><button class="copy" data-copy="self">复制</button></header>
+        <pre>[sodam]
+SigLevel = Optional TrustAll
+Server = https://sodahub-org.github.io/sodam/$arch</pre>
+      </div>
+
+      <div class="code">
+        <header><span>安装</span><button class="copy" data-copy="self">复制</button></header>
+        <pre>sudo pacman -Sy sodam</pre>
+      </div>
+
+      <div class="code">
+        <header><span>macOS · Homebrew</span><button class="copy" data-copy="self">复制</button></header>
+        <pre>brew install --cask sodahub-org/tap/sodam</pre>
+      </div>
+
+      <div class="note">
+        不想自己动手？把 <a href="llm.html">「让 AI 帮我装」</a> 页面的说明复制给你的 AI 助手，
+        它会先判断你的系统，再一步步带你装好。
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap row">
+    <span>© SodaM · AGPL-3.0-or-later · 非官方第三方客户端</span>
+    <a href="https://github.com/sodahub-org/sodam">源码</a>
+    <a href="https://github.com/sodahub-org/sodam/releases">Releases</a>
+    <a href="https://github.com/sodahub-org/libresoda">libresoda</a>
+    <a href="https://github.com/sodahub-org/gpui">gpui fork</a>
+    <a href="https://linux.do/t/topic/2921819">Linux.do 推广帖</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

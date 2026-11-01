@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use gpui::App;
+use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
 };
@@ -37,7 +38,13 @@ impl Controls {
                 commands.send(command).ok();
             }
         }) {
-            eprintln!("[media] 无法监听媒体键：{error:?}");
+            let detail = format!("{error:?}");
+            log_event(
+                LogLevel::Warn,
+                LogTopic::Media,
+                "hotkey_listen_failed",
+                &[("detail", detail.as_str())],
+            );
         }
         Ok(Self { controls })
     }
@@ -60,7 +67,13 @@ impl Controls {
             MediaMetadata::default()
         };
         if let Err(error) = self.controls.set_metadata(metadata) {
-            eprintln!("[media] 发布曲目失败：{error:?}");
+            let detail = format!("{error:?}");
+            log_event(
+                LogLevel::Warn,
+                LogTopic::Media,
+                "metadata_publish_failed",
+                &[("detail", detail.as_str())],
+            );
         }
     }
 
@@ -73,7 +86,13 @@ impl Controls {
             (true, false) => MediaPlayback::Paused { progress },
         };
         if let Err(error) = self.controls.set_playback(playback) {
-            eprintln!("[media] 发布播放状态失败：{error:?}");
+            let detail = format!("{error:?}");
+            log_event(
+                LogLevel::Warn,
+                LogTopic::Media,
+                "playback_publish_failed",
+                &[("detail", detail.as_str())],
+            );
         }
     }
 }

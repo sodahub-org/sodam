@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 # 轻量检查：编译 + 测试 + lint，全部带内存护栏、限制并行度。
 #
+# 用法：
+#   scripts/check.sh             完整检查（编译 + fmt + clippy + test）
+#   scripts/check.sh --fmt-only  只检查格式，不编译（禁止本地编译时用）
+#
 # 背景：这台机器 15GB 内存 + zram swap，本项目依赖的 GPUI 编译/链接较重，
 # 已经出现过 OOM 与整机卡死（见 AGENTS.md「资源护栏」）。所以：
 #   * 一律限制 cargo 并行度（CARGO_BUILD_JOBS）
 #   * 用 systemd-run 的 scope 给整条命令设内存/CPU 上限，超限只杀这条命令
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [[ "${1:-}" == "--fmt-only" ]]; then
+    cargo fmt --all -- --check
+    echo "格式化检查通过 ✅"
+    exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+    echo "用法：$0 [--fmt-only]" >&2
+    exit 2
+fi
 
 JOBS="${SODAM_BUILD_JOBS:-4}"
 MEM_MAX="${SODAM_BUILD_MEM_MAX:-6G}"

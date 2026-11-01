@@ -1,0 +1,56 @@
+name: 功能建议
+description: 想要新的能力，或现有行为不顺手
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前建议先对照一下 [官方客户端](https://www.qishui.com/) 与
+        [ROADMAP](https://github.com/sodahub-org/sodam/blob/main/docs/ROADMAP.md)，
+        有些功能已经在计划里了。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 使用场景
+      description: 你现在的做法是什么？卡在哪里？
+      placeholder: 例如：我常在歌单里来回切歌，现在每次都要点两次才能……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的行为
+      description: 描述交互与结果即可，不需要写实现方案
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+      description: 现在有没有别的办法凑合？官方客户端 / 其它播放器是怎么做的？
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 主要使用的平台
+      multiple: true
+      options:
+        - Linux
+        - macOS
+        - Windows
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 搜索过已有 issue / ROADMAP，没有重复
+          required: true

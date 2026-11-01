@@ -16,6 +16,7 @@ use gpui::{
     Resource, Window,
 };
 use image::{imageops, DynamicImage, Frame, ImageFormat, RgbaImage};
+use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 
 /// 缓存预算下限（超出后淘汰）；实际预算 = `max(这个, 一个满屏像素)`。
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -239,12 +240,19 @@ impl CoverImageCache {
             }
         }
 
-        if std::env::var("SODAM_COVER_LOG").is_ok() {
-            eprintln!(
-                "[cover] {} held / {} KiB (budget {} KiB)",
-                self.items.len(),
-                self.bytes / 1024,
-                budget / 1024
+        if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+            let held = self.items.len().to_string();
+            let kib = (self.bytes / 1024).to_string();
+            let budget_kib = (budget / 1024).to_string();
+            log_event(
+                LogLevel::Debug,
+                LogTopic::App,
+                "cover_cache_stats",
+                &[
+                    ("held", held.as_str()),
+                    ("kib", kib.as_str()),
+                    ("budget_kib", budget_kib.as_str()),
+                ],
             );
         }
     }

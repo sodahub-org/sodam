@@ -75,7 +75,8 @@ fn columns_for(width: f32) -> Columns {
     let base = COL_INDEX + COL_LIKE + theme::size::ROW_ART;
     let candidate = |artist: bool, album: bool, time: bool| -> Option<f32> {
         let mut fixed = base;
-        let mut count = 3.0;
+        // 4 个固定子项（#、爱心、封面、标题），间距数 = 子项数 - 1
+        let mut count = 4.0;
         if artist {
             fixed += COL_ARTIST;
             count += 1.0;
@@ -499,7 +500,10 @@ pub(crate) fn scrolling_detail_page(
                 .flex_row()
                 .items_start()
                 .gap(px(theme::space::XL))
-                .p(px(theme::space::SM))
+                // 左侧与曲目行的内容起点对齐（页面 24 + 行内 12）；底部留白避免首行贴住封面
+                .px(px(ROW_PAD))
+                .py(px(theme::space::SM))
+                .pb(px(theme::space::LG))
                 .child(cover(
                     cover_path.clone(),
                     theme::size::CARD_COVER,
@@ -779,15 +783,8 @@ pub(crate) fn back_button(cx: &mut Context<Root>) -> AnyElement {
 fn subtitle_for(root: &Root) -> String {
     let logged_in = !root.settings.cookie.trim().is_empty();
     match root.nav {
-        Nav::Search => {
-            if root.searching {
-                root.tr("正在搜索…").to_string()
-            } else if root.results.is_empty() {
-                root.tr("回车搜索歌曲、歌手或专辑").to_string()
-            } else {
-                root.localized("{} 条结果", &[root.results.len().to_string()])
-            }
-        }
+        // 搜索页有自己的标题，不走 page_header，因此没有副标题
+        Nav::Search => String::new(),
         Nav::Liked => {
             if !logged_in {
                 root.tr("未登录：先在「登录」页扫码").to_string()
@@ -818,24 +815,75 @@ fn subtitle_for(root: &Root) -> String {
     }
 }
 
+/// 页面标题。
+fn page_title(title: &str) -> AnyElement {
+    div()
+        .text_size(theme::Text::Title.size())
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(theme::text())
+        .child(title.to_string())
+        .into_any_element()
+}
+
 /// 页面标题 + 副标题。
 fn page_header(title: &str, subtitle: &str) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(theme::space::XS))
-        .child(
-            div()
-                .text_size(theme::Text::Title.size())
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(theme::text())
-                .child(title.to_string()),
-        )
+        .child(page_title(title))
         .child(
             div()
                 .text_size(theme::Text::Small.size())
                 .text_color(theme::text_muted())
                 .child(subtitle.to_string()),
+        )
+        .into_any_element()
+}
+
+/// 推荐页的失败终态：一句人话 + 重试。
+///
+/// 不能退回「正在准备推荐队列…」那个加载态：断网时它会一直转圈，用户既看不出
+/// 出了什么事，也没有任何能按的地方（#55）。
+fn recommendation_error_state(root: &Root, message: String, cx: &mut Context<Root>) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::space::MD))
+        .py(px(theme::space::XXL))
+        .child(
+            svg()
+                .path(icons::path("house"))
+                .size(px(theme::ICON_XL))
+                .text_color(theme::text_faint()),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(message),
+        )
+        .child(
+            div()
+                .id("retry-recommendation")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(theme::size::CONTROL_SM))
+                .px(px(theme::space::MD))
+                .rounded(px(theme::radius::PILL))
+                .bg(theme::surface_elevated())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .text_size(theme::Text::Tiny.size())
+                .text_color(theme::text_muted())
+                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                    root.retry_recommendation(cx);
+                }))
+                .child(root.tr("重试加载")),
         )
         .into_any_element()
 }
@@ -1024,12 +1072,17 @@ fn qr_canvas(matrix: Vec<Vec<bool>>) -> impl IntoElement {
 }
 
 /// 渲染内容区。
-pub fn render(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
+pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
     let settings = &root.settings;
     let logged_in = !settings.cookie.trim().is_empty();
 
     let body = match root.nav {
-        Nav::Home => loading_state(root.tr("正在准备推荐队列…")),
+        // 推荐页只有切队列时才会是可见加载态：失败后停在这里会永远转圈，
+        // 所以它必须能变成带「重试」的失败终态（#55）。
+        Nav::Home => match &root.recommendation_error {
+            Some(message) => recommendation_error_state(root, message.clone(), cx),
+            None => loading_state(root.tr("正在准备推荐队列…")),
+        },
         Nav::Scenes => scenes::scenes_view(root, cx),
         Nav::Search => search::search_page(root, window, cx),
         Nav::Liked => div()
@@ -1170,4 +1223,35 @@ pub fn render(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                 .gap(px(theme::space::LG))
                 .child(body),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表头与数据行共用的列宽必须装得进内容区，否则行右侧内边距会被吃掉。
+    #[test]
+    fn columns_fit_content_width() {
+        // 400 起：更窄时退化到 COL_TITLE_MIN，允许溢出。
+        for width in [400.0_f32, 640.0, 900.0, 1200.0] {
+            let cols = columns_for(width);
+            let mut total =
+                ROW_PAD * 2.0 + COL_INDEX + COL_LIKE + theme::size::ROW_ART + cols.title;
+            let mut items = 4.0;
+            if cols.artist {
+                total += COL_ARTIST;
+                items += 1.0;
+            }
+            if cols.album {
+                total += COL_ALBUM;
+                items += 1.0;
+            }
+            if cols.time {
+                total += COL_TIME;
+                items += 1.0;
+            }
+            total += COL_GAP * (items - 1.0);
+            assert!(total <= width + 0.01, "width={width} total={total}");
+        }
+    }
 }

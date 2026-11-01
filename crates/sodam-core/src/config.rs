@@ -21,17 +21,34 @@ pub struct Settings {
     pub device_id: String,
     pub iid: String,
     pub fp: String,
-    /// 音质偏好：`best` / `lossless` / `highest` / `medium` / `low`。
+    /// 音质偏好：只存**意图**——`auto` 或一个具体档位
+    ///（`hires` / `lossless` / `dolby` / `highest` / `medium` / `low`）。
+    ///
+    /// 空串是历史写法，按 `auto` 读；新写入一律写 `auto`。实际拿到哪一档由服务端按
+    /// 账号权益与曲目可用性决定，不落盘（见 [`crate::quality`]）。
     pub quality: String,
+    /// 音质偏好来源：记录是用户选择（`user`）、程序推导（`derived`）还是旧配置未知（`unknown`）。
+    #[serde(default)]
+    pub quality_source: crate::quality::QualitySource,
     /// 当前音量与静音前音量（0..=1）。旧配置缺字段时沿用 100%。
     pub volume: f32,
     pub volume_before_mute: f32,
+    /// 播放模式：列表循环 / 单曲循环 / 随机播放。旧配置缺字段时用列表循环。
+    #[serde(default)]
+    pub play_mode: crate::queue::PlayMode,
     /// 音频磁盘缓存上限（MiB），默认 10 GiB，设置页可调整。
     pub audio_cache_limit_mb: u64,
+    /// 是否保存搜索框历史；关闭时同时清空已有记录。
+    pub search_history_enabled: bool,
+    /// 最近搜索词（最近在前，最多 10 条，仅保存在本机）。
+    pub search_history: Vec<String>,
     /// 界面主题：`dark` / `light`；空 = 第一次启动跟随系统偏好。
     pub theme: String,
     /// 界面语言：`zh` / `en`；空或 `auto` = 跟随系统语言。
     pub language: String,
+    /// Linux 下是否自绘窗口控制按钮：`auto`（默认，按桌面装饰能力）/ `always` / `never`。
+    /// Windows 与 macOS 由系统负责，此项不生效。
+    pub titlebar: String,
     /// 播放/暂停快捷键（gpui 的 keystroke 写法，如 `space`、`ctrl-left`）。
     /// 空串 = 用内置默认值 `DEFAULT_SHORTCUT_*`。
     pub shortcut_toggle: String,
@@ -39,6 +56,11 @@ pub struct Settings {
     pub shortcut_previous: String,
     /// 下一首。
     pub shortcut_next: String,
+    /// 详细日志：打开后把六个话题都提到 DEBUG，即时生效、重启保持。
+    ///
+    /// 与环境变量是并集关系——两边都只能「记更多」，不存在谁覆盖谁。
+    #[serde(default)]
+    pub detailed_logs: bool,
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -70,6 +92,98 @@ fn effective_shortcut<'a>(value: &'a str, default: &'a str) -> &'a str {
     }
 }
 
+/// 把旧版本录制时写下的**显示形式**改回可解析的规范存储串。
+///
+/// 只认三类无歧义的本应用产物，其余一律返回 `None`（保持原样）：
+/// * 符号修饰键：`^`→`ctrl`、`⌥`→`alt`、`⇧`→`shift`、`⌘`/`⊞`/`❖`→本平台主修饰键；
+/// * 符号键名：`←↑→↓`→`left/right/up/down`；
+/// * 被大写化的单字符键：`ctrl-A`→`ctrl-a`（旧 Display 把 `Ctrl+K` 写成大写，
+///   而 parse 把大写读成「带 shift」，所以小写化是还原用户本意）。
+///
+/// 已经是合法 ASCII 写法的（`ctrl-left`、`cmd-left`、`secondary-a`）**一概不改**：
+/// 改写用户自己写进配置文件的值，会让他找不到原来写的是什么。认不出的值留给设置页
+/// 标成「未生效」，不在这里猜。
+fn normalize_legacy_keystroke(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let looks_like_our_output = !value.is_ascii()
+        || value.split('-').any(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(ch) if ch.is_ascii_uppercase()) && chars.next().is_none()
+        });
+    if !looks_like_our_output {
+        return None;
+    }
+
+    let mut function = false;
+    let mut control = false;
+    let mut alt = false;
+    let mut platform = false;
+    let mut shift = false;
+    let mut key = String::new();
+    for component in value.split('-') {
+        match component {
+            "" => {}
+            "ctrl" | "control" => control = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "fn" | "function" => function = true,
+            "secondary" | "cmd" | "command" | "super" | "win" => platform = true,
+            "left" | "right" | "up" | "down" => key = component.to_string(),
+            other => {
+                for ch in other.chars() {
+                    match ch {
+                        '^' => control = true,
+                        '⌥' => alt = true,
+                        '⇧' => shift = true,
+                        '⌘' | '⊞' | '❖' => platform = true,
+                        '←' => key = "left".into(),
+                        '→' => key = "right".into(),
+                        '↑' => key = "up".into(),
+                        '↓' => key = "down".into(),
+                        ch if ch.is_ascii_uppercase() => key.push(ch.to_ascii_lowercase()),
+                        ch if ch.is_ascii() => key.push(ch),
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    if key.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::with_capacity(6);
+    if function {
+        parts.push("fn");
+    }
+    if control {
+        parts.push("ctrl");
+    }
+    if alt {
+        parts.push("alt");
+    }
+    if platform {
+        // 与 gpui `Keystroke::unparse` 的写法一致，免得同一个修饰键在配置里有两种拼法
+        // （`secondary` 在非 macOS 上会被 parse 成 ctrl，绝不能拿来表示徽标键）。
+        parts.push(if cfg!(target_os = "macos") {
+            "cmd"
+        } else if cfg!(target_os = "windows") {
+            "win"
+        } else {
+            "super"
+        });
+    }
+    if shift {
+        parts.push("shift");
+    }
+    parts.push(key.as_str());
+    let normalized = parts.join("-");
+    (normalized != value).then_some(normalized)
+}
+
 /// 项目自建的签名服务（sodahub-org 部署）：开箱即用，可在设置里改成别的实例。
 pub const DEFAULT_SIGNER_URL: &str = "http://103.236.75.83:8899/sign";
 /// 上面那台服务的 token（等同取流能力，别外传；换服务时在设置里替换）。
@@ -81,6 +195,52 @@ pub const DEFAULT_SIGNER_TOKEN: &str = "b356ad402bc31ee9e5a99cfdbf41eaa39961a562
 const LEGACY_SIGNER_URL: &str = "http://222.186.10.201:8921/sign";
 const LEGACY_SIGNER_TOKEN: &str = "05f8089b8c5f60c63f2a6dcfe1028d28ee2725a504f3e59b";
 
+/// Linux 下自绘窗口控制按钮（标题栏）的策略。
+///
+/// 不同桌面对 xdg-decoration 的回答差别很大：
+/// * GNOME 等：协商成客户端装饰，告诉应用「你自己画」——必须自绘，否则没有按钮；
+/// * Hyprland / sway 等 wlroots 平铺桌面：协商成服务端装饰，但自己同样不画标题栏，
+///   这类桌面上窗口本来就由键盘/手势管理，通常不需要应用再画一套。
+///
+/// 所以默认 `Auto` 直接跟随协商结果，需要时可在设置里强制开或关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitlebarMode {
+    /// 按桌面协商结果决定（默认）。
+    #[default]
+    Auto,
+    /// 始终自绘。
+    Always,
+    /// 始终不自绘。
+    Never,
+}
+
+impl TitlebarMode {
+    pub fn from_key(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" | "on" | "show" => Self::Always,
+            "never" | "off" | "hide" => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// `client_decorated` 来自 gpui 的 `Decorations::Client`：桌面是否要求应用自绘。
+    pub fn draws_titlebar(self, client_decorated: bool) -> bool {
+        match self {
+            Self::Auto => client_decorated,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -90,16 +250,23 @@ impl Default for Settings {
             device_id: String::new(),
             iid: String::new(),
             fp: String::new(),
-            // 空 = 自动：登录后按账号 VIP 情况挑能用的最高档（见 Session::refresh_quality）
-            quality: String::new(),
+            // 只存意图，不存实际档位：新写入一律 auto，空串只作历史写法来读
+            //（见 crate::quality）。不再按会员等级推导一个具体档位写回。
+            quality: crate::quality::AUTO.to_string(),
+            quality_source: crate::quality::QualitySource::Unknown,
             volume: 1.0,
             volume_before_mute: 1.0,
+            play_mode: crate::queue::PlayMode::default(),
             audio_cache_limit_mb: crate::cache::DEFAULT_AUDIO_LIMIT_MB,
+            search_history_enabled: true,
+            search_history: Vec::new(),
             theme: String::new(),
             language: String::new(),
+            titlebar: String::new(),
             shortcut_toggle: String::new(),
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
+            detailed_logs: false,
         }
     }
 }
@@ -129,6 +296,7 @@ impl Settings {
         };
         let (mut settings, migrated) = settings.migrated();
         settings.normalize_playback();
+        settings.normalize_search_history();
         // 迁移后立刻落盘：用户下次打开配置文件看到的、以及设置页显示的，都是真正生效的那份。
         // 写失败不影响启动，内存里的值已经是迁移后的。
         if migrated {
@@ -137,20 +305,37 @@ impl Settings {
         settings
     }
 
-    /// 把老版本的默认端点迁到当前默认值。
+    /// 把老配置里已经失效的写法改到当前形式：内置签名端点、快捷键的显示形式。
     ///
-    /// 只认「等于旧默认值」这一种情况，用户填过别的地址就原样保留；
+    /// 端点只认「等于旧默认值」这一种情况，用户填过别的地址就原样保留；
     /// token 同理，避免覆盖用户自己给别的实例配的 token。
-    /// 返回是否发生了改动。
+    /// 返回是否发生了改动（改动后由 `load_from` 回存）。
     fn migrated(mut self) -> (Self, bool) {
-        if self.signer_url.trim() != LEGACY_SIGNER_URL {
-            return (self, false);
+        let mut changed = false;
+
+        if self.signer_url.trim() == LEGACY_SIGNER_URL {
+            self.signer_url = DEFAULT_SIGNER_URL.to_string();
+            if self.signer_token.trim() == LEGACY_SIGNER_TOKEN {
+                self.signer_token = DEFAULT_SIGNER_TOKEN.to_string();
+            }
+            changed = true;
         }
-        self.signer_url = DEFAULT_SIGNER_URL.to_string();
-        if self.signer_token.trim() == LEGACY_SIGNER_TOKEN {
-            self.signer_token = DEFAULT_SIGNER_TOKEN.to_string();
+
+        // 旧版本把按键的**显示形式**写进了配置（`⌘←`、`^←`、`ctrl-A`），这些串 parse 不回
+        // 原本那个键，绑上就是永不触发的死键（#39）。这里只改写「认得出是本应用产物」的值；
+        // 认不出的保持原样，交给设置页标成未生效。
+        for field in [
+            &mut self.shortcut_toggle,
+            &mut self.shortcut_previous,
+            &mut self.shortcut_next,
+        ] {
+            if let Some(normalized) = normalize_legacy_keystroke(field) {
+                *field = normalized;
+                changed = true;
+            }
         }
-        (self, true)
+
+        (self, changed)
     }
 
     /// 写配置（自动建目录）。
@@ -193,6 +378,72 @@ impl Settings {
         self.audio_cache_limit_mb = self.audio_cache_limit_mb.clamp(1024, 1024 * 1024);
     }
 
+    /// 搜索历史最多保留 10 条；去空白、去重，最近搜索保持在前。
+    pub const SEARCH_HISTORY_LIMIT: usize = 10;
+
+    pub fn search_history_is_enabled(&self) -> bool {
+        self.search_history_enabled
+    }
+
+    pub fn record_search(&mut self, query: &str) -> bool {
+        if !self.search_history_enabled {
+            return false;
+        }
+        let query = query.trim();
+        if query.is_empty() {
+            return false;
+        }
+        let before = self.search_history.clone();
+        self.search_history.retain(|item| item != query);
+        self.search_history.insert(0, query.to_string());
+        self.search_history.truncate(Self::SEARCH_HISTORY_LIMIT);
+        self.search_history != before
+    }
+
+    pub fn clear_search_history(&mut self) {
+        self.search_history.clear();
+    }
+
+    pub fn remove_search_history(&mut self, index: usize) -> bool {
+        if index >= self.search_history.len() {
+            return false;
+        }
+        self.search_history.remove(index);
+        true
+    }
+
+    pub fn set_search_history_enabled(&mut self, enabled: bool) -> bool {
+        if self.search_history_enabled == enabled {
+            return false;
+        }
+        self.search_history_enabled = enabled;
+        if !enabled {
+            self.search_history.clear();
+        }
+        true
+    }
+
+    fn normalize_search_history(&mut self) {
+        if !self.search_history_enabled {
+            self.search_history.clear();
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.search_history = self
+            .search_history
+            .drain(..)
+            .filter_map(|item| {
+                let item = item.trim().to_string();
+                if item.is_empty() || !seen.insert(item.clone()) {
+                    None
+                } else {
+                    Some(item)
+                }
+            })
+            .take(Self::SEARCH_HISTORY_LIMIT)
+            .collect();
+    }
+
     pub fn set_volume(&mut self, volume: f32) {
         if !volume.is_finite() {
             return;
@@ -217,6 +468,31 @@ impl Settings {
         !self.cookie.trim().is_empty() && !self.signer_url.trim().is_empty()
     }
 
+    /// 音质意图（空串按「自动」读）。
+    pub fn quality_intent(&self) -> crate::quality::QualityIntent {
+        crate::quality::QualityIntent::parse(&self.quality)
+    }
+
+    /// 音质偏好来源。
+    pub fn quality_source(&self) -> crate::quality::QualitySource {
+        self.quality_source
+    }
+
+    /// 用户在界面上手动写入音质意图，显式标记来源为 `QualitySource::User`。
+    pub fn set_quality_intent_by_user(&mut self, intent: &crate::quality::QualityIntent) {
+        self.set_quality_intent_with_source(intent, crate::quality::QualitySource::User);
+    }
+
+    /// 写入音质意图并显式记录其来源（用户手动选择或程序推导）。
+    pub fn set_quality_intent_with_source(
+        &mut self,
+        intent: &crate::quality::QualityIntent,
+        source: crate::quality::QualitySource,
+    ) {
+        self.quality = intent.as_setting().to_string();
+        self.quality_source = source;
+    }
+
     /// 生效的播放/暂停快捷键（配置为空时用内置默认值）。
     pub fn shortcut_toggle(&self) -> &str {
         effective_shortcut(&self.shortcut_toggle, DEFAULT_SHORTCUT_TOGGLE)
@@ -234,6 +510,10 @@ impl Settings {
 
     /// 用环境变量补全空字段（`SODA_COOKIE` / `QISHUI_SIGNER_URL` / `QISHUI_SIGNER_TOKEN`…），
     /// 便于先用 shell 跑起来，再逐步落到配置文件。
+    ///
+    /// `SODAM_QUALITY` 是唯一例外：音质的「自动」现在写成 `auto` 而不是空串，按「补空字段」
+    /// 的规则它会永远填不进去。所以它按**意图**与**来源**判断——只有当前未被用户显式
+    /// 选择且意图是自动时才让环境变量覆盖（标记为 `Derived`），用户手选的具体档位或明确选的「自动」不会被开发变量悄悄改掉。
     pub fn merged_with_env(mut self) -> Self {
         let pairs = [
             ("SODA_COOKIE", &mut self.cookie),
@@ -242,7 +522,6 @@ impl Settings {
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
-            ("SODAM_QUALITY", &mut self.quality),
         ];
         for (key, slot) in pairs {
             if slot.trim().is_empty() {
@@ -250,6 +529,16 @@ impl Settings {
                     if !value.trim().is_empty() {
                         *slot = value.trim().to_string();
                     }
+                }
+            }
+        }
+        if self.quality_source != crate::quality::QualitySource::User
+            && self.quality_intent() == crate::quality::QualityIntent::Auto
+        {
+            if let Ok(value) = std::env::var("SODAM_QUALITY") {
+                if !value.trim().is_empty() {
+                    self.quality = value.trim().to_string();
+                    self.quality_source = crate::quality::QualitySource::Derived;
                 }
             }
         }
@@ -266,6 +555,8 @@ mod tests {
         let mut settings: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(settings.volume, 1.0);
         assert_eq!(settings.audio_cache_limit_mb, 10 * 1024);
+        assert!(settings.search_history_is_enabled());
+        assert!(settings.search_history.is_empty());
         settings.set_volume(0.31);
         settings.toggle_mute();
         settings.toggle_mute();
@@ -279,6 +570,42 @@ mod tests {
         assert_eq!(settings.volume, 0.0);
         assert_eq!(settings.volume_before_mute, 1.0);
         assert_eq!(settings.audio_cache_limit_mb, 1024 * 1024);
+    }
+
+    #[test]
+    fn search_history_deduplicates_and_keeps_ten_recent_entries() {
+        let mut settings = Settings::default();
+        for index in 0..12 {
+            assert!(settings.record_search(&format!(" query-{index} ")));
+        }
+        assert_eq!(settings.search_history.len(), 10);
+        assert_eq!(settings.search_history[0], "query-11");
+        assert_eq!(settings.search_history[9], "query-2");
+
+        assert!(settings.record_search("query-5"));
+        assert_eq!(settings.search_history[0], "query-5");
+        assert_eq!(
+            settings
+                .search_history
+                .iter()
+                .filter(|item| item.as_str() == "query-5")
+                .count(),
+            1
+        );
+        assert!(!settings.record_search("   "));
+    }
+
+    #[test]
+    fn disabling_search_history_clears_and_stops_recording() {
+        let mut settings = Settings::default();
+        settings.record_search("first");
+        assert!(settings.set_search_history_enabled(false));
+        assert!(settings.search_history.is_empty());
+        assert!(!settings.record_search("second"));
+        assert!(!settings.set_search_history_enabled(false));
+        assert!(settings.set_search_history_enabled(true));
+        assert!(settings.record_search("third"));
+        assert_eq!(settings.search_history, vec!["third"]);
     }
 
     #[test]
@@ -361,6 +688,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 窗口按钮策略：默认 auto，未知值也回退 auto，老配置缺字段不影响。
+    #[test]
+    fn titlebar_mode_parses_and_resolves() {
+        assert_eq!(TitlebarMode::default(), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key(""), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key("auto"), TitlebarMode::Auto);
+        assert_eq!(TitlebarMode::from_key(" ALWAYS "), TitlebarMode::Always);
+        assert_eq!(TitlebarMode::from_key("never"), TitlebarMode::Never);
+        assert_eq!(TitlebarMode::from_key("nonsense"), TitlebarMode::Auto);
+
+        // auto 跟随桌面：GNOME 这类要求客户端自绘 → 画；Hyprland 这类 → 不画
+        assert!(TitlebarMode::Auto.draws_titlebar(true));
+        assert!(!TitlebarMode::Auto.draws_titlebar(false));
+        // 强制开关覆盖协商结果
+        assert!(TitlebarMode::Always.draws_titlebar(false));
+        assert!(!TitlebarMode::Never.draws_titlebar(true));
+
+        // 旧配置没有 titlebar 字段时按默认值读出来
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"theme":"dark","language":"zh"}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.titlebar, "");
+        assert_eq!(TitlebarMode::from_key(&loaded.titlebar), TitlebarMode::Auto);
+    }
+
     /// 快捷键：默认值、空串回退、老配置缺字段也能读。
     #[test]
     fn shortcut_defaults_and_fallback() {
@@ -382,5 +735,170 @@ mod tests {
         let parsed: Settings = serde_json::from_str(r#"{"cookie":"x"}"#).expect("老配置应能解析");
         assert_eq!(parsed.shortcut_next(), DEFAULT_SHORTCUT_NEXT);
         assert!(parsed.shortcut_toggle.is_empty());
+    }
+
+    /// gpui `unparse` 在本机给主修饰键用的拼法（macOS = cmd，Windows = win，其余 = super）。
+    fn platform_key() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd"
+        } else if cfg!(target_os = "windows") {
+            "win"
+        } else {
+            "super"
+        }
+    }
+
+    /// 旧 Display 写下来的符号形式被认出来并改写成规范串；合法写法与认不出的值一概不动。
+    #[test]
+    fn legacy_display_forms_migrate_and_legal_values_stay() {
+        let expected = format!("{}-left", platform_key());
+        assert_eq!(
+            normalize_legacy_keystroke("⌘←").as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            normalize_legacy_keystroke("^←").as_deref(),
+            Some("ctrl-left"),
+            "macOS 的 control 曾被写成不带连字符的 ^"
+        );
+        assert_eq!(
+            normalize_legacy_keystroke("ctrl-A").as_deref(),
+            Some("ctrl-a"),
+            "大写单字符是旧 Display 的产物，本意是 Ctrl+A"
+        );
+        let expected = format!("{}-shift-i", platform_key());
+        assert_eq!(
+            normalize_legacy_keystroke("⇧⌘I").as_deref(),
+            Some(expected.as_str())
+        );
+
+        // 已经是合法写法：不改，用户在配置文件里看到的仍是他写的东西。
+        assert_eq!(normalize_legacy_keystroke("ctrl-left"), None);
+        assert_eq!(normalize_legacy_keystroke("cmd-left"), None);
+        assert_eq!(normalize_legacy_keystroke(""), None);
+        // 认不出的符号不猜。
+        assert_eq!(normalize_legacy_keystroke("☃"), None);
+    }
+
+    /// 启动读到旧格式：改写并回存，用户下次打开配置文件看到的就是真正生效的值。
+    #[test]
+    fn load_from_migrates_legacy_shortcut_in_place() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"cookie":"x","shortcut_previous":"⌘←"}"#).expect("写入临时配置");
+        let expected = format!("{}-left", platform_key());
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.shortcut_previous, expected);
+        assert_eq!(loaded.cookie, "x", "迁移不该动别的字段");
+
+        let reread = std::fs::read_to_string(&path).expect("迁移后应回存");
+        assert!(
+            reread.contains(expected.as_str()),
+            "配置文件里应已是规范串：{reread}"
+        );
+    }
+
+    /// 音质只存意图并记录来源：用户选择落 `user`，推导落 `derived`，缺字段的旧配置读成未知。
+    #[test]
+    fn quality_setting_records_source_and_preserves_legacy_configs() {
+        use crate::quality::{QualityIntent, QualitySource};
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("config.json");
+
+        let mut settings = Settings::default();
+        assert_eq!(settings.quality_source(), QualitySource::Unknown);
+
+        // 用户手动设置音质后记为 User
+        settings.set_quality_intent_by_user(&QualityIntent::Tier("lossless".into()));
+        assert_eq!(settings.quality_source(), QualitySource::User);
+        settings.save_to(&path).expect("save");
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.quality, "lossless");
+        assert_eq!(loaded.quality_source(), QualitySource::User);
+
+        // 程序推导设定音质后记为 Derived
+        settings.set_quality_intent_with_source(
+            &QualityIntent::Tier("highest".into()),
+            QualitySource::Derived,
+        );
+        assert_eq!(settings.quality_source(), QualitySource::Derived);
+        settings.save_to(&path).expect("save");
+
+        let loaded_derived = Settings::load_from(&path);
+        assert_eq!(loaded_derived.quality, "highest");
+        assert_eq!(loaded_derived.quality_source(), QualitySource::Derived);
+
+        // 旧配置里的空串：读成自动，来源为未知，且文件不被无故改写
+        std::fs::write(&path, r#"{"quality":""}"#).expect("写入旧配置");
+        let legacy = Settings::load_from(&path);
+        assert_eq!(legacy.quality, "");
+        assert_eq!(legacy.quality_intent(), QualityIntent::Auto);
+        assert_eq!(legacy.quality_source(), QualitySource::Unknown);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回"),
+            r#"{"quality":""}"#,
+            "没有别的迁移时不应改写文件"
+        );
+
+        // 缺来源字段的具体档位旧配置：正常读取，来源为未知
+        std::fs::write(&path, r#"{"quality":"lossless"}"#).expect("写入旧配置");
+        let kept = Settings::load_from(&path);
+        assert_eq!(kept.quality, "lossless");
+        assert_eq!(
+            kept.quality_intent(),
+            QualityIntent::Tier("lossless".into())
+        );
+        assert_eq!(kept.quality_source(), QualitySource::Unknown);
+
+        // 包含未知来源字符串的旧配置：容错回退为未知，不破坏整份配置解析
+        std::fs::write(
+            &path,
+            r#"{"quality":"medium","quality_source":"unrecognized"}"#,
+        )
+        .expect("写入配置");
+        let fallback = Settings::load_from(&path);
+        assert_eq!(fallback.quality, "medium");
+        assert_eq!(fallback.quality_source(), QualitySource::Unknown);
+    }
+
+    /// 环境变量注入音质偏好：未手选时覆盖并标记为 Derived；用户手选后不再被覆盖。
+    #[test]
+    fn env_quality_override_records_derived_source_and_respects_user_choice() {
+        use crate::quality::{QualityIntent, QualitySource};
+
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let env_key = "SODAM_QUALITY";
+        let _guard = EnvGuard(env_key);
+        std::env::set_var(env_key, "lossless");
+        let merged = Settings::default().merged_with_env();
+        assert_eq!(merged.quality, "lossless");
+        assert_eq!(merged.quality_source(), QualitySource::Derived);
+
+        // 用户手选了档位（包括手选「自动」）时，环境变量不能覆盖用户的选择
+        let mut user_picked = Settings::default();
+        user_picked.set_quality_intent_by_user(&QualityIntent::Auto);
+        assert_eq!(user_picked.quality_source(), QualitySource::User);
+        let user_merged = user_picked.merged_with_env();
+        assert_eq!(user_merged.quality, "auto");
+        assert_eq!(user_merged.quality_source(), QualitySource::User);
+    }
+
+    /// 详细日志：新配置默认关闭，旧配置缺字段也能读。
+    #[test]
+    fn detailed_logs_defaults_off_and_reads_old_configs() {
+        assert!(!Settings::default().detailed_logs);
+        let parsed: Settings = serde_json::from_str(r#"{"cookie":"x"}"#).expect("老配置应能解析");
+        assert!(!parsed.detailed_logs);
+        let enabled: Settings = serde_json::from_str(r#"{"detailed_logs":true}"#).expect("解析");
+        assert!(enabled.detailed_logs);
     }
 }

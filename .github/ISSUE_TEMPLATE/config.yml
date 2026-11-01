@@ -1,0 +1,13 @@
+# 空白 issue 关掉：模板里的字段（版本、环境、复现）少问一轮就能定位问题。
+# 纯提问 / 使用交流走下面的链接，不占 issue。
+blank_issues_enabled: false
+contact_links:
+  - name: 安装、使用与常见问题
+    url: https://sodahub-org.github.io/sodam/install.html
+    about: 先看安装说明和 FAQ，多数「装不上 / 没声音 / 未登录」在这里能直接解决
+  - name: 让 AI 帮我装
+    url: https://sodahub-org.github.io/sodam/llm.html
+    about: 不想自己排查？复制这段提示词给你的 AI 助手
+  - name: Linux.do 交流帖
+    url: https://linux.do/t/topic/2921819
+    about: 使用体验、配置交流、非缺陷类讨论

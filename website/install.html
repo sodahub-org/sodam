@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安装 · SodaM</title>
+<meta name="description" content="SodaM 在 Linux、macOS 与 Windows 上的安装、校验与卸载说明。">
+<meta name="theme-color" content="#0d0f10">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="assets/logo.svg">
+<link rel="stylesheet" href="assets/style.css">
+<!-- 主题初始化必须放在 <head> 里同步执行：首屏绘制前把 data-theme 落到 <html> 上，避免闪白/闪黑 -->
+<script src="assets/theme.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="index.html">
+      <img src="assets/logo.svg" alt="SodaM">
+      <span>SodaM <small>汽水音乐第三方客户端</small></span>
+    </a>
+    <nav>
+      <a href="install.html" aria-current="page">安装</a>
+      <a href="changelog.html">更新日志</a>
+      <a href="llm.html">让 AI 帮我装</a>
+      <a href="developers.html">开发者</a>
+      <a href="https://github.com/sodahub-org/sodam">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap doc">
+  <div class="hero">
+    <h1>安装 SodaM</h1>
+    <p class="lead">
+      当前版本 <code data-version>—</code>。三个平台都提供预编译包；源码安装见
+      <a href="developers.html#build">开发者文档</a>。
+    </p>
+  </div>
+
+  <section id="linux">
+    <h2>Linux</h2>
+    <p>支持 <code>x86_64</code> 与 <code>aarch64</code>（含 Arch Linux ARM）。包依赖
+      <code>alsa-lib</code>、<code>dbus</code>、<code>fontconfig</code>、<code>freetype2</code>、
+      <code>libxkbcommon</code>、<code>libxcb</code>，由 pacman 自动处理。</p>
+
+    <h3>方式一：加 pacman 源（推荐，可随系统升级）</h3>
+    <div class="code">
+      <header><span>1. 编辑 /etc/pacman.conf，末尾追加</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>[sodam]
+SigLevel = Optional TrustAll
+Server = https://sodahub-org.github.io/sodam/$arch</pre>
+    </div>
+    <div class="code">
+      <header><span>2. 安装</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>sudo pacman -Sy sodam</pre>
+    </div>
+    <p class="lead-inline">
+      之后 <code>sudo pacman -Syu</code> 会一起升级。仓库内容由 CI 在每次发版后重建，
+      地址：<a href="https://sodahub-org.github.io/sodam/">sodahub-org.github.io/sodam</a>。
+      包未做 GPG 签名，所以用 <code>Optional TrustAll</code>；要严格校验请用方式二。
+    </p>
+
+    <h3>方式二：下载包手动安装</h3>
+    <div class="code">
+      <header><span>下载并校验</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>mkdir -p /tmp/sodam-install && cd /tmp/sodam-install
+
+arch=$(uname -m)          # x86_64 或 aarch64
+version=$(curl -fsSL https://api.github.com/repos/sodahub-org/sodam/releases/latest | grep -m1 tag_name | cut -d '"' -f4 | tr -d v)
+base=https://github.com/sodahub-org/sodam/releases/download/v${version}
+
+curl -fLO ${base}/SHA256SUMS
+curl -fLO ${base}/sodam-${version}-1-${arch}.pkg.tar.zst
+grep "sodam-${version}-1-${arch}\.pkg\.tar\.zst$" SHA256SUMS | sha256sum -c -</pre>
+    </div>
+    <div class="code">
+      <header><span>安装</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>sudo pacman -U ./sodam-*-1-${arch}.pkg.tar.zst</pre>
+    </div>
+
+    <h3>启动</h3>
+    <div class="code">
+      <header><span>命令行</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>sodam</pre>
+    </div>
+    <p class="lead-inline">也可以从应用菜单启动 <strong>SodaM</strong>。首次启动进入设置页，按提示扫码登录。</p>
+  </section>
+
+  <section id="macos">
+    <h2>macOS（Apple Silicon）</h2>
+    <p>需要 macOS <strong>Monterey (12)</strong> 或更高，仅支持 <code>arm64</code>。</p>
+
+    <h3>方式一：Homebrew（推荐）</h3>
+    <div class="code">
+      <header><span>安装 / 升级</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>brew install --cask sodahub-org/tap/sodam
+brew upgrade --cask sodam</pre>
+    </div>
+
+    <h3>方式二：下载 .app</h3>
+    <p>从 <a data-download="macos" href="https://github.com/sodahub-org/sodam/releases/latest">Releases</a>
+      下载 <code>sodam-&lt;version&gt;-macos-aarch64.zip</code>，解压后把 <strong>SodaM.app</strong> 拖进「应用程序」。</p>
+    <div class="note warn">
+      应用为 ad-hoc 签名，首次打开若被 Gatekeeper 拦截：右键点图标 →「打开」→ 再确认一次，
+      或在「系统设置 → 隐私与安全性」里选择「仍要打开」。
+    </div>
+  </section>
+
+  <section id="windows">
+    <h2>Windows（x64）</h2>
+    <p>Windows 10/11 x64。安装包按用户安装，不需要管理员权限。</p>
+    <ol>
+      <li>从 <a data-download="windows" href="https://github.com/sodahub-org/sodam/releases/latest">Releases</a>
+        下载 <code>sodam-&lt;version&gt;-windows-x64-setup.exe</code>。</li>
+      <li>双击运行，按向导完成安装（默认目录 <code>%LOCALAPPDATA%\Programs\SodaM</code>）。</li>
+      <li>首次运行若弹「Windows 已保护你的电脑」：点「更多信息」→「仍要运行」（安装包未做代码签名）。</li>
+    </ol>
+    <p class="lead-inline">配置保存在 <code>%APPDATA%\sodam\config.json</code>，覆盖安装不会丢失。</p>
+  </section>
+
+  <section id="verify">
+    <h2>校验下载</h2>
+    <p>每个 Release 都带 <code>SHA256SUMS</code>。Linux/macOS：</p>
+    <div class="code">
+      <header><span>sha256sum</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>sha256sum -c --ignore-missing SHA256SUMS</pre>
+    </div>
+    <p>Windows PowerShell：</p>
+    <div class="code">
+      <header><span>Get-FileHash</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>$expected = (Select-String -Path SHA256SUMS -Pattern "setup\.exe$").Line.Split(' ')[0]
+$actual = (Get-FileHash .\sodam-*-setup.exe -Algorithm SHA256).Hash.ToLower()
+if ($expected -eq $actual) { "SHA256 OK" } else { throw "SHA256 mismatch" }</pre>
+    </div>
+  </section>
+
+  <section id="uninstall">
+    <h2>卸载</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>平台</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr><td>Arch Linux</td><td><code>sudo pacman -Rns sodam</code>（从 pacman.conf 里删掉 <code>[sodam]</code> 段即为断开源）</td></tr>
+          <tr><td>macOS</td><td><code>brew uninstall --cask --zap sodam</code>，或把 app 拖进废纸篓</td></tr>
+          <tr><td>Windows</td><td>设置 → 应用 → SodaM → 卸载</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="lead-inline">
+      配置与缓存目录：Linux <code>~/.config/sodam</code> / <code>~/.cache/sodam</code>，
+      macOS <code>~/Library/Application Support/sodam</code>，Windows <code>%APPDATA%\sodam</code>。
+      需要彻底清理时手动删除即可。
+    </p>
+  </section>
+
+  <section id="faq">
+    <h2>常见问题</h2>
+
+    <h3>没有声音 / 音频设备不可用</h3>
+    <p>先确认系统里有可用的输出设备，然后在 设置 → 音频 里看错误提示。播放中切换默认输出设备（音响 ↔ 耳机）
+      会在 2 秒内自动跟随，不需要重启。</p>
+
+    <h3>扫码登录后还是未登录</h3>
+    <p>确认网络能访问汽水音乐接口；如果使用的是远程签名服务，检查设置里的签名地址与 Token。</p>
+
+    <h3>Linux 下没有标题栏按钮</h3>
+    <p>GNOME 等使用客户端装饰的桌面会由应用自绘最小化/最大化/关闭按钮；Hyprland/sway 这类平铺桌面
+      仍然由系统管理窗口（无标题栏），用桌面自己的快捷键即可。</p>
+
+    <h3>能装到非 Arch 的 Linux 吗</h3>
+    <p>目前只发布 pacman 包。其它发行版可以从源码构建（见 <a href="developers.html#build">开发者文档</a>）。</p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap row">
+    <span>© SodaM · AGPL-3.0-or-later</span>
+    <a href="https://github.com/sodahub-org/sodam">源码</a>
+    <a href="https://github.com/sodahub-org/sodam/releases">Releases</a>
+    <a href="llm.html">让 AI 帮我装</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

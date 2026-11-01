@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use crate::log_outlet::{self, LogLevel, LogTopic};
 use crate::models::{
     AlbumDetail, AlbumItem, ArtistDetail, ArtistItem, ArtistTracksPage, PlaylistItem, SceneItem,
     SearchEntry, SearchGroup, SearchResults, TrackItem,
@@ -196,8 +197,14 @@ fn recommended_page(
     });
     // 听歌时长就靠这个上报（最近播过 + 实际播放毫秒）。
     body["played_media"] = libresoda::media_played_array(played_media);
-    if std::env::var("SODAM_REPORT_LOG").is_ok() {
-        eprintln!("[report] feed played_media={}", body["played_media"]);
+    if log_outlet::enabled(LogLevel::Debug, LogTopic::Report) {
+        let payload = body["played_media"].to_string();
+        log_outlet::log_event(
+            LogLevel::Debug,
+            LogTopic::Report,
+            "feed_played_media",
+            &[("payload", payload.as_str())],
+        );
     }
     if let Some(scene) = &source.scene {
         if scene.scene_mode_id >= 0 {

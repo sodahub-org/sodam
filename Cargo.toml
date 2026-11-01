@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sodam", "crates/sodam-core"]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.3.7"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
@@ -24,4 +24,4 @@ ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] 
 
 # 公开源码依赖；本地联调可选：可用 `[patch."https://github.com/sodahub-org/libresoda"]`
 # 指向同级 clone，见 README「快速开始」。
-libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "928797d" }
+libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "44df096" }

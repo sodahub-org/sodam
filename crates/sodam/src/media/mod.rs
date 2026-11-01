@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use gpui::{App, Global};
+use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
 
 #[cfg(target_os = "linux")]
 mod mpris;
@@ -130,7 +131,13 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
     let controls = match Controls::new(hwnd, sender, cx) {
         Ok(controls) => controls,
         Err(error) => {
-            eprintln!("[media] 无法接入系统媒体控制：{error:#}");
+            let detail = format!("{error:#}");
+            log_event(
+                LogLevel::Warn,
+                LogTopic::Media,
+                "attach_failed",
+                &[("detail", detail.as_str())],
+            );
             return;
         }
     };

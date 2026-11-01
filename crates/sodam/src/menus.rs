@@ -32,11 +32,13 @@ pub fn install(cx: &mut App, language: Language) {
 ///
 /// 单独暴露给 `shortcuts::apply`：重绑播放快捷键时会整表重建 keymap，
 /// 这里必须跟着一起注册，否则 ⌘Q/⌘M/⌘W 会失效。
+/// 加上 `!capturing` 让录制态先收到按键；否则 keymap 会在 `on_key_down` 前
+/// 直接执行退出/最小化/关闭，根本走不到冲突提示。
 pub fn window_bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new("cmd-q", QuitApp, None),
-        KeyBinding::new("cmd-m", MinimizeWindow, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-q", QuitApp, Some("!capturing")),
+        KeyBinding::new("cmd-m", MinimizeWindow, Some("!capturing")),
+        KeyBinding::new("cmd-w", CloseWindow, Some("!capturing")),
     ]
 }
 

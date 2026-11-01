@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>开发者文档 · SodaM</title>
+<meta name="description" content="SodaM 的构建、目录结构、架构要点、开发约定与发布流程。">
+<meta name="theme-color" content="#0d0f10">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="assets/logo.svg">
+<link rel="stylesheet" href="assets/style.css">
+<!-- 主题初始化必须放在 <head> 里同步执行：首屏绘制前把 data-theme 落到 <html> 上，避免闪白/闪黑 -->
+<script src="assets/theme.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="index.html">
+      <img src="assets/logo.svg" alt="SodaM">
+      <span>SodaM <small>汽水音乐第三方客户端</small></span>
+    </a>
+    <nav>
+      <a href="install.html">安装</a>
+      <a href="changelog.html">更新日志</a>
+      <a href="llm.html">让 AI 帮我装</a>
+      <a href="developers.html" aria-current="page">开发者</a>
+      <a href="https://github.com/sodahub-org/sodam">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap doc">
+  <div class="hero">
+    <h1>开发者文档</h1>
+    <p class="lead">
+      SodaM 是一个 Rust workspace：<code>sodam-core</code> 是纯领域层，<code>sodam</code> 是 GPUI 应用。
+      音乐能力来自 <a href="https://github.com/sodahub-org/libresoda">libresoda</a>，
+      应用签名来自 <a href="https://github.com/sodahub-org/libmssdk">libmssdk</a>。
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/sodahub-org/sodam">克隆仓库</a>
+      <a class="btn ghost" href="#conventions">开发约定</a>
+      <a class="btn ghost" href="#release">发布流程</a>
+    </div>
+  </div>
+
+  <section id="requirements">
+    <h2>环境要求</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>项目</th><th>要求</th></tr></thead>
+        <tbody>
+          <tr><td>Rust</td><td>1.85+（workspace <code>rust-version</code>）</td></tr>
+          <tr><td>Linux 依赖</td><td><code>alsa-lib</code> <code>dbus</code> <code>fontconfig</code> <code>freetype2</code> <code>hicolor-icon-theme</code> <code>libxkbcommon</code> <code>libxcb</code></td></tr>
+          <tr><td>macOS</td><td>Apple Silicon，Xcode Command Line Tools</td></tr>
+          <tr><td>Windows</td><td>x64，MSVC 工具链</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="build">
+    <h2>构建与运行</h2>
+    <p>仓库自带带<b>内存护栏</b>的脚本（这台开发机 15GB 内存，GPUI 编译较重，曾出现过 OOM）：</p>
+    <div class="code">
+      <header><span>常用命令</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>git clone https://github.com/sodahub-org/sodam
+cd sodam
+
+scripts/check.sh   # cargo check + fmt --check + clippy -D warnings + test
+scripts/build.sh   # 构建（默认 debug，--release 出正式包）
+scripts/run.sh     # 启动 GUI（带 MemoryMax 护栏，编译时不要跑）</pre>
+    </div>
+    <div class="note warn">
+      资源护栏：编译时不跑 GUI、跑 GUI 时不编译；卡顿时先看
+      <code>journalctl -k | grep -iE "drm|flip_done|oom"</code>。
+    </div>
+    <p>提交前必须跑 <code>scripts/check.sh</code>；UI 改动必须用 <code>scripts/run.sh</code> 真机验证，不能只过 <code>cargo check</code>。</p>
+  </section>
+
+  <section id="layout">
+    <h2>目录结构</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>路径</th><th>职责</th></tr></thead>
+        <tbody>
+          <tr><td><code>crates/sodam-core/</code></td><td>领域层：配置、会话、队列、音乐库、播放引擎（<b>不依赖 GPUI</b>）</td></tr>
+          <tr><td><code>crates/sodam/</code></td><td>GPUI 应用：入口、Root 状态、动作、托盘、<code>ui/</code>、<code>views/</code></td></tr>
+          <tr><td><code>packaging/arch/</code></td><td>PKGBUILD、desktop 文件、<code>mkrepo.sh</code>（生成 pacman 源）</td></tr>
+          <tr><td><code>packaging/homebrew/</code></td><td>Homebrew Cask</td></tr>
+          <tr><td><code>website/</code></td><td>本官网（静态页面，CI 部署到 GitHub Pages）</td></tr>
+          <tr><td><code>docs/</code></td><td>ARCHITECTURE / ROADMAP / UI-SPEC</td></tr>
+          <tr><td><code>scripts/</code></td><td>check / build / run（带内存护栏）</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <h2>架构要点</h2>
+    <ul>
+      <li><b>领域层不依赖 GPUI</b>：<code>sodam-core</code> 是纯 Rust，可单独测试。</li>
+      <li><b>渲染线程不阻塞</b>：libresoda 的 HTTP / 下载是阻塞操作，必须放在 <code>cx.background_spawn</code> 或专用线程，结果回 UI 后 <code>cx.notify()</code>。</li>
+      <li><b>状态只有一处</b>：播放、队列、导航、设置由 <code>Root</code> 或 core 模型持有；UI 只读状态、生成元素、派发动作。</li>
+      <li><b>音频线程独立</b>：rodio 的 <code>OutputStream</code> 是 <code>!Send</code>，所以音频对象全留在 <code>sodam-audio</code> 线程，UI 通过命令通道操作、通过 <code>PlaybackSnapshot</code> 读状态。</li>
+      <li><b>错误不 panic</b>：网络/配置错误写进 <code>Root::status</code> 或页面提示；只有启动期不可恢复错误才允许 panic。</li>
+      <li><b>播放跟随系统默认设备</b>：音频线程每 2 秒探测默认输出设备 ID，变化时重建输出并从原位置续播。</li>
+    </ul>
+    <p class="lead-inline">更详细的线程模型见仓库 <a href="https://github.com/sodahub-org/sodam/blob/main/docs/ARCHITECTURE.md">docs/ARCHITECTURE.md</a>。</p>
+  </section>
+
+  <section id="conventions">
+    <h2>开发约定</h2>
+    <ol>
+      <li><b>接口能力先在 libresoda 打通</b>：SodaM 只做调用与展示，不绕过 libresoda 直接请求汽水接口。</li>
+      <li><b>凭据不入库、不入日志</b>：Cookie、签名 Token、抓包签名头、真实设备指纹禁止提交或打印。</li>
+      <li><b>界面文案走 i18n</b>：新增用户可见文案用 <code>root.tr</code> / <code>root.localized</code>，中文原文作为稳定 key，同步英文词典。</li>
+      <li><b>不引入个人数据</b>：不提交真实 Cookie、签名头、本机路径或账号数据。</li>
+      <li><b>UI 改动必须真机验证</b>，提交前跑 <code>scripts/check.sh</code>。</li>
+    </ol>
+  </section>
+
+  <section id="workflow">
+    <h2>提交与评审</h2>
+    <ol>
+      <li>从 <code>main</code> 切分支：<code>feat/…</code> / <code>fix/…</code> / <code>docs/…</code>。</li>
+      <li>commit message 用中文祈使句 + 类型前缀：<code>fix(audio): …</code>、<code>feat(ui): …</code>。</li>
+      <li>本地跑 <code>scripts/check.sh</code>，UI 改动用 <code>scripts/run.sh</code> 真机确认。</li>
+      <li>开 PR，说明「问题 / 原因 / 修复 / 验证」四段；CI 会跑四平台（Linux x86_64 &amp; aarch64、macOS arm64、Windows x64）。</li>
+      <li>Review 通过后 squash 合并。</li>
+    </ol>
+  </section>
+
+  <section id="release">
+    <h2>发布流程</h2>
+    <ol>
+      <li>改版本号：<code>Cargo.toml</code> 的 <code>[workspace.package] version</code>（<code>Cargo.lock</code> 同步）、<code>packaging/arch/PKGBUILD</code>、README 里的版本示例。</li>
+      <li>先由发版工作流生成产物，按 <code>SHA256SUMS</code> 更新 Homebrew Cask 并提交；</li>
+      <li>在包含正式 Cask 校验和的提交上打<b>附注 tag</b>，tag message 就是发布说明：</li>
+    </ol>
+    <div class="code">
+      <header><span>发版</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>git tag -a v0.3.5 -F changelog.txt
+git push origin main
+git push origin v0.3.5</pre>
+    </div>
+    <p>CI 会构建四平台产物、创建 GitHub Release，然后自动重建 pacman 源并部署本官网。</p>
+    <ul>
+      <li>用 <code>packaging/homebrew/sync-tap.sh</code> 把同一 Cask 同步到 homebrew-tap 仓库。</li>
+      <li>pacman 源需要补跑时：<code>gh workflow run pages.yml -f tag=v0.3.5</code>。</li>
+    </ul>
+  </section>
+
+  <section id="contributors">
+    <h2>维护者与贡献者</h2>
+    <a class="contrib-rocks" href="https://github.com/sodahub-org/sodam/graphs/contributors">
+      <img src="https://contrib.rocks/image?repo=sodahub-org/sodam" alt="SodaM contributors" loading="lazy">
+    </a>
+    <p class="lead-inline">
+      欢迎提 Issue / PR：先读
+      <a href="https://github.com/sodahub-org/sodam/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>，
+      提问题请用 <a href="https://github.com/sodahub-org/sodam/issues/new/choose">issue 模板</a>；
+      涉及界面改动请附真机截图。
+    </p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap row">
+    <span>© SodaM · AGPL-3.0-or-later</span>
+    <a href="https://github.com/sodahub-org/sodam">源码</a>
+    <a href="https://github.com/sodahub-org/sodam/blob/main/AGENTS.md">AGENTS.md</a>
+    <a href="https://github.com/sodahub-org/sodam/blob/main/docs/ARCHITECTURE.md">ARCHITECTURE.md</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

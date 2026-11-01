@@ -2,6 +2,405 @@
 
 use super::scenes::retry_button;
 use super::*;
+
+/// 歌词排版沿用 SodaM 原本的样式：字号 `Text::Large`、行高 32、每句间距 32。
+/// 不采用官方客户端的 24px/34 字号行高——那套在 SodaM 里显得过大。
+const LYRIC_LINE_HEIGHT: f32 = 32.0;
+/// 相邻两句之间的间距（单句文本 32 + 间距 32 = 原来每行 64 的效果）。
+const LYRIC_ROW_GAP: f32 = 32.0;
+
+/// 一行歌词的逐字高亮文字。
+///
+/// 官方客户端用 CSS 的 `background-clip: text` + 逐帧调 `background-position-x`，
+/// 所以亮光能停在**一个字中间**（亚像素级平滑）。gpui 没有 background-clip，
+/// 但等价的东西做得到：把同一段文字画两遍，第二遍用像素矩形裁出"已唱到"的宽度。
+///
+/// 为什么不能继续用 `TextRun` 分段：`TextRun` 按字节区间切，必然只能整个字跳变，
+/// 字内没有过渡 —— 这就是"能走字但不丝滑"的原因。
+///
+/// 两层文字共用**同一次 shaping**（同一份 `WrappedLine`），所以折行、字距、基线
+/// 完全一致，不会出现两层对不齐。
+///
+/// `reveal` 说明亮光走到哪：整行未亮 / 已亮一部分（按**字符位置**给出）/ 整行全亮。
+/// 用字符位置而不是比例，是为了让渲染层能按真实字形宽度换算像素。
+/// 把「亮到第几个字符」换算成**未折行坐标下的像素 x**。
+///
+/// 逐字形累加真实前进宽度，而不是用「字符比例 × 总宽」：
+/// 字符宽度差异很大（`I` 窄、`friends` 宽），按比例算会让亮光位置与字形
+/// 错位，末尾那段被一次性点亮，看起来就是"最后一个字一闪而过"。
+///
+/// `done` 可带小数（`7.42` = 前 7 字已满 + 第 8 字亮 42%），小数部分按
+/// 该字形自身的宽度插值，所以亮光能停在**一个字中间**。
+fn reveal_x_from_chars(
+    line: &gpui::WrappedLine,
+    text: &str,
+    done: f32,
+    fallback_width: f32,
+) -> f32 {
+    // 用**字节下标**对齐字符与字形。
+    //
+    // `done` 是"第几个字符"，而 shaping 的产物是字形：连字（fi/fl）、组合符号、
+    // emoji ZWJ 序列都可能让「字符数 ≠ 字形数」。直接拿字符下标去索引字形会错位，
+    // 甚至在文本还没走完时就跑出范围、提前返回 `f32::MAX` 把整行点亮。
+    // `ShapedGlyph::index` 是原文的 UTF-8 字节下标，字符序号换成字节偏移后再定位才是对的。
+    let glyphs: Vec<(usize, f32)> = line
+        .runs()
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
+        .collect();
+    reveal_x_from_glyphs(&glyphs, text, done, fallback_width)
+}
+
+/// [`reveal_x_from_chars`] 的纯计算部分：只依赖各字形的左边界 x。
+///
+/// 抽出来是为了能脱离窗口环境做单元测试 —— 这里是"走得丝不丝滑"的核心，
+/// 之前反复出错（比例当像素、末字不亮）。
+fn reveal_x_from_glyphs(
+    glyphs: &[(usize, f32)],
+    text: &str,
+    done: f32,
+    fallback_width: f32,
+) -> f32 {
+    if glyphs.is_empty() || done <= 0.0 {
+        return 0.0;
+    }
+
+    let whole = done.floor().max(0.0) as usize;
+    let fraction = (done - whole as f32).clamp(0.0, 1.0);
+
+    // 字符序号 → 字节偏移。越界说明整行都走完了。
+    let Some((byte_offset, _)) = text.char_indices().nth(whole) else {
+        return f32::MAX;
+    };
+    // 第一个字节下标 >= byte_offset 的字形，就是"该字符"开始的地方。
+    // 连字情况下可能没有精确等于的字形，取第一个不小于它的。
+    let index = glyphs.partition_point(|(byte, _)| *byte < byte_offset);
+    if index >= glyphs.len() {
+        return f32::MAX;
+    }
+    let start_x = glyphs[index].1;
+    if fraction <= 0.0 {
+        return start_x;
+    }
+    // 该字形的自身宽度 = 下一个字形的左边界 - 本字形左边界。
+    // 末字形没有"下一个"，用调用方补上的宽度兜底：否则末字宽被算成 0，
+    // 它的字内推进恒为 0 —— 表现就是"最后一个字不亮，直接跳到下一句"。
+    let next_x = glyphs
+        .get(index + 1)
+        .map(|(_, x)| *x)
+        .unwrap_or(start_x + fallback_width);
+    let glyph_width = (next_x - start_x).max(0.0);
+    start_x + glyph_width * fraction
+}
+
+/// 缓存一次 shaping 的结果，避免 60fps 下每帧重排同一行文字。
+///
+/// 为什么需要它：逐字高亮每帧只改"亮到哪个像素"，文字内容完全没变。
+/// 但每帧都会重新构造元素树，`canvas` 的 prepaint 会再跑一次 `shape_text` ——
+/// 实测每次约 0.3ms（debug），60fps 下就是 18% 单核的纯重复劳动。
+/// 这里按「文本 + 可用宽度 + 字号 + 底色 + 字体 id」缓存，
+/// 命中时只做一次 `Arc` 自增。
+///
+/// 只放在线程局部：只有 UI 线程会画字，且 `WrappedLine` 不要求 `Send`。
+/// 条目数超过上限就整体清空 —— 歌词页的元素数量天然有限，不需要 LRU。
+const SHAPE_CACHE_LIMIT: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text: u64,
+    width_bits: u32,
+    font_size_bits: u32,
+    /// 底色也必须进 key：`WrappedLine::paint` 用的是 **shaping 时**写进 run 的颜色，
+    /// 只缓存几何的话，主体色一变（换封面、切主题）就会继续画旧颜色。
+    base_bits: [u32; 4],
+    /// 字体 id：字体族晚一步加载完成时字形会变，靠它让旧缓存自然失效。
+    font_id: usize,
+}
+
+thread_local! {
+    static SHAPE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<ShapeKey, std::sync::Arc<Vec<gpui::WrappedLine>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn shape_cache_lookup(key: ShapeKey) -> Option<std::sync::Arc<Vec<gpui::WrappedLine>>> {
+    SHAPE_CACHE.with(|cache| cache.borrow().get(&key).cloned())
+}
+
+fn shape_cache_store(key: ShapeKey, lines: std::sync::Arc<Vec<gpui::WrappedLine>>) {
+    SHAPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= SHAPE_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, lines);
+    });
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LyricReveal {
+    /// 整行未点亮。
+    None,
+    /// 整行已点亮。
+    All,
+    /// 亮到 `done` 个字符（可含小数）。字符下标与 `text` 一一对应，
+    /// 渲染层直接索引字形即可，不需要总数。
+    Partial { done: f32 },
+}
+
+fn highlighted_line(
+    text: &str,
+    reveal: LyricReveal,
+    base: gpui::Rgba,
+    lit: gpui::Rgba,
+) -> AnyElement {
+    // 两端直接走普通文本：省掉 shaping 与两次绘制。
+    if matches!(reveal, LyricReveal::None) || matches!(reveal, LyricReveal::All) {
+        let color = if matches!(reveal, LyricReveal::All) {
+            lit
+        } else {
+            base
+        };
+        return div()
+            .text_color(color)
+            .child(text.to_string())
+            .into_any_element();
+    }
+
+    let base: gpui::Hsla = base.into();
+    let lit: gpui::Hsla = lit.into();
+    let shared: gpui::SharedString = text.to_string().into();
+    // paint 阶段也要按字节下标对齐字形（见 `reveal_x_from_chars`），留一份副本。
+    let paint_text: gpui::SharedString = shared.clone();
+
+    let overlay = gpui::canvas(
+        move |bounds, window, _cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line_height = window.pixel_snap(
+                style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            );
+            let run = |color| gpui::TextRun {
+                len: shared.len(),
+                // 字重必须与普通文本**完全一致**：当前行改用粗体会让字宽变化，
+                // 高亮行与非高亮行的字距就对不上了（官方也是整段统一字重，
+                // 只用颜色区分高亮）。这里直接用继承来的字体，不覆盖 weight。
+                font: style.font(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            // 按可用宽度折行：与普通文本一致，长句不会一路撑宽被裁（#56）。
+            let wrap = Some(bounds.size.width);
+            // shaping 结果按（文本, 宽度, 字号, 底色, 字体）缓存：逐字高亮每帧只改
+            // "亮到哪个像素"，文字内容没变，重排是纯重复劳动（见 `SHAPE_CACHE`）。
+            let key = ShapeKey {
+                text: hash_text(&shared),
+                width_bits: f32::from(bounds.size.width).to_bits(),
+                font_size_bits: f32::from(font_size).to_bits(),
+                base_bits: {
+                    let rgba = gpui::Rgba::from(base);
+                    [
+                        rgba.r.to_bits(),
+                        rgba.g.to_bits(),
+                        rgba.b.to_bits(),
+                        rgba.a.to_bits(),
+                    ]
+                },
+                font_id: window.text_system().resolve_font(&style.font()).0,
+            };
+            let lines = match shape_cache_lookup(key) {
+                Some(cached) => cached,
+                None => {
+                    let shaped = window
+                        .text_system()
+                        .shape_text(shared.clone(), font_size, &[run(base)], wrap, None)
+                        .ok()
+                        .map(|lines| lines.into_iter().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let shaped = std::sync::Arc::new(shaped);
+                    shape_cache_store(key, shaped.clone());
+                    shaped
+                }
+            };
+            (lines, line_height)
+        },
+        move |bounds, (lines, line_height), window, cx| {
+            // 已唱到的宽度按**像素**算，不对齐字符边界 —— 这是字内过渡的全部来源。
+            let origin_x = bounds.origin.x;
+
+            for base_line in lines.iter() {
+                let block_origin = gpui::point(origin_x, bounds.origin.y);
+
+                // 第 1 遍：整块底色（未唱部分）。一次画完，不用管折行。
+                let _ = base_line.paint(
+                    block_origin,
+                    line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+
+                // 第 2 遍：亮色重画，按**视觉行**逐段裁剪。
+                //
+                // 一个 `WrappedLine` 是**整段文本**，折行后含多个视觉行；`size()` 是
+                // 整块尺寸，不是单行尺寸（#80 实测：直接用它会让第二行整行亮或永远不亮）。
+                //
+                // 每个视觉行在**未折行**坐标里的 x 区间：
+                //   起点 = 上一个折行点 glyph 的 x，终点 = 本折行点（末行取整段宽度）。
+                // 相减就是该行的真实宽度。runs() 给的是未折行坐标，正好可以直接用。
+                let boundaries = base_line.wrap_boundaries();
+                let runs = base_line.runs();
+                let glyph_x = |run_ix: usize, glyph_ix: usize| -> f32 {
+                    runs.get(run_ix)
+                        .and_then(|run| run.glyphs.get(glyph_ix))
+                        .map(|glyph| f32::from(glyph.position.x))
+                        .unwrap_or(0.0)
+                };
+                // 每行的未折行 x 起点/终点。
+                let mut line_spans: Vec<(f32, f32)> = Vec::with_capacity(boundaries.len() + 1);
+                let mut cursor_x = 0.0f32;
+                for boundary in boundaries {
+                    let x = glyph_x(boundary.run_ix, boundary.glyph_ix);
+                    line_spans.push((cursor_x, x));
+                    cursor_x = x;
+                }
+                // 最后一行的右端：用**最后一个 glyph 的 x + 它的步进**，
+                // 不能用 `width()`——那是折行后的容器宽度（等于列宽），
+                // 末行通常远短于它，用错会把末行宽度算成“列宽 - 已用”。
+                let last_glyph_right = runs
+                    .iter()
+                    .flat_map(|run| run.glyphs.iter())
+                    .last()
+                    .map(|glyph| f32::from(glyph.position.x))
+                    .unwrap_or(0.0);
+                // 末字形没有"下一个字形"，它的宽度得单独估。
+                //
+                // 这个宽度有两个用途，缺了任何一个都会让**最后一个字永远不亮**：
+                //   1. 末字的字内插值（否则推进恒为 0，亮光卡在末字左边界）；
+                //   2. 末行总宽（`content_right` 若只取末字左边界，裁剪区域就
+                //      不包含末字本身，末字被裁掉）。
+                //
+                // 不能用 `text_system().advance(font_id, ..)` 查：`font_id` 是主字体，
+                // 而中日韩字符往往由 **fallback 字体**渲染，主字体查不到对应字形，
+                // `advance` 直接失败返回 0 —— 末字就又回到"永远不亮"。
+                // 这里改用与末字形**同一 run** 里前一个字形的间距：同一 run 意味着
+                // 同一个实际字体，间距才是对的。只有一个字形时退化成整行宽度。
+                let last_advance = {
+                    let glyphs: Vec<&gpui::ShapedGlyph> =
+                        runs.iter().flat_map(|run| run.glyphs.iter()).collect();
+                    match glyphs.len() {
+                        0 => 0.0,
+                        1 => f32::from(base_line.width()),
+                        _ => {
+                            let last = glyphs[glyphs.len() - 1];
+                            let prev = glyphs[glyphs.len() - 2];
+                            let gap = f32::from(last.position.x) - f32::from(prev.position.x);
+                            // 同一字体里中文等宽、西文差异不大；用一个正的间距兜底。
+                            gap.max(0.0)
+                        }
+                    }
+                };
+
+                // 末行右端 = 末字形左边界 + 末字形宽度。
+                //
+                // 之前只取 `last_glyph_right`（左边界），末行宽度少了一个字，
+                // 裁剪区域永远覆盖不到最后一个字 —— 实测"最后一个字不亮、
+                // 直接跳到下一句"就是这个原因。
+                let content_right = (last_glyph_right + last_advance).max(cursor_x);
+                line_spans.push((cursor_x, content_right.max(cursor_x)));
+
+                // 把"亮到第几个字符"换算成**像素位置**。
+                //
+                // 不能拿字符比例乘内容总宽：字符宽度差异很大（`I` 窄、`friends` 宽），
+                // 比例和像素位置不成正比，末尾那段会被一次性点亮——表现为
+                // "最后一个字一闪而过"。这里按字形逐个累加真实宽度。
+                let revealed_x = match reveal {
+                    LyricReveal::Partial { done } => {
+                        reveal_x_from_chars(base_line, &paint_text, done, last_advance)
+                    }
+                    _ => 0.0,
+                };
+                let mut remaining = revealed_x;
+                for (visual, (start_x, end_x)) in line_spans.iter().enumerate() {
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    let line_width = (end_x - start_x).max(0.0);
+                    let visible = remaining.min(line_width);
+                    if visible > 0.0 {
+                        let top = bounds.origin.y + line_height * visual as f32;
+                        let mask = gpui::ContentMask {
+                            bounds: gpui::Bounds {
+                                origin: gpui::point(origin_x, top),
+                                size: gpui::size(gpui::px(visible), line_height),
+                            },
+                        };
+                        // 第二遍用 `paint_tinted` 把字形染成亮色，
+                        // 复用同一份 shaping 结果。
+                        window.with_content_mask(Some(mask), |window| {
+                            let _ = base_line.paint_tinted(
+                                block_origin,
+                                line_height,
+                                gpui::TextAlign::Left,
+                                None,
+                                lit,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                    remaining -= line_width;
+                }
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element();
+
+    // 高度必须由**真实文本**撑出来：canvas 没有固有高度，单独用它会让外层布局
+    // 把整行压成 0（表现就是下一句贴在这一句上）。所以：
+    //   1. 先用一段同字号同字重的**透明文本**参与布局，决定高度与折行；
+    //   2. canvas 绝对定位覆盖在它上面，负责真正的两遍绘制。
+    // 两者用同一份文字和同样的宽度约束，折行位置一致。
+    div()
+        .relative()
+        .w_full()
+        .child(
+            div()
+                .w_full()
+                .text_color(gpui::transparent_black())
+                .child(text.to_string()),
+        )
+        .child(overlay)
+        .into_any_element()
+}
+
+/// 歌词区没有内容时（加载中 / 出错 / 无歌词）的占位：铺满右侧栏并垂直居中。
+fn centered_state(content: AnyElement) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .size_full()
+        .child(content)
+        .into_any_element()
+}
+
 /// 歌词播放页：左封面，右滚动歌词，当前行跟随播放进度。
 pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
     if root.switching_queue.is_some() {
@@ -13,7 +412,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .into_any_element();
     }
 
-    let snapshot = root.engine.snapshot();
     let Some(track) = root
         .pending_track
         .clone()
@@ -28,47 +426,76 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     };
 
     let liked = root.liked_ids.contains(&track.id);
-    let active = root.lyrics_active;
     let lines = root.lyrics.clone();
+    // 歌词区高度：滚到中间要给首尾句留出半个视口的空白，所以先算出来。
+    let lyrics_viewport_height =
+        (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
+    let lyric_padding = lyrics_viewport_height / 2.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
         Some(
-            uniform_list(
-                "lyrics-list",
-                root.lyrics.len(),
-                move |range, _window, _cx| {
-                    range
-                        .map(|index| {
-                            let Some(line) = lines.get(index) else {
-                                return div().h(px(64.0)).into_any_element();
-                            };
-                            let is_active = active == Some(index);
-                            let color = if is_active {
-                                theme::accent()
-                            } else {
-                                theme::text_muted()
-                            };
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .h(px(64.0))
-                                .text_size(theme::Text::Large.size())
-                                .line_height(px(32.0))
-                                .text_color(color)
-                                .when(is_active, |this| this.font_weight(gpui::FontWeight::BOLD))
-                                .child(line.text.clone())
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>()
-                },
-            )
-            .flex_1()
-            .min_h(px(0.0))
-            .track_scroll(&root.lyrics_scroll)
-            .into_any_element(),
+            div()
+                .id("lyrics-scroll")
+                // 整块歌词自己滚动。这里不用虚拟列表：长句折行后每句高度都不一样，
+                // 等高列表会把折出来的第二行裁掉（#56）。
+                .flex()
+                .flex_col()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .pt(px(lyric_padding))
+                .pb(px(lyric_padding))
+                .overflow_y_scroll()
+                .track_scroll(&root.lyrics_scroll)
+                // 用户滚动时暂停自动跟随 5 秒（官方行为），否则往回翻会被拽回当前句。
+                .on_scroll_wheel(cx.listener(|root, _event, _window, cx| {
+                    root.lyrics_user_scroll_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                    // 用户已经自己滚了，过渡动画必须让位，否则会和手动滚动打架。
+                    root.cancel_lyrics_scroll_tween();
+                    cx.notify();
+                }))
+                .children(lines.iter().enumerate().map(|(index, line)| {
+                    let next_start = lines.get(index + 1).map(|next| next.start_seconds);
+                    // 本行此刻是否"正在唱"：区间是 `[start, 下一句开始)`。
+                    //
+                    // 上一句一直保持高亮到下一句接管为止 —— 走完后亮光停在整行全亮，
+                    // 不会提前变暗。切句动画在**下一句开始之后**才起跑（滚动跟随
+                    // 不再提前 250ms），所以顺序是：先切换高亮（上一句归还强调色、
+                    // 下一句亮起），再播滚动动画把下一句带进来。
+                    let position = root.lyrics_position_seconds;
+                    let reveal = if line.is_active_at(position, next_start) {
+                        match line.chars_revealed(position) {
+                            // 已经走满：直接走纯文本快路径。
+                            // 否则"已唱满、等下一句"的整段都要走 canvas 两遍绘制，白花 CPU。
+                            Some((done, total)) if done >= total => LyricReveal::All,
+                            Some((done, _total)) => LyricReveal::Partial { done },
+                            // 普通 LRC（没有逐字轴）：整行直接算已亮。
+                            None => LyricReveal::All,
+                        }
+                    } else {
+                        LyricReveal::None
+                    };
+                    div()
+                        .w_full()
+                        // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
+                        // 会被折行文本吃掉，折成两行时间距就变成 0。
+                        // 上下各 16，相邻两句之间正好 32；单句总高仍是 64。
+                        .py(px(LYRIC_ROW_GAP / 2.0))
+                        // 这里不能加 `flex`：flex 容器给子元素的可用宽度是 MaxContent，
+                        // gpui 的文本只在拿到确定宽度时才折行，结果就是长句一路撑宽被裁。
+                        .text_size(theme::Text::Large.size())
+                        .line_height(px(LYRIC_LINE_HEIGHT))
+                        .child(highlighted_line(
+                            &line.text,
+                            reveal,
+                            theme::lyric_dim(),
+                            theme::accent(),
+                        ))
+                        .into_any_element()
+                }))
+                .into_any_element(),
         )
     };
 
@@ -198,51 +625,35 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .h_full()
             .flex_none()
             .min_h(px(0.0))
-            .gap(px(theme::space::MD))
-            .child(
-                div()
-                    .text_size(theme::Text::Title.size())
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme::text())
-                    .truncate()
-                    .child(track.title.clone()),
-            )
-            .child(
-                div()
-                    .text_size(theme::Text::Small.size())
-                    .text_color(theme::text_muted())
-                    .child(format!(
-                        "{} · {} · {}",
-                        track.artist,
-                        track.duration_label(),
-                        snapshot.progress_label()
-                    )),
-            )
             .child(if root.loading_lyrics {
-                loading_state(root.tr("正在读取歌词…")).into_any_element()
+                centered_state(loading_state(root.tr("正在读取歌词…")).into_any_element())
             } else if let Some(error) = &root.lyrics_error {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::space::SM))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Small.size())
-                            .text_color(theme::text_muted())
-                            .child(error.clone()),
-                    )
-                    .child(retry_button(root.language, cx))
-                    .into_any_element()
+                centered_state(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(theme::space::SM))
+                        .child(
+                            div()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::text_muted())
+                                .child(error.clone()),
+                        )
+                        .child(retry_button(root.language, cx))
+                        .into_any_element(),
+                )
             } else if root.lyrics.is_empty() {
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(theme::space::SM))
-                    .child(empty_state("music", root.tr("这首歌暂时没有歌词")))
-                    .child(retry_button(root.language, cx))
-                    .into_any_element()
+                centered_state(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(theme::space::SM))
+                        .child(empty_state("music", root.tr("这首歌暂时没有歌词")))
+                        .child(retry_button(root.language, cx))
+                        .into_any_element(),
+                )
             } else {
                 list.expect("loaded lyrics have a list")
             })
@@ -319,4 +730,118 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 ),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_x_from_glyphs;
+
+    /// 5 个单字节字符（`abcde`）的字形：`(字节下标, 左边界 x)`。
+    /// 宽度刻意不等：`b` 只有 10px，`d` 有 60px。
+    const TEXT: &str = "abcde";
+    const GLYPHS: [(usize, f32); 5] = [(0, 0.0), (1, 10.0), (2, 40.0), (3, 100.0), (4, 160.0)];
+    /// 末字形的宽度（末字后面没有"下一个字形"，必须由调用方补）。
+    const LAST_W: f32 = 40.0;
+
+    fn reveal(glyphs: &[(usize, f32)], text: &str, done: f32) -> f32 {
+        reveal_x_from_glyphs(glyphs, text, done, LAST_W)
+    }
+
+    /// 走满时必须覆盖整行 —— 最后一个字要亮起来。
+    ///
+    /// 旧实现走到 `whole == glyphs.len()` 时返回最后一个字的**左边界**，
+    /// 于是最后一个字永远不亮，就是"最后一个字走不完"。
+    #[test]
+    fn full_reveal_covers_every_glyph() {
+        assert_eq!(
+            reveal(&GLYPHS, TEXT, 5.0),
+            f32::MAX,
+            "走满必须覆盖整行，不能停在最后一个字的左边界"
+        );
+    }
+
+    /// 字内插值按**该字形自身宽度**，不是按平均宽度。
+    ///
+    /// 第 2 个字宽 30px。走到 1.5 个字时应当是 10 + 30*0.5 = 25，
+    /// 而不是 (1.5/5)*总宽。
+    #[test]
+    fn partial_reveal_uses_each_glyph_width() {
+        assert!((reveal(&GLYPHS, TEXT, 1.5) - 25.0).abs() < 1e-3);
+        // 第 4 个字宽 60px，走到 2.5 个字 = 40 + 30 = 70。
+        assert!((reveal(&GLYPHS, TEXT, 2.5) - 70.0).abs() < 1e-3);
+    }
+
+    /// 整字位置必须精确落在字形左边界上（否则字与字之间会有跳变）。
+    #[test]
+    fn integer_positions_snap_to_glyph_edges() {
+        assert!((reveal(&GLYPHS, TEXT, 2.0) - 40.0).abs() < 1e-3);
+        assert!((reveal(&GLYPHS, TEXT, 3.0) - 100.0).abs() < 1e-3);
+    }
+
+    /// **最后一个字必须能推进**：末字形没有"下一个字形"，宽度要靠
+    /// 调用方补；补成 0 的话末字的字内推进恒为 0，亮光会卡在它的左边界，
+    /// 然后直接跳到下一句（实测复现过的 bug）。
+    #[test]
+    fn last_glyph_advances_with_its_real_width() {
+        let last_start = GLYPHS[GLYPHS.len() - 1].1; // 160
+        let x = reveal(&GLYPHS, TEXT, 4.5);
+        assert!(
+            (x - (last_start + LAST_W * 0.5)).abs() < 1e-3,
+            "末字应能按自身宽度推进，得到 {x}"
+        );
+        // 宽度为 0 时末字确实推不动——这就是要防的情况。
+        let stuck = reveal_x_from_glyphs(&GLYPHS, TEXT, 4.5, 0.0);
+        assert!((stuck - last_start).abs() < 1e-3);
+    }
+
+    /// 推进必须单调：不能出现亮光回退（回退会看到"抽一下"）。
+    #[test]
+    fn reveal_is_monotonic() {
+        let mut prev = -1.0f32;
+        let mut t = 0.0f32;
+        while t <= 5.0 {
+            let x = reveal(&GLYPHS, TEXT, t);
+            assert!(x >= prev, "t={t} 处回退：{prev} -> {x}");
+            prev = x;
+            t += 0.05;
+        }
+    }
+
+    /// 边界输入不能崩。
+    #[test]
+    fn reveal_handles_edge_inputs() {
+        assert_eq!(reveal_x_from_glyphs(&[], TEXT, 1.0, LAST_W), 0.0);
+        assert_eq!(reveal(&GLYPHS, TEXT, 0.0), 0.0);
+        assert_eq!(reveal(&GLYPHS, TEXT, 9.0), f32::MAX);
+    }
+
+    /// 中文字符是多字节：字符序号必须先换成**字节偏移**再找字形。
+    ///
+    /// 直接拿字符下标当字形下标时，`ab中文` 第 3 个字符会被定位到第 3 个字形，
+    /// 而中文字形从字节 2 开始 —— 亮光会整体偏移。
+    #[test]
+    fn multibyte_chars_map_through_byte_offsets() {
+        // 4 个字符，8 个字节：a(0) b(1) 中(2..5) 文(5..8)
+        let text = "ab中文";
+        let glyphs = [(0usize, 0.0f32), (1, 10.0), (2, 20.0), (5, 50.0)];
+        // 走到第 3 个字符（"中"）的开头：字节 2 -> 字形下标 2 -> x=20
+        assert!((reveal_x_from_glyphs(&glyphs, text, 2.0, 30.0) - 20.0).abs() < 1e-3);
+        // 走到第 4 个字符（"文"）的开头：字节 5 -> 字形下标 3 -> x=50
+        assert!((reveal_x_from_glyphs(&glyphs, text, 3.0, 30.0) - 50.0).abs() < 1e-3);
+        // "中"字亮一半：20 + (50-20)*0.5 = 35
+        assert!((reveal_x_from_glyphs(&glyphs, text, 2.5, 30.0) - 35.0).abs() < 1e-3);
+    }
+
+    /// 连字（多字符 → 少字形）不能错位，也不能提前整行点亮。
+    #[test]
+    fn ligatures_do_not_skip_ahead() {
+        // "fi" 是 1 个字形（字节 0），后面还有 1 个字符
+        let text = "fix";
+        let glyphs = [(0usize, 0.0f32), (2, 20.0)];
+        // 3 个字符、2 个字形：走到第 2 个字符时应落在 x=20，而不是直接 f32::MAX
+        let x = reveal_x_from_glyphs(&glyphs, text, 2.0, 20.0);
+        assert_eq!(x, 20.0, "第 2 个字符对应字节 2 的字形");
+        // 只有超过整段文本长度才应整行点亮。
+        assert_eq!(reveal_x_from_glyphs(&glyphs, text, 3.0, 20.0), f32::MAX);
+    }
 }
