@@ -5,8 +5,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, svg, uniform_list, ClickEvent, Context, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent,
+    canvas, div, px, svg, uniform_list, Animation, AnimationExt, ClickEvent, Context, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent,
 };
 
 use crate::app::Root;
@@ -1658,82 +1658,70 @@ fn track_info_left(
                 .gap(px(6.0))
                 .min_w(px(0.0))
                 .child({
-                    // 歌名+歌手超长时向左滚动（官方行为）。
+                    // 官方：歌名+歌手超长时向左循环滚动，尾首相接、间隔 24px。
+                    // 用 gpui 的 with_animation（帧时钟驱动），比定时器 notify 更稳。
                     let title_len = track.title.chars().count() as f32;
                     let artist_len = track.artist.chars().count() as f32;
                     let estimated = title_len * 15.0 + artist_len * 12.0 + 28.0;
                     let long = estimated > 300.0;
-                    if long {
-                        root.marquee_needed.set(true);
-                        if !root.marquee_ticking.get() {
-                            root.marquee_ticking.set(true);
-                            let needed = root.marquee_needed.clone();
-                            let ticking = root.marquee_ticking.clone();
-                            cx.spawn(async move |this, cx| loop {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(16))
-                                    .await;
-                                if !needed.get() {
-                                    ticking.set(false);
-                                    break;
-                                }
-                                if this.update(cx, |_root, cx| cx.notify()).is_err() {
-                                    ticking.set(false);
-                                    break;
-                                }
-                            })
-                            .detach();
-                        }
-                    }
-                    let offset = if long {
-                        use std::sync::Mutex;
-                        use std::time::Instant;
-                        static MARQUEE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-                        let mut guard = MARQUEE.lock().unwrap_or_else(|e| e.into_inner());
-                        let started = match guard.as_ref() {
-                            Some((id, at)) if id == &track.id => *at,
-                            _ => {
-                                *guard = Some((track.id.clone(), Instant::now()));
-                                Instant::now()
-                            }
-                        };
-                        drop(guard);
-                        let elapsed = started.elapsed().as_secs_f32();
-                        let span = estimated + 24.0;
-                        -((elapsed * 40.0) % span)
-                    } else {
-                        0.0
+                    let title = track.title.clone();
+                    let artist = track.artist.clone();
+                    let copy = || {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .whitespace_nowrap()
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(gpui::Rgba {
+                                        a: 0.45,
+                                        ..theme::text()
+                                    })
+                                    .child(format!("– {artist}")),
+                            )
                     };
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.0))
-                                .ml(px(offset))
-                                .whitespace_nowrap()
-                                .child(
-                                    div()
-                                        .text_size(px(15.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(theme::text())
-                                        .child(track.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(15.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(gpui::Rgba {
-                                            a: 0.45,
-                                            ..theme::text()
-                                        })
-                                        .child(format!("– {}", track.artist)),
-                                ),
-                        )
+                    if long {
+                        let span = estimated + 24.0;
+                        let seconds = (span / 40.0).max(3.0);
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .whitespace_nowrap()
+                                    .child(copy())
+                                    .child(div().ml(px(24.0)).child(copy()))
+                                    .with_animation(
+                                        "bar-track-marquee",
+                                        Animation::new(std::time::Duration::from_secs_f32(seconds))
+                                            .repeat(),
+                                        move |element, delta| {
+                                            element.ml(px(-(delta as f32) * span))
+                                        },
+                                    ),
+                            )
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(copy())
+                    }
                 })
                 .child(
                     div()
