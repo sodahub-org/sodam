@@ -469,15 +469,23 @@ impl Root {
     /// 少推荐：把当前曲目提交给 /luna/track/dislike。
     pub fn dislike_track(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
+        let work_id = track.id.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            sodam_core::library::dislike_track(&session, &track.id)
+            sodam_core::library::dislike_track(&session, &work_id)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 match result {
-                    Ok(()) => root.set_status("已减少推荐：{}", std::slice::from_ref(&track.title)),
+                    Ok(()) => {
+                        root.set_status("已减少推荐：{}", std::slice::from_ref(&track.title));
+                        // 官方行为：少推荐后直接跳过这首。
+                        let current = root.queue.current().map(|item| item.id.clone());
+                        if current.as_deref() == Some(track.id.as_str()) {
+                            root.next_track(cx);
+                        }
+                    }
                     Err(err) => root.playback_error = Some(err.to_string()),
                 }
                 cx.notify();

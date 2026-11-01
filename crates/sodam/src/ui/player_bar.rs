@@ -469,15 +469,6 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .pending_track
         .clone()
         .or_else(|| root.queue.current().cloned());
-    let title = track
-        .as_ref()
-        .map(|track| track.title.clone())
-        .unwrap_or_else(|| language.text("未在播放").to_string());
-    let artist = track
-        .as_ref()
-        .map(|track| track.artist.clone())
-        .unwrap_or_else(|| language.text("选择一首歌开始播放吧").to_string());
-    let detail = artist.clone();
     // 引擎错误（解码/设备）与一次播放尝试的失败都显示在这一行。
     // 一律过词典：引擎给的是运行时 String，`==` 梯子只覆盖写死的那两条，其余原样
     // 上屏——英文界面就会露出中文。查不到的（已经翻过的）原样返回。
@@ -515,17 +506,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     // 降档：实际档位低于所选档位。每次现算——用户改了意图，旧结论就不该继续成立。
     // 实际档位未知（旧缓存）或意图为「自动」时一律不算降档；两边显示名相同时也不徽章，
     // 避免出现「降档·X」这种看起来没降的提示（分数拆档后真实降档都已不同名）。
-    let downgraded = sodam_core::quality::is_visible_downgrade(
-        &root.settings.quality_intent(),
-        snapshot.quality_rank,
-    );
-    let title_link_track = track.as_ref().cloned();
-    let artist_link_track = track.as_ref().cloned();
     let volume = root.settings.volume;
-    let liked = track
-        .as_ref()
-        .is_some_and(|track| root.liked_ids.contains(&track.id));
-    let cover_path = track.as_ref().and_then(|track| root.cover_of(&track.cover));
     let mode_icon = root.queue.mode.icon();
 
     div()
