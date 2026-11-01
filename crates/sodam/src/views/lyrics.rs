@@ -427,10 +427,23 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
 
     let liked = root.liked_ids.contains(&track.id);
     let lines = root.lyrics.clone();
-    // 歌词区高度：滚到中间要给首尾句留出半个视口的空白，所以先算出来。
-    let lyrics_viewport_height =
-        (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
-    let lyric_padding = lyrics_viewport_height / 2.0;
+    // 歌词列和封面同高：先算出封面尺寸，再按它的一半留上下空白，
+    // 当前句才正好落在歌词区的垂直中线上。
+    let viewport_width = f32::from(window.viewport_size().width);
+    let viewport_height = (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
+    let mut cover_size = (viewport_height * 0.40).min(viewport_width * 0.30);
+    let mut lyrics_width = (viewport_width * 0.30).clamp(300.0, 500.0);
+
+    // 窗口被平铺 WM 压得比官方最小尺寸还窄时，按同一比例整体收缩，
+    // 避免固定 300px 歌词下限把内容挤出可视区。
+    let centered_width = (viewport_width - theme::SIDEBAR_W - 100.0).max(220.0);
+    let natural_width = cover_size + 50.0 + lyrics_width;
+    if natural_width > centered_width {
+        let scale = centered_width / natural_width;
+        cover_size *= scale;
+        lyrics_width *= scale;
+    }
+    let lyric_padding = cover_size / 2.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
@@ -563,20 +576,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
 
     // 汽水播放页的规则：封面取 min(40vh, 30vw)；
     // 歌词列是 30vw，并限制在 300~500px。这里 vh/vw 以可用播放区为准。
-    let viewport_width = f32::from(window.viewport_size().width);
-    let viewport_height = (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
-    let mut cover_size = (viewport_height * 0.40).min(viewport_width * 0.30);
-    let mut lyrics_width = (viewport_width * 0.30).clamp(300.0, 500.0);
-
-    // 窗口被平铺 WM 压得比官方最小尺寸还窄时，按同一比例整体收缩，
-    // 避免固定 300px 歌词下限把内容挤出可视区。
-    let centered_width = (viewport_width - theme::SIDEBAR_W - 100.0).max(220.0);
-    let natural_width = cover_size + 50.0 + lyrics_width;
-    if natural_width > centered_width {
-        let scale = centered_width / natural_width;
-        cover_size *= scale;
-        lyrics_width *= scale;
-    }
 
     let track_info = div()
         .flex()
