@@ -480,7 +480,7 @@ pub(crate) fn quality_menu(
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(58.0))
+                .h(px(62.0))
                 .px(px(12.0))
                 .py(px(10.0))
                 .cursor_pointer()
@@ -580,9 +580,9 @@ pub(crate) fn quality_menu(
 
     // 官方菜单以音质按钮为锚点、箭头正对按钮：水平按菜单宽度居中，
     // 垂直整体上移，让底部三角落在点击位置上方。
-    let menu_height = if svip { 5.0 * 58.0 + 96.0 } else { 5.0 * 58.0 };
-    let anchor_x = f32::from(position.x) - 175.0;
-    let anchor_y = (f32::from(position.y) - menu_height - 10.0).max(8.0);
+    let menu_height = if svip { 5.0 * 62.0 + 104.0 } else { 5.0 * 62.0 };
+    let anchor_x = f32::from(position.x) - 190.0;
+    let anchor_y = (f32::from(position.y) - menu_height - 18.0).max(8.0);
     gpui::deferred(
         gpui::anchored()
             .snap_to_window()
@@ -596,7 +596,7 @@ pub(crate) fn quality_menu(
                             .id("quality-menu")
                             .flex()
                             .flex_col()
-                            .w(px(350.0))
+                            .w(px(380.0))
                             .py(px(8.0))
                             .rounded(px(8.0))
                             .bg(surface)
