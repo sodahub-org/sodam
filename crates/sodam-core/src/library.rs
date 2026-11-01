@@ -1373,6 +1373,20 @@ pub fn append_track_to_playlist(
     post_pc_json(session, "/luna/pc/me/playlist/media/append", &body)
 }
 
+/// 新建歌单并把曲目放进去：`POST /luna/pc/me/playlist`。
+pub fn create_playlist_with_track(
+    session: &Session,
+    name: &str,
+    track_id: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "name": name,
+        "is_private": false,
+        "track_ids": [track_id],
+    });
+    post_pc_json(session, "/luna/pc/me/playlist", &body)
+}
+
 /// 发表评论：`POST /luna/pc/comments/create`。
 pub fn create_comment(session: &Session, track_id: &str, text: &str) -> anyhow::Result<()> {
     let body = serde_json::json!({

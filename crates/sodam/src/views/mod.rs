@@ -1342,49 +1342,46 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 }
 
 /// 「添加到歌单」：列出自己的歌单，点一条就追加当前曲目。
+
 pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let Some((track, position)) = root.add_menu.clone() else {
         return div().into_any_element();
     };
-    let rows: Vec<AnyElement> = if root.playlists.is_empty() {
-        vec![div()
-            .px(px(theme::space::SM))
-            .py(px(theme::space::XS))
-            .text_size(theme::Text::Small.size())
-            .text_color(theme::text_muted())
-            .child(if root.loading_library {
-                root.tr("正在读取歌单…").to_string()
-            } else {
-                root.tr("还没有歌单").to_string()
-            })
-            .into_any_element()]
-    } else {
-        root
-        .playlists
-        .iter()
-        .take(20)
-        .map(|playlist| {
-            let id = playlist.id.clone();
-            let title = playlist.title.clone();
-            let track = track.clone();
-            div()
-                .id(gpui::ElementId::Name(format!("add-to-{}", id).into()))
-                .truncate()
-                .px(px(theme::space::SM))
-                .py(px(theme::space::XS))
-                .rounded(px(theme::radius::ROW))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::surface_hover()))
-                .text_size(theme::Text::Small.size())
-                .text_color(theme::text())
-                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
-                    root.add_menu = None;
-                    root.append_to_playlist(track.clone(), id.clone(), cx);
-                }))
-                .child(title)
-                .into_any_element()
-        })
-        .collect()
+    let item = |id: &'static str,
+                icon: &'static str,
+                label: String,
+                cx: &mut Context<Root>,
+                action: fn(&mut Root, sodam_core::models::TrackItem, &mut Context<Root>)| {
+        let track = track.clone();
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(8.0))
+            .h(px(40.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.add_menu = None;
+                action(root, track.clone(), cx);
+                cx.notify();
+            }))
+            .child(
+                svg()
+                    .path(icons::path(icon))
+                    .size(px(20.0))
+                    .text_color(theme::text()),
+            )
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::text())
+                    .child(label),
+            )
     };
     gpui::deferred(
         gpui::anchored()
@@ -1398,18 +1395,28 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     })
                     .flex()
                     .flex_col()
-                    .w(px(200.0))
-                    .max_h(px(320.0))
-                    .p(px(theme::space::XS))
-                    .rounded(px(theme::radius::CARD))
+                    .gap(px(2.0))
+                    .w(px(220.0))
+                    .p(px(8.0))
+                    .rounded(px(12.0))
                     .bg(theme::surface_elevated())
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .children(rows),
+                    .child(item(
+                        "add-create",
+                        "plus",
+                        root.tr("创建新歌单").to_string(),
+                        cx,
+                        |root, track, cx| root.create_playlist_with_track(track, cx),
+                    ))
+                    .child(item(
+                        "add-liked",
+                        "heart",
+                        root.tr("我喜欢的音乐").to_string(),
+                        cx,
+                        |root, track, cx| root.toggle_like(track, cx),
+                    )),
             ),
     )
     .into_any_element()
