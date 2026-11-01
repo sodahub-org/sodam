@@ -35,7 +35,11 @@ pub(crate) fn search_box(
         String::new()
     };
     let color = if empty {
-        theme::text_muted()
+        if header {
+            theme::text_faint()
+        } else {
+            theme::text_muted()
+        }
     } else {
         theme::text()
     };

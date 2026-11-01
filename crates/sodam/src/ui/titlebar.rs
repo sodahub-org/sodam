@@ -142,11 +142,14 @@ fn render_with_maximize_icon(
             ));
     }
 
+    // 原生在箭头与搜索框之间留了一段空白；按 2x 实测补上等宽占位。
+    row = row.child(div().w(px(52.0)).h_full());
+
     if let Some(search) = extras.search.take() {
         row = row.child(
             div()
                 .flex_none()
-                .w(px(237.0))
+                .w(px(240.0))
                 .h(px(STRIP_HEIGHT))
                 .flex()
                 .flex_col()
@@ -238,7 +241,7 @@ fn account_chip(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(theme::space::SM))
+        .gap(px(15.0))
         .h(px(STRIP_HEIGHT))
         .px(px(theme::space::SM))
         .cursor_pointer()
@@ -248,20 +251,22 @@ fn account_chip(
         chip = chip.child(
             div()
                 .h(px(24.0))
-                .px(px(10.0))
+                .px(px(12.0))
                 .rounded(px(12.0))
                 .flex()
                 .items_center()
                 .bg(theme::surface_hover())
                 .text_size(px(11.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme::text())
+                .font_weight(gpui::FontWeight::BOLD)
+                // 原生是「抠字」：字是透明洞，颜色跟随底下的界面；
+                // 这里用背景色画字，效果等同于在纯色底上开洞。
+                .text_color(theme::bg())
                 .child(badge),
         );
     }
 
     if let Some(path) = account.avatar {
-        chip = chip.child(crate::ui::artwork::cover(Some(path), 24.0, 999.0));
+        chip = chip.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0));
     }
 
     if let Some(callback) = on_click {
@@ -365,7 +370,7 @@ fn lyrics_button(
                         .path(icons::path("captions"))
                         .size(px(16.0))
                         .text_color(if active {
-                            theme::text()
+                            theme::bg()
                         } else {
                             theme::text_muted()
                         }),
