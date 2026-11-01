@@ -1968,6 +1968,7 @@ impl Root {
         if self.nav_history.len() > 50 {
             self.nav_history.remove(0);
         }
+        self.nav_forward.clear();
         self.nav = nav;
         if matches!(nav, Nav::Settings) {
             self.refresh_cache_stats(cx);
@@ -2244,6 +2245,21 @@ impl Root {
             Nav::Home
         };
         let nav = self.nav_history.pop().unwrap_or(fallback);
+        self.nav_forward.push(self.nav);
+        self.nav = nav;
+        self.on_nav_changed(cx);
+        cx.notify();
+    }
+
+    /// 前进：与 [`Self::go_back`] 对称，从前进栈里取回页面。
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(nav) = self.nav_forward.pop() else {
+            return;
+        };
+        self.nav_history.push(self.nav);
+        if self.nav_history.len() > 50 {
+            self.nav_history.remove(0);
+        }
         self.nav = nav;
         self.on_nav_changed(cx);
         cx.notify();

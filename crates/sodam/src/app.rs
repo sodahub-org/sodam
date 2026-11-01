@@ -227,6 +227,8 @@ pub struct Root {
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
+    /// 「后退」之后可以去「前进」的页面栈；任何新导航都会清空它。
+    pub(crate) nav_forward: Vec<Nav>,
     pub lyrics_return_nav: Option<Nav>,
     pub theme: ThemeKind,
     pub theme_follows_system: bool,
@@ -561,6 +563,7 @@ impl Root {
                 Nav::Settings
             },
             nav_history: Vec::new(),
+            nav_forward: Vec::new(),
             lyrics_return_nav: if logged_in { Some(Nav::Home) } else { None },
             theme,
             theme_follows_system,
@@ -1702,8 +1705,20 @@ impl Render for Root {
                 let logged_in = !self.settings.cookie.trim().is_empty();
                 let mut extras = ui::titlebar::HeaderExtras::default();
                 if own_titlebar {
+                    let back_root = cx.entity();
+                    let forward_root = cx.entity();
+                    extras.nav = Some(ui::titlebar::NavArrows {
+                        back_enabled: !self.nav_history.is_empty(),
+                        forward_enabled: !self.nav_forward.is_empty(),
+                        on_back: Box::new(move |_window, cx| {
+                            back_root.update(cx, |root, cx| root.go_back(cx));
+                        }),
+                        on_forward: Box::new(move |_window, cx| {
+                            forward_root.update(cx, |root, cx| root.go_forward(cx));
+                        }),
+                    });
                     extras.search = Some(
-                        crate::views::search::search_box(self, window, cx, 28.0)
+                        crate::views::search::search_box(self, window, cx, 32.0)
                             .into_any_element(),
                     );
                 }

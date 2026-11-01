@@ -29,11 +29,11 @@ use std::{cell::Cell, rc::Rc};
 use crate::ui::{icons, theme};
 
 /// 标题栏条高度（逻辑像素，与 Windows 惯例一致）。
-pub const STRIP_HEIGHT: f32 = 32.0;
+pub const STRIP_HEIGHT: f32 = 64.0;
 /// 单个标题栏按钮宽度。
-const BUTTON_WIDTH: f32 = 44.0;
+const BUTTON_WIDTH: f32 = 52.0;
 /// 控制图标边长。
-const GLYPH_SIZE: f32 = 12.0;
+const GLYPH_SIZE: f32 = 14.0;
 /// 关闭按钮悬停色（Windows 惯例红）。
 const CLOSE_HOVER: Hsla = hsla(4.0 / 360.0, 0.83, 0.49, 1.0);
 /// 拖拽阈值（逻辑像素）：移动超过它才把指针交给合成器移动窗口。
@@ -45,17 +45,22 @@ const DRAG_THRESHOLD: f32 = 4.0;
 /// Windows/macOS 由系统处理拖拽，这里只是保持签名一致。
 pub type DragAnchor = Rc<Cell<Option<Point<Pixels>>>>;
 
-/// 覆盖在窗口顶部，不占布局高度：侧边栏/内容列各自为控件留出空间，
-/// 背景仍延伸到标题栏下方，避免独立标题栏横条与面板之间出现色差。
-/// 左侧全部为拖拽区，右侧是三个窗口控制按钮；Linux 下再多一个桌面歌词开关。
+pub struct NavArrows {
+    pub back_enabled: bool,
+    pub forward_enabled: bool,
+    pub on_back: Box<dyn Fn(&mut Window, &mut App)>,
+    pub on_forward: Box<dyn Fn(&mut Window, &mut App)>,
+}
+
 /// 顶栏右侧的账号区：会员徽章 + 头像。
 pub struct HeaderAccount {
     pub badge: Option<SharedString>,
     pub avatar: Option<std::path::PathBuf>,
 }
 
-/// 顶栏里除窗口按钮之外的内容：搜索框与账号区都是可选的。
+/// 顶栏里除窗口按钮之外的内容：前进/后退、搜索框与账号区都是可选的。
 pub struct HeaderExtras {
+    pub nav: Option<NavArrows>,
     pub search: Option<AnyElement>,
     pub account: Option<HeaderAccount>,
     pub on_account_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
@@ -64,6 +69,7 @@ pub struct HeaderExtras {
 impl Default for HeaderExtras {
     fn default() -> Self {
         Self {
+            nav: None,
             search: None,
             account: None,
             on_account_click: None,
@@ -71,6 +77,9 @@ impl Default for HeaderExtras {
     }
 }
 
+/// 覆盖在窗口顶部，不占布局高度：侧边栏/内容列各自为控件留出空间，
+/// 背景仍延伸到标题栏下方，避免独立标题栏横条与面板之间出现色差。
+/// 左段拖拽、中段搜索、右段账号/歌词开关/窗口按钮。
 pub fn render(
     window: &Window,
     anchor: &DragAnchor,
@@ -117,11 +126,28 @@ fn render_with_maximize_icon(
         // 左侧越过侧栏的一段只做拖拽，顶栏内容从侧栏右边开始。
         .child(drag_area(anchor.clone(), Some(theme::SIDEBAR_W)));
 
+    if let Some(nav) = extras.nav.take() {
+        row = row
+            .child(arrow_button(
+                "titlebar-back",
+                "chevron-left",
+                nav.back_enabled,
+                nav.on_back,
+            ))
+            .child(arrow_button(
+                "titlebar-forward",
+                "chevron-right",
+                nav.forward_enabled,
+                nav.on_forward,
+            ));
+    }
+
     if let Some(search) = extras.search.take() {
         row = row.child(
             div()
                 .flex_none()
-                .w(px(320.0))
+                .w(px(280.0))
+                .h(px(STRIP_HEIGHT))
                 .px(px(theme::space::SM))
                 .flex()
                 .flex_col()
@@ -130,11 +156,14 @@ fn render_with_maximize_icon(
         );
     }
 
+    row = row.child(drag_area(anchor.clone(), None));
+
+    if let Some(account) = extras.account {
+        row = row.child(account_chip(account, extras.on_account_click.take()));
+    }
+
     row = row
-        .child(drag_area(anchor.clone(), None))
-        .when_some(extras.account, |this, account| {
-            this.child(account_chip(account, extras.on_account_click.take()))
-        })
+        .child(separator())
         // 桌面歌词开关：放在最小化左边，对应汽水音乐原生客户端的同一位置。
         .when(cfg!(target_os = "linux"), |this| {
             this.child(lyrics_button(lyrics_visible, on_toggle_lyrics))
@@ -160,6 +189,46 @@ fn render_with_maximize_icon(
     row
 }
 
+/// 前进/后退箭头：不可用时只降透明度，不接点击。
+fn arrow_button(
+    id: &'static str,
+    icon: &'static str,
+    enabled: bool,
+    on_click: Box<dyn Fn(&mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .w(px(36.0))
+        .h(px(STRIP_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(move |_, window, cx| on_click(window, cx))
+        })
+        .child(
+            svg()
+                .path(icons::path(icon))
+                .size(px(18.0))
+                .text_color(if enabled {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                }),
+        )
+}
+
+/// 账号区与窗口按钮之间的细分隔线。
+fn separator() -> impl IntoElement {
+    div()
+        .w(px(1.0))
+        .h(px(20.0))
+        .mx(px(theme::space::SM))
+        .bg(theme::border())
+}
+
 /// 账号区：会员徽章（SVIP / VIP / 开通 VIP）+ 头像，整块可点进设置。
 fn account_chip(
     account: HeaderAccount,
@@ -179,20 +248,21 @@ fn account_chip(
     if let Some(badge) = account.badge {
         chip = chip.child(
             div()
-                .h(px(18.0))
-                .px(px(8.0))
-                .rounded(px(9.0))
+                .h(px(28.0))
+                .px(px(12.0))
+                .rounded(px(14.0))
                 .flex()
                 .items_center()
                 .bg(theme::surface_hover())
-                .text_size(px(10.0))
-                .text_color(theme::text_muted())
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text())
                 .child(badge),
         );
     }
 
     if let Some(path) = account.avatar {
-        chip = chip.child(crate::ui::artwork::cover(Some(path), 22.0, 999.0));
+        chip = chip.child(crate::ui::artwork::cover(Some(path), 30.0, 999.0));
     }
 
     if let Some(callback) = on_click {
@@ -270,8 +340,10 @@ fn lyrics_button(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(BUTTON_WIDTH))
-        .h(px(STRIP_HEIGHT))
+        .w(px(36.0))
+        .h(px(36.0))
+        .mx(px(theme::space::XS))
+        .rounded(px(10.0))
         .hover(move |style| {
             if active {
                 style
@@ -287,12 +359,12 @@ fn lyrics_button(
                 .justify_center()
                 .w(px(22.0))
                 .h(px(18.0))
-                .rounded(px(4.0))
+                .rounded(px(8.0))
                 .when(active, |this| this.bg(theme::surface_hover()))
                 .child(
                     svg()
                         .path(icons::path("captions"))
-                        .size(px(GLYPH_SIZE))
+                        .size(px(18.0))
                         .text_color(if active {
                             theme::text()
                         } else {
