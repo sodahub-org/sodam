@@ -482,7 +482,7 @@ pub(crate) fn quality_menu(
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(48.0))
+                .h(px(56.0))
                 .px(px(10.0))
                 .py(px(0.0))
                 .cursor_pointer()
@@ -499,7 +499,7 @@ pub(crate) fn quality_menu(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(3.0))
+                        .gap(px(4.0))
                         .flex_1()
                         .min_w(px(0.0))
                         .child(
@@ -518,7 +518,7 @@ pub(crate) fn quality_menu(
                                 .child(
                                     div()
                                         .text_size(if option.svip { px(13.0) } else { px(12.0) })
-                                        .line_height(px(18.0))
+                                        .line_height(px(20.0))
                                         .font_weight(if option.svip {
                                             gpui::FontWeight::BOLD
                                         } else {
@@ -558,7 +558,7 @@ pub(crate) fn quality_menu(
                                     .items_center()
                                     .gap(px(4.0))
                                     .text_size(px(11.0))
-                                    .line_height(px(16.0))
+                                    .line_height(px(18.0))
                                     .text_color(text_secondary)
                                     .child(option.desc)
                                     .child(
@@ -652,11 +652,12 @@ pub(crate) fn quality_menu(
                 div()
                     .absolute()
                     .left(px(arrow_x))
-                    .bottom(px(-6.0))
+                    .bottom(px(-arrow_gap))
                     .child(
                         svg()
                             .path(icons::path("triangle-down"))
-                            .size(px(12.0))
+                            .w(px(20.0))
+                            .h(px(10.0))
                             .text_color(surface),
                     ),
             ),
