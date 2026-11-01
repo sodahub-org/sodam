@@ -649,6 +649,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     icon_button("bar-add", "note-plus", theme::ICON, theme::text_muted())
                         .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
                             if let Some(track) = root.queue.current().cloned() {
+                                root.load_playlists(cx);
                                 root.add_menu = Some((track, event.position()));
                                 cx.notify();
                             }

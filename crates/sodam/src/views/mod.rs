@@ -1346,7 +1346,20 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let Some((track, position)) = root.add_menu.clone() else {
         return div().into_any_element();
     };
-    let rows: Vec<AnyElement> = root
+    let rows: Vec<AnyElement> = if root.playlists.is_empty() {
+        vec![div()
+            .px(px(theme::space::SM))
+            .py(px(theme::space::XS))
+            .text_size(theme::Text::Small.size())
+            .text_color(theme::text_muted())
+            .child(if root.loading_library {
+                root.tr("正在读取歌单…").to_string()
+            } else {
+                root.tr("还没有歌单").to_string()
+            })
+            .into_any_element()]
+    } else {
+        root
         .playlists
         .iter()
         .take(20)
@@ -1371,7 +1384,8 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .child(title)
                 .into_any_element()
         })
-        .collect();
+        .collect()
+    };
     gpui::deferred(
         gpui::anchored()
             .snap_to_window()
@@ -1385,12 +1399,16 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .flex()
                     .flex_col()
                     .w(px(200.0))
+                    .max_h(px(320.0))
                     .p(px(theme::space::XS))
                     .rounded(px(theme::radius::CARD))
                     .bg(theme::surface_elevated())
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
                     .children(rows),
             ),
     )
