@@ -217,9 +217,7 @@ pub enum TierMismatch {
 ///
 /// 徽章与状态行都只读这一个出处，两边共用同一套刻度与同一道显示名闸。
 pub fn visible_tier_mismatch(intent: &QualityIntent, actual: Option<i64>) -> Option<TierMismatch> {
-    let Some(actual) = actual else {
-        return None;
-    };
+    let actual = actual?;
     let direction = if is_downgraded(intent, Some(actual)) {
         TierMismatch::Below
     } else if is_above_selected(intent, Some(actual)) {
