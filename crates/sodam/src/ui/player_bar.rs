@@ -753,8 +753,6 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .flex_none()
         .px(px(theme::space::LG))
         .bg(theme::bg())
-        .border_t_1()
-        .border_color(theme::border())
         // 官方把进度条贴在控制栏上沿（top: -9），横跨整个窗口。
         .child(
             div()
@@ -1701,8 +1699,8 @@ fn track_info_left(
                         };
                         drop(guard);
                         let elapsed = started.elapsed().as_secs_f32();
-                        let span = estimated + 60.0;
-                        -((elapsed * 34.0) % span)
+                        let span = estimated + 24.0;
+                        -((elapsed * 40.0) % span)
                     } else {
                         0.0
                     };
