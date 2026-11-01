@@ -1299,7 +1299,7 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
-                eprintln!("[more-menu] click {id}");
+                crate::debug_log(&format!("more-menu click {id}"));
                 root.more_menu = None;
                 action(root, track.clone(), cx);
                 cx.notify();

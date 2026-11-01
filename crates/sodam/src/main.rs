@@ -321,3 +321,16 @@ fn main() {
             cx.activate(true);
         });
 }
+
+/// 临时诊断日志：菜单点击等交互事件写文件，避免 stderr 被重定向或丢弃。
+pub fn debug_log(message: &str) {
+    use std::io::Write;
+    let line = format!("{:?} {}\n", std::time::SystemTime::now(), message);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sodam-actions.log")
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
