@@ -1299,6 +1299,7 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                eprintln!("[more-menu] click {id}");
                 root.more_menu = None;
                 action(root, track.clone(), cx);
                 cx.notify();
@@ -1324,9 +1325,6 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .child(
                 div()
                     .id("more-menu")
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                        cx.stop_propagation();
-                    })
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
@@ -1418,9 +1416,6 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .child(
                 div()
                     .id("add-to-playlist-menu")
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                        cx.stop_propagation();
-                    })
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
