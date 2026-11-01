@@ -611,10 +611,11 @@ pub(crate) fn quality_menu(
         .map(|bounds| f32::from(bounds.top()))
         .unwrap_or(height - theme::PLAYER_H + 28.0);
     let menu_left = (pill_center - menu_width / 2.0).max(12.0);
-    let menu_top = cover_center
-        .min(pill_top - menu_height - 8.0)
-        .min(bar_top - menu_height - 8.0)
-        .max(48.0);
+    // 箭头必须紧贴胶囊：底边固定停在胶囊顶上方 8px；只有空间实在不够时才上移。
+    let _ = cover_center;
+    // 胶囊本身在播放条里，所以箭头允许压在播放条上沿，不能再按 bar_top 上推。
+    let _ = bar_top;
+    let menu_top = (pill_top - menu_height - 8.0).max(48.0);
     let arrow_x = (pill_center - menu_left - 6.0).clamp(12.0, menu_width - 24.0);
     {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -998,6 +999,18 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .child(
                     div()
                         .id("quality-button")
+                        .relative()
+                        .child({
+                            let slot = root.quality_bounds.clone();
+                            canvas(
+                                move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
+                                    slot.set(Some(bounds));
+                                },
+                                |_bounds, _state, _window, _cx| {},
+                            )
+                            .absolute()
+                            .size_full()
+                        })
                         .h(px(26.0))
                         .px(px(6.0))
                         .min_w(px(32.0))
