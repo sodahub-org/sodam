@@ -1698,7 +1698,7 @@ fn track_info_left(
                         let measured = root.marquee_width.get().round();
                         let width = if measured > 1.0 { measured } else { estimated };
                         let span = width + 12.0;
-                        let seconds = (span / 30.0).max(4.0);
+                        let seconds = (span / 26.0).max(5.0);
                         div()
                             .flex_1()
                             .min_w(px(0.0))
@@ -1730,7 +1730,7 @@ fn track_info_left(
                                         "bar-track-marquee",
                                         Animation::new(std::time::Duration::from_secs_f32(seconds))
                                             .repeat()
-                                            .with_max_fps(120.0),
+                                            .with_max_fps(30.0),
                                         move |element, delta| {
                                             element.ml(px(-(delta as f32) * span))
                                         },
