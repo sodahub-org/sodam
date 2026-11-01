@@ -1084,7 +1084,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
             None => loading_state(root.tr("正在准备推荐队列…")),
         },
         Nav::Scenes => scenes::scenes_view(root, cx),
-        Nav::Search => search::search_page(root, window, cx),
+        Nav::Search => search::search_page(root, window, cx, !root.header_owns_search),
         Nav::Liked => div()
             .flex()
             .flex_col()

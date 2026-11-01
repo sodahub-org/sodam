@@ -20,7 +20,10 @@
 use gpui::prelude::*;
 #[cfg(target_os = "linux")]
 use gpui::MouseButton;
-use gpui::{div, hsla, px, svg, App, Div, Hsla, Pixels, Point, Window, WindowControlArea};
+use gpui::{
+    div, hsla, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
+    WindowControlArea,
+};
 use std::{cell::Cell, rc::Rc};
 
 use crate::ui::{icons, theme};
@@ -45,17 +48,42 @@ pub type DragAnchor = Rc<Cell<Option<Point<Pixels>>>>;
 /// 覆盖在窗口顶部，不占布局高度：侧边栏/内容列各自为控件留出空间，
 /// 背景仍延伸到标题栏下方，避免独立标题栏横条与面板之间出现色差。
 /// 左侧全部为拖拽区，右侧是三个窗口控制按钮；Linux 下再多一个桌面歌词开关。
+/// 顶栏右侧的账号区：会员徽章 + 头像。
+pub struct HeaderAccount {
+    pub badge: Option<SharedString>,
+    pub avatar: Option<std::path::PathBuf>,
+}
+
+/// 顶栏里除窗口按钮之外的内容：搜索框与账号区都是可选的。
+pub struct HeaderExtras {
+    pub search: Option<AnyElement>,
+    pub account: Option<HeaderAccount>,
+    pub on_account_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+}
+
+impl Default for HeaderExtras {
+    fn default() -> Self {
+        Self {
+            search: None,
+            account: None,
+            on_account_click: None,
+        }
+    }
+}
+
 pub fn render(
     window: &Window,
     anchor: &DragAnchor,
     lyrics_visible: bool,
     on_toggle_lyrics: impl Fn(&mut Window, &mut App) + 'static,
+    extras: HeaderExtras,
 ) -> Div {
     render_with_maximize_icon(
         maximize_icon(window.is_maximized()),
         anchor,
         lyrics_visible,
         on_toggle_lyrics,
+        extras,
     )
 }
 
@@ -74,8 +102,9 @@ fn render_with_maximize_icon(
     anchor: &DragAnchor,
     lyrics_visible: bool,
     on_toggle_lyrics: impl Fn(&mut Window, &mut App) + 'static,
+    mut extras: HeaderExtras,
 ) -> Div {
-    div()
+    let mut row = div()
         .absolute()
         .top(px(0.0))
         .left(px(0.0))
@@ -85,7 +114,27 @@ fn render_with_maximize_icon(
         .w_full()
         .h(px(STRIP_HEIGHT))
         .flex_none()
-        .child(drag_area(anchor.clone()))
+        // 左侧越过侧栏的一段只做拖拽，顶栏内容从侧栏右边开始。
+        .child(drag_area(anchor.clone(), Some(theme::SIDEBAR_W)));
+
+    if let Some(search) = extras.search.take() {
+        row = row.child(
+            div()
+                .flex_none()
+                .w(px(320.0))
+                .px(px(theme::space::SM))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .child(search),
+        );
+    }
+
+    row = row
+        .child(drag_area(anchor.clone(), None))
+        .when_some(extras.account, |this, account| {
+            this.child(account_chip(account, extras.on_account_click.take()))
+        })
         // 桌面歌词开关：放在最小化左边，对应汽水音乐原生客户端的同一位置。
         .when(cfg!(target_os = "linux"), |this| {
             this.child(lyrics_button(lyrics_visible, on_toggle_lyrics))
@@ -107,16 +156,60 @@ fn render_with_maximize_icon(
             "x",
             WindowControlArea::Close,
             true,
-        ))
+        ));
+    row
 }
 
-fn drag_area(anchor: DragAnchor) -> impl IntoElement {
+/// 账号区：会员徽章（SVIP / VIP / 开通 VIP）+ 头像，整块可点进设置。
+fn account_chip(
+    account: HeaderAccount,
+    on_click: Option<Box<dyn Fn(&mut Window, &mut App)>>,
+) -> impl IntoElement {
+    let mut chip = div()
+        .id("titlebar-account")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SM))
+        .h(px(STRIP_HEIGHT))
+        .px(px(theme::space::SM))
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::surface_hover()));
+
+    if let Some(badge) = account.badge {
+        chip = chip.child(
+            div()
+                .h(px(18.0))
+                .px(px(8.0))
+                .rounded(px(9.0))
+                .flex()
+                .items_center()
+                .bg(theme::surface_hover())
+                .text_size(px(10.0))
+                .text_color(theme::text_muted())
+                .child(badge),
+        );
+    }
+
+    if let Some(path) = account.avatar {
+        chip = chip.child(crate::ui::artwork::cover(Some(path), 22.0, 999.0));
+    }
+
+    if let Some(callback) = on_click {
+        chip = chip.on_click(move |_, window, cx| callback(window, cx));
+    }
+
+    chip
+}
+
+fn drag_area(anchor: DragAnchor, width: Option<f32>) -> impl IntoElement {
     #[cfg(not(target_os = "linux"))]
     let _ = &anchor;
     let area = div()
-        .id("titlebar-drag")
-        .flex_1()
+        .id(("titlebar-drag", width.map(|w| w as usize).unwrap_or(usize::MAX)))
         .h_full()
+        .when(width.is_some(), |this| this.w(px(width.unwrap_or(0.0))).flex_none())
+        .when(width.is_none(), |this| this.flex_1())
         .window_control_area(WindowControlArea::Drag);
 
     // Linux 后端不处理控制区：双击标题栏等同于最大化/还原（Windows 由
@@ -267,7 +360,13 @@ mod tests {
     #[test]
     fn titlebar_overlays_panel_backgrounds_without_its_own_fill() {
         let mut titlebar =
-            render_with_maximize_icon(maximize_icon(false), &test_anchor(), true, |_, _| {});
+            render_with_maximize_icon(
+            maximize_icon(false),
+            &test_anchor(),
+            true,
+            |_, _| {},
+            HeaderExtras::default(),
+        );
         let style = titlebar.style();
         assert_eq!(style.position, Some(gpui::Position::Absolute));
         assert_eq!(style.inset.top, Some(px(0.0).into()));
@@ -307,7 +406,13 @@ mod tests {
         assert_eq!(maximize_icon(true), "restore");
         // 两条分支都必须能构建出同高度的覆盖层。
         for icon in ["square", "restore"] {
-            let mut titlebar = render_with_maximize_icon(icon, &test_anchor(), true, |_, _| {});
+            let mut titlebar = render_with_maximize_icon(
+                icon,
+                &test_anchor(),
+                true,
+                |_, _| {},
+                HeaderExtras::default(),
+            );
             assert_eq!(titlebar.style().size.height, Some(px(STRIP_HEIGHT).into()));
         }
     }

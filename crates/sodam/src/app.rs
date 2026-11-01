@@ -312,6 +312,8 @@ pub struct Root {
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
     pub search_field: TextField,
+    /// 自绘标题栏是否承担了搜索框：是的话搜索页不再重复画一个输入框。
+    pub(crate) header_owns_search: bool,
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
@@ -609,6 +611,7 @@ impl Root {
             lyrics_scroll_tween_index: None,
             lyrics_request_seq: 0,
             search_field: TextField::default(),
+            header_owns_search: false,
             search_drag_by_word: false,
             search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1499,6 +1502,7 @@ impl Render for Root {
             )
         };
         let titlebar_anchor = self.titlebar_anchor.clone();
+        self.header_owns_search = own_titlebar;
         // 没有元素聚焦时把焦点收回根元素：gpui 的上下文栈取自聚焦节点的路径，
         // 空栈会让带谓词的快捷键绑定（播放三键）全部失效。
         if window.focused(cx).is_none() {
@@ -1694,6 +1698,33 @@ impl Render for Root {
             // 放在普通内容之后、弹层之前，控制按钮可点击，弹层仍能覆盖标题栏。
             .when(own_titlebar, |this| {
                 let root = cx.entity();
+                let account_root = cx.entity();
+                let logged_in = !self.settings.cookie.trim().is_empty();
+                let mut extras = ui::titlebar::HeaderExtras::default();
+                if own_titlebar {
+                    extras.search = Some(
+                        crate::views::search::search_box(self, window, cx, 28.0)
+                            .into_any_element(),
+                    );
+                }
+                if let Some(info) = self.account.as_ref().filter(|_| logged_in) {
+                    let badge = if info.vip_stage == "svip" {
+                        "SVIP"
+                    } else if info.vip {
+                        "VIP"
+                    } else {
+                        "开通 VIP"
+                    };
+                    extras.account = Some(ui::titlebar::HeaderAccount {
+                        badge: Some(gpui::SharedString::from(badge)),
+                        avatar: self.cover_of(&info.avatar_url),
+                    });
+                    extras.on_account_click = Some(Box::new(move |_window, cx| {
+                        account_root.update(cx, |root, cx| {
+                            root.set_nav(Nav::Settings, cx);
+                        });
+                    }));
+                }
                 this.child(ui::titlebar::render(
                     window,
                     &titlebar_anchor,
@@ -1704,6 +1735,7 @@ impl Render for Root {
                             cx.notify();
                         });
                     },
+                    extras,
                 ))
             })
             .when(self.track_menu.is_some(), |this| {

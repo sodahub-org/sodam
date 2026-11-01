@@ -3,7 +3,12 @@
 use super::*;
 use gpui::{MouseMoveEvent, MouseUpEvent};
 /// 搜索框：单击定位、拖拽扩选、双击选词、三击全选；按键走 keymap + action（见 `app_text`）。
-fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
+pub(crate) fn search_box(
+    root: &Root,
+    window: &Window,
+    cx: &mut Context<Root>,
+    height: f32,
+) -> impl IntoElement {
     let focused = root.search_focus.is_focused(window);
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
@@ -44,7 +49,7 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .flex()
         .flex_row()
         .items_center()
-        .h(px(38.0))
+        .h(px(height))
         .px_3()
         .rounded_md()
         .bg(theme::surface())
@@ -819,7 +824,12 @@ fn search_playlist_detail(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
-pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
+pub(crate) fn search_page(
+    root: &Root,
+    window: &Window,
+    cx: &mut Context<Root>,
+    show_input: bool,
+) -> AnyElement {
     if root.search_playlist.is_some() {
         return search_playlist_detail(root, cx);
     }
@@ -835,7 +845,9 @@ pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) 
         .flex_1()
         .min_h(px(0.0))
         .gap(px(theme::space::MD))
-        .child(search_box(root, window, cx))
+        .when(show_input, |this| {
+            this.child(search_box(root, window, cx, 38.0))
+        })
         .when(show_history, |this| {
             this.child(search_history_panel(root, cx))
         })

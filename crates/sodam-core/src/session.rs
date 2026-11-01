@@ -48,6 +48,8 @@ pub struct AccountInfo {
     pub nickname: String,
     pub user_id: String,
     pub vip: bool,
+    /// 会员档位（`vip` / `svip`，空串表示未知或非会员）。
+    pub vip_stage: String,
     /// 登录用户头像 URL（来自 /luna/pc/me 的 larger_avatar_url）
     pub avatar_url: String,
 }
@@ -282,6 +284,7 @@ impl Session {
             nickname: me.my_info.nickname.trim().to_string(),
             user_id: me.my_info.id.trim().to_string(),
             vip,
+            vip_stage: me.my_info.vip_stage.trim().to_ascii_lowercase(),
             avatar_url,
         })
     }
