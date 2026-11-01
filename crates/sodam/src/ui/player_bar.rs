@@ -483,7 +483,7 @@ pub(crate) fn quality_menu(
                 .items_center()
                 .h(px(62.0))
                 .px(px(10.0))
-                .py(px(2.0))
+                .py(px(0.0))
                 .cursor_pointer()
                 .hover(|style| style.bg(gpui::Rgba {
                     a: 0.1,
@@ -498,7 +498,7 @@ pub(crate) fn quality_menu(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
+                        .gap(px(1.0))
                         .flex_1()
                         .min_w(px(0.0))
                         .child(
@@ -595,7 +595,7 @@ pub(crate) fn quality_menu(
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
     let _ = cover_left;
     // 弹层整体必须落在播放条上方，底部箭头才不会压进控制栏。
-    let menu_height = if svip { 254.0 } else { 196.0 };
+    let menu_height = if svip { 218.0 } else { 168.0 };
     let bar_top = height - theme::PLAYER_H;
     let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
     let menu_top = cover_center.min(bar_top - menu_height - 10.0).max(48.0);
@@ -909,7 +909,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                 .items_center()
                                 .justify_center()
                                 .w(px(84.0))
-                                .h(px(38.0))
+                                .h(px(32.0))
                                 .rounded(px(100.0))
                                 .bg(gpui::Rgba { a: 0.05, ..theme::text() })
                                 .hover(|style| style.bg(gpui::Rgba { a: 0.1, ..theme::text() }))
