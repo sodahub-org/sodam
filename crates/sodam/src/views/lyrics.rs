@@ -478,6 +478,13 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         LyricReveal::None
                     };
                     let seek_to = line.start_seconds;
+                    // 官方用 mask 在上下边缘渐隐；gpui 没有渐变遮罩，
+                    // 改成按离当前句的行距做透明度衰减，视觉上接近。
+                    let distance = match root.lyrics_active {
+                        Some(active) => (index as i32 - active as i32).unsigned_abs() as f32,
+                        None => 0.0,
+                    };
+                    let fade = (1.0 - distance * 0.16).clamp(0.22, 1.0);
                     div()
                         .id(gpui::ElementId::Name(
                             format!("lyric-line-{index}").into(),
@@ -485,6 +492,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .cursor_pointer()
                         .p(px(6.0))
                         .rounded(px(8.0))
+                        .opacity(fade)
                         .hover(|style| style.bg(theme::surface_hover()))
                         .on_click(cx.listener(
                             move |root, _event: &ClickEvent, _window, cx| {
@@ -638,7 +646,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .min_w(px(300.0))
             // 官方歌词区和左侧「封面 + 歌曲信息」同高（lyrics-container
             // align-self: stretch），不是铺满整页。
-            .h(px(cover_size + 110.0))
+            .h(px(cover_size + 118.0))
             .flex_none()
             .min_h(px(0.0))
             .child(if root.loading_lyrics {
