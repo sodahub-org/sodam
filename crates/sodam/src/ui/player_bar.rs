@@ -452,11 +452,11 @@ pub(crate) fn quality_menu(
                 .items_center()
                 .gap(px(8.0))
                 .child(
-                    div()
-                        .text_size(px(16.0))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(gpui::rgb(0xffd98a))
-                        .child("SVIP"),
+                    svg()
+                        .path(icons::path("svip"))
+                        .w(px(52.0))
+                        .h(px(14.0))
+                        .text_color(gpui::rgb(0xffd98a)),
                 )
                 .child(
                     div()
@@ -537,10 +537,13 @@ pub(crate) fn quality_menu(
                                             .bg(gpui::rgb(0x4a4636))
                                             .flex()
                                             .items_center()
-                                            .text_size(px(10.0))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(gpui::rgb(0xffd98a))
-                                            .child("SVIP"),
+                                            .child(
+                                                svg()
+                                                    .path(icons::path("svip"))
+                                                    .w(px(28.0))
+                                                    .h(px(8.0))
+                                                    .text_color(gpui::rgb(0xffd98a)),
+                                            ),
                                     )
                                 }),
                         )
@@ -647,6 +650,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         "higher" => "较高".to_string(),
         "highest" => "极高".to_string(),
         "lossless" => "无损".to_string(),
+        "dolby" => "全景声".to_string(),
         "spatial" => "全景声".to_string(),
         _ => quality.clone(),
     };
