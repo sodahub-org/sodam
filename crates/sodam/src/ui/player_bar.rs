@@ -260,16 +260,31 @@ fn progress_bar(
                 .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
         )
         .when_some(chorus, |this, fraction| {
-            this.child(
-                // 高潮点：官方 slider-dot，高度跟随轨道、正方形圆点。
-                div()
-                    .absolute()
-                    .top(px(5.0))
-                    .left(gpui::relative(fraction))
-                    .size(px(4.0))
-                    .rounded_full()
-                    .bg(gpui::Rgba { a: 0.8, ..theme::text() }),
-            )
+            this
+                .child(
+                    // 高潮点：高度跟随轨道（平时 3px）。
+                    div()
+                        .absolute()
+                        .top(px(5.5))
+                        .left(gpui::relative(fraction))
+                        .size(px(3.0))
+                        .rounded_full()
+                        .bg(gpui::Rgba { a: 0.8, ..theme::text() })
+                        .opacity(1.0)
+                        .group_hover(PROGRESS_GROUP, |style| style.opacity(0.0)),
+                )
+                .child(
+                    // 悬停时跟着轨道一起变粗（6px）。
+                    div()
+                        .absolute()
+                        .top(px(4.0))
+                        .left(gpui::relative(fraction))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(gpui::Rgba { a: 0.8, ..theme::text() })
+                        .opacity(0.0)
+                        .group_hover(PROGRESS_GROUP, |style| style.opacity(1.0)),
+                )
         })
         .child(
             canvas(
@@ -558,6 +573,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .items_center()
                 .gap(px(theme::space::MD))
                 .w(gpui::relative(0.5))
+                .pr(px(150.0))
                 .child(
                     div()
                         .id("now-playing-cover")
@@ -843,6 +859,14 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             })),
                     )
                 })
+                .child(
+                    icon_button("expand", "maximize-2", theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(
+                            |root, _event: &ClickEvent, _window, cx| {
+                                root.open_playback(cx);
+                            },
+                        )),
+                )
                 .child(
                     icon_button("queue", "list-end", theme::ICON, theme::text_muted()).on_click(
                         cx.listener(|root, _event: &ClickEvent, _window, cx| {
