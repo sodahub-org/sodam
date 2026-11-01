@@ -329,6 +329,9 @@ pub struct Root {
     pub toast: Option<(String, std::time::Instant)>,
     /// 切音质后重载当前曲目要恢复的进度与播放状态。
     pub quality_resume: Option<(f64, bool)>,
+    /// 音质胶囊的实际屏幕区域（由 canvas 每帧写入，菜单用它精确定位）。
+    pub quality_bounds:
+        std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
     /// 静音前的音量，用于再次点击恢复。
@@ -678,6 +681,7 @@ impl Root {
             artist_ids: std::collections::HashMap::new(),
             toast: None,
             quality_resume: None,
+            quality_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             volume_open: false,
             volume_before_mute: 0.8,
             search_sug: Vec::new(),
@@ -1872,7 +1876,13 @@ impl Render for Root {
                 this.child(crate::views::track_menu(self, cx))
             })
             .when_some(self.quality_menu, |this, position| {
-                this.child(ui::player_bar::quality_menu(self, cx, position, window.viewport_size()))
+                this.child(ui::player_bar::quality_menu(
+                    self,
+                    cx,
+                    position,
+                    window.viewport_size(),
+                    self.quality_bounds.get(),
+                ))
             })
             .when(
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),

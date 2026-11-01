@@ -415,6 +415,7 @@ pub(crate) fn quality_menu(
     cx: &mut Context<Root>,
     position: gpui::Point<gpui::Pixels>,
     viewport: gpui::Size<gpui::Pixels>,
+    pill_bounds: Option<gpui::Bounds<gpui::Pixels>>,
 ) -> impl IntoElement {
     let playing = root.engine.snapshot().quality.to_ascii_lowercase();
     let current_key = if playing.is_empty() {
@@ -600,13 +601,21 @@ pub(crate) fn quality_menu(
     let menu_height = if svip { 218.0 } else { 168.0 };
     let bar_top = height - theme::PLAYER_H;
     let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
-    let menu_top = cover_center.min(bar_top - menu_height - 10.0).max(48.0);
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
-    // 菜单以音质胶囊为中心：宽度收窄后箭头仍正对胶囊中心。
+    // 菜单以音质胶囊为中心：中心与底边都取胶囊的真实区域，避免估算偏差。
     let menu_width = 280.0;
-    let menu_left = (width - 271.5 - menu_width / 2.0).max(12.0);
-    let pill_center = width - 271.5;
-    let arrow_x = (pill_center - menu_left - 7.5).clamp(12.0, menu_width - 24.0);
+    let pill_center = pill_bounds
+        .map(|bounds| f32::from(bounds.center().x))
+        .unwrap_or(width - 302.0);
+    let pill_top = pill_bounds
+        .map(|bounds| f32::from(bounds.top()))
+        .unwrap_or(height - theme::PLAYER_H + 28.0);
+    let menu_left = (pill_center - menu_width / 2.0).max(12.0);
+    let menu_top = cover_center
+        .min(pill_top - menu_height - 8.0)
+        .min(bar_top - menu_height - 8.0)
+        .max(48.0);
+    let arrow_x = (pill_center - menu_left - 6.0).clamp(12.0, menu_width - 24.0);
     let _ = position;
     gpui::deferred(
         div()
