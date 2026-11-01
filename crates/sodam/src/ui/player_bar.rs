@@ -40,6 +40,13 @@ fn volume_popover(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
 
     div()
         .id("volume-popover")
+        .on_hover(cx.listener(|root, hovered: &bool, _window, cx| {
+            root.volume_inside = *hovered;
+            if *hovered {
+                root.volume_open = true;
+            }
+            cx.notify();
+        }))
         .absolute()
         .left(gpui::relative(0.5))
         .ml(px(-20.0))
@@ -615,7 +622,7 @@ pub(crate) fn quality_menu(
     let arrow_gap = 10.0;
     let menu_bottom_offset = (height - pill_top + arrow_gap).max(0.0);
     // 箭头宽 20：要让其中线对准胶囊中心，左边界 = 中心 - 10。
-    let arrow_x = (pill_center - menu_left - 9.0).clamp(12.0, menu_width - 32.0);
+    let arrow_x = (pill_center - menu_left - 8.0).clamp(12.0, menu_width - 32.0);
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST: AtomicU64 = AtomicU64::new(0);
@@ -652,12 +659,12 @@ pub(crate) fn quality_menu(
                 div()
                     .absolute()
                     .left(px(arrow_x))
-                    .bottom(px(-arrow_gap))
+                    .bottom(px(-6.0))
                     .child(
                         svg()
                             .path(icons::path("triangle-down"))
-                            .w(px(18.0))
-                            .h(px(9.0))
+                            .w(px(16.0))
+                            .h(px(8.0))
                             .text_color(surface),
                     ),
             ),
@@ -1032,7 +1039,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme::text())
                         .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
-                            root.quality_menu = Some(event.position());
+                            root.quality_menu = if root.quality_menu.is_some() {
+                                None
+                            } else {
+                                Some(event.position())
+                            };
                             cx.notify();
                         }))
                         .child(quality_name.clone()),
@@ -1083,8 +1094,25 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .id("volume-anchor")
                         .relative()
                         .on_hover(cx.listener(|root, hovered: &bool, _window, cx| {
-                            root.volume_open = *hovered;
-                            cx.notify();
+                            if *hovered {
+                                root.volume_open = true;
+                                cx.notify();
+                                return;
+                            }
+                            // 鼠标要跨过按钮与浮层之间的空隙：延迟关闭，
+                            // 进入浮层会取消这次关闭。
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(350))
+                                    .await;
+                                let _ = this.update(cx, |root, cx| {
+                                    if !root.volume_inside {
+                                        root.volume_open = false;
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
                         }))
                         .child(
                             icon_button(

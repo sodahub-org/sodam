@@ -334,6 +334,8 @@ pub struct Root {
         std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量弹层的开合状态。
     pub volume_open: bool,
+    /// 鼠标是否在音量浮层内（用于离开按钮后的宽限关闭）。
+    pub volume_inside: bool,
     /// 静音前的音量，用于再次点击恢复。
     pub volume_before_mute: f32,
     /// 搜索联想词与下拉状态。
@@ -683,6 +685,7 @@ impl Root {
             quality_resume: None,
             quality_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             volume_open: false,
+            volume_inside: false,
             volume_before_mute: 0.8,
             search_sug: Vec::new(),
             search_sug_open: false,
