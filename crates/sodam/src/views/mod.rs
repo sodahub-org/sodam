@@ -1576,15 +1576,13 @@ pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .id("comment-panel")
             .absolute()
             .right(px(0.0))
-            .top(px(48.0))
+            .top(px(0.0))
             .bottom(px(0.0))
-            .w(px(420.0))
+            .w(px(380.0))
             .flex()
             .flex_col()
-            .bg(gpui::Rgba {
-                a: 0.94,
-                ..theme::surface_elevated()
-            })
+            // 官方评论区是不透明面板，并且盖住窗口右上角的最小化/最大化/关闭。
+            .bg(theme::surface_elevated())
             .border_l_1()
             .border_color(theme::border())
             .occlude()
