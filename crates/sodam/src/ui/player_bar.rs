@@ -432,6 +432,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     let mode_icon = root.queue.mode.icon();
 
     div()
+        .relative()
         .flex()
         .flex_row()
         .items_center()
@@ -444,6 +445,15 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         .bg(theme::bg())
         .border_t_1()
         .border_color(theme::border())
+        // 官方把进度条贴在控制栏上沿（top: -9），横跨整个窗口。
+        .child(
+            div()
+                .absolute()
+                .top(px(-9.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .child(progress_bar(root, progress, loading, cx)),
+        )
         // 左：封面 + 标题/歌手/进度文案
         .child(
             div()
@@ -685,28 +695,6 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             },
                         )),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::space::SM))
-                        .w(px(420.0))
-                        .max_w_full()
-                        .child(
-                            div()
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::text_faint())
-                                .child(snapshot.position_label()),
-                        )
-                        .child(progress_bar(root, progress, loading, cx))
-                        .child(
-                            div()
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::text_faint())
-                                .child(snapshot.duration_label()),
-                        ),
-                ),
         )
         // 右：音量（内联滑条）+ 队列抽屉开关
         .child(
