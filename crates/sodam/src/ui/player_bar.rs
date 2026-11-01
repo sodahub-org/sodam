@@ -597,8 +597,6 @@ pub(crate) fn quality_menu(
     }
     let cover_left = (width - (cover + 50.0 + lyrics_w)) / 2.0;
     let _ = cover_left;
-    // 弹层整体必须落在播放条上方，底部箭头才不会压进控制栏。
-    let menu_height = if svip { 332.0 } else { 264.0 };
     let bar_top = height - theme::PLAYER_H;
     let cover_center = 48.0 + (content_h - (cover + 110.0)).max(0.0) / 2.0 + cover / 2.0;
     // 右侧：右距 20 + 队列 32 + 间距 12 + 音量 32 + 间距 12 = 循环右缘
@@ -611,11 +609,11 @@ pub(crate) fn quality_menu(
         .map(|bounds| f32::from(bounds.top()))
         .unwrap_or(height - theme::PLAYER_H + 28.0);
     let menu_left = (pill_center - menu_width / 2.0).max(12.0);
-    // 箭头必须紧贴胶囊：底边固定停在胶囊顶上方 8px；只有空间实在不够时才上移。
+    // 用「底边贴胶囊」定位：菜单高度怎么变，箭头与胶囊的间距都固定。
     let _ = cover_center;
-    // 胶囊本身在播放条里，所以箭头允许压在播放条上沿，不能再按 bar_top 上推。
     let _ = bar_top;
-    let menu_top = (pill_top - menu_height - 8.0).max(48.0);
+    let arrow_gap = 10.0;
+    let menu_bottom_offset = (height - pill_top + arrow_gap).max(0.0);
     // 箭头宽 20：要让其中线对准胶囊中心，左边界 = 中心 - 10。
     let arrow_x = (pill_center - menu_left - 10.0).clamp(12.0, menu_width - 32.0);
     {
@@ -628,7 +626,7 @@ pub(crate) fn quality_menu(
         if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 500 {
             LAST.store(now, Ordering::Relaxed);
             crate::debug_log(&format!(
-                "quality-menu geom: viewport={width}x{height} pill={pill_bounds:?} left={menu_left} top={menu_top} w={menu_width} arrow_x={arrow_x}"
+                "quality-menu geom: viewport={width}x{height} pill={pill_bounds:?} left={menu_left} bottom_off={menu_bottom_offset} w={menu_width} arrow_x={arrow_x} gap={arrow_gap}"
             ));
         }
     }
@@ -638,7 +636,7 @@ pub(crate) fn quality_menu(
             .id("quality-menu")
             .absolute()
             .left(px(menu_left))
-            .top(px(menu_top))
+            .bottom(px(menu_bottom_offset))
             .w(px(menu_width))
             .flex()
             .flex_col()
