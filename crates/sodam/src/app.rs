@@ -1907,7 +1907,14 @@ impl Render for Root {
                             .size_full()
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
-                                cx.listener(|root, _event, _window, cx| {
+                                cx.listener(|root, event: &gpui::MouseDownEvent, _window, cx| {
+                                    // 点在音质胶囊上时交给按钮自己处理（第二次点击关闭），
+                                    // 遮罩不要先把它关掉再让按钮重新打开。
+                                    if let Some(bounds) = root.quality_bounds.get() {
+                                        if bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                    }
                                     if root.any_menu_open() {
                                         root.queue_menu = None;
                                         root.track_menu = None;
