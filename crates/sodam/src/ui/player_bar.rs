@@ -811,7 +811,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .justify_end()
                 .gap(px(12.0))
                 .flex_shrink(1.0)
-                // 官方 actions-right 的音质入口。
+                // 官方 actions-right 顺序：音质 → 音效 → 歌词 → 循环 → 音量 → 队列
                 .child(
                     div()
                         .id("quality-button")
@@ -827,54 +827,64 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                         .text_size(px(13.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme::text())
-                        .on_click(cx.listener(
-                            |root, event: &ClickEvent, _window, cx| {
-                                root.quality_menu = Some(event.position());
-                                cx.notify();
-                            },
-                        ))
+                        .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
+                            root.quality_menu = Some(event.position());
+                            cx.notify();
+                        }))
                         .child(quality.clone()),
                 )
-                // 官方 BottomPlayerDurationIndicator：当前 / 总时长
                 .child(
                     div()
+                        .id("effect-button")
+                        .h(px(26.0))
                         .px(px(6.0))
+                        .min_w(px(32.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.0))
+                        .bg(gpui::Rgba { a: 0.07, ..theme::text() })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(gpui::Rgba { a: 0.12, ..theme::text() }))
                         .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme::text_muted())
-                        .child(format!(
-                            "{} / {}",
-                            snapshot.position_label(),
-                            snapshot.duration_label()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(root.tr("音效").to_string()),
+                )
+                .child(
+                    icon_button("lyrics-toggle", "music", theme::ICON, theme::text_muted())
+                        .on_click(cx.listener(
+                            |root, _event: &ClickEvent, _window, cx| {
+                                root.open_playback(cx);
+                            },
                         )),
                 )
+                .when(!root.queue_origin.is_feed_like(), |bar| {
+                    bar.child(
+                        icon_button("play-mode", mode_icon, theme::ICON, theme::text_muted())
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.cycle_play_mode(cx);
+                            })),
+                    )
+                })
                 .child(
                     div()
                         .id("volume-anchor")
                         .relative()
-                        .on_hover(cx.listener(
-                            |root, hovered: &bool, _window, cx| {
-                                root.volume_open = *hovered;
-                                cx.notify();
-                            },
-                        ))
+                        .on_hover(cx.listener(|root, hovered: &bool, _window, cx| {
+                            root.volume_open = *hovered;
+                            cx.notify();
+                        }))
                         .child(
                             icon_button(
                                 "volume",
-                                if volume <= 0.01 {
-                                    "volume-x"
-                                } else {
-                                    "volume-2"
-                                },
+                                if volume <= 0.01 { "volume-x" } else { "volume-2" },
                                 theme::ICON,
                                 theme::text_muted(),
                             )
-                            .on_click(cx.listener(
-                                |root, _event: &ClickEvent, _window, cx| {
-                                    root.toggle_mute();
-                                    cx.notify();
-                                },
-                            )),
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.toggle_mute();
+                                cx.notify();
+                            })),
                         )
                         .when(root.volume_open, |this| {
                             this.child(
@@ -884,49 +894,11 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             )
                         }),
                 )
-                .when(!root.queue_origin.is_feed_like(), |bar| {
-                    bar.child(
-                        // 播放模式：列表循环 / 单曲循环 / 随机播放，点击轮换。
-                        // 推荐流与听歌模式不显示——那边的歌由服务端持续追加，
-                        // 播放模式没有意义。
-                        icon_button("play-mode", mode_icon, theme::ICON, theme::text_muted())
-                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                                root.cycle_play_mode(cx);
-                            })),
-                    )
-                })
-                .child(
-                    icon_button("expand", "maximize-2", theme::ICON, theme::text_muted())
-                        .on_click(cx.listener(
-                            |root, _event: &ClickEvent, _window, cx| {
-                                root.open_playback(cx);
-                            },
-                        )),
-                )
-                // 官方「更多」：打开当前曲目的操作菜单。
-                .when(track.is_some(), |this| {
-                    this.child(
-                        icon_button("more", "more-horizontal", theme::ICON, theme::text_muted())
-                            .on_click(cx.listener(
-                                |root, event: &ClickEvent, _window, cx| {
-                                    if let Some(track) = root.queue.current().cloned() {
-                                        root.queue_menu = None;
-                                        root.track_menu = Some(crate::app::TrackMenu {
-                                            track,
-                                            position: event.position(),
-                                        });
-                                        cx.notify();
-                                    }
-                                },
-                            )),
-                    )
-                })
                 .child(
                     icon_button("queue", "list-end", theme::ICON, theme::text_muted()).on_click(
                         cx.listener(|root, _event: &ClickEvent, _window, cx| {
                             root.queue_open = !root.queue_open;
                             if root.queue_open {
-                                // 打开时把滚动位置锚到「正在播放」
                                 root.anchor_queue_scroll();
                             }
                             cx.notify();
