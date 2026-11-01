@@ -1554,6 +1554,14 @@ impl Root {
 
     /// 异步取当前歌曲的高潮点，拿到后刷新进度条上的标记。
     pub(crate) fn load_chorus(&mut self, track: &sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        // 切歌时评论区跟着刷新会很跳：直接关掉旧面板，等用户自己再打开。
+        if self.comment_panel_open
+            && self.comment_track.as_deref() != Some(track.id.as_str())
+        {
+            self.comment_panel_open = false;
+            self.comment_items.clear();
+            self.comment_track = None;
+        }
         if track.id.is_empty() || self.chorus_cache.contains_key(&track.id) {
             return;
         }
