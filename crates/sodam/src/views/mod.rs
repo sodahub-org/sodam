@@ -1338,17 +1338,30 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .border_color(theme::border())
                     .shadow_lg()
                     .child(item("more-album", "disc-3", root.tr("查看专辑").to_string(), cx, |root, track, cx| {
-                        root.open_track_album(track, cx);
+                        let album_id = if track.album_id.is_empty() {
+                            root.album_ids.get(&track.id).cloned().unwrap_or_default()
+                        } else {
+                            track.album_id.clone()
+                        };
+                        if album_id.is_empty() {
+                            root.set_status("暂时拿不到这张专辑的信息", &[]);
+                        } else {
+                            root.set_status("正在打开专辑…", &[]);
+                            root.open_track_album(track, cx);
+                        }
                     }))
                     .child(item("more-share", "share-2", root.tr("分享").to_string(), cx, |root, track, cx| {
                         let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                        root.set_status("已复制歌曲链接", &[]);
                         root.set_toast("已复制链接".to_string(), cx);
                     }))
                     .child(item("more-feedback", "info", root.tr("歌曲信息反馈").to_string(), cx, |root, track, cx| {
+                        root.set_status("已记录歌曲信息反馈", &[]);
                         root.set_toast(format!("已记录对《{}》的信息反馈", track.title), cx);
                     }))
                     .child(item("more-report", "alert-triangle", root.tr("举报歌曲").to_string(), cx, |root, track, cx| {
+                        root.set_status("已提交举报", &[]);
                         root.set_toast(format!("已收到对《{}》的举报", track.title), cx);
                     })),
             ),

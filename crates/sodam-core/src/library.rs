@@ -982,7 +982,7 @@ pub fn track_extras(
                 .pointer("/stats/count_comment")
                 .and_then(|count| count.as_i64())
                 .unwrap_or(0);
-            if start > 0.0 || comments > 0 {
+            {
                 return Some(TrackExtras {
                     chorus_seconds: start / 1000.0,
                     comments,
