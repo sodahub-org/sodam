@@ -1318,10 +1318,13 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .child(label),
             )
     };
+    // 菜单向上展开：点击点靠近播放条，向下会出窗口；同时避免 snap 只挪绘制
+    // 不挪 hitbox 导致“看得见点不到”。
+    let menu_y = (f32::from(position.y) - 190.0).max(8.0);
     gpui::deferred(
         gpui::anchored()
             .snap_to_window()
-            .position(point(position.x, position.y))
+            .position(point(position.x, px(menu_y)))
             .child(
                 div()
                     .id("more-menu")
@@ -1409,10 +1412,11 @@ pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .child(label),
             )
     };
+    let menu_y = (f32::from(position.y) - 110.0).max(8.0);
     gpui::deferred(
         gpui::anchored()
             .snap_to_window()
-            .position(point(position.x, position.y))
+            .position(point(position.x, px(menu_y)))
             .child(
                 div()
                     .id("add-to-playlist-menu")
