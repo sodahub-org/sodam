@@ -121,6 +121,10 @@ impl Root {
         if self.searching {
             return;
         }
+        // 顶栏搜索是全局入口：提交后要切到搜索结果页，不能只留一条状态提示。
+        if self.nav != Nav::Search {
+            self.set_nav(Nav::Search, cx);
+        }
         if self.settings.record_search(&keyword) {
             let _ = self.settings.save();
         }
