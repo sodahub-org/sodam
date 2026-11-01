@@ -132,7 +132,7 @@ icon_set!(
     "shuffle",
     "volume-2",
     "volume-x",
-    "list-end", "maximize-2",
+    "list-end", "maximize-2", "more-horizontal",
     "music",
     "spinner",
     "chevron-left",

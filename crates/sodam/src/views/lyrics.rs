@@ -645,8 +645,12 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .max_w(px(500.0))
             .min_w(px(300.0))
             // 官方歌词区和左侧「封面 + 歌曲信息」同高（lyrics-container
-            // align-self: stretch），不是铺满整页。
+            // align-self: stretch），不是铺满整页。显式给 h + max_h，
+            // 防止父级 flex 把它拉伸回整页高度。
             .h(px(cover_size + 118.0))
+            .max_h(px(cover_size + 118.0))
+            .self_start()
+            .overflow_hidden()
             .flex_none()
             .min_h(px(0.0))
             .child(if root.loading_lyrics {

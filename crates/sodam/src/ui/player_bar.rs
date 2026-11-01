@@ -815,15 +815,18 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .child(
                     div()
                         .id("quality-button")
-                        .h(px(32.0))
+                        .h(px(26.0))
                         .px(px(6.0))
+                        .min_w(px(32.0))
                         .flex()
                         .items_center()
                         .rounded(px(8.0))
+                        .bg(gpui::Rgba { a: 0.07, ..theme::text() })
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme::surface_hover()))
+                        .hover(|style| style.bg(gpui::Rgba { a: 0.12, ..theme::text() }))
                         .text_size(px(13.0))
-                        .text_color(theme::text_muted())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
                         .on_click(cx.listener(
                             |root, event: &ClickEvent, _window, cx| {
                                 root.quality_menu = Some(event.position());
@@ -900,6 +903,24 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             },
                         )),
                 )
+                // 官方「更多」：打开当前曲目的操作菜单。
+                .when(track.is_some(), |this| {
+                    this.child(
+                        icon_button("more", "more-horizontal", theme::ICON, theme::text_muted())
+                            .on_click(cx.listener(
+                                |root, event: &ClickEvent, _window, cx| {
+                                    if let Some(track) = root.queue.current().cloned() {
+                                        root.queue_menu = None;
+                                        root.track_menu = Some(crate::app::TrackMenu {
+                                            track,
+                                            position: event.position(),
+                                        });
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                    )
+                })
                 .child(
                     icon_button("queue", "list-end", theme::ICON, theme::text_muted()).on_click(
                         cx.listener(|root, _event: &ClickEvent, _window, cx| {
