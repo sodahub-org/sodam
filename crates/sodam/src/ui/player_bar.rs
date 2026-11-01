@@ -356,62 +356,195 @@ pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language
 }
 
 /// 播放条的档位菜单：勾选的是**意图**，徽章上显示的是**实际**档位。
+/// 官方音质菜单的展示项（顺序、标题、副标题、SVIP 标记都照官方）。
+struct QualityOption {
+    key: &'static str,
+    title: &'static str,
+    desc: &'static str,
+    svip: bool,
+}
+
+const QUALITY_OPTIONS: [QualityOption; 5] = [
+    QualityOption {
+        key: "hires",
+        title: "录音室音质",
+        desc: "还原录音室效果，更通透纯净",
+        svip: true,
+    },
+    QualityOption {
+        key: "dolby",
+        title: "全景声",
+        desc: "无损全面升级，沉浸式空间环绕音感",
+        svip: true,
+    },
+    QualityOption {
+        key: "lossless",
+        title: "无损音质",
+        desc: "真无损，官方出品，原汁原味",
+        svip: true,
+    },
+    QualityOption {
+        key: "highest",
+        title: "极高音质",
+        desc: "",
+        svip: false,
+    },
+    QualityOption {
+        key: "medium",
+        title: "标准音质",
+        desc: "",
+        svip: false,
+    },
+];
+
+/// 音质在菜单/设置里的官方名称。
+pub fn official_quality_label(value: &str) -> &'static str {
+    match value {
+        "hires" => "录音室音质",
+        "dolby" => "全景声",
+        "lossless" => "无损音质",
+        "highest" => "极高音质",
+        "medium" => "标准音质",
+        "low" => "低音质",
+        _ => "自动",
+    }
+}
+
 pub(crate) fn quality_menu(
     root: &Root,
     cx: &mut Context<Root>,
     position: gpui::Point<gpui::Pixels>,
 ) -> impl IntoElement {
-    let current = root.settings.quality_intent();
-    let language = root.language;
-    let rows = std::iter::once(sodam_core::quality::AUTO)
-        .chain(sodam_core::quality::TIERS)
-        .map(|value| {
-            let chosen = sodam_core::quality::QualityIntent::parse(value) == current;
-            let hint = if value == sodam_core::quality::AUTO {
-                root.tr("不设上限，按账号权益和单曲可用档位取最高")
-            } else {
-                ""
-            };
+    let playing = root.engine.snapshot().quality.to_ascii_lowercase();
+    let current_key = if playing.is_empty() {
+        root.settings.quality_intent().as_setting().to_string()
+    } else {
+        playing
+    };
+    let svip = root
+        .account
+        .as_ref()
+        .is_some_and(|account| account.vip || !account.vip_stage.is_empty());
+
+    // 官方深色弹层：不跟随主题，固定 #252525。
+    let surface = gpui::rgb(0x252525);
+    let text_primary = gpui::Rgba {
+        a: 0.85,
+        ..gpui::rgb(0xffffff)
+    };
+    let text_secondary = gpui::Rgba {
+        a: 0.5,
+        ..gpui::rgb(0xffffff)
+    };
+
+    let mut items: Vec<gpui::AnyElement> = Vec::new();
+    if svip {
+        items.push(
+            div()
+                .mx(px(12.0))
+                .my(px(8.0))
+                .px(px(16.0))
+                .py(px(16.0))
+                .rounded(px(8.0))
+                .bg(gpui::rgb(0x3a3a2e))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(gpui::rgb(0xffd98a))
+                        .child("SVIP"),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(text_primary)
+                        .child("权益生效中，尊享音质、音效特权"),
+                )
+                .into_any_element(),
+        );
+    }
+    for option in QUALITY_OPTIONS {
+        let chosen = current_key == option.key
+            || (option.key == "dolby" && current_key == "spatial");
+        let key = option.key;
+        items.push(
             div()
                 .id(gpui::ElementId::Name(
-                    format!("quality-menu-{value}").into(),
+                    format!("quality-menu-{key}").into(),
                 ))
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .gap(px(theme::space::LG))
-                .px(px(theme::space::SM))
-                .py(px(theme::space::XS))
-                .rounded(px(theme::radius::ROW))
+                .h(px(58.0))
+                .px(px(12.0))
+                .py(px(10.0))
                 .cursor_pointer()
-                .when(chosen, |this| this.bg(theme::surface_selected()))
-                .hover(|style| style.bg(theme::surface_hover()))
+                .hover(|style| style.bg(gpui::Rgba {
+                    a: 0.1,
+                    ..gpui::rgb(0xffffff)
+                }))
                 .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
-                    root.set_quality(value, cx);
+                    root.set_quality(key, cx);
+                    root.quality_menu = None;
                     cx.notify();
                 }))
                 .child(
                     div()
                         .flex()
                         .flex_col()
+                        .gap(px(4.0))
+                        .flex_1()
                         .min_w(px(0.0))
                         .child(
                             div()
-                                .text_size(theme::Text::Small.size())
-                                .text_color(if chosen {
-                                    theme::text()
-                                } else {
-                                    theme::text_muted()
-                                })
-                                .child(quality_label(value, language)),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_size(px(14.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(text_primary)
+                                        .child(option.title),
+                                )
+                                .when(option.svip, |this| {
+                                    this.child(
+                                        div()
+                                            .px(px(4.0))
+                                            .h(px(16.0))
+                                            .rounded(px(4.0))
+                                            .bg(gpui::rgb(0x4a4636))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(gpui::rgb(0xffd98a))
+                                            .child("SVIP"),
+                                    )
+                                }),
                         )
-                        .when(!hint.is_empty(), |this| {
+                        .when(!option.desc.is_empty(), |this| {
                             this.child(
                                 div()
-                                    .text_size(theme::Text::Tiny.size())
-                                    .text_color(theme::text_faint())
-                                    .child(hint),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .text_size(px(13.0))
+                                    .text_color(text_secondary)
+                                    .child(option.desc)
+                                    .child(
+                                        svg()
+                                            .path(icons::path("info"))
+                                            .size(px(14.0))
+                                            .text_color(text_secondary),
+                                    ),
                             )
                         }),
                 )
@@ -419,43 +552,45 @@ pub(crate) fn quality_menu(
                     this.child(
                         svg()
                             .path(icons::path("check"))
-                            .size(px(theme::ICON_SM))
-                            .text_color(theme::accent()),
+                            .size(px(16.0))
+                            .text_color(gpui::rgb(0xffffff)),
                     )
                 })
-                .into_any_element()
-        })
-        .collect::<Vec<_>>();
+                .into_any_element(),
+        );
+    }
 
     gpui::deferred(
-        gpui::anchored().snap_to_window().position(position).child(
-            div()
-                .id("quality-menu")
-                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                    // 菜单内的点击不要穿透到下层（否则会误触播放条其他按钮）
-                    cx.stop_propagation();
-                })
-                .flex()
-                .flex_col()
-                .w(px(QUALITY_MENU_W))
-                .p(px(theme::space::XS))
-                .rounded(px(theme::radius::CARD))
-                .bg(theme::surface_elevated())
-                .border_1()
-                .border_color(theme::border())
-                .shadow_lg()
-                .child(
-                    div()
-                        .px(px(theme::space::SM))
-                        .py(px(theme::space::XS))
-                        .text_size(theme::Text::Tiny.size())
-                        .text_color(theme::text_faint())
-                        .child(root.tr("音质：从下一首生效")),
-                )
-                .children(rows),
-        ),
+        gpui::anchored()
+            .snap_to_window()
+            .position(position)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("quality-menu")
+                            .flex()
+                            .flex_col()
+                            .w(px(350.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(surface)
+                            .shadow_lg()
+                            .children(items),
+                    )
+                    .child(
+                        div().flex().justify_center().child(
+                            svg()
+                                .path(icons::path("triangle-down"))
+                                .size(px(12.0))
+                                .text_color(surface),
+                        ),
+                    ),
+            ),
     )
-    .with_priority(2)
+    .with_priority(3)
 }
 
 /// 渲染播放条。

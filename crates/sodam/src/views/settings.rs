@@ -524,13 +524,17 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         }
     };
     let language = root.language;
-    let label_for = |value: &str| crate::ui::player_bar::quality_label(value, language);
+    // 官方音质档位与命名：录音室 / 全景声 / 无损 / 极高 / 标准（另有自动）。
+    const OFFICIAL_TIERS: [&str; 5] = ["hires", "dolby", "lossless", "highest", "medium"];
+    let label_for = |value: &str| {
+        crate::ui::player_bar::official_quality_label(value).to_string()
+    };
     let options: Vec<(&str, String)> = std::iter::once(sodam_core::quality::AUTO)
-        .chain(sodam_core::quality::TIERS)
+        .chain(OFFICIAL_TIERS)
         .map(|value| (value, label_for(value)))
         .collect();
-    // 批量升级同样从 `TIERS` 派生，避免播放档位能选、批量升级却少几档。
-    let batch_tiers: Vec<(&str, String)> = sodam_core::quality::TIERS
+    // 批量升级同样用官方档位，避免播放档位能选、批量升级却少几档。
+    let batch_tiers: Vec<(&str, String)> = OFFICIAL_TIERS
         .into_iter()
         .map(|tier| (tier, label_for(tier)))
         .collect();
