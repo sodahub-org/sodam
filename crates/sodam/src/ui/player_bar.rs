@@ -616,6 +616,20 @@ pub(crate) fn quality_menu(
         .min(bar_top - menu_height - 8.0)
         .max(48.0);
     let arrow_x = (pill_center - menu_left - 6.0).clamp(12.0, menu_width - 24.0);
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        if now.saturating_sub(LAST.load(Ordering::Relaxed)) > 500 {
+            LAST.store(now, Ordering::Relaxed);
+            crate::debug_log(&format!(
+                "quality-menu geom: viewport={width}x{height} pill={pill_bounds:?} left={menu_left} top={menu_top} w={menu_width} arrow_x={arrow_x}"
+            ));
+        }
+    }
     let _ = position;
     gpui::deferred(
         div()
