@@ -674,7 +674,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     // 不再从标签字符串里 `contains("试听")` —— 那样显示与状态就同一个事实两处真相。
     let mut quality = localized_quality(snapshot.quality.clone(), language);
     // 官方按钮直接显示服务端档位名（去掉“音质”）：录音室 / 标准 / 较高 / 极高 / 无损 / 全景声
-    let quality_name = match snapshot.quality.to_ascii_lowercase().as_str() {
+    let mut quality_name = match snapshot.quality.to_ascii_lowercase().as_str() {
         "hi_res" | "hires" | "hi-res" => "录音室".to_string(),
         "medium" | "standard" => "标准".to_string(),
         "higher" => "较高".to_string(),
