@@ -648,7 +648,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             // 防止父级 flex 把它拉伸回整页高度。
             .h(px(cover_size))
             .max_h(px(cover_size))
-            .self_start()
             .overflow_hidden()
             .flex_none()
             .min_h(px(0.0))
