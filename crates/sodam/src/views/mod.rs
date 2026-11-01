@@ -1340,3 +1340,59 @@ pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     )
     .into_any_element()
 }
+
+/// 「添加到歌单」：列出自己的歌单，点一条就追加当前曲目。
+pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let Some((track, position)) = root.add_menu.clone() else {
+        return div().into_any_element();
+    };
+    let rows: Vec<AnyElement> = root
+        .playlists
+        .iter()
+        .take(20)
+        .map(|playlist| {
+            let id = playlist.id.clone();
+            let title = playlist.title.clone();
+            let track = track.clone();
+            div()
+                .id(gpui::ElementId::Name(format!("add-to-{}", id).into()))
+                .truncate()
+                .px(px(theme::space::SM))
+                .py(px(theme::space::XS))
+                .rounded(px(theme::radius::ROW))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text())
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    root.add_menu = None;
+                    root.append_to_playlist(track.clone(), id.clone(), cx);
+                }))
+                .child(title)
+                .into_any_element()
+        })
+        .collect();
+    gpui::deferred(
+        gpui::anchored()
+            .snap_to_window()
+            .position(point(position.x, position.y))
+            .child(
+                div()
+                    .id("add-to-playlist-menu")
+                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .flex()
+                    .flex_col()
+                    .w(px(200.0))
+                    .p(px(theme::space::XS))
+                    .rounded(px(theme::radius::CARD))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .children(rows),
+            ),
+    )
+    .into_any_element()
+}

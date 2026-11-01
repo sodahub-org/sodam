@@ -661,11 +661,20 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 })
                 .child(
                     icon_button("bar-add", "note-plus", theme::ICON, theme::text_muted())
-                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
+                        .on_click(cx.listener(|root, event: &ClickEvent, _window, cx| {
+                            if let Some(track) = root.queue.current().cloned() {
+                                root.add_menu = Some((track, event.position()));
+                                cx.notify();
+                            }
+                        })),
                 )
                 .child(
                     icon_button("bar-dislike", "thumb-down", theme::ICON, theme::text_muted())
-                        .on_click(cx.listener(|_root, _event: &ClickEvent, _window, _cx| {})),
+                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                            if let Some(track) = root.queue.current().cloned() {
+                                root.dislike_track(track, cx);
+                            }
+                        })),
                 )
                 .when(track.is_some(), |this| {
                     this.child(

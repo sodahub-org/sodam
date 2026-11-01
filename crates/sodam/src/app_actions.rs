@@ -466,6 +466,51 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 少推荐：把当前曲目提交给 /luna/track/dislike。
+    pub fn dislike_track(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::dislike_track(&session, &track.id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                match result {
+                    Ok(()) => root.set_status("已减少推荐：{}", std::slice::from_ref(&track.title)),
+                    Err(err) => root.playback_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把曲目追加到指定歌单。
+    pub fn append_to_playlist(
+        &mut self,
+        track: sodam_core::models::TrackItem,
+        playlist_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::append_track_to_playlist(&session, &playlist_id, &track.id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                match result {
+                    Ok(()) => root.set_status("已添加到歌单", &[]),
+                    Err(err) => root.playback_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 音量图标点击：静音 / 恢复。
     pub fn toggle_mute(&mut self) {
         if self.settings.volume > 0.01 {

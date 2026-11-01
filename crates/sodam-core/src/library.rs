@@ -1353,3 +1353,57 @@ mod tests {
         assert!(liked_songs(&session).is_err());
     }
 }
+
+/// 少推荐：`POST /luna/track/dislike`。
+pub fn dislike_track(session: &Session, track_id: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({ "track_id": track_id });
+    post_pc_json(session, "/luna/track/dislike", &body)
+}
+
+/// 把曲目追加到歌单：`POST /luna/pc/me/playlist/media/append`。
+pub fn append_track_to_playlist(
+    session: &Session,
+    playlist_id: &str,
+    track_id: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "playlist_id": playlist_id,
+        "media": [{ "id": track_id, "type": "track" }],
+    });
+    post_pc_json(session, "/luna/pc/me/playlist/media/append", &body)
+}
+
+fn post_pc_json(
+    session: &Session,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.qishui.com{path}");
+    let response = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Cookie", &session.soda().cookie())
+        .set("content-type", "application/json")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1")
+        .send_string(&body.to_string())
+        .map_err(|err| anyhow::anyhow!("请求失败: {err}"))?;
+    let text = response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("请求失败: {err}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| anyhow::anyhow!("响应解析失败: {err}"))?;
+    if value.get("status_code").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+        let message = value
+            .pointer("/status_info/status_msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
