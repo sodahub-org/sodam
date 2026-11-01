@@ -441,11 +441,11 @@ pub(crate) fn quality_menu(
     if svip {
         items.push(
             div()
-                .mx(px(12.0))
-                .my(px(8.0))
-                .px(px(16.0))
-                .py(px(16.0))
-                .rounded(px(8.0))
+                .mx(px(15.0))
+                .my(px(10.0))
+                .px(px(20.0))
+                .py(px(20.0))
+                .rounded(px(10.0))
                 .bg(gpui::rgb(0x3a3a2e))
                 .flex()
                 .flex_row()
@@ -454,13 +454,13 @@ pub(crate) fn quality_menu(
                 .child(
                     svg()
                         .path(icons::path("svip"))
-                        .w(px(52.0))
-                        .h(px(14.0))
+                        .w(px(65.0))
+                        .h(px(17.0))
                         .text_color(gpui::rgb(0xffd98a)),
                 )
                 .child(
                     div()
-                        .text_size(px(15.0))
+                        .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(text_primary)
                         .child("权益生效中，尊享音质、音效特权"),
@@ -480,9 +480,9 @@ pub(crate) fn quality_menu(
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(58.0))
-                .px(px(12.0))
-                .py(px(10.0))
+                .h(px(72.0))
+                .px(px(15.0))
+                .py(px(12.0))
                 .cursor_pointer()
                 .hover(|style| style.bg(gpui::Rgba {
                     a: 0.1,
@@ -509,13 +509,13 @@ pub(crate) fn quality_menu(
                                 .when(option.svip, |this| {
                                     this.child(
                                         gpui::img("icons/spatial-quality-mini.png")
-                                            .w(px(22.0))
-                                            .h(px(17.0)),
+                                            .w(px(27.0))
+                                            .h(px(21.0)),
                                     )
                                 })
                                 .child(
                                     div()
-                                        .text_size(if option.svip { px(15.0) } else { px(14.0) })
+                                        .text_size(if option.svip { px(18.0) } else { px(17.0) })
                                         .font_weight(if option.svip {
                                             gpui::FontWeight::BOLD
                                         } else {
@@ -540,8 +540,8 @@ pub(crate) fn quality_menu(
                                             .child(
                                                 svg()
                                                     .path(icons::path("svip"))
-                                                    .w(px(28.0))
-                                                    .h(px(8.0))
+                                                    .w(px(34.0))
+                                                    .h(px(11.0))
                                                     .text_color(gpui::rgb(0xffd98a)),
                                             ),
                                     )
@@ -554,13 +554,13 @@ pub(crate) fn quality_menu(
                                     .flex_row()
                                     .items_center()
                                     .gap(px(4.0))
-                                    .text_size(px(13.0))
+                                    .text_size(px(16.0))
                                     .text_color(text_secondary)
                                     .child(option.desc)
                                     .child(
                                         svg()
                                             .path(icons::path("info"))
-                                            .size(px(14.0))
+                                            .size(px(17.0))
                                             .text_color(text_secondary),
                                     ),
                             )
@@ -570,7 +570,7 @@ pub(crate) fn quality_menu(
                     this.child(
                         svg()
                             .path(icons::path("check"))
-                            .size(px(16.0))
+                            .size(px(20.0))
                             .text_color(gpui::rgb(0xffffff)),
                     )
                 })
@@ -591,9 +591,9 @@ pub(crate) fn quality_menu(
                             .id("quality-menu")
                             .flex()
                             .flex_col()
-                            .w(px(350.0))
-                            .py(px(8.0))
-                            .rounded(px(8.0))
+                            .w(px(440.0))
+                            .py(px(10.0))
+                            .rounded(px(10.0))
                             .bg(surface)
                             .shadow_lg()
                             .children(items),
@@ -602,7 +602,7 @@ pub(crate) fn quality_menu(
                         div().flex().justify_center().child(
                             svg()
                                 .path(icons::path("triangle-down"))
-                                .size(px(12.0))
+                                .size(px(15.0))
                                 .text_color(surface),
                         ),
                     ),
