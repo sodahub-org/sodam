@@ -332,6 +332,8 @@ pub struct Root {
     /// 音质胶囊的实际屏幕区域（由 canvas 每帧写入，菜单用它精确定位）。
     /// 信息块跑马灯：是否需要逐帧刷新、以及刷新循环是否已在跑。
     /// 信息块歌名行的实测宽度（canvas 回填，跑马灯用它算无缝周期）。
+    /// 信息块跑马灯的滚动句柄：用滚动偏移做位移，避免每帧重排文字。
+    pub marquee_scroll: gpui::ScrollHandle,
     pub marquee_width: std::rc::Rc<std::cell::Cell<f32>>,
     pub marquee_needed: std::rc::Rc<std::cell::Cell<bool>>,
     pub marquee_ticking: std::rc::Rc<std::cell::Cell<bool>>,
@@ -688,6 +690,7 @@ impl Root {
             artist_ids: std::collections::HashMap::new(),
             toast: None,
             quality_resume: None,
+            marquee_scroll: gpui::ScrollHandle::new(),
             marquee_width: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             marquee_needed: std::rc::Rc::new(std::cell::Cell::new(false)),
             marquee_ticking: std::rc::Rc::new(std::cell::Cell::new(false)),

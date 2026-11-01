@@ -1697,8 +1697,8 @@ fn track_info_left(
                         // 宽度取整：亚像素抖动会让 duration 每帧变化，动画看起来发抖。
                         let measured = root.marquee_width.get().round();
                         let width = if measured > 1.0 { measured } else { estimated };
-                        let span = width + 12.0;
-                        let seconds = (span / 26.0).max(5.0);
+                        let span = width + 24.0;
+                        let seconds = (width * 0.03).max(3.0);
                         div()
                             .flex_1()
                             .min_w(px(0.0))
@@ -1725,13 +1725,13 @@ fn track_info_left(
                                                 .size_full(),
                                             )
                                     })
-                                    .child(div().ml(px(12.0)).child(copy()))
+                                    .child(div().ml(px(24.0)).child(copy()))
                                     .with_animation(
                                         "bar-track-marquee",
                                         Animation::new(std::time::Duration::from_secs_f32(seconds))
-                                            .repeat()
-                                            .with_max_fps(30.0),
+                                            .repeat(),
                                         move |element, delta| {
+                                            // 对应官方 translateX(0 → -(width+24)) 的关键帧。
                                             element.ml(px(-(delta as f32) * span))
                                         },
                                     ),
