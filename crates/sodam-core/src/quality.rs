@@ -1,11 +1,13 @@
 //! 音质意图：配置里只存用户的选择，实际拿到哪一档由服务端决定。
 //!
-//! 三条对外行为：
+//! 四条对外行为：
 //! * 意图归一化——空串、空白、`auto` / `best` 都是「自动」，未知值也按不设上限处理
 //!   （与 libresoda 的 `preference_rank` 一致），免得用户手写一个错字就被锁进低档；
 //! * 缓存标签——同一个意图永远落到同一个文件名，`auto` 与空串共享 `auto`；
 //! * 不符判定——实际档位**低于**或**高于**所选档位时都要说出来；`auto` 永不提示，
 //!   实际档位未知（旧缓存）也不提示。
+//! * 升级判定——这份缓存该不该重新取流。与不符判定相反，档位未知不能算「不用重下」，
+//!   只有旧标签能证明已达目标时才抑制（见 [`legacy_label_floor_rank`]）。
 //!
 //! 这里的档位分数直接沿用 libresoda 的 [`quality_rank`] / [`preference_rank`]：
 //! 取流时的筛选就发生在那边，界面若另算一套，两边迟早会对同一个文件给出不同结论。
@@ -257,12 +259,63 @@ pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> 
 
 /// 实际档位是否低于目标档位分数。
 ///
-/// `actual` 缺失（旧缓存未知档位）时返回 `false`。
+/// `actual` 缺失（旧缓存未知档位）时返回 `false`：这条只回答「已知分数够不够」，
+/// 缓存该不该重下要用 [`cache_is_below_target`]，它才知道怎么处理未知。
 pub fn is_below_target(actual: Option<i64>, target: i64) -> bool {
     match actual {
         Some(rank) => rank < target,
         None => false,
     }
+}
+
+/// 旧三字段缓存的档位**下限**：标签能证明「至少无损」时给出无损的分数，其余给 `None`。
+///
+/// 只有这一条证得起来：两代旧写入者（早期按码率命名、后来按档位分数命名）都只在
+/// libresoda 判为无损（≥100）时才把档位写成「无损」，与本仓用的刻度同源。更低的标签
+/// 证明不了任何下限——老边界里「极高」= 码率 ≥300（按当前刻度可能只有 70），
+/// 「标准」横跨 1..65 好几种流，按显示名倒推分数会把猜测当成测量。
+///
+/// 因此它只用来**抑制**一次注定没有收益的重下，不作为实际档位展示，
+/// 不参与降档判定、徽章与状态行——那些地方档位未知就说未知。
+pub fn legacy_label_floor_rank(label: &str) -> Option<i64> {
+    let label = label.trim();
+    // 只认档名前缀，后面的码率不参与：两代写入者写的码率口径没变过这个判断。
+    // 「Hi-Res 无损」不以「无损」开头，单独列出来，它同样至少是无损。
+    if label.starts_with("无损") || label.starts_with("Hi-Res 无损") {
+        preference_rank("lossless")
+    } else {
+        None
+    }
+}
+
+/// 这份缓存是否低于目标：档位已知就比分数，未知（旧三字段）只看标签能否证明已达目标。
+///
+/// 未知不再算「不低于」（#89 要修的就是这一条）：既然证明不了达标，就重下一次，
+/// 取完流会把实际档位写进 sidecar，之后走已知分支。唯一例外是标签已经证明达标，
+/// 那次重下注定没有收益。
+pub fn cache_is_below_target(actual: Option<i64>, label: &str, target: i64) -> bool {
+    match actual {
+        Some(rank) => rank < target,
+        None => !legacy_label_floor_rank(label).is_some_and(|floor| floor >= target),
+    }
+}
+
+/// 命中缓存时，当前档位是否低于所选（可升级判定）。
+///
+/// * 所选为具体档位：实际档位低于该档位即为真；
+/// * 所选为「自动」且为 VIP：实际档位低于无损（100）即为真（非会员时期缓存的低档流在会员后可升级）；
+/// * 实际档位未知（旧三字段缓存）时看 `label`：标签证明不了达标就要重下
+///   （见 [`cache_is_below_target`]），不再一律判「不需要升级」。
+pub fn is_tier_below_selected(
+    actual: Option<i64>,
+    label: &str,
+    intent: &QualityIntent,
+    is_vip: Option<bool>,
+) -> bool {
+    let Some(target) = target_rank(intent, is_vip) else {
+        return false;
+    };
+    cache_is_below_target(actual, label, target)
 }
 
 /// 这个目标档位的「没有更高流」结论能否持久化。
@@ -275,22 +328,6 @@ pub fn can_record_unavailable(target_rank: Option<i64>, is_vip: Option<bool>) ->
         Some(rank) if preference_rank("lossless") == Some(rank) => is_vip == Some(true),
         _ => false,
     }
-}
-
-/// 命中缓存时，当前档位是否低于所选（可升级判定）。
-///
-/// * 所选为具体档位：实际档位低于该档位即为真；
-/// * 所选为「自动」且为 VIP：实际档位低于无损（100）即为真（非会员时期缓存的低档流在会员后可升级）；
-/// * 实际档位未知（旧缓存没有记录分数）时返回 `false`：不知道就不能断言低于所选，也不触发重下。
-pub fn is_tier_below_selected(
-    actual: Option<i64>,
-    intent: &QualityIntent,
-    is_vip: Option<bool>,
-) -> bool {
-    let Some(target) = target_rank(intent, is_vip) else {
-        return false;
-    };
-    is_below_target(actual, target)
 }
 
 /// 一条流（`DownloadInfo`）的档位分数，用于写进缓存边车。
@@ -715,27 +752,86 @@ mod tests {
         let auto = QualityIntent::Auto;
 
         // 具体档位（无损，100）：低于 100 即可升级，等于或高于不算
-        assert!(is_tier_below_selected(Some(80), &lossless, None));
-        assert!(is_tier_below_selected(Some(50), &lossless, Some(false)));
-        assert!(!is_tier_below_selected(Some(100), &lossless, None));
-        assert!(!is_tier_below_selected(Some(110), &lossless, None));
-        assert!(!is_tier_below_selected(None, &lossless, None));
+        assert!(is_tier_below_selected(
+            Some(80),
+            "流畅 128k",
+            &lossless,
+            None
+        ));
+        assert!(is_tier_below_selected(
+            Some(50),
+            "流畅 128k",
+            &lossless,
+            Some(false)
+        ));
+        assert!(!is_tier_below_selected(
+            Some(100),
+            "无损 871k",
+            &lossless,
+            None
+        ));
+        assert!(!is_tier_below_selected(
+            Some(110),
+            "Hi-Res 无损 871k",
+            &lossless,
+            None
+        ));
 
         // 具体档位（极高，80）：
-        assert!(is_tier_below_selected(Some(70), &highest, None));
-        assert!(!is_tier_below_selected(Some(80), &highest, None));
-        assert!(!is_tier_below_selected(Some(100), &highest, None));
+        assert!(is_tier_below_selected(
+            Some(70),
+            "较高 320k",
+            &highest,
+            None
+        ));
+        assert!(!is_tier_below_selected(
+            Some(80),
+            "极高 320k",
+            &highest,
+            None
+        ));
+        assert!(!is_tier_below_selected(
+            Some(100),
+            "无损 871k",
+            &highest,
+            None
+        ));
 
         // 自动模式：
         // 1. VIP 用户：目标收敛到无损（100），非会员时期缓存的 50/70/80 均判断为可升级
-        assert!(is_tier_below_selected(Some(50), &auto, Some(true)));
-        assert!(is_tier_below_selected(Some(80), &auto, Some(true)));
-        assert!(!is_tier_below_selected(Some(100), &auto, Some(true)));
-        assert!(!is_tier_below_selected(None, &auto, Some(true)));
+        assert!(is_tier_below_selected(
+            Some(50),
+            "流畅 128k",
+            &auto,
+            Some(true)
+        ));
+        assert!(is_tier_below_selected(
+            Some(80),
+            "极高 320k",
+            &auto,
+            Some(true)
+        ));
+        assert!(!is_tier_below_selected(
+            Some(100),
+            "无损 871k",
+            &auto,
+            Some(true)
+        ));
+        assert!(!is_tier_below_selected(
+            None,
+            "无损 871k",
+            &auto,
+            Some(true)
+        ));
 
         // 2. 非 VIP 或未知：不指定上限，不盲目判断为低于所选
-        assert!(!is_tier_below_selected(Some(50), &auto, Some(false)));
-        assert!(!is_tier_below_selected(Some(50), &auto, None));
+        assert!(!is_tier_below_selected(
+            Some(50),
+            "流畅 128k",
+            &auto,
+            Some(false)
+        ));
+        assert!(!is_tier_below_selected(Some(50), "流畅 128k", &auto, None));
 
         // 目标分数与直接比较测试
         assert_eq!(target_rank(&lossless, None), Some(100));
@@ -748,6 +844,44 @@ mod tests {
         assert!(!is_below_target(Some(100), 100));
         assert!(!is_below_target(Some(110), 100));
         assert!(!is_below_target(None, 100));
+    }
+
+    /// #89：档位未知的旧缓存要能参与升级，只有标签证明达标才抑制重下。
+    #[test]
+    fn unknown_rank_cache_needs_redownload_unless_label_proves_lossless() {
+        // 未知 + 证明不了下限 → 重下（旧行为是恒 false，存量缓存永远不参与升级）
+        for label in ["极高 320k", "标准 128k", "流畅 128k", "较高 256k", "未知"] {
+            assert!(
+                cache_is_below_target(None, label, 100),
+                "档位未知的「{label}」不能假装已达目标"
+            );
+        }
+        // 未知 + 标签证明至少无损 → 目标不高于无损时不必重下（注定没有收益的一次流量）
+        assert!(!cache_is_below_target(None, "无损 871k", 100));
+        assert!(!cache_is_below_target(None, "无损 871k", 80));
+        assert!(!cache_is_below_target(None, "Hi-Res 无损 871k", 100));
+        // 但 Hi-Res 目标（110）仍然要探：标签只证明到无损，无损标签里也混过 110 的流
+        assert!(cache_is_below_target(None, "无损 871k", 110));
+        // 已知分数时标签不参与判定，仍按分数比
+        assert!(!cache_is_below_target(Some(100), "流畅 128k", 100));
+        assert!(cache_is_below_target(Some(70), "无损 871k", 100));
+    }
+
+    /// 旧标签的下限只认「无损」：更低的标签在两代旧刻度里边界不同，证不出分数。
+    #[test]
+    fn legacy_label_floor_only_trusts_lossless() {
+        assert_eq!(legacy_label_floor_rank("无损 871k"), Some(100));
+        assert_eq!(legacy_label_floor_rank("无损"), Some(100));
+        assert_eq!(legacy_label_floor_rank("Hi-Res 无损 871k"), Some(100));
+        // 早期按码率命名的档位：300k 以上一律写「极高」，按当前刻度可能只有 70。
+        assert_eq!(legacy_label_floor_rank("极高 320k"), None);
+        assert_eq!(legacy_label_floor_rank("较高 192k"), None);
+        assert_eq!(legacy_label_floor_rank("标准 128k"), None);
+        assert_eq!(legacy_label_floor_rank("未知"), None);
+        assert_eq!(legacy_label_floor_rank(""), None);
+        // sidecar 的档位文本已剥掉试听标记，这里按纯档位处理；带标记的写法也不认。
+        assert_eq!(legacy_label_floor_rank("无损 · 试听"), Some(100));
+        assert_eq!(legacy_label_floor_rank("试听 128k"), None);
     }
 
     #[test]

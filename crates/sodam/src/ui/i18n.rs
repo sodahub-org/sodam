@@ -498,6 +498,9 @@ impl Language {
             "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}" => {
                 "{} songs can be upgraded · Est. traffic {} · Storage change {}"
             }
+            "其中 {} 首是档位未知的旧缓存，需整曲重下" => {
+                "{} of them are legacy caches with no recorded quality tier and need a full re-download"
+            }
             "正在计算升级预估…" => "Estimating upgrade…",
             "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
             "批量升级" => "Batch Upgrade",

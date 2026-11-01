@@ -193,7 +193,8 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
 ///
 /// 尺寸不符或档位为空一律返回 `None`。
 /// 第四到第六个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
-/// 不影响前三字段的命中判定。
+/// 不影响前三字段的命中判定。第 4 字段也可能是空串——档位未知的旧缓存
+/// 记下「已探测」结论之后就是这个样子，读回来仍然是「档位未知」。
 /// 旧缓存把 50 分档写作「标准」，这里按记录里的实际分数洗成当前显示名
 ///（50 分档是「流畅」、更低分是「省流」），只换档位前缀、保留码率，旧文件不必重下。
 pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
@@ -281,34 +282,35 @@ pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>)
 /// 网络失败与试听回退都不写，它们会随网络或会员权益变化。
 ///
 /// `expected_actual_rank` 与 sidecar 现有分数不一致时直接跳过——说明文件已经被
-/// 另一个写者替换，不能再把旧结论写到新文件上。调用方必须持有该文件的
-/// `download_lock`，避免与替换序列交错。
+/// 另一个写者替换，不能再把旧结论写到新文件上。传 `None` 表示这条记录档位未知
+/// （旧三字段缓存），此时 sidecar 也不许有分数；写入时第 4 字段留空，
+/// 探测结论照样落得下去，否则这类文件每轮批量升级都要白下一遍。
+/// 调用方必须持有该文件的 `download_lock`，避免与替换序列交错。
 pub(crate) fn record_upgrade_check(
     sidecar_path: &Path,
-    expected_actual_rank: i64,
+    expected_actual_rank: Option<i64>,
     checked_rank: i64,
     now: u64,
 ) -> std::io::Result<()> {
     let text = std::fs::read_to_string(sidecar_path)?;
     let trimmed = text.trim_end_matches(['\r', '\n']);
-    let mut fields: Vec<&str> = trimmed.split('\t').collect();
+    let fields: Vec<&str> = trimmed.split('\t').collect();
     if fields.len() < 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "sidecar has fewer than three fields",
         ));
     }
-    if parse_rank(fields.get(3).copied()) != Some(expected_actual_rank) {
+    if parse_rank(fields.get(3).copied()) != expected_actual_rank {
         return Ok(());
     }
-    // 前四个字段原样保留，丢掉旧的探测结论后重新写。
-    fields.truncate(4);
+    // 前四个字段原样保留（旧三字段缺的第 4 个补空位），丢掉旧的探测结论后重新写。
+    let rank_field = fields.get(3).copied().unwrap_or("").trim();
     let content = format!(
-        "{}\t{}\t{}\t{}\t{checked_rank}\t{now}",
+        "{}\t{}\t{}\t{rank_field}\t{checked_rank}\t{now}",
         fields[0].trim(),
         fields[1].trim(),
         fields[2].trim(),
-        fields[3].trim(),
     );
     let tmp = sidecar_path.with_extension("quality.tmp");
     if let Err(err) = std::fs::write(&tmp, content) {
@@ -385,14 +387,19 @@ impl CachedAudioRecord {
     }
 
     /// 当前实际档位是否低于目标档位分数。
+    ///
+    /// 档位未知（旧三字段缓存）时不再算「不低于」：按 sidecar 的档位标签看能否证明达标，
+    /// 证明不了就当作需要重下（见 [`crate::quality::cache_is_below_target`]）。
     pub fn is_below_target(&self, target_rank: i64) -> bool {
-        crate::quality::is_below_target(self.actual_rank, target_rank)
+        crate::quality::cache_is_below_target(self.actual_rank, &self.quality_label, target_rank)
     }
 
     /// 当前记录是否允许批量升级至目标档位。
     ///
     /// 排除试听片段、已达到或超过目标的记录，以及最近已经确认过「没有更高档位」的目标：
     /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
+    /// 档位未知的旧缓存计入可升级——它证明不了自己达标；其中标签已证明达标的
+    /// （旧「无损」标签）由 [`CachedAudioRecord::is_below_target`] 挡掉，不白花流量。
     /// 同时受该缓存文件自身的 quality_tag 意图上限约束：
     /// 例如用户在省流模式下缓存的 `-low.m4a`（上限 50），不会被冲高为无损（100），
     /// 以免后续省流播放时命中数十兆的庞大文件破坏省流意图。
@@ -457,6 +464,8 @@ pub fn list_cached_audio(audio_dir: &Path) -> Vec<CachedAudioRecord> {
 pub struct UpgradeEstimate {
     /// 能够升级的曲目数
     pub upgradeable_count: usize,
+    /// 可升级曲目里档位未知的旧缓存数（`upgradeable_count` 的一部分，需整曲重下）
+    pub unknown_rank_count: usize,
     /// 可升级曲目当前所占字节总数
     pub current_bytes: u64,
     /// 升级后预计所占字节总数
@@ -496,6 +505,7 @@ pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
 /// 评估将已有缓存批量升级到指定档位所需流量与容量变化。
 pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> UpgradeEstimate {
     let mut count = 0usize;
+    let mut unknown_rank_count = 0usize;
     let mut current_bytes = 0u64;
     let mut estimated_new_bytes = 0u64;
     let single_est = estimated_single_track_bytes(target_rank);
@@ -504,6 +514,11 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
         // 试听片段、超出意图上限、以及已确认无更高档位的记录都不计入升级。
         if record.is_upgradeable_to(target_rank) {
             count += 1;
+            // 档位未知的旧缓存单独计一笔：界面要说清这几首是「重下才知道是什么档」，
+            // 不是「已知比目标低」。
+            if record.actual_rank.is_none() {
+                unknown_rank_count += 1;
+            }
             current_bytes = current_bytes.saturating_add(record.file_size);
             estimated_new_bytes = estimated_new_bytes.saturating_add(single_est);
         }
@@ -511,6 +526,7 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
 
     UpgradeEstimate {
         upgradeable_count: count,
+        unknown_rank_count,
         current_bytes,
         estimated_new_bytes,
         estimated_traffic_bytes: estimated_new_bytes,
@@ -756,6 +772,53 @@ mod tests {
         assert_eq!(checked.actual_rank, Some(80));
         assert_eq!(checked.checked_rank, Some(100));
         assert_eq!(checked.checked_at, Some(1_700_000_000));
+    }
+
+    /// 写一对缓存文件（音频 + sidecar）。sidecar 内容原样落盘。
+    fn write_cached(dir: &Path, stem: &str, sidecar: &str, bytes: usize) {
+        std::fs::write(dir.join(format!("{stem}.m4a")), vec![0u8; bytes]).unwrap();
+        std::fs::write(dir.join(format!("{stem}.quality")), sidecar).unwrap();
+    }
+
+    /// #89：旧三字段缓存（没有档位分数）要计入批量升级，标签已证明达标的除外。
+    #[test]
+    fn legacy_three_field_sidecars_join_upgrade_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        // 档位未知，标签也证明不了达标：重下一次才知道它到底是什么档。
+        write_cached(dir.path(), "7001-auto", "极高 320k\t3000\t0", 3000);
+        // 档位未知，但旧标签写明无损：目标不超过无损时不值得再下一遍。
+        write_cached(dir.path(), "7002-auto", "无损 871k\t9000\t0", 9000);
+        // 档位未知，且已确认过无损目标没有更高流（第 4 字段留空）：同一目标不再计入。
+        let fresh = now_epoch_secs();
+        write_cached(
+            dir.path(),
+            "7003-auto",
+            &format!("较高 256k\t4000\t0\t\t100\t{fresh}"),
+            4000,
+        );
+
+        let records = list_cached_audio(dir.path());
+        assert_eq!(records.len(), 3);
+        let checked = records
+            .iter()
+            .find(|r| r.track_id == "7003")
+            .expect("空第 4 字段的记录仍能读回");
+        assert_eq!(
+            checked.actual_rank, None,
+            "第 4 字段留空读回来仍是档位未知，不是 0 档"
+        );
+        assert_eq!(checked.checked_rank, Some(100));
+
+        // 目标无损（100）：只有证明不了达标、也没确认过的那首进入升级。
+        let est = estimate_upgrade(&records, 100);
+        assert_eq!(est.upgradeable_count, 1);
+        assert_eq!(est.unknown_rank_count, 1);
+        assert_eq!(est.current_bytes, 3000);
+
+        // 目标 Hi-Res 无损（110）：无损标签只证明到 100，三首都要重新探。
+        let est_hires = estimate_upgrade(&records, 110);
+        assert_eq!(est_hires.upgradeable_count, 3);
+        assert_eq!(est_hires.unknown_rank_count, 3, "三首都没有记录的档位分数");
     }
 
     #[test]
@@ -1034,7 +1097,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = dir.path().join("song-auto.quality");
         std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
-        record_upgrade_check(&sidecar, 80, 100, 1_700_000_000).unwrap();
+        record_upgrade_check(&sidecar, Some(80), 100, 1_700_000_000).unwrap();
         let text = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(text, "极高 320k\t2000\t0\t80\t100\t1700000000");
         let parsed = parse_sidecar(&text, 2000).unwrap();
@@ -1043,19 +1106,39 @@ mod tests {
         assert_eq!(parsed.checked_at, Some(1_700_000_000));
 
         // 文件已经被别的写者换成另一档：旧结论不能盖到新文件上。
-        record_upgrade_check(&sidecar, 50, 110, 1_700_000_001).unwrap();
+        record_upgrade_check(&sidecar, Some(50), 110, 1_700_000_001).unwrap();
         assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
 
         // 换一个更高目标重探后，记录被替换而不是叠加。
-        record_upgrade_check(&sidecar, 80, 110, 1_700_000_002).unwrap();
+        record_upgrade_check(&sidecar, Some(80), 110, 1_700_000_002).unwrap();
         let updated = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(updated, "极高 320k\t2000\t0\t80\t110\t1700000002");
 
-        // 旧三字段没有实际档位，身份无法确认，跳过写入。
+        // 旧三字段（无第 4 字段）：档位未知也能记下结论，第 4 字段留空位。
         std::fs::write(&sidecar, "极高 320k\t2000\t0").unwrap();
-        record_upgrade_check(&sidecar, 80, 100, 1_700_000_003).unwrap();
+        record_upgrade_check(&sidecar, None, 100, 1_700_000_003).unwrap();
         let legacy = std::fs::read_to_string(&sidecar).unwrap();
-        assert_eq!(legacy, "极高 320k\t2000\t0");
+        assert_eq!(legacy, "极高 320k\t2000\t0\t\t100\t1700000003");
+        let parsed = parse_sidecar(&legacy, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, None, "第 4 字段留空读回来仍是档位未知");
+        assert_eq!(parsed.checked_rank, Some(100));
+        assert_eq!(parsed.checked_at, Some(1_700_000_003));
+
+        // 档位未知不能盖到有分数的记录上，反之亦然。
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        record_upgrade_check(&sidecar, None, 100, 1_700_000_004).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "极高 320k\t2000\t0\t80",
+            "已知分数的记录不被未知身份的结论覆盖"
+        );
+        std::fs::write(&sidecar, "极高 320k\t2000\t0").unwrap();
+        record_upgrade_check(&sidecar, Some(80), 100, 1_700_000_005).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "极高 320k\t2000\t0",
+            "档位未知的记录不被声称知道分数的结论覆盖"
+        );
     }
 
     /// 写回失败或字段不完整时只报错，不碰原 sidecar。
@@ -1063,11 +1146,11 @@ mod tests {
     fn record_upgrade_check_errors_without_touching_existing_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.quality");
-        assert!(record_upgrade_check(&missing, 80, 100, 1).is_err());
+        assert!(record_upgrade_check(&missing, Some(80), 100, 1).is_err());
 
         let short = dir.path().join("short.quality");
         std::fs::write(&short, "x\ty").unwrap();
-        assert!(record_upgrade_check(&short, 80, 100, 1).is_err());
+        assert!(record_upgrade_check(&short, Some(80), 100, 1).is_err());
         assert_eq!(std::fs::read_to_string(&short).unwrap(), "x\ty");
     }
 
@@ -1079,7 +1162,7 @@ mod tests {
         let backup = dir.path().join("song-auto.quality.old");
         std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
         std::fs::write(&backup, "stale").unwrap();
-        record_upgrade_check(&sidecar, 80, 100, 1_700_000_000).unwrap();
+        record_upgrade_check(&sidecar, Some(80), 100, 1_700_000_000).unwrap();
         assert!(!backup.exists());
         let text = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(text, "极高 320k\t2000\t0\t80\t100\t1700000000");

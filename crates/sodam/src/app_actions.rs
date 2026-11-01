@@ -2940,7 +2940,8 @@ impl Root {
                         let actual_quality = cached.quality.clone();
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
-                        let needs_upgrade = was_cached && cached.needs_upgrade(&intent, is_vip);
+                        let needs_upgrade =
+                            was_cached && cached.needs_auto_upgrade(&intent, is_vip);
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);

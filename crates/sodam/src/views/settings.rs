@@ -1133,14 +1133,25 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     } else {
                                         format!("-{}", human_bytes((-delta) as u64))
                                     };
-                                    root.localized(
+                                    let mut text = root.localized(
                                         "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}",
                                         &[
                                             estimate.upgradeable_count.to_string(),
                                             human_bytes(estimate.estimated_traffic_bytes),
                                             delta_str,
                                         ],
-                                    )
+                                    );
+                                    // 档位未知的旧缓存（#89）要说清它跟「已知比目标低」不是一回事：
+                                    // 这些是旧版本没记档位，重下一遍才知道是什么档。
+                                    if estimate.unknown_rank_count > 0 {
+                                        let legacy = root.localized(
+                                            "其中 {} 首是档位未知的旧缓存，需整曲重下",
+                                            &[estimate.unknown_rank_count.to_string()],
+                                        );
+                                        text.push_str(" · ");
+                                        text.push_str(&legacy);
+                                    }
+                                    text
                                 }
                             } else {
                                 root.tr("正在计算升级预估…").to_string()
