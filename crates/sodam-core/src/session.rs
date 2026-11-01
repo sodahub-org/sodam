@@ -252,6 +252,38 @@ fn confirmed_miss_rank(
     (actual_rank < target).then_some(target)
 }
 
+/// 这次取到的新流是否值得换掉本地已有的那一份缓存。
+///
+/// * 档位已知（sidecar 第 4 字段有分数）：新流档位更高才算提升；
+/// * 档位未知的旧三字段缓存（#89）只剩标签可用：旧「无损」标签给得出下限就按下限比，
+///   给不出就用标签里记着的码率兜底——新流码率更低说明这次是拿差货换好货（权益过期、
+///   曲库退档都会走到这里），不换；但新流已经够到用户要的目标档位时照样换，
+///   无损 FLAC 的码率本来就可能低于有损的高码率流，不能被这道闸误挡；
+/// * 试听片段换成整曲永远是提升。
+fn is_better_stream(
+    info: &libresoda::soda::types::DownloadInfo,
+    current: &CachedTrack,
+    target_rank: Option<i64>,
+) -> bool {
+    let new_rank = crate::quality::stream_rank(info);
+    if current.preview && !info.is_preview {
+        return true;
+    }
+    let Some(old_rank) = current
+        .quality_rank
+        .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
+    else {
+        if new_rank <= 0 {
+            return false;
+        }
+        let bitrate = libresoda::soda::quality::normalize_bitrate(info.bitrate.max(0));
+        return crate::quality::legacy_label_bitrate_kbps(&current.quality)
+            .is_none_or(|old_bitrate| bitrate >= old_bitrate)
+            || target_rank.is_some_and(|target| new_rank >= target);
+    };
+    new_rank > old_rank
+}
+
 /// 拼出 sidecar 内容；有探测结论时写第 5、6 字段。
 fn encode_sidecar(
     quality: &str,
@@ -661,15 +693,9 @@ impl Session {
         // 成功拿到完整流但仍在目标之下，同样是确认性结论：服务端已给出它能给的最好档位。
         let checked_rank =
             confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
-        // 若新流档位并未高于旧档位，且未发生「由试听升级为整曲」，丢弃临时文件，保留旧文件。
-        // 旧三字段缓存没有档位分数（#89），能比较的唯一依据是标签证明的下限（旧「无损」）：
-        // 拿一条档位相同的流去换它没有意义，而标签证明不了下限就认这次重下——重取是这类
-        // 文件把实际档位写进 sidecar 的唯一机会，原地不换会让它永远停在「档位未知」。
-        let old_rank = current
-            .quality_rank
-            .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality));
-        let is_improved = new_rank > old_rank.unwrap_or(0) || (current.preview && !info.is_preview);
-        if !is_improved {
+        // 若新流并不比本地这份更好（含「由试听升级为整曲」这一种提升），丢弃临时文件保留旧文件。
+        // 档位未知的旧缓存怎么比，见 `is_better_stream`。
+        if !is_better_stream(&info, &current, target_rank) {
             let _ = std::fs::remove_file(&part);
             // 只有「拿到完整流、档位仍没提升」才是确认性结论。试听回退与下载失败
             // 会随会员权益或网络变化，不能写成「没有更高档位」。
@@ -1122,6 +1148,86 @@ mod tests {
             ..legacy("流畅 128k", None)
         };
         assert!(measured.needs_auto_upgrade(&lossless, Some(false)));
+    }
+
+    /// #89：新流值不值得换掉本地这份缓存——档位未知的旧文件不能被更差的流顶掉。
+    #[test]
+    fn is_better_stream_never_trades_a_legacy_file_for_worse_audio() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("s.m4a"));
+        let cached = |quality: &str, rank: Option<i64>, preview: bool| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: quality.into(),
+            preview,
+            quality_rank: rank,
+            checked_rank: None,
+            lease: lease.clone(),
+        };
+        let info = |quality: &str, format: &str, bitrate: i64, preview: bool| DownloadInfo {
+            quality: quality.into(),
+            format: format.into(),
+            bitrate,
+            is_preview: preview,
+            ..Default::default()
+        };
+
+        // 档位已知：只认档位提升。
+        let known = cached("极高 320k", Some(80), false);
+        assert!(!is_better_stream(
+            &info("highest", "m4a", 320_000, false),
+            &known,
+            Some(100)
+        ));
+        assert!(is_better_stream(
+            &info("lossless", "flac", 871_000, false),
+            &known,
+            Some(100)
+        ));
+        // 试听片段换成整曲永远是提升，哪怕档位与码率都没变。
+        assert!(is_better_stream(
+            &info("standard", "m4a", 128_000, false),
+            &cached("流畅 128k", Some(50), true),
+            None
+        ));
+
+        // 档位未知、标签也证不出下限：只剩标签里的码率可比，新流更差就不换。
+        let legacy = cached("极高 320k", None, false);
+        assert!(!is_better_stream(
+            &info("standard", "m4a", 128_000, false),
+            &legacy,
+            Some(100)
+        ));
+        assert!(is_better_stream(
+            &info("higher", "m4a", 320_000, false),
+            &legacy,
+            Some(100)
+        ));
+        // 够到用户要的目标档位时照样换：无损 FLAC 的码率本来就可能低于有损高码率流。
+        assert!(is_better_stream(
+            &info("lossless", "flac", 300_000, false),
+            &legacy,
+            Some(100)
+        ));
+        // 新流档位认不出来（0 档）不换：旧文件至少还有一个能看的标签。
+        assert!(!is_better_stream(
+            &info("", "", 0, false),
+            &legacy,
+            Some(100)
+        ));
+
+        // 旧标签是无损 → 按下限比：目标 110 时只有 Hi-Res 才值得换。
+        let lossless_legacy = cached("无损 871k", None, false);
+        assert!(!is_better_stream(
+            &info("lossless", "flac", 871_000, false),
+            &lossless_legacy,
+            Some(110)
+        ));
+        assert!(is_better_stream(
+            &info("hires", "flac", 1_200_000, false),
+            &lossless_legacy,
+            Some(110)
+        ));
     }
 
     #[test]

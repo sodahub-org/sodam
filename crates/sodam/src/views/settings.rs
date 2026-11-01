@@ -1107,6 +1107,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .children(batch_tier_rows),
                         )
                         .child({
+                            let mut legacy_note = None;
                             let estimate_text = if batch_upgrade_blocked_by_vip {
                                 root.localized(
                                     "「{}」音质需 VIP 会员权限，当前账号无法升级",
@@ -1133,25 +1134,22 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     } else {
                                         format!("-{}", human_bytes((-delta) as u64))
                                     };
-                                    let mut text = root.localized(
+                                    // 档位未知的旧缓存另起一行（#89）：这几首不是「已知比目标低」，
+                                    // 是旧版本没记档位，重下一遍才知道是什么档。
+                                    if estimate.unknown_rank_count > 0 {
+                                        legacy_note = Some(root.localized(
+                                            "其中 {} 首是档位未知的旧缓存，需整曲重下",
+                                            &[estimate.unknown_rank_count.to_string()],
+                                        ));
+                                    }
+                                    root.localized(
                                         "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}",
                                         &[
                                             estimate.upgradeable_count.to_string(),
                                             human_bytes(estimate.estimated_traffic_bytes),
                                             delta_str,
                                         ],
-                                    );
-                                    // 档位未知的旧缓存（#89）要说清它跟「已知比目标低」不是一回事：
-                                    // 这些是旧版本没记档位，重下一遍才知道是什么档。
-                                    if estimate.unknown_rank_count > 0 {
-                                        let legacy = root.localized(
-                                            "其中 {} 首是档位未知的旧缓存，需整曲重下",
-                                            &[estimate.unknown_rank_count.to_string()],
-                                        );
-                                        text.push_str(" · ");
-                                        text.push_str(&legacy);
-                                    }
-                                    text
+                                    )
                                 }
                             } else {
                                 root.tr("正在计算升级预估…").to_string()
@@ -1160,6 +1158,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .text_size(theme::Text::Small.size())
                                 .text_color(theme::text_muted())
                                 .child(estimate_text)
+                                .children(legacy_note)
                         })
                         .child({
                             let upgradeable = root

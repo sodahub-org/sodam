@@ -257,35 +257,37 @@ pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> 
     }
 }
 
-/// 实际档位是否低于目标档位分数。
+/// 旧三字段缓存的档位**下限**：标签能证明「至少无损」时给出无损的分数，否则给 `None`。
 ///
-/// `actual` 缺失（旧缓存未知档位）时返回 `false`：这条只回答「已知分数够不够」，
-/// 缓存该不该重下要用 [`cache_is_below_target`]，它才知道怎么处理未知。
-pub fn is_below_target(actual: Option<i64>, target: i64) -> bool {
-    match actual {
-        Some(rank) => rank < target,
-        None => false,
-    }
-}
-
-/// 旧三字段缓存的档位**下限**：标签能证明「至少无损」时给出无损的分数，其余给 `None`。
-///
-/// 只有这一条证得起来：两代旧写入者（早期按码率命名、后来按档位分数命名）都只在
-/// libresoda 判为无损（≥100）时才把档位写成「无损」，与本仓用的刻度同源。更低的标签
-/// 证明不了任何下限——老边界里「极高」= 码率 ≥300（按当前刻度可能只有 70），
-/// 「标准」横跨 1..65 好几种流，按显示名倒推分数会把猜测当成测量。
+/// 只有这一条证得起来。两代旧写入者写「无损」的条件分别是
+/// `quality_rank >= 100`（按分数命名的那代）与
+/// `is_lossless(info) || format == "flac" || quality 含 "lossless"`（按码率命名的那代），
+/// 而这三者在当前刻度里每一条都评到 100 及以上（libresoda 的 `quality_rank`：
+/// 无损标签、flac/alac/wav 格式、码率 ≥900 都是 100）——所以「无损」开头的标签是一个下限，
+/// 不是一个猜测。更低的标签证明不了任何下限：老边界里「极高」= 码率 ≥300
+/// （按当前刻度可能只有 70），「标准」横跨 1..65 好几种流，按显示名倒推分数就是把猜测当测量。
 ///
 /// 因此它只用来**抑制**一次注定没有收益的重下，不作为实际档位展示，
 /// 不参与降档判定、徽章与状态行——那些地方档位未知就说未知。
+/// 档名跟着 [`tier_label`] 走：改名时这条判定跟着变，不会悄悄失效。
 pub fn legacy_label_floor_rank(label: &str) -> Option<i64> {
-    let label = label.trim();
-    // 只认档名前缀，后面的码率不参与：两代写入者写的码率口径没变过这个判断。
-    // 「Hi-Res 无损」不以「无损」开头，单独列出来，它同样至少是无损。
-    if label.starts_with("无损") || label.starts_with("Hi-Res 无损") {
-        preference_rank("lossless")
-    } else {
-        None
+    if !label.trim().starts_with(tier_label(100)) {
+        return None;
     }
+    preference_rank("lossless")
+}
+
+/// 旧 sidecar 的档位文本里记着的码率（kbps），如「极高 320k」→ 320；没写码率则 `None`。
+///
+/// 这是当年 `describe_quality` 直接写进文件的原始数字，不是档位：档位未知时，它是唯一
+/// 能诚实回答「新取的流是不是比本地这份更差」的依据（见 `session::upgrade_cached_track`）。
+pub fn legacy_label_bitrate_kbps(label: &str) -> Option<i64> {
+    let tail = label.trim().rsplit(' ').next()?;
+    let digits = tail.trim_end_matches('k').trim_end_matches('K');
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok().filter(|bitrate| *bitrate > 0)
 }
 
 /// 这份缓存是否低于目标：档位已知就比分数，未知（旧三字段）只看标签能否证明已达目标。
@@ -840,10 +842,11 @@ mod tests {
         assert_eq!(target_rank(&auto, Some(false)), None);
         assert_eq!(target_rank(&auto, None), None);
 
-        assert!(is_below_target(Some(70), 100));
-        assert!(!is_below_target(Some(100), 100));
-        assert!(!is_below_target(Some(110), 100));
-        assert!(!is_below_target(None, 100));
+        assert!(cache_is_below_target(Some(70), "无损 871k", 100));
+        assert!(!cache_is_below_target(Some(100), "流畅 128k", 100));
+        assert!(!cache_is_below_target(Some(110), "流畅 128k", 100));
+        // 档位未知时按标签判定，不再恒为 false（#89 修的就是这一条）
+        assert!(cache_is_below_target(None, "极高 320k", 100));
     }
 
     /// #89：档位未知的旧缓存要能参与升级，只有标签证明达标才抑制重下。
@@ -859,7 +862,6 @@ mod tests {
         // 未知 + 标签证明至少无损 → 目标不高于无损时不必重下（注定没有收益的一次流量）
         assert!(!cache_is_below_target(None, "无损 871k", 100));
         assert!(!cache_is_below_target(None, "无损 871k", 80));
-        assert!(!cache_is_below_target(None, "Hi-Res 无损 871k", 100));
         // 但 Hi-Res 目标（110）仍然要探：标签只证明到无损，无损标签里也混过 110 的流
         assert!(cache_is_below_target(None, "无损 871k", 110));
         // 已知分数时标签不参与判定，仍按分数比
@@ -872,16 +874,49 @@ mod tests {
     fn legacy_label_floor_only_trusts_lossless() {
         assert_eq!(legacy_label_floor_rank("无损 871k"), Some(100));
         assert_eq!(legacy_label_floor_rank("无损"), Some(100));
-        assert_eq!(legacy_label_floor_rank("Hi-Res 无损 871k"), Some(100));
         // 早期按码率命名的档位：300k 以上一律写「极高」，按当前刻度可能只有 70。
         assert_eq!(legacy_label_floor_rank("极高 320k"), None);
         assert_eq!(legacy_label_floor_rank("较高 192k"), None);
         assert_eq!(legacy_label_floor_rank("标准 128k"), None);
         assert_eq!(legacy_label_floor_rank("未知"), None);
         assert_eq!(legacy_label_floor_rank(""), None);
-        // sidecar 的档位文本已剥掉试听标记，这里按纯档位处理；带标记的写法也不认。
+        // 「Hi-Res 无损」是补上第 4 字段之后才出现的档名，档位未知的记录不可能带它；
+        // 真带上也不认——它的下限是 110，不是无损的 100。
+        assert_eq!(legacy_label_floor_rank("Hi-Res 无损 871k"), None);
+        // 老格式的「· 试听」拼在档位里：认档位前缀，标记留在后面不影响判定。
         assert_eq!(legacy_label_floor_rank("无损 · 试听"), Some(100));
         assert_eq!(legacy_label_floor_rank("试听 128k"), None);
+    }
+
+    /// 下限跟着档名走：`tier_label` 改名时这条判定一起改，不会悄悄失效。
+    #[test]
+    fn legacy_label_floor_follows_the_tier_label() {
+        let lossless = tier_label(100);
+        assert_eq!(
+            legacy_label_floor_rank(&format!("{lossless} 871k")),
+            preference_rank("lossless"),
+            "无损档名开头的标签必须给出无损的分数"
+        );
+        assert_eq!(
+            legacy_label_floor_rank(&format!("{} 871k", tier_label(110))),
+            None,
+            "比无损更高的档名不以「{lossless}」开头，交给带分数的记录自己说明"
+        );
+    }
+
+    /// 旧标签里的码率是当年写进文件的原始数字，用来判断新流是不是更差。
+    #[test]
+    fn legacy_label_bitrate_reads_the_recorded_number_and_nothing_else() {
+        assert_eq!(legacy_label_bitrate_kbps("极高 320k"), Some(320));
+        assert_eq!(legacy_label_bitrate_kbps("无损 871k"), Some(871));
+        assert_eq!(legacy_label_bitrate_kbps("标准 128k"), Some(128));
+        assert_eq!(legacy_label_bitrate_kbps("未知 96k"), Some(96));
+        // 没有码率的写法（早期档位文本单独成串）与认不出的尾巴都给 None，不参与比较。
+        assert_eq!(legacy_label_bitrate_kbps("极高"), None);
+        assert_eq!(legacy_label_bitrate_kbps("无损 · 试听"), None);
+        assert_eq!(legacy_label_bitrate_kbps("较高 k"), None);
+        assert_eq!(legacy_label_bitrate_kbps("较高 0k"), None);
+        assert_eq!(legacy_label_bitrate_kbps(""), None);
     }
 
     #[test]

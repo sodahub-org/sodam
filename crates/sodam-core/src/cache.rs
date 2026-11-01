@@ -206,7 +206,7 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
     }
     let (quality, preview) = match fields.next() {
         Some(flag) => (quality, flag.trim() == "1"),
-        None => (quality.replace(" · 试听", ""), quality.contains("试听")),
+        None => (strip_preview_marker(&quality), preview_from_label(&quality)),
     };
     let actual_rank = parse_rank(fields.next());
     let checked_rank = parse_rank(fields.next());
@@ -226,6 +226,16 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
 
 fn parse_rank(field: Option<&str>) -> Option<i64> {
     field.and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+/// 更早的两字段格式把试听拼在档位里（`无损 · 试听`），这里把它还原成布尔。
+fn preview_from_label(quality: &str) -> bool {
+    quality.contains("试听")
+}
+
+/// 去掉档位文本里的试听标记，只留档位与码率。
+fn strip_preview_marker(quality: &str) -> String {
+    quality.replace(" · 试听", "")
 }
 
 /// 一条 sidecar 记录。前四个字段是旧格式，后两个记录升级探测结果：
@@ -285,6 +295,7 @@ pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>)
 /// 另一个写者替换，不能再把旧结论写到新文件上。传 `None` 表示这条记录档位未知
 /// （旧三字段缓存），此时 sidecar 也不许有分数；写入时第 4 字段留空，
 /// 探测结论照样落得下去，否则这类文件每轮批量升级都要白下一遍。
+/// 更早的两字段格式连试听标记都没有，补第 3 字段时从档位文本还原，顺手把文本洗干净。
 /// 调用方必须持有该文件的 `download_lock`，避免与替换序列交错。
 pub(crate) fn record_upgrade_check(
     sidecar_path: &Path,
@@ -295,22 +306,32 @@ pub(crate) fn record_upgrade_check(
     let text = std::fs::read_to_string(sidecar_path)?;
     let trimmed = text.trim_end_matches(['\r', '\n']);
     let fields: Vec<&str> = trimmed.split('\t').collect();
-    if fields.len() < 3 {
+    // 尺寸字段读不出来就别改写：写回去的 sidecar 会让每次读取都 miss，等于删掉这份缓存。
+    if fields.len() < 2 || fields[1].trim().parse::<u64>().is_err() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "sidecar has fewer than three fields",
+            "sidecar is missing the quality or size field",
         ));
     }
     if parse_rank(fields.get(3).copied()) != expected_actual_rank {
         return Ok(());
     }
-    // 前四个字段原样保留（旧三字段缺的第 4 个补空位），丢掉旧的探测结论后重新写。
+    // 前四个字段原样保留（旧格式缺的第 3、4 字段补上），丢掉旧的探测结论后重新写。
+    let (quality_field, preview_field) = match fields.get(2).copied() {
+        Some(flag) => (fields[0].trim().to_string(), flag.trim().to_string()),
+        None => {
+            let raw = fields[0].trim();
+            (
+                strip_preview_marker(raw),
+                u8::from(preview_from_label(raw)).to_string(),
+            )
+        }
+    };
     let rank_field = fields.get(3).copied().unwrap_or("").trim();
     let content = format!(
-        "{}\t{}\t{}\t{rank_field}\t{checked_rank}\t{now}",
-        fields[0].trim(),
+        "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}",
+        quality_field,
         fields[1].trim(),
-        fields[2].trim(),
     );
     let tmp = sidecar_path.with_extension("quality.tmp");
     if let Err(err) = std::fs::write(&tmp, content) {
@@ -1152,6 +1173,31 @@ mod tests {
         std::fs::write(&short, "x\ty").unwrap();
         assert!(record_upgrade_check(&short, Some(80), 100, 1).is_err());
         assert_eq!(std::fs::read_to_string(&short).unwrap(), "x\ty");
+
+        // 只剩一个字段：连尺寸都没有，不能改写。
+        let one = dir.path().join("one.quality");
+        std::fs::write(&one, "极高 320k").unwrap();
+        assert!(record_upgrade_check(&one, None, 100, 1).is_err());
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "极高 320k");
+    }
+
+    /// 更早的两字段格式（试听拼在档位里）补得齐，改写完仍能按现在的布局读回来。
+    #[test]
+    fn record_upgrade_check_fills_the_missing_preview_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "无损 · 试听\t9000").unwrap();
+        record_upgrade_check(&sidecar, None, 100, 1_700_000_000).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            text, "无损\t9000\t1\t\t100\t1700000000",
+            "试听标记换成第 3 字段"
+        );
+        let parsed = parse_sidecar(&text, 9000).unwrap();
+        assert!(parsed.preview);
+        assert_eq!(parsed.quality, "无损", "档位文本不再拖着试听标记");
+        assert_eq!(parsed.actual_rank, None);
+        assert_eq!(parsed.checked_rank, Some(100));
     }
 
     /// 写回成功时清掉可能遗留的旧备份，不留下临时文件。
