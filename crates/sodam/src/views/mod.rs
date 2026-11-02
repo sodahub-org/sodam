@@ -16,10 +16,12 @@ use crate::ui::theme::ThemeKind;
 pub use login::login_modal;
 pub mod login;
 pub mod lyrics;
+pub mod me;
 pub mod scenes;
 pub mod search;
 pub mod settings;
 pub mod shortcut_card;
+pub mod signer;
 use settings::duration_of;
 
 use sodam_core::library::SearchScope;
@@ -241,13 +243,30 @@ fn track_row(
             },
         )
         .child(
+            // 序号：悬停整行时变成播放图标，和官方一致。
             div()
                 .w(px(COL_INDEX))
                 .flex_none()
-                .text_size(theme::Text::Small.size())
-                .text_color(theme::text_faint())
-                .group_hover(TRACK_GROUP, |style| style.text_color(theme::accent()))
-                .child(format!("{}", index + 1)),
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_faint())
+                        .group_hover(TRACK_GROUP, |style| style.opacity(0.0))
+                        .child(format!("{}", index + 1)),
+                )
+                .child(
+                    svg()
+                        .path(icons::path("play"))
+                        .absolute()
+                        .size(px(12.0))
+                        .opacity(0.0)
+                        .text_color(theme::text())
+                        .group_hover(TRACK_GROUP, |style| style.opacity(1.0)),
+                ),
         )
         .child({
             // 爱心：空心 = 未收藏，实心（强调色）= 已收藏；点一下切换
@@ -783,7 +802,8 @@ pub(crate) fn back_button(cx: &mut Context<Root>) -> AnyElement {
 fn subtitle_for(root: &Root) -> String {
     let logged_in = !root.settings.cookie.trim().is_empty();
     match root.nav {
-        // 搜索页有自己的标题，不走 page_header，因此没有副标题
+        // 搜索页 / 我的主页有自己的标题，不走 page_header，因此没有副标题
+        Nav::Me => String::new(),
         Nav::Search => String::new(),
         Nav::Liked => {
             if !logged_in {
@@ -1084,7 +1104,8 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
             None => loading_state(root.tr("正在准备推荐队列…")),
         },
         Nav::Scenes => scenes::scenes_view(root, cx),
-        Nav::Search => search::search_page(root, window, cx),
+        Nav::Me => me::me_view(root, cx),
+        Nav::Search => search::search_page(root, window, cx, !root.header_owns_search),
         Nav::Liked => div()
             .flex()
             .flex_col()
@@ -1225,6 +1246,498 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
         )
 }
 
+/// 底部「更多功能」菜单：对齐官方四项（查看专辑 / 分享 / 歌曲信息反馈 / 举报歌曲）。
+pub fn more_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let Some((track, _position)) = root.more_menu.clone() else {
+        return div().into_any_element();
+    };
+    let item =
+        |id: &'static str,
+         icon: &'static str,
+         label: String,
+         cx: &mut Context<Root>,
+         action: fn(&mut Root, sodam_core::models::TrackItem, &mut Context<Root>)| {
+            let track = track.clone();
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(8.0))
+                .h(px(40.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    root.more_menu = None;
+                    action(root, track.clone(), cx);
+                    cx.notify();
+                }))
+                .child(
+                    svg()
+                        .path(icons::path(icon))
+                        .size(px(20.0))
+                        .text_color(theme::text()),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .child(label),
+                )
+        };
+    gpui::deferred(
+        div()
+            .id("more-menu")
+            .absolute()
+            .left(px(20.0))
+            .bottom(px(theme::PLAYER_H + 8.0))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(220.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(item(
+                "more-album",
+                "disc-3",
+                root.tr("查看专辑").to_string(),
+                cx,
+                |root, track, cx| {
+                    root.open_track_album(track, cx);
+                },
+            ))
+            .child(item(
+                "more-share",
+                "share-2",
+                root.tr("分享").to_string(),
+                cx,
+                |root, track, cx| {
+                    let url = format!("https://music.douyin.com/qishui/song/{}", track.id);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    root.set_status("已复制歌曲链接", &[]);
+                    root.set_toast("已复制链接".to_string(), cx);
+                },
+            )),
+    )
+    .with_priority(3)
+    .into_any_element()
+}
+
+pub fn add_to_playlist_menu(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let Some((track, _position)) = root.add_menu.clone() else {
+        return div().into_any_element();
+    };
+    let item =
+        |id: &'static str,
+         icon: &'static str,
+         label: String,
+         cx: &mut Context<Root>,
+         action: fn(&mut Root, sodam_core::models::TrackItem, &mut Context<Root>)| {
+            let track = track.clone();
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(8.0))
+                .h(px(40.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                    root.add_menu = None;
+                    action(root, track.clone(), cx);
+                    cx.notify();
+                }))
+                .child(
+                    svg()
+                        .path(icons::path(icon))
+                        .size(px(20.0))
+                        .text_color(theme::text()),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .child(label),
+                )
+        };
+    gpui::deferred(
+        div()
+            .id("add-to-playlist-menu")
+            .absolute()
+            .left(px(64.0))
+            .bottom(px(theme::PLAYER_H + 8.0))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(220.0))
+            .p(px(8.0))
+            .rounded(px(12.0))
+            .bg(theme::surface_elevated())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .child(item(
+                "add-create",
+                "plus",
+                root.tr("创建新歌单").to_string(),
+                cx,
+                |root, track, cx| {
+                    root.create_playlist_with_track(track, cx);
+                },
+            ))
+            .child(item(
+                "add-liked",
+                "heart",
+                root.tr("我喜欢的音乐").to_string(),
+                cx,
+                |root, track, cx| {
+                    root.toggle_like(track, cx);
+                },
+            )),
+    )
+    .with_priority(3)
+    .into_any_element()
+}
+
+/// 评论面板（只读列表 + 加载更多）。
+pub fn comment_panel(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let items: Vec<AnyElement> = root
+        .comment_items
+        .iter()
+        .map(|comment| {
+            let avatar = root.cover_of(&comment.avatar);
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(10.0))
+                .px(px(20.0))
+                .py(px(12.0))
+                .child(div().flex_none().child(cover(avatar, 36.0, 999.0)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.6,
+                                            ..theme::text()
+                                        })
+                                        .child(comment.user.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        })
+                                        .child(format_comment_time(comment.created_at)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .line_height(px(22.0))
+                                .text_color(theme::text())
+                                .child(render_emoji_tokens(&comment.content)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.0))
+                                .text_size(px(12.0))
+                                .text_color(gpui::Rgba {
+                                    a: 0.45,
+                                    ..theme::text()
+                                })
+                                .child(root.tr("回复").to_string())
+                                .when(comment.replies > 0, |this| {
+                                    let id = comment.id.clone();
+                                    this.child(
+                                        div()
+                                            .id(gpui::ElementId::Name(
+                                                format!("comment-expand-{}", comment.id).into(),
+                                            ))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(theme::accent()))
+                                            .on_click(cx.listener(
+                                                move |root, _event: &ClickEvent, _window, cx| {
+                                                    if root.expanded_comments.remove(&id) {
+                                                        cx.notify();
+                                                        return;
+                                                    }
+                                                    root.expanded_comments.insert(id.clone());
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(format!("— 展开 {} 条回复", comment.replies)),
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .id(gpui::ElementId::Name(
+                                    format!("comment-like-{}", comment.id).into(),
+                                ))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(theme::accent()))
+                                .child(
+                                    svg()
+                                        .path(icons::path("thumb-up"))
+                                        .size(px(18.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.45,
+                                            ..theme::text()
+                                        }),
+                                )
+                                .on_click(cx.listener({
+                                    let id = comment.id.clone();
+                                    move |root, _event: &ClickEvent, _window, cx| {
+                                        root.like_comment(id.clone(), cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(gpui::Rgba {
+                                    a: 0.45,
+                                    ..theme::text()
+                                })
+                                .child(if comment.likes > 0 {
+                                    comment.likes.to_string()
+                                } else {
+                                    String::new()
+                                }),
+                        ),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    gpui::deferred(
+        div()
+            .id("comment-panel")
+            .absolute()
+            .right(px(0.0))
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .w(px(380.0))
+            .flex()
+            .flex_col()
+            // 官方评论区是不透明面板，并且盖住窗口右上角的最小化/最大化/关闭。
+            .bg(theme::surface_elevated())
+            .border_l_1()
+            .border_color(theme::border())
+            .occlude()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(16.0))
+                    .px(px(20.0))
+                    .py(px(16.0))
+                    .child(
+                        div()
+                            .id("comment-close")
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(22.0))
+                            .text_color(theme::text_muted())
+                            .hover(|style| style.text_color(theme::text()))
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.comment_panel_open = false;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(format!("评论（{}）", root.comment_total)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("comment-list")
+                    .flex()
+                    .flex_col()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(
+                        root.comment_items.is_empty() && !root.comment_loading,
+                        |this| this.child(empty_state("music", root.tr("还没有评论"))),
+                    )
+                    .children(items)
+                    .when(root.comment_has_more, |this| {
+                        this.child(
+                            div()
+                                .id("comment-more")
+                                .py(px(theme::space::SM))
+                                .flex()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_size(theme::Text::Small.size())
+                                .text_color(theme::accent())
+                                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                    root.load_more_comments(cx);
+                                }))
+                                .child(root.tr("加载更多").to_string()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .mx(px(20.0))
+                    .my(px(12.0))
+                    .px(px(12.0))
+                    .h(px(36.0))
+                    .rounded(px(999.0))
+                    .bg(gpui::Rgba {
+                        a: 0.08,
+                        ..theme::text()
+                    })
+                    .text_size(px(13.0))
+                    .text_color(gpui::Rgba {
+                        a: 0.4,
+                        ..theme::text()
+                    })
+                    .child(
+                        root.tr("评论功能暂不可用（需要客户端会话签名）")
+                            .to_string(),
+                    ),
+            ),
+    )
+    .with_priority(4)
+    .into_any_element()
+}
+
+fn format_comment_time(seconds: i64) -> String {
+    if seconds <= 0 {
+        return String::new();
+    }
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(seconds, 0) {
+        chrono::LocalResult::Single(value) => value.format("%Y-%m-%d").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 顶部居中的轻提示。
+pub fn toast_overlay(text: String, _cx: &mut Context<Root>) -> AnyElement {
+    gpui::deferred(
+        div()
+            .absolute()
+            .top(px(64.0))
+            .left(gpui::relative(0.5))
+            .ml(px(-120.0))
+            .w(px(240.0))
+            .flex()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .text_size(theme::Text::Small.size())
+                    .text_color(theme::text())
+                    .child(text),
+            ),
+    )
+    .with_priority(8)
+    .into_any_element()
+}
+
+/// 把抖音评论里的 `[流泪]` 这类表情标记换成 Unicode 表情；
+/// 没收录的保留原文，避免内容被吃掉。
+fn render_emoji_tokens(text: &str) -> String {
+    const MAP: [(&str, &str); 28] = [
+        ("[微笑]", "🙂"),
+        ("[大笑]", "😄"),
+        ("[笑哭]", "😂"),
+        ("[流泪]", "😢"),
+        ("[哭]", "😭"),
+        ("[赞]", "👍"),
+        ("[鼓掌]", "👏"),
+        ("[爱心]", "❤️"),
+        ("[心碎]", "💔"),
+        ("[玫瑰]", "🌹"),
+        ("[火]", "🔥"),
+        ("[捂脸]", "🤦"),
+        ("[思考]", "🤔"),
+        ("[得意]", "😎"),
+        ("[调皮]", "😜"),
+        ("[疑问]", "❓"),
+        ("[拜拜]", "👋"),
+        ("[加油]", "💪"),
+        ("[音乐]", "🎵"),
+        ("[话筒]", "🎤"),
+        ("[庆祝]", "🎉"),
+        ("[蛋糕]", "🎂"),
+        ("[礼物]", "🎁"),
+        ("[星星]", "⭐"),
+        ("[月亮]", "🌙"),
+        ("[太阳]", "☀️"),
+        ("[狗]", "🐶"),
+        ("[猫]", "🐱"),
+    ];
+    let mut out = text.to_string();
+    for (token, emoji) in MAP {
+        out = out.replace(token, emoji);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,5 +1766,20 @@ mod tests {
             total += COL_GAP * (items - 1.0);
             assert!(total <= width + 0.01, "width={width} total={total}");
         }
+    }
+
+    #[test]
+    fn comment_time_uses_local_date() {
+        let stamp = 1_700_000_000;
+        let expected = {
+            use chrono::TimeZone;
+            chrono::Local
+                .timestamp_opt(stamp, 0)
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        assert_eq!(format_comment_time(stamp), expected);
+        assert!(format_comment_time(0).is_empty());
     }
 }

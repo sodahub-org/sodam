@@ -16,6 +16,12 @@ mod media;
 // 播放控制快捷键（可重绑），见 shortcuts.rs。
 mod shortcuts;
 // 单实例防护：第二次启动只把已有窗口提到前台，见 single_instance.rs。
+mod gnome_extension;
+
+/// 读取设置里的 GNOME 扩展开关（启动阶段设置尚未加载）。
+fn settings_flag_enabled() -> bool {
+    sodam_core::config::Settings::load().gnome_extension_enabled
+}
 mod single_instance;
 // macOS 菜单栏与标准快捷键（⌘Q/⌘M/⌘W），见 menus.rs。
 #[cfg(target_os = "macos")]
@@ -83,7 +89,7 @@ fn start_tray_service(
         let mut tick = 0u32;
         loop {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(100))
+                .timer(std::time::Duration::from_millis(250))
                 .await;
             while let Ok(command) = rx.try_recv() {
                 match command {
@@ -112,6 +118,15 @@ fn start_tray_service(
                             media::Command::Toggle => root.toggle_play(cx),
                             media::Command::Next => root.next_track(cx),
                             media::Command::Previous => root.prev_track(cx),
+                            media::Command::SetBarVisible(visible) => {
+                                root.desktop_lyrics_visible = visible;
+                                cx.notify();
+                            }
+                            media::Command::ToggleLike => {
+                                if let Some(track) = root.queue.current().cloned() {
+                                    root.toggle_like(track, cx);
+                                }
+                            }
                             _ => {}
                         }
                     })
@@ -132,29 +147,33 @@ fn start_tray_service(
             }
 
             tick += 1;
-            if tick % 5 == 0 {
+            // 托盘文字 500ms 同步一次就够；歌词要跟唱，100ms 一帧才不显得慢半拍。
+            let sync_tray = tick % 5 == 0;
+            {
                 let now = cx.update(|cx| {
                     app.update(cx, |root, _cx| {
                         let snapshot = root.engine.snapshot();
                         let track = root.queue.current();
-                        let title = if snapshot.track_id.is_empty() {
-                            "SodaM".to_string()
-                        } else {
-                            snapshot.title.clone()
-                        };
-                        let subtitle = if snapshot.track_id.is_empty() {
-                            root.tr("就绪").to_string()
-                        } else {
-                            track.map(|track| track.artist.clone()).unwrap_or_default()
-                        };
-                        sync(tray::TrayState {
-                            language: root.language,
-                            title,
-                            subtitle,
-                            playing: snapshot.playing,
-                            has_track: !snapshot.track_id.is_empty(),
-                            cover_path: track.and_then(|track| root.cover_of(&track.cover)),
-                        });
+                        if sync_tray {
+                            let title = if snapshot.track_id.is_empty() {
+                                "SodaM".to_string()
+                            } else {
+                                snapshot.title.clone()
+                            };
+                            let subtitle = if snapshot.track_id.is_empty() {
+                                root.tr("就绪").to_string()
+                            } else {
+                                track.map(|track| track.artist.clone()).unwrap_or_default()
+                            };
+                            sync(tray::TrayState {
+                                language: root.language,
+                                title,
+                                subtitle,
+                                playing: snapshot.playing,
+                                has_track: !snapshot.track_id.is_empty(),
+                                cover_path: track.and_then(|track| root.cover_of(&track.cover)),
+                            });
+                        }
                         // 顺手发布给系统媒体面板（内容没变时 publish 内部会跳过）。
                         media::NowPlaying {
                             track_id: snapshot.track_id.clone(),
@@ -165,6 +184,31 @@ fn start_tray_service(
                             duration_seconds: snapshot.duration_seconds,
                             position_seconds: snapshot.position_seconds,
                             playing: snapshot.playing,
+                            // 没有曲目时必须清空，否则停止播放后歌词接口会残留上一首，
+                            // 和已经清空的 MPRIS 元数据对不上。
+                            lyric_current: if snapshot.track_id.is_empty() {
+                                String::new()
+                            } else {
+                                root.lyrics_active
+                                    .and_then(|index| root.lyrics.get(index))
+                                    .or_else(|| root.lyrics.first())
+                                    .map(|line| line.text.clone())
+                                    .unwrap_or_default()
+                            },
+                            lyric_next: if snapshot.track_id.is_empty() {
+                                String::new()
+                            } else {
+                                root.lyrics_active
+                                    .map(|index| index + 1)
+                                    .and_then(|index| root.lyrics.get(index))
+                                    .map(|line| line.text.clone())
+                                    .unwrap_or_default()
+                            },
+                            has_lyrics: !snapshot.track_id.is_empty() && !root.lyrics.is_empty(),
+                            liked: track
+                                .map(|track| root.liked_ids.contains(&track.id))
+                                .unwrap_or(false),
+                            lyrics_visible: root.desktop_lyrics_visible,
                         }
                     })
                 });
@@ -208,6 +252,7 @@ fn start_single_instance_service(
 }
 
 fn main() {
+    gnome_extension::ensure_installed();
     // 单实例：第二次启动不再开第二个窗口，只把已在跑的窗口提到前台。
     // Secondary 时已经代为请求前台，本进程直接退出（静默，符合 issue #14）。
     let instance = single_instance::acquire();

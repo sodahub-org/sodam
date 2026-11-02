@@ -574,6 +574,65 @@ impl Language {
             "当前跟随系统语言；手动选择后会固定语言" => {
                 "Following system; choose a language to pin it"
             }
+            "我的" => "My",
+            "音效" => "Effects",
+            "词" => "Lyrics",
+            "查看专辑" => "View album",
+            "查看所有{}" => "View all {}",
+            "创建的歌单" => "Created playlists",
+            "创建新歌单" => "Create playlist",
+            "分享" => "Share",
+            "粉丝" => "Followers",
+            "服务" => "Service",
+            "歌曲信息反馈" => "Track info feedback",
+            "歌手、歌曲或专辑名" => "Artist, track or album",
+            "关注" => "Following",
+            "还没有评论" => "No comments yet",
+            "回复" => "Reply",
+            "会员中心" => "Membership",
+            "获赞" => "Likes",
+            "加载更多" => "Load more",
+            "举报歌曲" => "Report track",
+            "评论操作失败：{}" => "Comment action failed: {}",
+            "评论加载失败：{}" => "Failed to load comments: {}",
+            "启动服务" => "Start service",
+            "启动中…" => "Starting…",
+            "签名服务（写接口 / 整曲取流）" => "Signing service (writes / full streams)",
+            "签名文件" => "Signature files",
+            "确认退出登录吗？" => "Sign out?",
+            "提取签名模块" => "Extract signature modules",
+            "停止服务" => "Stop service",
+            "未运行" => "Not running",
+            "下载 libmssdk" => "Download libmssdk",
+            "下载 Node" => "Download Node",
+            "写下你想说的…" => "Write a comment…",
+            "已创建歌单：{}" => "Playlist created: {}",
+            "已复制歌曲链接" => "Track link copied",
+            "已记录歌曲信息反馈" => "Track info feedback recorded",
+            "已减少推荐：{}" => "Fewer recommendations like {}",
+            "已提交举报" => "Report submitted",
+            "已添加到歌单" => "Added to playlist",
+            "已在「我喜欢的音乐」" => "Already in Liked Music",
+            "音质已切换为 {}" => "Quality switched to {}",
+            "正在执行…" => "Working…",
+            "重新检测" => "Re-check",
+            "登录后这里会显示你的主页" => "Sign in to see your profile",
+            "7z" => "7z",
+            "libmssdk" => "libmssdk",
+            "Node (Windows)" => "Node (Windows)",
+            "wine" => "wine",
+            "安装包路径" => "Installer path",
+            "评论功能暂不可用（需要客户端会话签名）" => {
+                "Comments are unavailable until client session signing is available"
+            }
+            "开启后安装并启用 GNOME Shell 扩展；关闭会停用并删除扩展目录" => {
+                "Install and enable the GNOME Shell extension; turning it off disables and removes it"
+            }
+            "GNOME 顶栏歌词" => "GNOME top-bar lyrics",
+            "已启用 GNOME 顶栏歌词（需重新登录桌面生效）" => {
+                "GNOME top-bar lyrics enabled (sign out and back in to apply)"
+            }
+            "已停用并移除 GNOME 顶栏歌词扩展" => "GNOME top-bar lyrics extension disabled and removed",
             _ => return None,
         })
     }

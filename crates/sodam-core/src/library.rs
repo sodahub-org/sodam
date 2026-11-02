@@ -772,6 +772,233 @@ fn scoped_results(
 }
 
 /// 官方搜索页：综合 / 歌曲 / 音乐人 / 专辑 / 歌单。
+/// 一条搜索联想：文本 + 可直达的歌单/音乐人 id。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchSuggestion {
+    pub text: String,
+    pub playlist_id: Option<String>,
+    pub artist_id: Option<String>,
+}
+
+/// 搜索联想词（官方 `/luna/pc/sug`）。
+pub fn search_suggest(session: &Session, keyword: &str) -> anyhow::Result<Vec<SearchSuggestion>> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value = libresoda::soda::search::suggest(session.soda(), keyword)
+        .map_err(|err| wrap_err("搜索联想失败", err))?;
+    let words = value
+        .get("sugs")
+        .and_then(|sugs| sugs.as_array())
+        .map(|sugs| {
+            sugs.iter()
+                .filter_map(|item| {
+                    let text = item.get("suggestion")?.as_str()?.to_string();
+                    Some(SearchSuggestion {
+                        text,
+                        playlist_id: item
+                            .pointer("/entity/playlist/id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        artist_id: item
+                            .pointer("/entity/artist/id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(words)
+}
+
+/// 查询串转义（PC 搜索的参数里可能带空格/中文）。
+fn encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 官方 PC 搜索：`GET /luna/pc/search/{search_type}`。
+///
+/// 和 Android 接口相比，它会带上 `search_id / search_method / from_search_id /
+/// search_scene` 这些官方客户端必带的参数，用于服务端做会话级排序和埋点。
+pub fn search_pc(
+    session: &Session,
+    keyword: &str,
+    search_type: &str,
+    cursor: &str,
+    from_search_id: &str,
+) -> anyhow::Result<SearchResults> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(SearchResults::default());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let search_id = format!(
+        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+        (now >> 32) as u32,
+        (now >> 16) as u16,
+        (now as u16) & 0x0fff,
+        ((now >> 4) as u16) & 0x0fff,
+        now as u64 & 0xffff_ffff_ffff
+    );
+    let params = [
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        ("device_id", now.to_string()),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("q", keyword.to_string()),
+        ("cursor", cursor.to_string()),
+        ("search_id", search_id),
+        ("search_method", String::new()),
+        ("debug_params", String::new()),
+        ("from_search_id", from_search_id.to_string()),
+        ("search_scene", String::new()),
+        ("scene_name", String::new()),
+    ];
+    let body = pc_search_body_with(session, &params, search_type)?;
+    raw_search_results(keyword, body.as_bytes())
+}
+
+/// 直接拿 PC 搜索的原始回包（歌 chorused 取点时复用）。
+fn pc_search_body_with(
+    session: &Session,
+    params: &[(&str, String)],
+    search_type: &str,
+) -> anyhow::Result<String> {
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("https://api.qishui.com/luna/pc/search/{search_type}?{query}");
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Cookie", &session.soda().cookie())
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1")
+        .call()
+        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))?;
+    response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("综合搜索失败: {err}"))
+}
+
+/// 取某首歌的高潮点与评论数（`chorus.start` 秒、`stats.count_comment`）。
+#[derive(Debug, Clone, Default)]
+pub struct TrackExtras {
+    pub chorus_seconds: f64,
+    pub comments: i64,
+    pub album_id: String,
+    pub artist_id: String,
+}
+
+pub fn track_extras(
+    session: &Session,
+    track_id: &str,
+    title: &str,
+    artist: &str,
+) -> Option<TrackExtras> {
+    let keyword = format!("{title} {artist}");
+    let keyword = keyword.trim();
+    if keyword.is_empty() || track_id.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    let params = [
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        ("device_id", now.to_string()),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("q", keyword.to_string()),
+        ("cursor", "0".to_string()),
+        ("search_id", now.to_string()),
+        ("search_method", String::new()),
+        ("debug_params", String::new()),
+        ("from_search_id", String::new()),
+        ("search_scene", String::new()),
+        ("scene_name", String::new()),
+    ];
+    let body = pc_search_body_with(session, &params, "all").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    for group in value.get("result_groups")?.as_array()? {
+        for item in group.get("data")?.as_array()? {
+            let track = match item.pointer("/entity/track") {
+                Some(track) => track,
+                None => continue,
+            };
+            if track.get("id").and_then(|id| id.as_str()) != Some(track_id) {
+                continue;
+            }
+            let start = track
+                .pointer("/chorus/start")
+                .and_then(|start| start.as_f64())
+                .unwrap_or(0.0);
+            let comments = track
+                .pointer("/stats/count_comment")
+                .and_then(|count| count.as_i64())
+                .unwrap_or(0);
+            {
+                return Some(TrackExtras {
+                    chorus_seconds: start / 1000.0,
+                    comments,
+                    album_id: track
+                        .pointer("/album/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    artist_id: track
+                        .pointer("/artists/0/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
 pub fn search(
     session: &Session,
     keyword: &str,
@@ -779,12 +1006,7 @@ pub fn search(
 ) -> anyhow::Result<SearchResults> {
     let soda = session.soda();
     match scope {
-        SearchScope::All => {
-            let body = soda
-                .fetch_search_all_body(keyword, 1, 30)
-                .map_err(|err| wrap_err("综合搜索失败", err))?;
-            raw_search_results(keyword, &body)
-        }
+        SearchScope::All => search_pc(session, keyword, "all", "0", ""),
         SearchScope::Tracks => {
             let tracks = session.search(keyword)?;
             Ok(scoped_results(
@@ -1147,4 +1369,267 @@ mod tests {
         let session = fake_session();
         assert!(liked_songs(&session).is_err());
     }
+}
+
+/// 少推荐：`POST /luna/track/dislike`。
+pub fn dislike_track(session: &Session, track_id: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({ "track_id": track_id });
+    post_pc_json(session, "/luna/track/dislike", &body)
+}
+
+/// 把曲目追加到歌单：`POST /luna/pc/me/playlist/media/append`。
+pub fn append_track_to_playlist(
+    session: &Session,
+    playlist_id: &str,
+    track_id: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "playlist_id": playlist_id,
+        "media": [{ "id": track_id, "type": "track" }],
+    });
+    post_pc_json(session, "/luna/pc/me/playlist/media/append", &body)
+}
+
+/// 新建歌单并把曲目放进去：`POST /luna/pc/me/playlist`。
+pub fn create_playlist_with_track(
+    session: &Session,
+    name: &str,
+    track_id: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "name": name,
+        "is_private": false,
+        "track_ids": [track_id],
+    });
+    post_pc_json(session, "/luna/pc/me/playlist", &body)
+}
+
+/// 发表评论：`POST /luna/pc/comments/create`。
+pub fn create_comment(session: &Session, track_id: &str, text: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "group_id": track_id,
+        "text": text,
+        "group_type": 0,
+    });
+    post_pc_json(session, "/luna/pc/comments/create", &body)
+}
+
+/// 评论点赞 / 取消：`POST /luna/pc/comments/action`。
+pub fn like_comment(
+    session: &Session,
+    track_id: &str,
+    comment_id: &str,
+    liked: bool,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "comment_id": comment_id,
+        "reply_id": "",
+        "group_id": track_id,
+        "type": if liked { 1 } else { 0 },
+        "scene_name": "comment_panel",
+    });
+    post_pc_json(session, "/luna/pc/comments/action", &body)
+}
+
+fn post_pc_json(session: &Session, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+    let url = format!("https://api.qishui.com{path}");
+    let mut request = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("Cookie", &session.soda().cookie())
+        .set("content-type", "application/json")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1");
+    // 写接口（评论/点赞/歌单追加）要客户端签名头，读接口不校验。
+    if let Some(credentials) = session.soda().app_credentials() {
+        for (name, value) in credentials.headers() {
+            request = request.set(name, &value);
+        }
+    }
+    let response = request
+        .send_string(&body.to_string())
+        .map_err(|err| anyhow::anyhow!("请求失败: {err}"))?;
+    let text = response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("请求失败: {err}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| anyhow::anyhow!("响应解析失败: {err}"))?;
+    if value
+        .get("status_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0
+    {
+        let message = value
+            .pointer("/status_info/status_msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
+
+/// 一条评论。
+#[derive(Debug, Clone, Default)]
+pub struct CommentItem {
+    pub id: String,
+    pub user: String,
+    pub avatar: String,
+    pub content: String,
+    pub likes: i64,
+    pub replies: i64,
+    pub created_at: i64,
+}
+
+/// 一页评论。
+#[derive(Debug, Clone, Default)]
+pub struct CommentPage {
+    pub items: Vec<CommentItem>,
+    pub cursor: String,
+    pub has_more: bool,
+    pub total: i64,
+}
+
+/// 拉评论：`GET /luna/pc/comments`。
+pub fn list_comments(
+    session: &Session,
+    track_id: &str,
+    cursor: &str,
+    count: i64,
+) -> anyhow::Result<CommentPage> {
+    let mut params = vec![
+        ("aid", "386088".to_string()),
+        ("app_name", "luna_pc".to_string()),
+        ("region", "cn".to_string()),
+        ("geo_region", "cn".to_string()),
+        ("os_region", "cn".to_string()),
+        ("sim_region", String::new()),
+        (
+            "device_id",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_millis())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        ("device_platform", "windows".to_string()),
+        ("os", "windows".to_string()),
+        ("version_code", "380000".to_string()),
+        ("version_name", "3.8.0".to_string()),
+        ("channel", "official".to_string()),
+        ("pkg_type", "official".to_string()),
+        ("group_id", track_id.to_string()),
+        ("group_type", "0".to_string()),
+        (
+            "cursor",
+            if cursor.is_empty() {
+                "0".to_string()
+            } else {
+                cursor.to_string()
+            },
+        ),
+        ("count", count.max(1).to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(b.0));
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("https://api.qishui.com/luna/pc/comments?{query}");
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .set("Cookie", &session.soda().cookie())
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
+        )
+        .set("x-luna-background-type", "foreground")
+        .set("x-luna-is-background-req", "0")
+        .set("x-luna-is-local-user", "1")
+        .call()
+        .map_err(|err| anyhow::anyhow!("读取评论失败: {err}"))?;
+    let body = response
+        .into_string()
+        .map_err(|err| anyhow::anyhow!("读取评论失败: {err}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|err| anyhow::anyhow!("评论解析失败: {err}"))?;
+    if value
+        .get("status_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0
+    {
+        let message = value
+            .pointer("/status_info/status_msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("{message}");
+    }
+    let items = value
+        .get("comments")
+        .and_then(|comments| comments.as_array())
+        .map(|comments| {
+            comments
+                .iter()
+                .map(|comment| CommentItem {
+                    id: comment
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    user: comment
+                        .pointer("/user/nickname")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    avatar: comment
+                        .pointer("/user/medium_avatar_url/urls/0")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: comment
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    likes: comment
+                        .get("count_digged")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    replies: comment
+                        .get("count_reply")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    created_at: comment
+                        .get("time_created")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(CommentPage {
+        items,
+        cursor: value
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        has_more: value
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        total: value
+            .get("count")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
 }

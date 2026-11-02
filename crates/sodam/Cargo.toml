@@ -12,6 +12,7 @@ name = "sodam"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sodam-core = { path = "../sodam-core" }
 anyhow.workspace = true
 sys-locale.workspace = true
@@ -25,6 +26,8 @@ unicode-segmentation = "1.13.3"
 ksni = "0.2"
 # 系统媒体控制：MPRIS（playerctl / 桌面挂件 / 合成器绑的媒体键）。
 mpris-server = "0.10"
+# 桌面歌词扩展的独立 D-Bus 接口（`#[zbus::interface]` 需要 crate 本身在作用域）。
+zbus = "5"
 tokio = { version = "1", features = ["sync"] }
 futures-lite = "2"
 

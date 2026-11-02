@@ -20,15 +20,18 @@
 use gpui::prelude::*;
 #[cfg(target_os = "linux")]
 use gpui::MouseButton;
-use gpui::{div, hsla, px, svg, Div, Hsla, Pixels, Point, Window, WindowControlArea};
+use gpui::{
+    div, hsla, px, svg, AnyElement, App, Div, Hsla, Pixels, Point, SharedString, Window,
+    WindowControlArea,
+};
 use std::{cell::Cell, rc::Rc};
 
 use crate::ui::{icons, theme};
 
 /// 标题栏条高度（逻辑像素，与 Windows 惯例一致）。
-pub const STRIP_HEIGHT: f32 = 32.0;
+pub const STRIP_HEIGHT: f32 = 48.0;
 /// 单个标题栏按钮宽度。
-const BUTTON_WIDTH: f32 = 44.0;
+const BUTTON_WIDTH: f32 = 46.0;
 /// 控制图标边长。
 const GLYPH_SIZE: f32 = 12.0;
 /// 关闭按钮悬停色（Windows 惯例红）。
@@ -42,11 +45,53 @@ const DRAG_THRESHOLD: f32 = 4.0;
 /// Windows/macOS 由系统处理拖拽，这里只是保持签名一致。
 pub type DragAnchor = Rc<Cell<Option<Point<Pixels>>>>;
 
+/// 顶栏按钮的回调类型。
+pub type HeaderAction = Box<dyn Fn(&mut Window, &mut App)>;
+
+pub struct NavArrows {
+    pub back_enabled: bool,
+    pub forward_enabled: bool,
+    pub on_back: HeaderAction,
+    pub on_forward: HeaderAction,
+}
+
+/// 顶栏右侧的账号区：会员徽章 + 头像。
+pub struct HeaderAccount {
+    pub badge: Option<SharedString>,
+    pub avatar: Option<std::path::PathBuf>,
+}
+
+/// 顶栏里除窗口按钮之外的内容：前进/后退、搜索框与账号区都是可选的。
+#[derive(Default)]
+pub struct HeaderExtras {
+    pub nav: Option<NavArrows>,
+    pub search: Option<AnyElement>,
+    pub account: Option<HeaderAccount>,
+    /// 点 SVIP 胶囊：打开会员购买页。
+    pub on_vip_click: Option<HeaderAction>,
+    /// 点头像：弹出账号菜单。
+    pub on_account_click: Option<HeaderAction>,
+    /// 未登录时的「登录」按钮。
+    pub on_login_click: Option<HeaderAction>,
+}
+
 /// 覆盖在窗口顶部，不占布局高度：侧边栏/内容列各自为控件留出空间，
 /// 背景仍延伸到标题栏下方，避免独立标题栏横条与面板之间出现色差。
-/// 左侧全部为拖拽区，右侧是三个窗口控制按钮。
-pub fn render(window: &Window, anchor: &DragAnchor) -> Div {
-    render_with_maximize_icon(maximize_icon(window.is_maximized()), anchor)
+/// 左段拖拽、中段搜索、右段账号/歌词开关/窗口按钮。
+pub fn render(
+    window: &Window,
+    anchor: &DragAnchor,
+    lyrics_visible: bool,
+    on_toggle_lyrics: impl Fn(&mut Window, &mut App) + 'static,
+    extras: HeaderExtras,
+) -> Div {
+    render_with_maximize_icon(
+        maximize_icon(window.is_maximized()),
+        anchor,
+        lyrics_visible,
+        on_toggle_lyrics,
+        extras,
+    )
 }
 
 /// 最大化后按钮换成「还原」图标，和系统窗口的语义一致。
@@ -59,8 +104,14 @@ fn maximize_icon(is_maximized: bool) -> &'static str {
 }
 
 /// 与真实 `Window` 解耦：单测不必构造平台窗口，也能覆盖普通/最大化两条分支。
-fn render_with_maximize_icon(maximize_icon: &'static str, anchor: &DragAnchor) -> Div {
-    div()
+fn render_with_maximize_icon(
+    maximize_icon: &'static str,
+    anchor: &DragAnchor,
+    lyrics_visible: bool,
+    on_toggle_lyrics: impl Fn(&mut Window, &mut App) + 'static,
+    mut extras: HeaderExtras,
+) -> Div {
+    let mut row = div()
         .absolute()
         .top(px(0.0))
         .left(px(0.0))
@@ -70,7 +121,88 @@ fn render_with_maximize_icon(maximize_icon: &'static str, anchor: &DragAnchor) -
         .w_full()
         .h(px(STRIP_HEIGHT))
         .flex_none()
-        .child(drag_area(anchor.clone()))
+        // 左侧越过侧栏的一段只做拖拽，顶栏内容从侧栏右边开始。
+        .child(drag_area(anchor.clone(), Some(theme::SIDEBAR_W)));
+
+    if let Some(nav) = extras.nav.take() {
+        row = row
+            .child(arrow_button(
+                "titlebar-back",
+                "chevron-left",
+                nav.back_enabled,
+                nav.on_back,
+            ))
+            .child(arrow_button(
+                "titlebar-forward",
+                "chevron-right",
+                nav.forward_enabled,
+                nav.on_forward,
+            ));
+    }
+
+    // 箭头与搜索框之间留弹性空白，搜索框靠右侧控件组。
+    row = row.child(drag_area(anchor.clone(), None));
+
+    if let Some(search) = extras.search.take() {
+        row = row.child(
+            div()
+                .flex_none()
+                .w(px(240.0))
+                .h(px(STRIP_HEIGHT))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .child(search),
+        );
+    }
+
+    // 搜索框 → 账号区固定 15，与账号区内部的「SVIP → 头像」保持一致。
+    row = row.child(div().w(px(16.0)).h_full());
+
+    if let Some(login) = extras.on_login_click.take() {
+        row = row.child(
+            div()
+                .id("titlebar-login")
+                .h(px(32.0))
+                .px(px(10.0))
+                .ml(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(100.0))
+                .bg(gpui::Rgba {
+                    a: 0.1,
+                    ..theme::text()
+                })
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::text())
+                .cursor_pointer()
+                .on_click(move |_, window, cx| login(window, cx))
+                .child("登录")
+                .child(
+                    svg()
+                        .path(icons::path("user"))
+                        .size(px(20.0))
+                        .text_color(theme::text()),
+                ),
+        );
+    }
+
+    if let Some(account) = extras.account {
+        row = row.child(account_chip(
+            account,
+            extras.on_vip_click.take(),
+            extras.on_account_click.take(),
+        ));
+    }
+
+    row = row
+        .child(separator())
+        // 桌面歌词开关：放在最小化左边，对应汽水音乐原生客户端的同一位置。
+        .when(cfg!(target_os = "linux"), |this| {
+            this.child(lyrics_button(lyrics_visible, on_toggle_lyrics))
+        })
         .child(caption_button(
             "titlebar-min",
             "minus",
@@ -88,16 +220,153 @@ fn render_with_maximize_icon(maximize_icon: &'static str, anchor: &DragAnchor) -
             "x",
             WindowControlArea::Close,
             true,
-        ))
+        ));
+    row
 }
 
-fn drag_area(anchor: DragAnchor) -> impl IntoElement {
+/// 前进/后退箭头：不可用时只降透明度，不接点击。
+fn arrow_button(
+    id: &'static str,
+    icon: &'static str,
+    enabled: bool,
+    on_click: HeaderAction,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .w(px(36.0))
+        .h(px(STRIP_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(move |_, window, cx| on_click(window, cx))
+        })
+        .child(
+            svg()
+                .path(icons::path(icon))
+                .size(px(18.0))
+                .text_color(if enabled {
+                    gpui::Rgba {
+                        a: 0.85,
+                        ..theme::text()
+                    }
+                } else {
+                    gpui::Rgba {
+                        a: 0.4,
+                        ..theme::text()
+                    }
+                }),
+        )
+}
+
+/// 账号区与窗口按钮之间的细分隔线。
+fn separator() -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(1.0))
+        .h(px(24.0))
+        .self_center()
+        .ml(px(14.0))
+        .mr(px(8.0))
+        .bg(theme::border())
+}
+
+/// 账号区：会员徽章（SVIP / VIP / 开通 VIP）+ 头像，整块可点进设置。
+fn account_chip(
+    account: HeaderAccount,
+    on_vip_click: Option<HeaderAction>,
+    on_avatar_click: Option<HeaderAction>,
+) -> impl IntoElement {
+    let mut chip = div()
+        .id("titlebar-account")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(16.0))
+        .h(px(STRIP_HEIGHT));
+
+    if let Some(badge) = account.badge {
+        let mut vip = div()
+            .id("titlebar-vip")
+            .cursor_pointer()
+            .flex()
+            .items_center();
+        if let Some(click) = on_vip_click {
+            vip = vip.on_click(move |_, window, cx| click(window, cx));
+        }
+        // 官方字标：SVIP / VIP 的路径直接从客户端 3.8.0 的 bundle 里取，
+        // 颜色用背景色，保持「字是洞」的观感。
+        let logo = match badge.as_ref() {
+            "SVIP" => Some(
+                svg()
+                    .path(icons::path("svip"))
+                    .w(px(36.25))
+                    .h(px(10.0))
+                    .text_color(theme::bg()),
+            ),
+            "VIP" => Some(
+                svg()
+                    .path(icons::path("vip"))
+                    .w(px(26.0))
+                    .h(px(10.0))
+                    .text_color(theme::bg()),
+            ),
+            _ => None,
+        };
+        chip = chip.child(
+            vip.child(match logo {
+                Some(logo) => div()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(999.0))
+                    .flex()
+                    .items_center()
+                    .bg(theme::surface_hover())
+                    .text_color(theme::text())
+                    .child(logo)
+                    .into_any_element(),
+                None => div()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .rounded(px(999.0))
+                    .flex()
+                    .items_center()
+                    .bg(theme::surface_hover())
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme::text())
+                    .child(badge)
+                    .into_any_element(),
+            }),
+        );
+    }
+
+    if let Some(path) = account.avatar {
+        let mut avatar = div().id("titlebar-avatar").cursor_pointer();
+        if let Some(click) = on_avatar_click {
+            avatar = avatar.on_click(move |_, window, cx| click(window, cx));
+        }
+        chip = chip.child(avatar.child(crate::ui::artwork::cover(Some(path), 28.0, 999.0)));
+    }
+
+    chip
+}
+
+fn drag_area(anchor: DragAnchor, width: Option<f32>) -> impl IntoElement {
     #[cfg(not(target_os = "linux"))]
     let _ = &anchor;
     let area = div()
-        .id("titlebar-drag")
-        .flex_1()
+        .id((
+            "titlebar-drag",
+            width.map(|w| w as usize).unwrap_or(usize::MAX),
+        ))
         .h_full()
+        .when(width.is_some(), |this| {
+            this.w(px(width.unwrap_or(0.0))).flex_none()
+        })
+        .when(width.is_none(), |this| this.flex_1())
         .window_control_area(WindowControlArea::Drag);
 
     // Linux 后端不处理控制区：双击标题栏等同于最大化/还原（Windows 由
@@ -147,6 +416,59 @@ fn drag_threshold_exceeded(origin: Point<Pixels>, current: Point<Pixels>) -> boo
     dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD
 }
 
+/// 桌面歌词开关：开启时整块填充强调色、图标反白；关闭时只有灰色线条。
+///
+/// 只在 Linux 显示（调用处按 `cfg!` 判断），但函数本身要在所有平台可编译：
+/// `.when(cfg!(...), ..)` 是运行时分支，闭包里的符号仍会被类型检查。
+fn lyrics_button(
+    active: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id("titlebar-lyrics")
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .mx(px(theme::space::XS))
+        .rounded(px(8.0))
+        .hover(move |style| {
+            if active {
+                style
+            } else {
+                style.bg(theme::surface_hover())
+            }
+        })
+        // 背景只包住图标本身：整格铺满会变成一个黑色方块。
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.0))
+                .h(px(18.0))
+                .rounded(px(8.0))
+                .when(active, |this| {
+                    this.bg(gpui::Rgba {
+                        a: 1.0,
+                        ..gpui::rgb(0xB5B5C6)
+                    })
+                })
+                .child(
+                    svg()
+                        .path(icons::path("widget-toggle"))
+                        .size(px(16.0))
+                        .text_color(if active {
+                            theme::bg()
+                        } else {
+                            theme::text_muted()
+                        }),
+                ),
+        )
+        .on_click(move |_, window, cx| on_toggle(window, cx))
+}
+
 fn caption_button(
     id: &'static str,
     icon: &'static str,
@@ -166,7 +488,10 @@ fn caption_button(
             svg()
                 .path(icons::path(icon))
                 .size(px(GLYPH_SIZE))
-                .text_color(theme::text_muted())
+                .text_color(gpui::Rgba {
+                    a: 0.85,
+                    ..theme::text()
+                })
                 .group_hover(id, |style| {
                     if danger {
                         style.text_color(gpui::white())
@@ -203,7 +528,13 @@ mod tests {
 
     #[test]
     fn titlebar_overlays_panel_backgrounds_without_its_own_fill() {
-        let mut titlebar = render_with_maximize_icon(maximize_icon(false), &test_anchor());
+        let mut titlebar = render_with_maximize_icon(
+            maximize_icon(false),
+            &test_anchor(),
+            true,
+            |_, _| {},
+            HeaderExtras::default(),
+        );
         let style = titlebar.style();
         assert_eq!(style.position, Some(gpui::Position::Absolute));
         assert_eq!(style.inset.top, Some(px(0.0).into()));
@@ -243,7 +574,13 @@ mod tests {
         assert_eq!(maximize_icon(true), "restore");
         // 两条分支都必须能构建出同高度的覆盖层。
         for icon in ["square", "restore"] {
-            let mut titlebar = render_with_maximize_icon(icon, &test_anchor());
+            let mut titlebar = render_with_maximize_icon(
+                icon,
+                &test_anchor(),
+                true,
+                |_, _| {},
+                HeaderExtras::default(),
+            );
             assert_eq!(titlebar.style().size.height, Some(px(STRIP_HEIGHT).into()));
         }
     }

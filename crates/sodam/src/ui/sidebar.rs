@@ -9,11 +9,16 @@ use gpui::{div, img, px, svg, AnyElement, ClickEvent, Context, IntoElement};
 use crate::app::{Nav, Root};
 use crate::ui::{icons, theme};
 
+fn current_logged_in(root: &Root) -> bool {
+    !root.settings.cookie.trim().is_empty()
+}
+
 /// 导航项的图标名（Lucide 线性图标）。
 fn icon_name(nav: Nav) -> &'static str {
     match nav {
         Nav::Home => "house",
         Nav::Scenes => "radio",
+        Nav::Me => "user",
         Nav::Search => "search",
         Nav::Liked => "heart",
         Nav::Library => "list-music",
@@ -149,10 +154,17 @@ pub fn render(root: &Root, cx: &mut Context<Root>, own_titlebar: bool) -> impl I
             nav_row(nav, labels[&nav].clone(), active, cx)
         })
         .collect();
-    let footer_items: Vec<AnyElement> = [Nav::Settings]
-        .into_iter()
-        .map(|nav| nav_row(nav, labels[&nav].clone(), nav == current, cx))
-        .collect();
+    // 登录后设置入口只在头像菜单里，主界面不再放设置按钮；
+    // 未登录时保留，作为扫码登录的入口。
+    // 已登录但账号信息还没拉到（或拉取失败）时也要能进设置。
+    let footer_items: Vec<AnyElement> = if current_logged_in(root) && root.account.is_some() {
+        Vec::new()
+    } else {
+        [Nav::Settings]
+            .into_iter()
+            .map(|nav| nav_row(nav, labels[&nav].clone(), nav == current, cx))
+            .collect()
+    };
 
     div()
         .flex()

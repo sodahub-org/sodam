@@ -1,0 +1,44 @@
+/* 透明胶囊：颜色跟随顶栏主题，不额外加底色。 */
+.sodam-lyrics-pill {
+  spacing: 10px;
+  padding: 0 8px;
+}
+
+.sodam-lyrics-info {
+  spacing: 8px;
+  padding: 0 2px;
+  border-radius: 8px;
+}
+
+.sodam-lyrics-info:hover {
+  background-color: rgba(58, 55, 51, 0.08);
+}
+
+.sodam-lyrics-cover {
+  border-radius: 6px;
+}
+
+/* 字号与颜色由 JS 按顶栏高度写入内联样式，这里只留字重。 */
+.sodam-lyrics-title {
+  font-weight: 500;
+}
+
+.sodam-lyrics-line {
+  font-weight: 400;
+}
+
+.sodam-lyrics-button {
+  border-radius: 999px;
+}
+
+.sodam-lyrics-button:hover {
+  background-color: rgba(58, 55, 51, 0.1);
+}
+
+.sodam-lyrics-button:active {
+  background-color: rgba(58, 55, 51, 0.18);
+}
+
+.sodam-lyrics-cover-bin {
+  border-radius: 6px;
+}
