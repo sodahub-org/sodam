@@ -158,14 +158,38 @@ impl CachedTrack {
     /// 命中缓存后是否还需要向服务端要更高档位。
     ///
     /// 实际档位已达目标、或最近已经确认过该目标没有更高流时，都不再请求。
+    /// 档位未知的旧缓存（#89）按 sidecar 的档位标签判断：证明不了达标就重下。
     pub fn needs_upgrade(
         &self,
         intent: &crate::quality::QualityIntent,
         is_vip: Option<bool>,
     ) -> bool {
         let target_rank = crate::quality::target_rank(intent, is_vip);
-        crate::quality::is_tier_below_selected(self.quality_rank, intent, is_vip)
+        crate::quality::is_tier_below_selected(self.quality_rank, &self.quality, intent, is_vip)
             && !crate::cache::upgrade_check_covers(self.checked_rank, target_rank)
+    }
+
+    /// 播放命中时是否值得**自动**发起后台升级。
+    ///
+    /// 与 [`Self::needs_upgrade`] 只差一种情形：档位未知的旧缓存，如果这次探测的结论
+    /// 根本没法写进 sidecar（账号权益未确认，见 `can_record_unavailable`），那这个结论
+    /// 就留不下来——本会话内的去重（`cache_upgrade_attempted`）挡得住连续切歌，
+    /// 挡不住下次启动再来一遍。对存量缓存来说那等于每次启动都把这首歌整曲下一遍、
+    /// 再发现没有更高的流。自动路径不该替用户做这种决定；用户主动点的批量升级仍走
+    /// `needs_upgrade`，那一下是他自己同意花流量的。
+    pub fn needs_auto_upgrade(
+        &self,
+        intent: &crate::quality::QualityIntent,
+        is_vip: Option<bool>,
+    ) -> bool {
+        if !self.needs_upgrade(intent, is_vip) {
+            return false;
+        }
+        self.quality_rank.is_some()
+            || crate::quality::can_record_unavailable(
+                crate::quality::target_rank(intent, is_vip),
+                is_vip,
+            )
     }
 }
 
@@ -199,7 +223,7 @@ fn is_truncated_download(declared: i64, written: u64) -> bool {
 fn record_upgrade_check(
     quality_path: &std::path::Path,
     audio_path: &std::path::Path,
-    actual_rank: i64,
+    actual_rank: Option<i64>,
     checked_rank: i64,
 ) {
     // 与替换路径共用同一把写锁，避免结论落到并发替换后的新文件上。
@@ -228,6 +252,38 @@ fn confirmed_miss_rank(
     }
     let target = target_rank?;
     (actual_rank < target).then_some(target)
+}
+
+/// 这次取到的新流是否值得换掉本地已有的那一份缓存。
+///
+/// * 档位已知（sidecar 第 4 字段有分数）：新流档位更高才算提升；
+/// * 档位未知的旧三字段缓存（#89）只剩标签可用：旧「无损」标签给得出下限就按下限比，
+///   给不出就用标签里记着的码率兜底——新流码率更低说明这次是拿差货换好货（权益过期、
+///   曲库退档都会走到这里），不换；但新流已经够到用户要的目标档位时照样换，
+///   无损 FLAC 的码率本来就可能低于有损的高码率流，不能被这道闸误挡；
+/// * 试听片段换成整曲永远是提升。
+fn is_better_stream(
+    info: &libresoda::soda::types::DownloadInfo,
+    current: &CachedTrack,
+    target_rank: Option<i64>,
+) -> bool {
+    let new_rank = crate::quality::stream_rank(info);
+    if current.preview && !info.is_preview {
+        return true;
+    }
+    let Some(old_rank) = current
+        .quality_rank
+        .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
+    else {
+        if new_rank <= 0 {
+            return false;
+        }
+        let bitrate = libresoda::soda::quality::normalize_bitrate(info.bitrate.max(0));
+        return crate::quality::legacy_label_bitrate_kbps(&current.quality)
+            .is_none_or(|old_bitrate| bitrate >= old_bitrate)
+            || target_rank.is_some_and(|target| new_rank >= target);
+    };
+    new_rank > old_rank
 }
 
 /// 拼出 sidecar 内容；有探测结论时写第 5、6 字段。
@@ -515,8 +571,10 @@ impl Session {
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
     /// * 若中途失败，清理临时文件，绝不破坏原有缓存；
     /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存；
+    ///   档位未知的旧三字段缓存按标签能证明的下限比较（#89）；
     /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
     ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
+    ///   档位未知的旧缓存同样记得下（sidecar 第 4 字段留空），否则每轮都会重下一遍。
     pub fn upgrade_cached_track(
         &self,
         track: &crate::models::TrackItem,
@@ -637,18 +695,16 @@ impl Session {
         // 成功拿到完整流但仍在目标之下，同样是确认性结论：服务端已给出它能给的最好档位。
         let checked_rank =
             confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
-        // 若新流档位并未高于旧档位，且未发生「由试听升级为整曲」，丢弃临时文件，保留旧文件
-        if let Some(old_rank) = current.quality_rank {
-            let is_improved = new_rank > old_rank || (current.preview && !info.is_preview);
-            if !is_improved {
-                let _ = std::fs::remove_file(&part);
-                // 只有「拿到完整流、档位仍没提升」才是确认性结论。试听回退与下载失败
-                // 会随会员权益或网络变化，不能写成「没有更高档位」。
-                if let Some(checked_rank) = checked_rank {
-                    record_upgrade_check(&quality_path, &path, old_rank, checked_rank);
-                }
-                return Ok(current);
+        // 若新流并不比本地这份更好（含「由试听升级为整曲」这一种提升），丢弃临时文件保留旧文件。
+        // 档位未知的旧缓存怎么比，见 `is_better_stream`。
+        if !is_better_stream(&info, &current, target_rank) {
+            let _ = std::fs::remove_file(&part);
+            // 只有「拿到完整流、档位仍没提升」才是确认性结论。试听回退与下载失败
+            // 会随会员权益或网络变化，不能写成「没有更高档位」。
+            if let Some(checked_rank) = checked_rank {
+                record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
             }
+            return Ok(current);
         }
 
         let quality = describe_quality(&info);
@@ -1054,6 +1110,126 @@ mod tests {
         assert!(!track(80, Some(100)).needs_upgrade(&lossless, None));
         assert!(track(80, Some(70)).needs_upgrade(&lossless, None));
         assert!(!track(100, None).needs_upgrade(&lossless, None));
+    }
+
+    /// #89：档位未知的旧三字段缓存也要能升级；自动路径再多一道「结论记不住就别探」的闸。
+    #[test]
+    fn unknown_rank_cache_upgrades_only_when_the_answer_can_be_remembered() {
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("legacy.m4a"));
+        let legacy = |quality: &str, checked: Option<i64>| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: quality.into(),
+            preview: false,
+            quality_rank: None,
+            checked_rank: checked,
+            lease: lease.clone(),
+        };
+        let lossless = crate::quality::QualityIntent::parse("lossless");
+        let hires = crate::quality::QualityIntent::parse("hires");
+
+        // 未知档位且标签证明不了达标 → 重下（旧行为是恒不升级，存量缓存全废）
+        assert!(legacy("极高 320k", None).needs_upgrade(&lossless, Some(true)));
+        // 旧标签写明无损 → 目标不超过无损时不值得再花一遍流量
+        assert!(!legacy("无损 871k", None).needs_upgrade(&lossless, Some(true)));
+        // 已确认过「无损目标没有更高流」 → 同一目标不再请求
+        assert!(!legacy("极高 320k", Some(100)).needs_upgrade(&lossless, Some(true)));
+        // 目标换成 Hi-Res：那次结论不代表更高档位，仍要探
+        assert!(legacy("无损 871k", Some(100)).needs_upgrade(&hires, Some(true)));
+
+        // 自动路径：非会员要无损，负结论写不进 sidecar（买会员后必须重探），
+        // 于是每次播放都会整曲重下一遍——这种探测不自动发起。
+        assert!(!legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(false)));
+        // 权益确认为会员 → 结论记得住，可以自动升
+        assert!(legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(true)));
+        // 不依赖权益的目标（较高 70）同样记得住结论
+        let medium = crate::quality::QualityIntent::parse("medium");
+        assert!(legacy("流畅 128k", None).needs_auto_upgrade(&medium, Some(false)));
+        // 档位已知的记录不受这道闸影响，保持 #78 的原行为
+        let measured = CachedTrack {
+            quality_rank: Some(50),
+            ..legacy("流畅 128k", None)
+        };
+        assert!(measured.needs_auto_upgrade(&lossless, Some(false)));
+    }
+
+    /// #89：新流值不值得换掉本地这份缓存——档位未知的旧文件不能被更差的流顶掉。
+    #[test]
+    fn is_better_stream_never_trades_a_legacy_file_for_worse_audio() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("s.m4a"));
+        let cached = |quality: &str, rank: Option<i64>, preview: bool| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: quality.into(),
+            preview,
+            quality_rank: rank,
+            checked_rank: None,
+            lease: lease.clone(),
+        };
+        let info = |quality: &str, format: &str, bitrate: i64, preview: bool| DownloadInfo {
+            quality: quality.into(),
+            format: format.into(),
+            bitrate,
+            is_preview: preview,
+            ..Default::default()
+        };
+
+        // 档位已知：只认档位提升。
+        let known = cached("极高 320k", Some(80), false);
+        assert!(!is_better_stream(
+            &info("highest", "m4a", 320_000, false),
+            &known,
+            Some(100)
+        ));
+        assert!(is_better_stream(
+            &info("lossless", "flac", 871_000, false),
+            &known,
+            Some(100)
+        ));
+        // 试听片段换成整曲永远是提升，哪怕档位与码率都没变。
+        assert!(is_better_stream(
+            &info("standard", "m4a", 128_000, false),
+            &cached("流畅 128k", Some(50), true),
+            None
+        ));
+
+        // 档位未知、标签也证不出下限：只剩标签里的码率可比，新流更差就不换。
+        let legacy = cached("极高 320k", None, false);
+        assert!(!is_better_stream(
+            &info("standard", "m4a", 128_000, false),
+            &legacy,
+            Some(100)
+        ));
+        assert!(is_better_stream(
+            &info("higher", "m4a", 320_000, false),
+            &legacy,
+            Some(100)
+        ));
+        // 够到用户要的目标档位时照样换：无损 FLAC 的码率本来就可能低于有损高码率流。
+        assert!(is_better_stream(
+            &info("lossless", "flac", 300_000, false),
+            &legacy,
+            Some(100)
+        ));
+        // 新流档位认不出来（0 档）不换：旧文件至少还有一个能看的标签。
+        assert!(!is_better_stream(
+            &info("", "", 0, false),
+            &legacy,
+            Some(100)
+        ));
+
+        // 旧标签是无损 → 按下限比：目标 110 时只有 Hi-Res 才值得换。
+        let lossless_legacy = cached("无损 871k", None, false);
+        assert!(!is_better_stream(
+            &info("lossless", "flac", 871_000, false),
+            &lossless_legacy,
+            Some(110)
+        ));
+        assert!(is_better_stream(
+            &info("hires", "flac", 1_200_000, false),
+            &lossless_legacy,
+            Some(110)
+        ));
     }
 
     #[test]

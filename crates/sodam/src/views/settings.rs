@@ -571,8 +571,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         .collect();
     let batch_target = root.batch_upgrade_target.clone();
     let batch_target_label = label_for(batch_target.as_setting());
+    // 需要会员的档位只在账号**确认**有权益时才放行；与 `start_batch_upgrade` 共用同一条
+    // 判定，按钮状态和执行结果不会各说各话。
     let batch_upgrade_blocked_by_vip =
-        batch_target.requires_membership() && root.account.as_ref().is_some_and(|a| !a.vip);
+        sodam_core::quality::batch_upgrade_needs_confirmed_entitlement(
+            &batch_target,
+            root.account.as_ref().map(|account| account.vip),
+        );
     // 勾选的是**意图**；配置里的空串是历史写法，按「自动」显示。
     let current = root.settings.quality_intent().as_setting().to_string();
 
@@ -1107,9 +1112,26 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .children(batch_tier_rows),
                         )
                         .child({
+                            // 档位未知的旧缓存另起一行（#89）：这几首不是「已知比目标低」，是旧版本
+                            // 没记档位。被权益挡住、或这一轮全都抑制掉了，也要照样报出来——
+                            // 「没有可升级的缓存歌曲」在这种存量下就不是实话（P5 的原话）。
+                            // 只报事实、不写「需重下」：这一轮到底会不会重下已经由上一行的可升级数说过。
+                            let legacy_note = if root.batch_upgrading {
+                                None
+                            } else {
+                                root.batch_upgrade_estimate
+                                    .as_ref()
+                                    .filter(|estimate| estimate.unknown_rank_count > 0)
+                                    .map(|estimate| {
+                                        root.localized(
+                                            "{} 首旧缓存未记录档位",
+                                            &[estimate.unknown_rank_count.to_string()],
+                                        )
+                                    })
+                            };
                             let estimate_text = if batch_upgrade_blocked_by_vip {
                                 root.localized(
-                                    "「{}」音质需 VIP 会员权限，当前账号无法升级",
+                                    "「{}」音质需 VIP 会员权限，当前账号未确认该权益",
                                     std::slice::from_ref(&batch_target_label),
                                 )
                             } else if root.batch_upgrading {
@@ -1149,6 +1171,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .text_size(theme::Text::Small.size())
                                 .text_color(theme::text_muted())
                                 .child(estimate_text)
+                                .children(legacy_note)
                         })
                         .child({
                             let upgradeable = root
