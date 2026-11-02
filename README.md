@@ -18,6 +18,14 @@
     <a href="https://sodahub-org.github.io/sodam/changelog.html">更新日志</a> ·
     <a href="https://sodahub-org.github.io/sodam/developers.html">开发者文档</a> ·
     <a href="PRIVACY.md">隐私政策</a></p>
+  <p>友情链接：<a href="https://github.com/mytv-android/myMusic"><strong>myMusic</strong></a>
+    —— Android 手机 / 平板 / TV 端的汽水音乐客户端，由
+    <a href="https://github.com/mytv-android">mytv-android</a> 独立维护，不是 SodaM 项目的一部分。</p>
+  <p>
+    <a href="https://github.com/mytv-android/myMusic">
+      <img src="https://raw.githubusercontent.com/mytv-android/myMusic/main/docs/images/banner.png" width="240" alt="myMusic：第三方 Android 手机 / 平板 / TV 端客户端，非 SodaM 组成部分">
+    </a>
+  </p>
   <p>
     <a href="https://linux.do/t/topic/2921819">
       <img src="docs/img/linux-do.svg" width="22" alt="LINUX DO">
@@ -456,6 +464,16 @@ sudo pacman -U ./sodam-<version>-<arch>.pkg.tar.zst
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：分层、线程、播放与导航架构
 - [`docs/UI-SPEC.md`](docs/UI-SPEC.md)：主题、布局、尺寸与性能约束
 - [`docs/ROADMAP.md`](docs/ROADMAP.md)：已完成能力与后续优先级
+
+## 友情链接
+
+以下项目由第三方独立维护，**不是 SodaM 项目的一部分**，SodaM 不为它们的发布、质量与行为负责；
+下面的描述只是帮助你对上号。
+
+- [**myMusic**](https://github.com/mytv-android/myMusic)：Android 端（手机 / 平板 / 折叠屏 / Android TV）的
+  同类开源客户端，由 [mytv-android](https://github.com/mytv-android) 维护；Jetpack Compose + Material 3，
+  平台能力来自 [music-lib](https://github.com/guohuiyuan/music-lib)；按它的说明，汽水音乐会员整曲的
+  签名服务由 SodaM 提供。
 
 ## 许可与合规
 
