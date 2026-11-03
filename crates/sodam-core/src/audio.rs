@@ -379,19 +379,38 @@ fn rebuild_player_at(
     Ok(player)
 }
 
+/// 处理 cpal 的流错误。
+///
+/// 缓冲区欠载（ALSA XRUN / EPIPE）是偶发抖动，cpal 自己会 `try_recover` 接着播，
+/// 所以只记日志；其余错误才算输出失效，写进 `errors` 让播放线程拆掉输出。
+/// 返回写出的日志事件名，测试据此区分两条路径。
+fn record_stream_error(err: &rodio::cpal::StreamError, errors: &OutputErrors) -> &'static str {
+    let detail = err.to_string();
+    let recoverable = matches!(err, rodio::cpal::StreamError::BufferUnderrun);
+    let event = if recoverable {
+        "underrun"
+    } else {
+        "device_lost"
+    };
+    log_event(
+        LogLevel::Warn,
+        LogTopic::Audio,
+        event,
+        &[("detail", detail.as_str())],
+    );
+    if recoverable {
+        return event;
+    }
+    if let Ok(mut slot) = errors.lock() {
+        *slot = Some("音频输出中断了。".to_string());
+    }
+    event
+}
+
 fn open_output(errors: OutputErrors) -> OutputResult {
     rodio::DeviceSinkBuilder::from_default_device()?
         .with_error_callback(move |err| {
-            let detail = err.to_string();
-            log_event(
-                LogLevel::Warn,
-                LogTopic::Audio,
-                "device_lost",
-                &[("detail", detail.as_str())],
-            );
-            if let Ok(mut errors) = errors.lock() {
-                *errors = Some("音频输出中断了。".to_string());
-            }
+            record_stream_error(&err, &errors);
         })
         .open_sink_or_fallback()
 }
@@ -1159,6 +1178,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(snap.progress_label(), "01:05 / 03:56");
+    }
+
+    #[test]
+    fn buffer_underrun_does_not_stop_playback_but_device_loss_does() {
+        // 回归：ALSA 欠载只是一次抖动，cpal 会 try_recover 接着播；
+        // 写成致命错误会让界面停在「音频输出中断了。」（蓝牙 A2DP 下实测踩过）。
+        let errors: OutputErrors = Arc::new(Mutex::new(None));
+        assert_eq!(
+            record_stream_error(&rodio::cpal::StreamError::BufferUnderrun, &errors),
+            "underrun"
+        );
+        assert!(
+            errors.lock().unwrap().is_none(),
+            "欠载不能写致命错误，否则整首会停住"
+        );
+
+        // 设备真的没了，仍然要停机报错。
+        assert_eq!(
+            record_stream_error(&rodio::cpal::StreamError::DeviceNotAvailable, &errors),
+            "device_lost"
+        );
+        assert_eq!(
+            errors.lock().unwrap().as_deref(),
+            Some("音频输出中断了。"),
+            "设备丢失必须写致命错误"
+        );
     }
 
     #[test]
