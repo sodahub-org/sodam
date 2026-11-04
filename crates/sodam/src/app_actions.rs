@@ -3016,7 +3016,7 @@ impl Root {
                         let message = root.tr(play_failure_text(&failure, skip_now)).to_string();
 
                         if failure.is_per_track() {
-                            if skip && !cap_reached {
+                            if !cap_reached {
                                 // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条。
                                 // 真的前进时撤下与这次结论无关的旧常驻错误；不会前进
                                 // （单曲循环 / 只有一首）时原因仍然成立，留在常驻位。
@@ -3027,6 +3027,11 @@ impl Root {
                                 };
                                 root.notify_warning_once("track-unavailable", message);
                             }
+                        } else if skip_now {
+                            // 可前进的非按曲目失败（网络抖动）：同属一次性反馈，
+                            // 常驻错误位只留给落闸与全局故障。
+                            root.playback_error = None;
+                            root.notify_warning_once("track-stream-failed", message);
                         } else {
                             root.playback_error = Some(message.clone());
                             root.notify_warning_once("track-stream-failed", message);
