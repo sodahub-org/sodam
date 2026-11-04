@@ -52,7 +52,8 @@ pub enum RecoveryAction {
     /// 按曲目不可播：当前账号拿不到这一首的整曲流（上游只回了试听流等）。
     /// 与 [`Self::PickAnother`] 同属「结论关于单个曲目」，区别只在成因文案。
     TrackUnavailable,
-    /// 曲目已下架或取不到。
+    /// 按曲目不可播的另一半：曲目已下架或取不到（含非 Cookie 的参数不合法）。
+    /// 与 [`Self::TrackUnavailable`] 一起由 [`PlaybackFailure::is_per_track`] 判定。
     PickAnother,
     /// 本地磁盘或文件写入问题。
     FreeSpace,
@@ -164,9 +165,10 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
     // 下面是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过字符串
     // 匹配判断错误种类，libresoda 的 `AGENTS.md` 要求 `"requires cookie"`、
     // `"returned preview stream"`、`"full stream unavailable"` 原样保留
-    // （模块文档同样点名这些子串；`"requires logged-in user id"` 来自其
-    // `SodaError::is_missing_entitlement` 的同一组判定）。改上游文案前必须先改那份契约。
-    if detail.contains("requires cookie") || detail.contains("requires logged-in user id") {
+    // （模块文档同样点名这些子串）。`"logged-in user id"` 只取稳定短语：上游
+    // `user_playlist.rs` 实际产出的是 `"require logged-in user id"`（无 s），而
+    // libresoda 自己的 `is_missing_entitlement` 检查的是带 s 的形态，两种都要认。
+    if detail.contains("requires cookie") || detail.contains("logged-in user id") {
         // 登录态缺失是全局故障：换一首结论不变。
         return PlaybackFailure::new(
             Stage::ResolveStream,
@@ -176,7 +178,13 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
-    if detail.contains("full stream unavailable") || detail.contains("returned preview stream") {
+    if detail.contains("full stream unavailable")
+        || detail.contains("returned preview stream")
+        // 只有试听流且没有可用试听地址：libresoda 在地址解析阶段把这两种形态
+        // 报成 NotFound。它们仍属于「这一首拿不到整曲」，不是曲目下架。
+        || detail.contains("missing player info url")
+        || detail.contains("player info url not found")
+    {
         // 按曲目不可播：这一首在本账号拿不到整曲流，队列里换一首大概率能播。
         return PlaybackFailure::new(
             Stage::ResolveStream,
@@ -486,6 +494,20 @@ mod tests {
             assert!(failure.is_per_track(), "应判为按曲目：{failure:?}");
         }
 
+        // 只有试听流且没有可用试听地址：归到「拿不到整曲」，不按曲目下架处理。
+        for text in [
+            "soda pc track_v2 missing player info url",
+            "player info url not found",
+        ] {
+            let failure = failure(SodaError::not_found(text));
+            assert_eq!(
+                failure.action,
+                RecoveryAction::TrackUnavailable,
+                "{failure:?}"
+            );
+            assert!(failure.is_per_track(), "{failure:?}");
+        }
+
         // 样本曲目的实际形态：不可重试，但结论只关于这一首。
         let sample = failure(SodaError::not_found(
             "soda pc track_v2 returned preview stream",
@@ -497,7 +519,10 @@ mod tests {
         let global = [
             // 缺 Cookie / 缺登录用户 id：换一首结论不变。
             SodaError::invalid_input("feed requires cookie"),
-            SodaError::not_found("requires logged-in user id"),
+            // 上游实际产出的是 require（无 s），libresoda 自己的判定检查的是 requires。
+            // 两种形态都必须归为全局，否则缺登录会退化成按曲目跳过。
+            SodaError::not_found("soda user playlists require logged-in user id"),
+            SodaError::not_found("soda user playlists requires logged-in user id"),
             SodaError::http("signer error: bad token"),
             SodaError::Io("disk full".into()),
             SodaError::api(7, "need login"),
