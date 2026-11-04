@@ -162,8 +162,8 @@ impl std::error::Error for PlaybackFailure {}
 pub fn classify(error: &SodaError) -> PlaybackFailure {
     let detail = error.to_string();
 
-    // 下面是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过字符串
-    // 匹配判断错误种类，libresoda 的 `AGENTS.md` 要求 `"requires cookie"`、
+    // 前两个子串是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过
+    // 字符串匹配判断错误种类，libresoda 的 `AGENTS.md` 要求 `"requires cookie"`、
     // `"returned preview stream"`、`"full stream unavailable"` 原样保留
     // （模块文档同样点名这些子串）。`"logged-in user id"` 只取稳定短语：上游
     // `user_playlist.rs` 实际产出的是 `"require logged-in user id"`（无 s），而
@@ -178,10 +178,10 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
+    // 前两个子串来自上面的上游契约；后两个是 libresoda 在地址解析阶段自产的
+    // 「没有可用试听地址」形态（不是上游 Go 契约），但同样只说明这一首拿不到整曲。
     if detail.contains("full stream unavailable")
         || detail.contains("returned preview stream")
-        // 只有试听流且没有可用试听地址：libresoda 在地址解析阶段把这两种形态
-        // 报成 NotFound。它们仍属于「这一首拿不到整曲」，不是曲目下架。
         || detail.contains("missing player info url")
         || detail.contains("player info url not found")
     {
@@ -206,6 +206,9 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
+    // 下架 / 取不到 / 非 Cookie 参数错误仍走既有 PickAnother：它们与上面的
+    // TrackUnavailable 同属按曲目不可播（由 `is_per_track` 统一判定），
+    // 但给用户的成因文案是「这首当前取不到」。
     match error {
         SodaError::InvalidInput(_) => {
             // 缺 Cookie 的 InvalidInput 已在上面归为全局；其余参数不合法只影响当前这一首，
@@ -479,9 +482,6 @@ mod tests {
             // 只有试听流 / 拿不到整曲：上游只回试听流。
             SodaError::not_found("soda pc track_v2 returned preview stream"),
             SodaError::not_found("full stream unavailable"),
-            // 只有试听流且没有可用试听地址：试听地址也取不到。
-            SodaError::not_found("soda pc track_v2 missing player info url"),
-            SodaError::not_found("player info url not found"),
             // 曲目下架 / 取不到。
             SodaError::not_found("track not found"),
             SodaError::unsupported("track unsupported"),

@@ -149,6 +149,9 @@ impl Language {
             "账号登录已过期，已停止播放。" => {
                 "Your account's sign-in expired. Playback stopped."
             }
+            "账号登录已过期，请重新登录。" => {
+                "Your account's sign-in expired. Sign in again."
+            }
             "这首歌暂时放不出来。签名服务不可用，可在设置里更换。" => {
                 "This song can't play now. Change the signer service in Settings."
             }

@@ -23,7 +23,7 @@ use super::{
     status_label, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root, REMOTE_TEXT,
     RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
 };
-use sodam_core::queue::Queue;
+use sodam_core::queue::{PlayMode, Queue};
 
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
@@ -1363,8 +1363,9 @@ impl Root {
                 if let Err(err) = result {
                     let context = load_failure_context(err.stage, root.language);
                     root.log_failure(&context, &err);
-                    // 这条路径不前进，不能说「已跳过」；等 #109 接入换候选后再改。
-                    root.playback_error = Some(root.tr(play_failure_text(&err, false)).to_string());
+                    // 这条路径不前进，也不能说「已跳过」或「已停止播放」；
+                    // 等 #109 接入换候选后再改。
+                    root.playback_error = Some(root.tr(pending_failure_text(&err)).to_string());
                     root.playing = false;
                 }
                 cx.notify();
@@ -3004,19 +3005,21 @@ impl Root {
                         // 这次尝试失败了：它之前的「播出去」不再为它抵账。
                         root.progress_token = None;
 
-                        // 「已跳过」只有在真的换到下一首时才能说。封顶落闸与空队列都
-                        // 不会前进，它们改由下面的常驻错误位说明。
+                        // 「已跳过」只有在真的换到下一首时才能说。封顶落闸、空队列、
+                        // 单曲循环 / 只有一首都不会前进，它们改由常驻错误位或非跳过文案说明。
                         let skip = should_skip_to_next(&failure);
                         let cap_reached =
                             skip && root.consecutive_failures + 1 >= PLAY_FAILURE_HALT_AFTER;
-                        let skip_now = skip && !cap_reached && !root.queue.is_empty();
+                        let will_advance =
+                            root.queue.len() > 1 && root.queue.mode != PlayMode::RepeatOne;
+                        let skip_now = skip && !cap_reached && will_advance;
                         let message = root.tr(play_failure_text(&failure, skip_now)).to_string();
 
                         if failure.is_per_track() {
-                            if skip_now {
-                                // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条；
-                                // 常驻错误位只承载「条件仍然成立」的全局故障 / 落闸，
-                                // 跳过时顺手撤下与这次跳过无关的旧错误。
+                            // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条。
+                            // 这次结论关于单曲，旧常驻错误不再代表当前状态；不会前进时
+                            // 先说清原因，#108 接上「不可播的前进」后这里会真的跳。
+                            if skip && !cap_reached {
                                 root.playback_error = None;
                                 root.notify_warning_once("track-skipped", message);
                             }
@@ -3202,6 +3205,18 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
             Stage::Input => "这首歌暂时放不出来。",
             _ => "暂时连不上，检查网络后重试。",
         },
+    }
+}
+
+/// 自动装载第一首（不前进）时给用户看的失败说明。
+///
+/// 这条路径没有开始播放，登录类文案不能说「已停止播放」；按曲目类同样不能说「已跳过」。
+fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
+    match failure.action {
+        RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => {
+            "账号登录已过期，请重新登录。"
+        }
+        _ => play_failure_text(failure, false),
     }
 }
 
@@ -3435,6 +3450,18 @@ mod failure_text_tests {
             let english = Language::English.text(key);
             assert_ne!(english, key, "英文词典缺少：{key}");
         }
+
+        // 自动装载第一首时还没开始播放，登录类不能说「已停止播放」。
+        let login = pending_failure_text(&PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::Relogin,
+            "detail",
+        ));
+        assert!(login.contains("请重新登录"), "{login}");
+        assert!(!login.contains("已停止播放"), "{login}");
+        let english = Language::English.text(login);
+        assert_ne!(english, login, "英文词典缺少：{login}");
     }
 
     /// 按曲目类换下一首，全局类落闸；判据是结论对象，不是可重试性。
