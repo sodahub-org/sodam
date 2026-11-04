@@ -3016,12 +3016,16 @@ impl Root {
                         let message = root.tr(play_failure_text(&failure, skip_now)).to_string();
 
                         if failure.is_per_track() {
-                            // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条。
-                            // 这次结论关于单曲，旧常驻错误不再代表当前状态；不会前进时
-                            // 先说清原因，#108 接上「不可播的前进」后这里会真的跳。
                             if skip && !cap_reached {
-                                root.playback_error = None;
-                                root.notify_warning_once("track-skipped", message);
+                                // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条。
+                                // 真的前进时撤下与这次结论无关的旧常驻错误；不会前进
+                                // （单曲循环 / 只有一首）时原因仍然成立，留在常驻位。
+                                root.playback_error = if skip_now {
+                                    None
+                                } else {
+                                    Some(message.clone())
+                                };
+                                root.notify_warning_once("track-unavailable", message);
                             }
                         } else {
                             root.playback_error = Some(message.clone());
@@ -3032,7 +3036,7 @@ impl Root {
                             // 已知中间态（#106）：按曲目类失败本票仍计入连败封顶，
                             // 由 #108「不可播集合驱动扫一圈」把它从计数里摘出去。
                             root.consecutive_failures += 1;
-                            if root.consecutive_failures >= PLAY_FAILURE_HALT_AFTER {
+                            if cap_reached {
                                 root.halt_playback();
                                 let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
                                 root.playback_error = Some(halted.clone());

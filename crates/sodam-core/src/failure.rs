@@ -162,13 +162,17 @@ impl std::error::Error for PlaybackFailure {}
 pub fn classify(error: &SodaError) -> PlaybackFailure {
     let detail = error.to_string();
 
-    // 前两个子串是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过
+    // 下面这些上游子串是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过
     // 字符串匹配判断错误种类，libresoda 的 `AGENTS.md` 要求 `"requires cookie"`、
     // `"returned preview stream"`、`"full stream unavailable"` 原样保留
-    // （模块文档同样点名这些子串）。`"logged-in user id"` 只取稳定短语：上游
-    // `user_playlist.rs` 实际产出的是 `"require logged-in user id"`（无 s），而
-    // libresoda 自己的 `is_missing_entitlement` 检查的是带 s 的形态，两种都要认。
-    if detail.contains("requires cookie") || detail.contains("logged-in user id") {
+    // （模块文档同样点名这些子串）。`"require cookie"` / `"logged-in user id"` 只取
+    // 稳定短语：上游 `user_playlist.rs` 实际产出的是 `"require cookie"` 与
+    // `"require logged-in user id"`（都没有 s），而 libresoda 自己的
+    // `is_missing_entitlement` 检查的是带 s 的形态，两种都要认。
+    if detail.contains("require cookie")
+        || detail.contains("requires cookie")
+        || detail.contains("logged-in user id")
+    {
         // 登录态缺失是全局故障：换一首结论不变。
         return PlaybackFailure::new(
             Stage::ResolveStream,
@@ -517,8 +521,9 @@ mod tests {
         assert!(sample.is_per_track());
 
         let global = [
-            // 缺 Cookie / 缺登录用户 id：换一首结论不变。
+            // 缺 Cookie / 缺登录用户 id：换一首结论不变。上游两种拼写都要认。
             SodaError::invalid_input("feed requires cookie"),
+            SodaError::invalid_input("soda my playlists require cookie"),
             // 上游实际产出的是 require（无 s），libresoda 自己的判定检查的是 requires。
             // 两种形态都必须归为全局，否则缺登录会退化成按曲目跳过。
             SodaError::not_found("soda user playlists require logged-in user id"),
