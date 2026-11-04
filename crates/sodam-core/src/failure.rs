@@ -47,8 +47,11 @@ pub enum RecoveryAction {
     Relogin,
     /// 签名服务不可用或鉴权失败，可在设置页换地址 / Token，或本机跑 libmssdk。
     CheckSigner,
-    /// 当前账号对该曲目没有整曲权益。
+    /// 登录态缺失（缺 Cookie / 缺登录用户 id），换一首结论不变。
     CheckEntitlement,
+    /// 按曲目不可播：当前账号拿不到这一首的整曲流（上游只回了试听流等）。
+    /// 与 [`Self::PickAnother`] 同属「结论关于单个曲目」，区别只在成因文案。
+    TrackUnavailable,
     /// 曲目已下架或取不到。
     PickAnother,
     /// 本地磁盘或文件写入问题。
@@ -87,6 +90,7 @@ impl RecoveryAction {
             Self::Relogin => "relogin",
             Self::CheckSigner => "check_signer",
             Self::CheckEntitlement => "check_entitlement",
+            Self::TrackUnavailable => "track_unavailable",
             Self::PickAnother => "pick_another",
             Self::FreeSpace => "free_space",
         }
@@ -119,6 +123,18 @@ impl PlaybackFailure {
             detail: redact_url_secrets(&detail.into()),
         }
     }
+
+    /// 这个结论是否关于单个曲目（换一首大概率能播）？
+    ///
+    /// 判据是**结论对象**（修复动作），不是可重试性：签名服务鉴权同样是
+    /// [`Retryability::Never`]，但它是全局故障；反过来，按曲目不可播里也可能出现
+    /// 可重试形态。调用方据此决定「跳过」还是「落闸」，两者不能互相推导。
+    pub fn is_per_track(&self) -> bool {
+        matches!(
+            self.action,
+            RecoveryAction::TrackUnavailable | RecoveryAction::PickAnother
+        )
+    }
 }
 
 impl fmt::Display for PlaybackFailure {
@@ -145,11 +161,27 @@ impl std::error::Error for PlaybackFailure {}
 pub fn classify(error: &SodaError) -> PlaybackFailure {
     let detail = error.to_string();
 
-    if error.is_missing_entitlement() || error.is_cookie_required() {
+    // 下面是 libresoda **文档化的字符串契约**，不是本仓库临时造的：上游通过字符串
+    // 匹配判断错误种类，libresoda 的 `AGENTS.md` 要求 `"requires cookie"`、
+    // `"returned preview stream"`、`"full stream unavailable"` 原样保留
+    // （模块文档同样点名这些子串；`"requires logged-in user id"` 来自其
+    // `SodaError::is_missing_entitlement` 的同一组判定）。改上游文案前必须先改那份契约。
+    if detail.contains("requires cookie") || detail.contains("requires logged-in user id") {
+        // 登录态缺失是全局故障：换一首结论不变。
         return PlaybackFailure::new(
             Stage::ResolveStream,
             Retryability::Never,
             RecoveryAction::CheckEntitlement,
+            detail,
+        );
+    }
+
+    if detail.contains("full stream unavailable") || detail.contains("returned preview stream") {
+        // 按曲目不可播：这一首在本账号拿不到整曲流，队列里换一首大概率能播。
+        return PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
             detail,
         );
     }
@@ -167,12 +199,16 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
     }
 
     match error {
-        SodaError::InvalidInput(_) => PlaybackFailure::new(
-            Stage::Input,
-            Retryability::Never,
-            RecoveryAction::Nothing,
-            detail,
-        ),
+        SodaError::InvalidInput(_) => {
+            // 缺 Cookie 的 InvalidInput 已在上面归为全局；其余参数不合法只影响当前这一首，
+            // 按「取不到」处理，别停掉整轮自动连播。
+            PlaybackFailure::new(
+                Stage::Input,
+                Retryability::Never,
+                RecoveryAction::PickAnother,
+                detail,
+            )
+        }
         SodaError::NotFound(_) | SodaError::Unsupported(_) => PlaybackFailure::new(
             Stage::ResolveStream,
             Retryability::Never,
@@ -407,11 +443,11 @@ mod tests {
             ),
             (
                 SodaError::http("soda pc track_v2 returned preview stream"),
-                RecoveryAction::CheckEntitlement,
+                RecoveryAction::TrackUnavailable,
             ),
             (
                 SodaError::invalid_input("track id is empty"),
-                RecoveryAction::Nothing,
+                RecoveryAction::PickAnother,
             ),
         ];
         for (error, action) in cases {
@@ -422,6 +458,76 @@ mod tests {
                 "不该自动重试：{classified:?}"
             );
             assert_eq!(classified.action, action, "修复动作错位：{classified:?}");
+        }
+    }
+
+    /// 「结论是否关于单个曲目」只看结论对象，不看可重试性。
+    ///
+    /// 这些上游错误文本来自 libresoda 的文档化字符串契约；测试用它们钉住分类，
+    /// 也钉住「签名服务同样的 Never 不是按曲目」这条边界。
+    #[test]
+    fn per_track_predicate_uses_the_conclusion_not_retryability() {
+        let per_track = [
+            // 只有试听流 / 拿不到整曲：上游只回试听流。
+            SodaError::not_found("soda pc track_v2 returned preview stream"),
+            SodaError::not_found("full stream unavailable"),
+            // 只有试听流且没有可用试听地址：试听地址也取不到。
+            SodaError::not_found("soda pc track_v2 missing player info url"),
+            SodaError::not_found("player info url not found"),
+            // 曲目下架 / 取不到。
+            SodaError::not_found("track not found"),
+            SodaError::unsupported("track unsupported"),
+            SodaError::http("http request failed: status 404 (https://x.test/track)"),
+            // 非 Cookie 类的参数不合法。
+            SodaError::invalid_input("track id is empty"),
+        ];
+        for error in per_track {
+            let failure = failure(error);
+            assert!(failure.is_per_track(), "应判为按曲目：{failure:?}");
+        }
+
+        // 样本曲目的实际形态：不可重试，但结论只关于这一首。
+        let sample = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        assert_eq!(sample.action, RecoveryAction::TrackUnavailable);
+        assert_eq!(sample.retryability, Retryability::Never);
+        assert!(sample.is_per_track());
+
+        let global = [
+            // 缺 Cookie / 缺登录用户 id：换一首结论不变。
+            SodaError::invalid_input("feed requires cookie"),
+            SodaError::not_found("requires logged-in user id"),
+            SodaError::http("signer error: bad token"),
+            SodaError::Io("disk full".into()),
+            SodaError::api(7, "need login"),
+            SodaError::http("http request failed: status 401 (https://x.test)"),
+        ];
+        for error in global {
+            let failure = failure(error);
+            assert!(!failure.is_per_track(), "应判为全局：{failure:?}");
+        }
+
+        // 网络抖动不可重试性与结论对象无关：它既不是按曲目，也不影响上面的判定。
+        let network = failure(SodaError::http("io: timed out reading response"));
+        assert!(!network.is_per_track());
+        assert_eq!(network.retryability, Retryability::Transient);
+    }
+
+    /// 日志里的动作值既有的一字不改，新增的固定为 `track_unavailable`。
+    #[test]
+    fn action_log_values_are_stable_and_additive() {
+        let values = [
+            (RecoveryAction::Nothing, "nothing"),
+            (RecoveryAction::Relogin, "relogin"),
+            (RecoveryAction::CheckSigner, "check_signer"),
+            (RecoveryAction::CheckEntitlement, "check_entitlement"),
+            (RecoveryAction::TrackUnavailable, "track_unavailable"),
+            (RecoveryAction::PickAnother, "pick_another"),
+            (RecoveryAction::FreeSpace, "free_space"),
+        ];
+        for (action, expected) in values {
+            assert_eq!(action.as_str(), expected);
         }
     }
 

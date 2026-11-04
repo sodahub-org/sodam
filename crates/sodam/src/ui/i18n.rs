@@ -146,12 +146,17 @@ impl Language {
             "出现了一点问题，检查网络后重试。" => "Something went wrong. Check your network.",
             "出现了一点问题，请重试。" => "Something went wrong. Try again.",
             "没能保存，检查磁盘空间后重试。" => "Couldn't save. Check your disk space.",
-            "登录已过期，请重新登录。" => "Sign-in expired. Sign in again.",
+            "账号登录已过期，已停止播放。" => {
+                "Your account's sign-in expired. Playback stopped."
+            }
             "这首歌暂时放不出来。签名服务不可用，可在设置里更换。" => {
                 "This song can't play now. Change the signer service in Settings."
             }
             "这首歌暂时放不出来。" => "This song can't play now.",
-            "这首歌在你的账号下无法播放。" => "Your account can't play this song.",
+            "这首在你的账号下没有整曲，已跳过。" => {
+                "Your account doesn't have the full track. Skipped."
+            }
+            "这首当前取不到，已跳过。" => "This track isn't available right now. Skipped.",
             "本地缓存写入失败，检查磁盘空间。" => "Cache write failed. Check disk space.",
             "打开验证窗口失败，请改用官方客户端导出 Cookie。" => {
                 "Couldn't open the verification window. Export your cookie from the official app instead."

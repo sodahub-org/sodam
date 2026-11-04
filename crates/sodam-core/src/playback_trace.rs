@@ -259,6 +259,35 @@ mod tests {
     }
 
     #[test]
+    fn track_unavailable_failure_keeps_track_id_and_action_in_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let outlet = LogOutlet::new(temp.path().join("logs"));
+        let trace = PlaybackTrace::new(&outlet, "track-9");
+
+        let result = drive_play_attempt(
+            PlayBudget::default(),
+            Some(&trace),
+            Instant::now(),
+            |_| {
+                Err::<(), _>(PlaybackFailure::new(
+                    Stage::ResolveStream,
+                    Retryability::Never,
+                    RecoveryAction::TrackUnavailable,
+                    "soda pc track_v2 returned preview stream",
+                ))
+            },
+            |_| panic!("按曲目不可播不该等待重试"),
+        );
+
+        assert!(result.is_err());
+        let lines = lines_of(&outlet);
+        let failed = lines.last().expect("失败尝试必须留一行日志");
+        assert!(failed.contains("track_id=track-9"), "{failed}");
+        assert!(failed.contains("action=track_unavailable"), "{failed}");
+        assert!(failed.contains("reason=non_retryable"), "{failed}");
+    }
+
+    #[test]
     fn transient_failures_retry_until_budget_exhausted_in_order() {
         let temp = tempfile::tempdir().unwrap();
         let outlet = LogOutlet::new(temp.path().join("logs"));

@@ -3003,9 +3003,17 @@ impl Root {
                         // 这次尝试失败了：它之前的「播出去」不再为它抵账。
                         root.progress_token = None;
                         let message = root.tr(play_failure_text(&failure)).to_string();
-                        root.playback_error = Some(message.clone());
-                        root.notify_warning_once("track-stream-failed", message);
+                        if failure.is_per_track() {
+                            // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条；
+                            // 常驻错误位只承载「条件仍然成立」的全局故障，所以不写它。
+                            root.notify_warning_once("track-skipped", message);
+                        } else {
+                            root.playback_error = Some(message.clone());
+                            root.notify_warning_once("track-stream-failed", message);
+                        }
                         if should_skip_to_next(&failure) {
+                            // 已知中间态（#106）：按曲目类失败本票仍计入连败封顶，
+                            // 由 #108「不可播集合驱动扫一圈」把它从计数里摘出去。
                             root.consecutive_failures += 1;
                             if root.consecutive_failures >= PLAY_FAILURE_HALT_AFTER {
                                 root.halt_playback();
@@ -3019,7 +3027,7 @@ impl Root {
                                 root.halt_playback();
                             }
                         } else {
-                            // 全局性故障（登录 / 签名服务 / 权益 / 磁盘）：换一首也一样失败。
+                            // 全局性故障（登录 / 签名服务 / 缺 Cookie / 磁盘）：换一首也一样失败。
                             // 停下并把修复动作留在状态里，别用连续跳过把全局故障
                             // 伪装成「这几首运气不好」。
                             root.halt_playback();
@@ -3148,11 +3156,14 @@ fn load_failure_context(stage: Stage, language: Language) -> String {
 /// 三条共用说法 `REMOTE_TEXT` / `SAVE_TEXT` / `RETRY_TEXT` 定义在 [`super`]。
 fn play_failure_text(failure: &PlaybackFailure) -> &'static str {
     match failure.action {
-        RecoveryAction::Relogin => "登录已过期，请重新登录。",
-        RecoveryAction::CheckSigner => "这首歌暂时放不出来。签名服务不可用，可在设置里更换。",
-        RecoveryAction::CheckEntitlement | RecoveryAction::PickAnother => {
-            "这首歌在你的账号下无法播放。"
+        // 登录类（登录过期、缺 Cookie / 缺登录用户 id）是全局故障，换一首也一样。
+        RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => {
+            "账号登录已过期，已停止播放。"
         }
+        RecoveryAction::CheckSigner => "这首歌暂时放不出来。签名服务不可用，可在设置里更换。",
+        // 按曲目不可播的两种成因分成两句话；都不报歌名，识别交给列表标记。
+        RecoveryAction::TrackUnavailable => "这首在你的账号下没有整曲，已跳过。",
+        RecoveryAction::PickAnother => "这首当前取不到，已跳过。",
         RecoveryAction::FreeSpace => "本地缓存写入失败，检查磁盘空间。",
         RecoveryAction::Nothing => match failure.stage {
             Stage::Unpack => "本地缓存写入失败，检查磁盘空间。",
@@ -3165,14 +3176,12 @@ fn play_failure_text(failure: &PlaybackFailure) -> &'static str {
 
 /// 这类失败要不要换一首再试。
 ///
-/// * 下架 / 取不到（`PickAnother`）与纯网络抖动（`Nothing`）→ 换，队列里还有别的歌；
-/// * 登录、签名服务、权益、磁盘 → 换一首也一样失败，停下来把动作告诉用户，
+/// * 按曲目不可播（[`PlaybackFailure::is_per_track`]：无整曲权益 / 下架取不到 / 参数不合法）
+///   与纯网络抖动（`Nothing`）→ 换，队列里还有别的歌；
+/// * 登录、签名服务、缺 Cookie、磁盘 → 换一首也一样失败，停下来把动作告诉用户，
 ///   别用「跳过」把同一个全局故障伪装成单首曲目的问题。
 fn should_skip_to_next(failure: &PlaybackFailure) -> bool {
-    matches!(
-        failure.action,
-        RecoveryAction::PickAnother | RecoveryAction::Nothing
-    )
+    failure.is_per_track() || failure.action == RecoveryAction::Nothing
 }
 
 /// 连败封顶阈值：连续这么多首装载失败就停下，别再替用户往后翻。
@@ -3302,10 +3311,11 @@ mod failure_text_tests {
     fn play_failure_text_is_human_only() {
         let raw = "soda track_v2 failed: https://x.test/a?sign=SECRET: tls connection init failed";
         let signer = "这首歌暂时放不出来。签名服务不可用，可在设置里更换。";
-        let no_rights = "这首歌在你的账号下无法播放。";
+        let login = "账号登录已过期，已停止播放。";
+        let no_full_track = "这首在你的账号下没有整曲，已跳过。";
+        let unavailable = "这首当前取不到，已跳过。";
         let cache = "本地缓存写入失败，检查磁盘空间。";
         let offline = "暂时连不上，检查网络后重试。";
-        let relogin = "登录已过期，请重新登录。";
         let cant_play = "这首歌暂时放不出来。";
         let at = |stage, action| {
             play_failure_text(&PlaybackFailure::new(
@@ -3320,18 +3330,22 @@ mod failure_text_tests {
         assert_eq!(at(Stage::Transfer, RecoveryAction::Nothing), offline);
         assert_eq!(at(Stage::Unpack, RecoveryAction::Nothing), cache);
         assert_eq!(at(Stage::Input, RecoveryAction::Nothing), cant_play);
-        assert_eq!(at(Stage::ResolveStream, RecoveryAction::Relogin), relogin);
+        assert_eq!(at(Stage::ResolveStream, RecoveryAction::Relogin), login);
+        assert_eq!(
+            at(Stage::ResolveStream, RecoveryAction::CheckEntitlement),
+            login
+        );
         assert_eq!(
             at(Stage::ResolveStream, RecoveryAction::CheckSigner),
             signer
         );
         assert_eq!(
-            at(Stage::ResolveStream, RecoveryAction::CheckEntitlement),
-            no_rights
+            at(Stage::ResolveStream, RecoveryAction::TrackUnavailable),
+            no_full_track
         );
         assert_eq!(
             at(Stage::ResolveStream, RecoveryAction::PickAnother),
-            no_rights
+            unavailable
         );
         assert_eq!(at(Stage::ResolveStream, RecoveryAction::FreeSpace), cache);
 
@@ -3340,6 +3354,61 @@ mod failure_text_tests {
             assert!(!text.contains("tls"), "{text}");
             assert!(!text.contains("://"), "{text}");
             assert!(!text.contains("SECRET"), "{text}");
+        }
+    }
+
+    /// 三句按类文案互不相同、都有英文，且按曲目文案不报歌名。
+    #[test]
+    fn failure_copy_is_split_by_class_and_translated() {
+        let at = |action| {
+            play_failure_text(&PlaybackFailure::new(
+                Stage::ResolveStream,
+                Retryability::Never,
+                action,
+                "returned preview stream",
+            ))
+        };
+        let login = at(RecoveryAction::Relogin);
+        let no_full_track = at(RecoveryAction::TrackUnavailable);
+        let unavailable = at(RecoveryAction::PickAnother);
+
+        assert_ne!(login, no_full_track);
+        assert_ne!(no_full_track, unavailable);
+        assert_ne!(login, unavailable);
+        assert!(no_full_track.contains("已跳过"), "{no_full_track}");
+        assert!(unavailable.contains("已跳过"), "{unavailable}");
+
+        for key in [login, no_full_track, unavailable] {
+            let english = Language::English.text(key);
+            assert_ne!(english, key, "英文词典缺少：{key}");
+            // 被跳过的曲目不报歌名：文案是静态的，不含任何曲目标题占位符。
+            assert!(!key.contains("{"), "{key}");
+        }
+    }
+
+    /// 按曲目类换下一首，全局类落闸；判据是结论对象，不是可重试性。
+    #[test]
+    fn only_per_track_failures_skip_to_next() {
+        let at = |action| {
+            PlaybackFailure::new(Stage::ResolveStream, Retryability::Never, action, "detail")
+        };
+        assert!(should_skip_to_next(&at(RecoveryAction::TrackUnavailable)));
+        assert!(should_skip_to_next(&at(RecoveryAction::PickAnother)));
+        // 网络抖动仍然换一首（既有行为）。
+        assert!(should_skip_to_next(&PlaybackFailure::new(
+            Stage::Network,
+            Retryability::Transient,
+            RecoveryAction::Nothing,
+            "timeout",
+        )));
+        // 全局故障一律落闸。
+        for action in [
+            RecoveryAction::Relogin,
+            RecoveryAction::CheckSigner,
+            RecoveryAction::CheckEntitlement,
+            RecoveryAction::FreeSpace,
+        ] {
+            assert!(!should_skip_to_next(&at(action)), "{action:?}");
         }
     }
 
