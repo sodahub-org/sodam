@@ -3013,18 +3013,18 @@ impl Root {
                         let will_advance =
                             root.queue.len() > 1 && root.queue.mode != PlayMode::RepeatOne;
                         let skip_now = skip && !cap_reached && will_advance;
+                        // 按曲目不可播却无处可去（单曲循环 / 只有一首）或已经封顶：
+                        // 这次不会真的前进，原因留在常驻位，不再谎称「已跳过」。
+                        let per_track_stops =
+                            failure.is_per_track() && (!will_advance || cap_reached);
                         let message = root.tr(play_failure_text(&failure, skip_now)).to_string();
 
                         if failure.is_per_track() {
-                            if !cap_reached {
-                                // 按曲目不可播：一次性的轻提示，同一 key 连跳只保留一条。
-                                // 真的前进时撤下与这次结论无关的旧常驻错误；不会前进
-                                // （单曲循环 / 只有一首）时原因仍然成立，留在常驻位。
-                                root.playback_error = if skip_now {
-                                    None
-                                } else {
-                                    Some(message.clone())
-                                };
+                            if per_track_stops {
+                                root.playback_error = Some(message.clone());
+                            } else {
+                                // 真的前进时撤下与这次结论无关的旧常驻错误。
+                                root.playback_error = None;
                                 root.notify_warning_once("track-unavailable", message);
                             }
                         } else if skip_now {
@@ -3041,7 +3041,11 @@ impl Root {
                             // 已知中间态（#106）：按曲目类失败本票仍计入连败封顶，
                             // 由 #108「不可播集合驱动扫一圈」把它从计数里摘出去。
                             root.consecutive_failures += 1;
-                            if cap_reached {
+                            if failure.is_per_track() && !will_advance {
+                                // 同一首确定性失败且没有别的歌可换：原地重试只会白等。
+                                // 停在当前曲目，原因已在常驻位；#108 接上真正的前进后再换。
+                                root.halt_playback();
+                            } else if cap_reached {
                                 root.halt_playback();
                                 let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
                                 root.playback_error = Some(halted.clone());
