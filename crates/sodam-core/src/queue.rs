@@ -207,6 +207,12 @@ impl Queue {
                     // 否则「接下来」会重复显示，下一轮还会再播一次。
                     self.shuffle_round.retain(|index| *index != redo);
                     self.index = redo;
+                    if self.shuffle_round.is_empty() {
+                        // 轮次只剩被放弃的那首：回到它之后立刻补满新一轮，
+                        // 面板的「接下来」不能出现空档（与下面正常推进一致）。
+                        self.history.clear();
+                        self.shuffle_round = self.build_shuffle_round();
+                    }
                     return self.current();
                 }
                 if let Some(next) = self.next_shuffle_index() {
@@ -799,6 +805,7 @@ mod tests {
             !queue.upcoming().contains(&second),
             "回到 redo 目标后，它不应再留在待播轮次里"
         );
+        assert!(!queue.upcoming().is_empty(), "面板的「接下来」不能空");
 
         // redo 指向已确认不可播的曲目：不再回去，按候选继续前进。
         let mut blocked = Queue::new(tracks(5));
@@ -936,6 +943,10 @@ mod tests {
         assert!(
             !queue.upcoming().contains(&second),
             "回到被放弃的那首后，它不应再留在待播轮次里"
+        );
+        assert!(
+            !queue.upcoming().is_empty(),
+            "回到被放弃的那首后要立刻补满新一轮，面板不能空"
         );
     }
 
