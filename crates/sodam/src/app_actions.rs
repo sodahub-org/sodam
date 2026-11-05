@@ -3144,9 +3144,11 @@ impl Root {
                             let skip = should_skip_to_next(&failure);
                             let cap_reached =
                                 skip && root.consecutive_failures + 1 >= PLAY_FAILURE_HALT_AFTER;
-                            let will_advance =
-                                root.queue.len() > 1 && root.queue.mode != PlayMode::RepeatOne;
-                            let skip_now = skip && !cap_reached && will_advance;
+                            // 单曲循环的「跳过」是原地重试同一首，不换歌；其余模式先问
+                            // 队列有没有可播候选。只有真的能前进时文案才说「已跳过」。
+                            let in_place = root.queue.mode == PlayMode::RepeatOne;
+                            let has_candidate = in_place || root.has_playable_ahead();
+                            let skip_now = skip && !cap_reached && has_candidate;
                             let message =
                                 root.tr(play_failure_text(&failure, skip_now)).to_string();
                             if skip_now {
@@ -3165,19 +3167,16 @@ impl Root {
                                     let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
                                     root.playback_error = Some(halted.clone());
                                     root.notify_error_once("consecutive-stream-failures", halted);
-                                } else if !root.queue.is_empty() {
+                                } else if in_place {
+                                    // 单曲循环：原地重试同一首，由连败封顶兜底。
+                                    root.next_track(cx);
+                                } else if has_candidate {
                                     // 自动跳过同样先查不可播集合，别把已知放不出来的歌
-                                    // 再装载一次；单曲循环保留「原地重试同一首」的封顶语义。
-                                    if root.queue.mode == PlayMode::RepeatOne {
-                                        root.next_track(cx);
-                                    } else {
-                                        root.auto_advance_track(cx);
-                                    }
+                                    // 再装载一次。
+                                    root.auto_advance_track(cx);
                                 } else {
-                                    // 没有下一首可换：停在当前状态，并把原因留在常驻位。
-                                    root.playback_error = Some(
-                                        root.tr(play_failure_text(&failure, false)).to_string(),
-                                    );
+                                    // 没有可播候选：保持这次网络故障的文案并停下，
+                                    // 不套用「整圈没有能播的歌」去误报成权益问题。
                                     root.halt_playback();
                                 }
                             } else {

@@ -203,6 +203,9 @@ impl Queue {
                 self.history.push(self.index);
                 // 「上一首」之后按「下一首」应回到被放弃的那首，而不是重新随机。
                 if let Some(redo) = self.redo.take() {
+                    // `rewind` 把它插回了轮次首位；回到它之后要摘掉，
+                    // 否则「接下来」会重复显示，下一轮还会再播一次。
+                    self.shuffle_round.retain(|index| *index != redo);
                     self.index = redo;
                     return self.current();
                 }
@@ -283,62 +286,68 @@ impl Queue {
     pub fn advance_playable(&mut self, unavailable: impl Fn(&str) -> bool) -> Option<&TrackItem> {
         // 随机播放里「上一首」之后的下一次前进应回到被放弃的那首，语义与 `advance`
         // 一致。它若已确认不可播，就丢掉这条回退意图，继续找可播候选。
+        let redo = if self.mode == PlayMode::Shuffle {
+            self.redo.take().filter(|redo| {
+                *redo < self.tracks.len()
+                    && *redo != self.index
+                    && !unavailable(self.tracks[*redo].id.as_str())
+            })
+        } else {
+            None
+        };
+
+        if let Some(redo) = redo {
+            self.bump();
+            self.history.push(self.index);
+            // `rewind` 把被放弃的那首插回了轮次首位；回到它之后必须再摘掉，
+            // 否则「接下来」会把它当成待播项重复显示 / 重复播放。
+            self.shuffle_round.retain(|index| *index != redo);
+            self.index = redo;
+        } else {
+            let candidate = self.next_playable(&unavailable)?;
+            self.bump();
+            match self.mode {
+                PlayMode::ListLoop | PlayMode::RepeatOne => self.index = candidate,
+                PlayMode::Shuffle => {
+                    if let Some(position) = self
+                        .shuffle_round
+                        .iter()
+                        .position(|index| *index == candidate)
+                    {
+                        // 候选之前的项都是已确认不可播的，连同候选一起从待播顺序里去掉。
+                        self.shuffle_round.drain(0..=position);
+                        self.history.push(self.index);
+                        self.index = candidate;
+                    } else {
+                        // 本轮没有可播项：开新一轮，且只收可播曲目。
+                        self.history.clear();
+                        self.shuffle_round = self.build_playable_round(&unavailable);
+                        self.index = match self.shuffle_round.first().copied() {
+                            Some(next) => {
+                                self.shuffle_round.remove(0);
+                                next
+                            }
+                            // `next_playable` 已保证存在可播项；这里只做兜底，不 panic。
+                            None => candidate,
+                        };
+                    }
+                }
+            }
+        }
+
         if self.mode == PlayMode::Shuffle {
-            if let Some(redo) = self.redo.take() {
-                let playable = redo < self.tracks.len()
-                    && redo != self.index
-                    && !unavailable(self.tracks[redo].id.as_str());
-                if playable {
-                    self.bump();
-                    self.history.push(self.index);
-                    // `rewind` 把被放弃的那首插回了轮次首位；回到它之后必须再摘掉，
-                    // 否则「接下来」会把它当成待播项重复显示 / 重复播放。
-                    self.shuffle_round.retain(|index| *index != redo);
-                    self.index = redo;
-                    return self.current();
-                }
+            // 摘掉已确认不可播的项；与本轮播完时的 `advance` 保持一致，只要还有
+            // 可播曲目就立刻补满新一轮，面板的「接下来」不能出现空档。
+            self.shuffle_round.retain(|index| {
+                self.tracks
+                    .get(*index)
+                    .is_some_and(|track| !unavailable(track.id.as_str()))
+            });
+            if self.shuffle_round.is_empty() {
+                self.history.clear();
+                self.shuffle_round = self.build_playable_round(&unavailable);
             }
         }
-        let candidate = self.next_playable(&unavailable)?;
-        self.bump();
-        match self.mode {
-            PlayMode::ListLoop | PlayMode::RepeatOne => self.index = candidate,
-            PlayMode::Shuffle => {
-                if let Some(position) = self
-                    .shuffle_round
-                    .iter()
-                    .position(|index| *index == candidate)
-                {
-                    // 候选之前的项都是已确认不可播的，连同候选一起从待播顺序里去掉。
-                    self.shuffle_round.drain(0..=position);
-                    self.history.push(self.index);
-                    self.index = candidate;
-                } else {
-                    // 本轮没有可播项：开新一轮，且只收可播曲目。
-                    self.history.clear();
-                    self.shuffle_round = self.build_playable_round(&unavailable);
-                    self.index = match self.shuffle_round.first().copied() {
-                        Some(next) => {
-                            self.shuffle_round.remove(0);
-                            next
-                        }
-                        // `next_playable` 已保证存在可播项；这里只做兜底，不 panic。
-                        None => candidate,
-                    };
-                }
-                // 与本轮播完时的 `advance` 保持一致：只要还有可播曲目就立刻补满
-                // 新一轮，面板的「接下来」不能出现空档。
-                if self.shuffle_round.is_empty() {
-                    self.history.clear();
-                    self.shuffle_round = self.build_playable_round(&unavailable);
-                }
-            }
-        }
-        self.shuffle_round.retain(|index| {
-            self.tracks
-                .get(*index)
-                .is_some_and(|track| !unavailable(track.id.as_str()))
-        });
         self.current()
     }
 
@@ -786,6 +795,10 @@ mod tests {
             "redo 应回到被放弃的那首"
         );
         assert_eq!(queue.index(), second);
+        assert!(
+            !queue.upcoming().contains(&second),
+            "回到 redo 目标后，它不应再留在待播轮次里"
+        );
 
         // redo 指向已确认不可播的曲目：不再回去，按候选继续前进。
         let mut blocked = Queue::new(tracks(5));
@@ -920,6 +933,10 @@ mod tests {
         assert_eq!(queue.index(), first, "应退回上一首");
         queue.advance();
         assert_eq!(queue.index(), second, "再按下一首应回到刚放弃的那首");
+        assert!(
+            !queue.upcoming().contains(&second),
+            "回到被放弃的那首后，它不应再留在待播轮次里"
+        );
     }
 
     #[test]
