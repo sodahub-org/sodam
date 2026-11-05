@@ -8,7 +8,7 @@
 //! 「签名」要单列得等上游补结构化相位。
 
 use libresoda::SodaError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -173,6 +173,13 @@ struct UnplayableEntry {
 #[derive(Debug, Clone, Default)]
 pub struct UnplayableTracks {
     entries: HashMap<String, UnplayableEntry>,
+    /// 本轮扫描已经尝试过的曲目 id。
+    ///
+    /// 容量上限只约束上面的结论集合；队列比上限更长时，被淘汰的旧条目会重新
+    /// 变成「可播候选」，一次扫描就永远走不完。这份游标不受 256 限制，但只会
+    /// 增长到队列长度，并在成功装载 / 换队列 / 账号作废时清空——它不是结论，
+    /// 只是「这一轮别再试同一首」的记忆。
+    attempted: HashSet<String>,
 }
 
 impl UnplayableTracks {
@@ -181,6 +188,18 @@ impl UnplayableTracks {
 
     pub fn contains(&self, track_id: &str) -> bool {
         self.entries.contains_key(track_id)
+    }
+
+    /// 这首在本轮扫描里还要不要跳过：已有结论，或本轮已经试过一次。
+    pub fn is_unavailable(&self, track_id: &str) -> bool {
+        self.entries.contains_key(track_id) || self.attempted.contains(track_id)
+    }
+
+    /// 开始新一轮扫描：保留结论，只忘掉「本轮试过哪些」。
+    ///
+    /// 成功装载或换队列时调用；账号作废用 [`Self::clear`] 连结论一起清。
+    pub fn reset_scan(&mut self) {
+        self.attempted.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -193,6 +212,7 @@ impl UnplayableTracks {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.attempted.clear();
     }
 
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻。
@@ -211,6 +231,7 @@ impl UnplayableTracks {
         if !failure.is_per_track() {
             return false;
         }
+        self.attempted.insert(track_id.to_string());
         self.record(track_id, failure.retryability);
         true
     }
@@ -960,6 +981,78 @@ mod tests {
         assert!(!set.contains("track-0"), "最旧的确定性条目应先出局");
         assert!(set.contains("track-1"));
         assert!(set.contains("newest"));
+    }
+
+    /// 队列比容量长时，被淘汰的旧条目在本轮扫描里仍算「试过了」；
+    /// 换一轮扫描（成功装载 / 换队列）才忘掉。
+    #[test]
+    fn scan_cursor_survives_capacity_eviction() {
+        let mut set = UnplayableTracks::default();
+        let per_track = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        for index in 0..=UnplayableTracks::CAPACITY {
+            set.record_failure(&format!("track-{index}"), &per_track);
+        }
+        // 最早的结论已被容量淘汰……
+        assert_eq!(set.len(), UnplayableTracks::CAPACITY);
+        assert!(!set.contains("track-0"));
+        // ……但本轮扫描仍记得它，不会立刻回头重试。
+        assert!(set.is_unavailable("track-0"));
+
+        set.reset_scan();
+        assert!(!set.is_unavailable("track-0"), "新一轮扫描应忘掉试过的曲目");
+        assert!(
+            set.is_unavailable("track-1"),
+            "结论不能被 reset_scan 清掉：它仍在容量内"
+        );
+
+        set.clear();
+        assert!(!set.is_unavailable("track-1"));
+    }
+
+    /// 队列比容量长、且整队都按曲目不可播时，扫描必须停在整圈处，
+    /// 不能因为旧结论被淘汰就无限回头重试。
+    #[test]
+    fn scan_cursor_terminates_a_queue_longer_than_capacity() {
+        use crate::models::TrackItem;
+        use crate::queue::{PlayMode, Queue};
+
+        let total = UnplayableTracks::CAPACITY + 44;
+        let tracks: Vec<TrackItem> = (0..total)
+            .map(|index| TrackItem {
+                id: format!("track-{index}"),
+                ..Default::default()
+            })
+            .collect();
+        let mut queue = Queue::new(tracks);
+        queue.mode = PlayMode::ListLoop;
+        let failure = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            "returned preview stream",
+        );
+        let mut set = UnplayableTracks::default();
+        let mut attempts = 0;
+        loop {
+            let current = queue.current().expect("队列非空").id.clone();
+            set.record_failure(&current, &failure);
+            attempts += 1;
+            assert!(attempts <= total, "扫描应在整圈内结束");
+            if queue
+                .advance_playable(|id| set.is_unavailable(id))
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert_eq!(attempts, total, "整队每首恰好尝试一次");
+        assert_eq!(
+            set.len(),
+            UnplayableTracks::CAPACITY,
+            "结论集合仍受容量上限约束"
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ impl Root {
             }
             // 已确认当前账号放不出来的曲目不再预取：那只是在为已知结论重复打网络。
             // 集合作废（账号 / 会员状态变化）后才重新参与。
-            if self.unplayable.contains(&next.id) {
+            if self.unplayable.is_unavailable(&next.id) {
                 if log {
                     log_event(
                         LogLevel::Debug,
@@ -1116,7 +1116,7 @@ impl Root {
         self.queue.replace(tracks, 0);
         self.played_history.clear();
         self.playback_error = None;
-        self.clear_round_exhaustion();
+        self.new_playback_round();
         self.queue_origin = match source.scene.as_ref() {
             Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
             None => QueueOrigin::Feed,
@@ -1494,7 +1494,7 @@ impl Root {
         self.lyrics_error = None;
         self.loading_lyrics = false;
         self.playback_error = None;
-        self.clear_round_exhaustion();
+        self.new_playback_round();
     }
 
     /// 歌词滚动过渡的时长范围与换算。
@@ -1740,8 +1740,8 @@ impl Root {
         if !had_cached_recommendation {
             self.recommendation = None;
             self.queue = Queue::new(Vec::new());
-            // 队列都没了，上一轮的「整圈无候选」结论不再成立。
-            self.clear_round_exhaustion();
+            // 队列都没了，上一轮的扫描游标与「整圈无候选」结论不再成立。
+            self.new_playback_round();
             self.queue_origin = QueueOrigin::None;
             self.played_history.clear();
             self.pending_track = None;
@@ -1793,7 +1793,7 @@ impl Root {
                                 root.queue.replace(tracks, 0);
                                 root.played_history.clear();
                                 root.playback_error = None;
-                                root.clear_round_exhaustion();
+                                root.new_playback_round();
                                 root.queue_origin = QueueOrigin::Radio(card.playlist.id.clone());
                                 root.recommendation = None;
                                 root.sync_queue_cache();
@@ -1856,7 +1856,7 @@ impl Root {
                         root.queue.replace(tracks, 0);
                         root.played_history.clear();
                         root.playback_error = None;
-                        root.clear_round_exhaustion();
+                        root.new_playback_round();
                         root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
                         root.recommendation = None;
                         root.switching_queue = None;
@@ -2687,8 +2687,8 @@ impl Root {
             .unwrap_or_default();
         let covers: Vec<String> = tracks.iter().map(|track| track.cover.clone()).collect();
         self.queue.replace(tracks, index);
-        // 换了一轮队列：上一轮的「整圈无候选」结论不再成立。
-        self.clear_round_exhaustion();
+        // 换了一轮队列：上一轮的扫描游标与「整圈无候选」结论不再成立。
+        self.new_playback_round();
         // 列表整体换队时清掉旧播放历史，避免抽屉把上一批队列误标成“已播放”。
         self.played_history.clear();
         // 换队时保留用户选好的播放模式：之前这里强制重置成顺序播放，
@@ -2899,11 +2899,17 @@ impl Root {
         }
     }
 
+    /// 换队列或成功装载：上一轮的扫描游标与「整圈无候选」判定都作废。
+    fn new_playback_round(&mut self) {
+        self.unplayable.reset_scan();
+        self.clear_round_exhaustion();
+    }
+
     /// 当前位置之后是否还有可播候选（不含当前曲目）。
     fn has_playable_ahead(&self) -> bool {
         let unplayable = &self.unplayable;
         self.queue
-            .next_playable(|id| unplayable.contains(id))
+            .next_playable(|id| unplayable.is_unavailable(id))
             .is_some()
     }
 
@@ -2916,17 +2922,17 @@ impl Root {
         let has_candidate = {
             let unplayable = &self.unplayable;
             self.queue
-                .advance_playable(|id| unplayable.contains(id))
+                .advance_playable(|id| unplayable.is_unavailable(id))
                 .is_some()
         };
         if !has_candidate {
             // 扫一圈只剩当前这首：它没被确认不可播就接着放——列表循环绕回自己，
-            // 随机播放视为新一轮只剩这一首。只有当前这首也在不可播集合里时，
+            // 随机播放视为新一轮只剩这一首。只有当前这首也不可用时，
             // 「这一轮没有能播的歌了」才是真话。
             let current_playable = self
                 .queue
                 .current()
-                .is_some_and(|track| !self.unplayable.contains(&track.id));
+                .is_some_and(|track| !self.unplayable.is_unavailable(&track.id));
             if current_playable {
                 self.sync_queue_cache();
                 self.start_track(cx);
@@ -3065,7 +3071,8 @@ impl Root {
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
                         root.playback_error = None;
-                        root.clear_round_exhaustion();
+                        // 成功装载：上一轮「扫一圈」的游标作废。
+                        root.new_playback_round();
                         // 记录真实播放历史（去重最近一条，避免重复刷屏）
                         if root.played_history.last().map(String::as_str) != Some(track.id.as_str())
                         {
@@ -3131,7 +3138,7 @@ impl Root {
                             let has_candidate = {
                                 let unplayable = &root.unplayable;
                                 root.queue
-                                    .advance_playable(|id| unplayable.contains(id))
+                                    .advance_playable(|id| unplayable.is_unavailable(id))
                                     .is_some()
                             };
                             if has_candidate {
