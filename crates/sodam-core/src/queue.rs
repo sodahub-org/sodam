@@ -275,10 +275,11 @@ impl Queue {
         }
     }
 
-    /// 推进到 [`Queue::next_playable`] 给出的候选；没有候选时不动队列并返回 `None`。
+    /// 推进到下一个可播曲目；没有候选时不动队列并返回 `None`。
     ///
-    /// 随机播放会同步本轮待播顺序：跳过的已知不可播项从轮次里摘掉，
-    /// 本轮确实没得播时只按可播曲目开新一轮，避免下一轮又把这些歌排进来。
+    /// 随机播放按 `redo` → 本轮顺序 → 新一轮的顺序选目标，并同步待播顺序：
+    /// 跳过的已知不可播项（以及回到的 redo 目标）从轮次里摘掉；本轮确实没得播时
+    /// 只按可播曲目开新一轮，避免下一轮又把这些歌排进来。
     pub fn advance_playable(&mut self, unavailable: impl Fn(&str) -> bool) -> Option<&TrackItem> {
         // 随机播放里「上一首」之后的下一次前进应回到被放弃的那首，语义与 `advance`
         // 一致。它若已确认不可播，就丢掉这条回退意图，继续找可播候选。
@@ -290,6 +291,9 @@ impl Queue {
                 if playable {
                     self.bump();
                     self.history.push(self.index);
+                    // `rewind` 把被放弃的那首插回了轮次首位；回到它之后必须再摘掉，
+                    // 否则「接下来」会把它当成待播项重复显示 / 重复播放。
+                    self.shuffle_round.retain(|index| *index != redo);
                     self.index = redo;
                     return self.current();
                 }

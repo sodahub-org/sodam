@@ -196,7 +196,9 @@ impl UnplayableTracks {
     }
 
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻。
-    pub fn record(&mut self, track_id: &str, retryability: Retryability) {
+    ///
+    /// 私有：外部只能经 [`Self::record_failure`] 进来，避免绕开「只收按曲目类」的判据。
+    fn record(&mut self, track_id: &str, retryability: Retryability) {
         self.record_at(track_id, retryability, Instant::now());
     }
 

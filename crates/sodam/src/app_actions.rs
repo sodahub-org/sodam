@@ -1740,6 +1740,8 @@ impl Root {
         if !had_cached_recommendation {
             self.recommendation = None;
             self.queue = Queue::new(Vec::new());
+            // 队列都没了，上一轮的「整圈无候选」结论不再成立。
+            self.clear_round_exhaustion();
             self.queue_origin = QueueOrigin::None;
             self.played_history.clear();
             self.pending_track = None;
@@ -3164,7 +3166,13 @@ impl Root {
                                     root.playback_error = Some(halted.clone());
                                     root.notify_error_once("consecutive-stream-failures", halted);
                                 } else if !root.queue.is_empty() {
-                                    root.next_track(cx);
+                                    // 自动跳过同样先查不可播集合，别把已知放不出来的歌
+                                    // 再装载一次；单曲循环保留「原地重试同一首」的封顶语义。
+                                    if root.queue.mode == PlayMode::RepeatOne {
+                                        root.next_track(cx);
+                                    } else {
+                                        root.auto_advance_track(cx);
+                                    }
                                 } else {
                                     // 没有下一首可换：停在当前状态，并把原因留在常驻位。
                                     root.playback_error = Some(
