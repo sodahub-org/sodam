@@ -126,9 +126,6 @@ pub fn is_global_failure(failure: &PlaybackFailure) -> bool {
 /// 判据沿用 [`PlaybackFailure::is_per_track`]：结论关于单首曲目的不挂管线
 /// （只进不可播集合），换一首都可能变好的抖动类也不挂——那是逐曲冷却的职责。
 fn suspension_class(failure: &PlaybackFailure) -> Option<SuspensionClass> {
-    if failure.is_per_track() {
-        return None;
-    }
     match failure.action {
         RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => Some(SuspensionClass::Login),
         RecoveryAction::FreeSpace => Some(SuspensionClass::Disk),

@@ -208,9 +208,8 @@ impl Root {
                             } else if is_global_failure(failure) {
                                 // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
                                 root.suspend_prefetch(failure);
-                            } else if root.prefetch_gate.allows() {
-                                // 抖动类进逐曲冷却。管线挂起期间不给单首记永久失败——
-                                // 恢复后它们还要重新参与预取。
+                            } else {
+                                // 抖动类进逐曲冷却（与管线是否挂起无关：它只影响这一首）。
                                 // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
                                 if root.prefetch_failed.len() > 256 {
                                     root.prefetch_failed.retain(|_, (_, retryability)| {
@@ -319,14 +318,13 @@ impl Root {
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
                 if root.prefetch_patrol % 25 == 0 {
-                    // 冷却类挂起在落闸期间也要到期：落闸只停预取，不停计时。
-                    log_prefetch_resume(
-                        root.prefetch_gate
-                            .expire_cooldown(std::time::Instant::now()),
-                    );
                     if !root.playback_halted {
-                        // 落闸（#106 连败封顶 / 全局故障停播）期间照旧不预取，
-                        // 等用户主动播放；即使登录类挂起已因重新登录打开也遵守这条约定。
+                        // 冷却从挂起时刻算；判定放在真正会预取的那一拍，落闸期间
+                        // 不预取也不谎报「已恢复」，等用户主动播放后的下一拍再判定。
+                        log_prefetch_resume(
+                            root.prefetch_gate
+                                .expire_cooldown(std::time::Instant::now()),
+                        );
                         root.prefetch_failed.retain(|_, (failed_at, retryability)| {
                             *retryability == Retryability::Never
                                 || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN

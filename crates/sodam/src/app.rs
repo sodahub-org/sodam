@@ -459,10 +459,10 @@ pub struct Root {
         HashMap<String, (std::time::Instant, sodam_core::failure::Retryability)>,
     /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）补一次预取。
     pub(crate) prefetch_patrol: u32,
-    /// 预取管线的全局故障总闸（规则见 `sodam_core::prefetch`）。
+    /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
-    /// 与 `prefetch_failed`（逐曲冷却）正交：那张表回答「这一首要不要再试」，
-    /// 这道闸回答「整条管线现在该不该跑」。
+    /// 与 `prefetch_failed`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
+    /// 是两件事：前者管整条预取管线，后者管自动续播与巡检本身。
     pub(crate) prefetch_gate: PrefetchGate,
     /// 缓存统计快照（音频字节, 歌曲数, 封面字节, 封面张数）：
     /// 后台扫盘后回填，设置页只读它（渲染路径不做同步 IO）。
