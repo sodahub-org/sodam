@@ -123,8 +123,9 @@ pub fn is_global_failure(failure: &PlaybackFailure) -> bool {
 
 /// 哪些失败算「整条管线都该停」的全局故障。
 ///
-/// 判据沿用 [`PlaybackFailure::is_per_track`]：结论关于单首曲目的不挂管线
-/// （只进不可播集合），换一首都可能变好的抖动类也不挂——那是逐曲冷却的职责。
+/// 与 [`PlaybackFailure::is_per_track`] 同一判据：结论关于单首曲目的
+/// （`TrackUnavailable` / `PickAnother`）不挂管线，只进不可播集合；
+/// 换一首都可能变好的抖动类（`Nothing`）也不挂——那是逐曲冷却的职责。
 fn suspension_class(failure: &PlaybackFailure) -> Option<SuspensionClass> {
     match failure.action {
         RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => Some(SuspensionClass::Login),

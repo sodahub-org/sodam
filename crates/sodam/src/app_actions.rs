@@ -69,7 +69,7 @@ impl Root {
     /// （后者自动覆盖 append/remove 等队列变更，不必逐个调用点补）。
     pub(crate) fn spawn_prefetch(&mut self, cx: &mut Context<Self>) {
         // 全局故障期间整条管线挂起：巡检每 5 秒仍会路过这里，但一次请求都不发。
-        // 冷却到期由心跳统一轮询（落闸期间也要计时），这里只问闸开没开。
+        // 冷却到期由心跳在未落闸的巡检里轮询，这里只问闸开没开。
         if !self.prefetch_gate.allows() {
             return;
         }
