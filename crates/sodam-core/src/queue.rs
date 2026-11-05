@@ -82,6 +82,23 @@ fn mix_seed(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// 把一组下标随机打散（Fisher-Yates，种子先混一次）。
+///
+/// 纳秒低位在连续调用间变化太小，直接取模会退化，所以每步都再混一轮。
+fn shuffled_indices(mut round: Vec<usize>) -> Vec<usize> {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut state = mix_seed(seed);
+    for i in (1..round.len()).rev() {
+        state = mix_seed(state);
+        let pick = (state % (i as u64 + 1)) as usize;
+        round.swap(i, pick);
+    }
+    round
+}
+
 impl Queue {
     pub fn new(tracks: Vec<TrackItem>) -> Self {
         Self {
@@ -224,21 +241,97 @@ impl Queue {
 
     /// 生成一轮随机顺序（不含当前曲目），并从中移除已取走的元素。
     fn build_shuffle_round(&self) -> Vec<usize> {
-        let mut round: Vec<usize> = (0..self.tracks.len())
+        let round: Vec<usize> = (0..self.tracks.len())
             .filter(|index| *index != self.index)
             .collect();
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_nanos() as u64)
-            .unwrap_or(0x9E3779B97F4A7C15);
-        // Fisher-Yates，种子先混一次：纳秒低位连续调用变化太小，直接取模会退化。
-        let mut state = mix_seed(seed);
-        for i in (1..round.len()).rev() {
-            state = mix_seed(state);
-            let pick = (state % (i as u64 + 1)) as usize;
-            round.swap(i, pick);
+        shuffled_indices(round)
+    }
+
+    /// 从当前位置之后求**下一个可播曲目**（纯查询，不改队列状态）。
+    ///
+    /// 「可播」= 曲目 id 不在不可播集合里（集合由调用方以谓词给出，领域层不持有它）。
+    /// 按播放模式扫描：
+    /// * 列表循环 / 单曲循环：沿列表前进并绕回；绕完整圈仍无候选即 `None`。
+    ///   单曲循环同样按列表前进——这是「取不到的前进」，与「播完重播」的循环语义是两件事；
+    /// * 随机播放：先按本轮待播顺序找；本轮没有可播项时再扫完整圈——有可播项
+    ///   就说明可以开新一轮，不能因为本轮播完就误报「没有能播的歌」。
+    ///
+    /// 返回值是队列下标，调用方用 [`Queue::advance_playable`] 真正推进。
+    pub fn next_playable(&self, unavailable: impl Fn(&str) -> bool) -> Option<usize> {
+        let len = self.tracks.len();
+        if len < 2 {
+            return None;
         }
-        round
+        let playable = |index: &usize| {
+            *index != self.index && *index < len && !unavailable(self.tracks[*index].id.as_str())
+        };
+        match self.mode {
+            PlayMode::Shuffle => self
+                .shuffle_round
+                .iter()
+                .copied()
+                .find(|index| playable(index))
+                .or_else(|| (0..len).find(|index| playable(index))),
+            PlayMode::ListLoop | PlayMode::RepeatOne => (1..len)
+                .map(|step| (self.index + step) % len)
+                .find(|index| playable(index)),
+        }
+    }
+
+    /// 推进到 [`Queue::next_playable`] 给出的候选；没有候选时不动队列并返回 `None`。
+    ///
+    /// 随机播放会同步本轮待播顺序：跳过的已知不可播项从轮次里摘掉，
+    /// 本轮确实没得播时只按可播曲目开新一轮，避免下一轮又把这些歌排进来。
+    pub fn advance_playable(&mut self, unavailable: impl Fn(&str) -> bool) -> Option<&TrackItem> {
+        let candidate = self.next_playable(&unavailable)?;
+        self.bump();
+        match self.mode {
+            PlayMode::ListLoop | PlayMode::RepeatOne => self.index = candidate,
+            PlayMode::Shuffle => {
+                if let Some(position) = self
+                    .shuffle_round
+                    .iter()
+                    .position(|index| *index == candidate)
+                {
+                    // 候选之前的项都是已确认不可播的，连同候选一起从待播顺序里去掉。
+                    self.shuffle_round.drain(0..=position);
+                    self.history.push(self.index);
+                    self.index = candidate;
+                } else {
+                    // 本轮没有可播项：开新一轮，且只收可播曲目。
+                    self.history.clear();
+                    self.shuffle_round = self.build_playable_round(&unavailable);
+                    self.index = match self.shuffle_round.first().copied() {
+                        Some(next) => {
+                            self.shuffle_round.remove(0);
+                            next
+                        }
+                        // `next_playable` 已保证存在可播项；这里只做兜底，不 panic。
+                        None => candidate,
+                    };
+                }
+                // 与本轮播完时的 `advance` 保持一致：只要还有可播曲目就立刻补满
+                // 新一轮，面板的「接下来」不能出现空档。
+                if self.shuffle_round.is_empty() {
+                    self.history.clear();
+                    self.shuffle_round = self.build_playable_round(&unavailable);
+                }
+            }
+        }
+        self.shuffle_round.retain(|index| {
+            self.tracks
+                .get(*index)
+                .is_some_and(|track| !unavailable(track.id.as_str()))
+        });
+        self.current()
+    }
+
+    /// 生成一轮「除当前曲目与已知不可播曲目之外」的随机顺序。
+    fn build_playable_round(&self, unavailable: &impl Fn(&str) -> bool) -> Vec<usize> {
+        let round: Vec<usize> = (0..self.tracks.len())
+            .filter(|index| *index != self.index && !unavailable(self.tracks[*index].id.as_str()))
+            .collect();
+        shuffled_indices(round)
     }
 
     /// 清空随机待播顺序，下次推进时重新生成一轮。
@@ -551,6 +644,112 @@ mod tests {
         assert_eq!(PlayMode::ListLoop.next(), PlayMode::RepeatOne);
         assert_eq!(PlayMode::RepeatOne.next(), PlayMode::Shuffle);
         assert_eq!(PlayMode::Shuffle.next(), PlayMode::ListLoop);
+    }
+
+    /// 列表循环：绕过不可播项并回绕；扫完整圈无候选才算没有。
+    #[test]
+    fn next_playable_wraps_in_list_loop() {
+        let mut queue = Queue::new(tracks(4));
+        queue.mode = PlayMode::ListLoop;
+        queue.jump(2);
+
+        // 2 → 3（不可播）→ 0（可播）：回绕生效。
+        assert_eq!(queue.next_playable(|id| id == "3"), Some(0));
+        assert_eq!(queue.next_playable(|id| id == "3" || id == "0"), Some(1));
+        // 扫一圈全不可播：没有候选。
+        assert_eq!(queue.next_playable(|_| true), None);
+
+        // 真正推进到候选，旧位置不会被当成候选重播。
+        assert_eq!(queue.advance_playable(|id| id == "3").unwrap().id, "0");
+        assert_eq!(queue.index(), 0);
+        // 没有候选时不动队列。
+        let before = queue.index();
+        assert!(queue.advance_playable(|_| true).is_none());
+        assert_eq!(queue.index(), before);
+    }
+
+    /// 单曲循环下「不可播的前进」不能被「播完重播」的循环语义吞掉。
+    #[test]
+    fn repeat_one_unplayable_advance_still_moves_forward() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::RepeatOne;
+        queue.jump(0);
+
+        // 播完重播：advance 停在原地（既有语义，保持不变）。
+        assert_eq!(queue.advance().unwrap().id, "0");
+        assert_eq!(queue.index(), 0);
+
+        // 不可播的前进：按列表走到下一个可播候选。
+        assert_eq!(queue.next_playable(|id| id == "1"), Some(2));
+        assert_eq!(queue.advance_playable(|id| id == "1").unwrap().id, "2");
+        assert_eq!(queue.index(), 2);
+        // 模式不变：下一次「播完重播」仍停在当前这首。
+        assert_eq!(queue.mode, PlayMode::RepeatOne);
+        assert_eq!(queue.advance().unwrap().id, "2");
+
+        // 只有一首 / 全部不可播：没有可前进的候选。
+        assert_eq!(Queue::new(tracks(1)).next_playable(|_| false), None);
+        let mut all = Queue::new(tracks(3));
+        all.mode = PlayMode::RepeatOne;
+        assert_eq!(all.next_playable(|_| true), None);
+        assert!(all.advance_playable(|_| true).is_none());
+    }
+
+    /// 随机播放：按本轮顺序跳过不可播项；本轮没有可播项时按整圈判断，
+    /// 有可播项就开新一轮，不能误报「没有能播的歌」。
+    #[test]
+    fn shuffle_skips_unavailable_and_starts_a_new_round() {
+        let mut queue = Queue::new(tracks(5));
+        queue.mode = PlayMode::Shuffle;
+        queue.prepare_shuffle_round();
+        let round = queue.upcoming();
+        assert_eq!(round.len(), 4);
+
+        // 候选之前的项都不可播 → 候选是本轮第一个可播项；候选之后也放一条
+        // 已知不可播项，验证它会被从待播顺序里摘掉。
+        let target = round[2];
+        let blocked: HashSet<String> = [round[0], round[1], round[3], queue.index()]
+            .iter()
+            .map(|index| index.to_string())
+            .collect();
+        assert_eq!(queue.next_playable(|id| blocked.contains(id)), Some(target));
+
+        assert_eq!(
+            queue
+                .advance_playable(|id| blocked.contains(id))
+                .map(|track| track.id.clone()),
+            Some(target.to_string())
+        );
+        assert_eq!(queue.index(), target);
+        // 被跳过的已知不可播项不应留在「接下来」里再次被尝试。
+        assert!(
+            queue.upcoming().is_empty(),
+            "本轮剩余项全是已知不可播，应被摘掉：{:?}",
+            queue.upcoming()
+        );
+
+        // 整队全不可播 → 扫一圈无候选。
+        let mut exhausted = Queue::new(tracks(4));
+        exhausted.mode = PlayMode::Shuffle;
+        exhausted.prepare_shuffle_round();
+        let all_blocked: HashSet<String> = std::iter::once(exhausted.index().to_string())
+            .chain(exhausted.upcoming().iter().map(|index| index.to_string()))
+            .collect();
+        assert_eq!(exhausted.next_playable(|id| all_blocked.contains(id)), None);
+
+        // 本轮已播完（待播顺序为空）但其他曲目可播：必须开新一轮。
+        let mut fresh = Queue::new(tracks(5));
+        fresh.mode = PlayMode::Shuffle;
+        fresh.prepare_shuffle_round();
+        fresh.reset_shuffle_round();
+        let current = fresh.index();
+        assert!(fresh.upcoming().is_empty());
+        let next = fresh
+            .advance_playable(|id| id == current.to_string())
+            .expect("其他曲目可播时应开新一轮");
+        assert_ne!(next.id, current.to_string());
+        assert!(!fresh.upcoming().is_empty(), "新一轮要立刻可见，面板不能空");
+        assert!(fresh.upcoming().iter().all(|index| *index != current));
     }
 
     #[test]

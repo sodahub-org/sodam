@@ -8,8 +8,9 @@
 //! 「签名」要单列得等上游补结构化相位。
 
 use libresoda::SodaError;
+use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 失败发生的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +153,116 @@ impl fmt::Display for PlaybackFailure {
 }
 
 impl std::error::Error for PlaybackFailure {}
+
+/// 一条不可播结论：何时确认、当时的可重试性。
+///
+/// 时间用来做容量淘汰的先进先出；可重试性用来决定「先淘汰谁」。
+#[derive(Debug, Clone, Copy)]
+struct UnplayableEntry {
+    recorded_at: Instant,
+    retryability: Retryability,
+}
+
+/// 会话内的「按曲目不可播」集合：只回答「要不要再为这首打网络」。
+///
+/// 作用域是**账号 × 本次会话**：
+/// * 只由按曲目类失败写入（[`PlaybackFailure::is_per_track`]），全局故障写进来会把
+///   整屏曲目误标成不可播；
+/// * 账号 id 或会员状态任一变化即整份作废（[`Self::invalidate_if_account_changed`]）；
+/// * 不落盘，也不参与缓存文件的有效性判断——缓存命中发生在任何网络请求之前。
+#[derive(Debug, Clone, Default)]
+pub struct UnplayableTracks {
+    entries: HashMap<String, UnplayableEntry>,
+}
+
+impl UnplayableTracks {
+    /// 容量上限沿用预取失败表的既有上限（256），超界时淘汰最旧的条目。
+    pub const CAPACITY: usize = 256;
+
+    pub fn contains(&self, track_id: &str) -> bool {
+        self.entries.contains_key(track_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻。
+    pub fn record(&mut self, track_id: &str, retryability: Retryability) {
+        self.record_at(track_id, retryability, Instant::now());
+    }
+
+    /// 按失败分类写入：**只有按曲目类写**，全局故障一律不写。
+    ///
+    /// 一次签名服务故障若写进来，整屏曲目都会被标成「账号不能放」，
+    /// 所以这条判据必须留在集合自己的入口上，而不是指望每个调用点记得先判断。
+    /// 返回是否真的写入。
+    pub fn record_failure(&mut self, track_id: &str, failure: &PlaybackFailure) -> bool {
+        if !failure.is_per_track() {
+            return false;
+        }
+        self.record(track_id, failure.retryability);
+        true
+    }
+
+    fn record_at(&mut self, track_id: &str, retryability: Retryability, at: Instant) {
+        self.entries.insert(
+            track_id.to_string(),
+            UnplayableEntry {
+                recorded_at: at,
+                retryability,
+            },
+        );
+        self.evict_over_capacity();
+    }
+
+    /// 账号 id 或会员状态任一变化 → 整份作废。返回是否真的作废过。
+    ///
+    /// `previous` 为 `None` 表示此前没有账号身份（启动 / 退出登录后）。
+    pub fn invalidate_if_account_changed(
+        &mut self,
+        previous: Option<(&str, bool)>,
+        current: (&str, bool),
+    ) -> bool {
+        if previous.is_some_and(|previous| previous != current) {
+            self.clear();
+            return true;
+        }
+        false
+    }
+
+    /// 超界时**先**清瞬时类条目，再按失败时刻对剩余条目先进先出。
+    ///
+    /// 瞬时类（网络抖动被误判成按曲目时）更可能自行恢复，先丢它们；
+    /// 确定性的按曲目结论留得久一点，避免刚确认过又去白打一次网络。
+    fn evict_over_capacity(&mut self) {
+        while self.entries.len() > Self::CAPACITY {
+            let transient = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.retryability != Retryability::Never)
+                .min_by_key(|(_, entry)| entry.recorded_at)
+                .map(|(track_id, _)| track_id.clone());
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.recorded_at)
+                .map(|(track_id, _)| track_id.clone());
+            let Some(victim) = transient.or(oldest) else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+}
 
 /// 把 `SodaError` 翻译成播放尝试的失败分类。
 ///
@@ -728,6 +839,120 @@ mod tests {
             strip_urls_for_user("回退（https://x.test/a）后失败"),
             "回退（）后失败"
         );
+    }
+
+    #[test]
+    fn unplayable_set_records_and_clears() {
+        let mut set = UnplayableTracks::default();
+        assert!(set.is_empty());
+        set.record("track-1", Retryability::Never);
+        set.record("track-2", Retryability::Never);
+        assert!(set.contains("track-1"));
+        assert!(set.contains("track-2"));
+        assert_eq!(set.len(), 2);
+        assert!(!set.contains("track-3"));
+        set.clear();
+        assert!(set.is_empty());
+    }
+
+    /// 集合只由按曲目类失败写入：一次签名服务故障不能把整屏曲目标成不可播。
+    #[test]
+    fn unplayable_set_only_accepts_per_track_failures() {
+        let mut set = UnplayableTracks::default();
+
+        for error in [
+            SodaError::http("signer error: bad token"),
+            SodaError::http("http request failed: status 401 (https://x.test)"),
+            SodaError::invalid_input("feed requires cookie"),
+            SodaError::Io("disk full".into()),
+            SodaError::http("io: timed out reading response"),
+        ] {
+            let failure = failure(error);
+            assert!(
+                !set.record_failure("track-1", &failure),
+                "全局 / 非确定性失败不该写入：{failure:?}"
+            );
+            assert!(set.is_empty(), "{failure:?}");
+        }
+
+        let per_track = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        assert!(set.record_failure("track-1", &per_track));
+        assert!(set.contains("track-1"));
+    }
+
+    /// 账号 id 或会员状态任一变化就整份作废；没变时一条都不能丢。
+    #[test]
+    fn unplayable_set_invalidates_only_when_account_identity_changes() {
+        let mut set = UnplayableTracks::default();
+        set.record("track-1", Retryability::Never);
+
+        // 同一账号、同一会员状态：保留。
+        assert!(!set.invalidate_if_account_changed(Some(("user-a", true)), ("user-a", true)));
+        assert!(set.contains("track-1"));
+
+        // 会员状态变化：作废。
+        assert!(set.invalidate_if_account_changed(Some(("user-a", true)), ("user-a", false)));
+        assert!(set.is_empty());
+
+        // 换账号：作废。
+        set.record("track-2", Retryability::Never);
+        assert!(set.invalidate_if_account_changed(Some(("user-a", false)), ("user-b", false)));
+        assert!(set.is_empty());
+
+        // 此前没有账号身份（刚启动 / 退出登录后）：没有可作废的结论。
+        set.record("track-3", Retryability::Never);
+        assert!(!set.invalidate_if_account_changed(None, ("user-b", false)));
+        assert!(set.contains("track-3"));
+    }
+
+    /// 超界时先清瞬时类，再按失败时刻先进先出。
+    #[test]
+    fn unplayable_set_evicts_transient_entries_before_permanent_ones() {
+        let base = Instant::now();
+        let at = |millis: u64| base + Duration::from_millis(millis);
+        let mut set = UnplayableTracks::default();
+        // 两条确定性结论最早写入，但不应先于瞬时条目被淘汰。
+        set.record_at("keep-a", Retryability::Never, at(0));
+        set.record_at("keep-b", Retryability::Never, at(1));
+        for index in 0..(UnplayableTracks::CAPACITY - 2) {
+            set.record_at(
+                &format!("transient-{index}"),
+                Retryability::Transient,
+                at(10 + index as u64),
+            );
+        }
+        assert_eq!(set.len(), UnplayableTracks::CAPACITY);
+
+        set.record_at("overflow", Retryability::Transient, at(9_000));
+        assert_eq!(set.len(), UnplayableTracks::CAPACITY);
+        assert!(set.contains("keep-a"), "确定性条目不该先被淘汰");
+        assert!(set.contains("keep-b"), "确定性条目不该先被淘汰");
+        assert!(!set.contains("transient-0"), "最旧的瞬时条目应先出局");
+        assert!(set.contains("overflow"));
+    }
+
+    #[test]
+    fn unplayable_set_evicts_permanent_entries_first_in_first_out() {
+        let base = Instant::now();
+        let mut set = UnplayableTracks::default();
+        for index in 0..UnplayableTracks::CAPACITY {
+            set.record_at(
+                &format!("track-{index}"),
+                Retryability::Never,
+                base + Duration::from_millis(index as u64),
+            );
+        }
+        set.record_at(
+            "newest",
+            Retryability::Never,
+            base + Duration::from_millis(9_000),
+        );
+        assert_eq!(set.len(), UnplayableTracks::CAPACITY);
+        assert!(!set.contains("track-0"), "最旧的确定性条目应先出局");
+        assert!(set.contains("track-1"));
+        assert!(set.contains("newest"));
     }
 
     #[test]

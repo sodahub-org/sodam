@@ -92,6 +92,19 @@ impl Root {
             if self.prefetch_inflight.len() >= max_inflight {
                 break;
             }
+            // 已确认当前账号放不出来的曲目不再预取：那只是在为已知结论重复打网络。
+            // 集合作废（账号 / 会员状态变化）后才重新参与。
+            if self.unplayable.contains(&next.id) {
+                if log {
+                    log_event(
+                        LogLevel::Debug,
+                        LogTopic::Prefetch,
+                        "skip_unplayable",
+                        &[("track_id", next.id.as_str())],
+                    );
+                }
+                continue;
+            }
             // 已经在缓存里就不用再排（继续看更后面的：多首预取的意义）
             if let Some(session) = &self.session {
                 if session.is_cached(&next.id) {
@@ -210,6 +223,20 @@ impl Root {
                 let snap = root.engine.snapshot();
                 // 播放进度 / 时长上报：喂一拍快照（内部异步发请求，不阻塞）
                 root.play_reporter.observe(&snap);
+                // 「这一轮没有能播的歌了」只在条件仍成立时留着：账号 / 会员状态变化
+                // 让集合作废、或队列换成了一批新歌之后，常驻错误要自己撤下，不等用户关。
+                if root.round_exhausted {
+                    let has_playable = {
+                        let unplayable = &root.unplayable;
+                        root.queue
+                            .next_playable(|id| unplayable.contains(id))
+                            .is_some()
+                    };
+                    if has_playable {
+                        root.round_exhausted = false;
+                        root.playback_error = None;
+                    }
+                }
                 // 加载完成：引擎已切到 pending 曲目 → 清 loading 态
                 if root.pending_engine_load == Some(snap.load_seq) {
                     root.pending_engine_load = None;
@@ -259,7 +286,13 @@ impl Root {
                 // 「再试几首」，而网络恢复该由用户按下播放来确认。
                 let should_advance = current && !root.playback_halted;
                 if snap.finished && should_advance && root.pending_track.is_none() {
-                    root.next_track(cx);
+                    if root.queue.mode == PlayMode::RepeatOne {
+                        // 播完重播：单曲循环的正常语义，不能拿「不可播的前进」替换。
+                        root.next_track(cx);
+                    } else {
+                        // 自动续播同样先查不可播集合：已确认放不出来的歌不再白打一次网络。
+                        root.auto_advance_track(cx);
+                    }
                 }
                 // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
@@ -735,6 +768,14 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
+                                        // 换了一份登录凭据：旧账号的不可播结论不再适用。
+                                        // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
+                                        // 但账号信息读取失败时拿不到新身份，这里先保守作废。
+                                        root.unplayable.clear();
+                                        if root.round_exhausted {
+                                            root.round_exhausted = false;
+                                            root.playback_error = None;
+                                        }
                                         root.set_status_text(
                                             language
                                                 .text("登录成功，正在读取账号信息…")
@@ -842,6 +883,21 @@ impl Root {
                         let vip = info.vip;
                         if !info.avatar_url.trim().is_empty() {
                             root.ensure_covers(std::slice::from_ref(&info.avatar_url.clone()), cx);
+                        }
+                        // 不可播结论的作用域是「账号 × 会话」：账号 id 或会员状态
+                        // 任一变化就整份作废，否则换号 / 刚续费的用户仍会被旧结论挡住。
+                        let previous = root
+                            .account
+                            .as_ref()
+                            .map(|account| (account.user_id.as_str(), account.vip));
+                        let invalidated = root.unplayable.invalidate_if_account_changed(
+                            previous,
+                            (info.user_id.as_str(), info.vip),
+                        );
+                        if invalidated && root.round_exhausted {
+                            // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
+                            root.round_exhausted = false;
+                            root.playback_error = None;
                         }
                         root.account = Some(info.clone());
                         root.play_reporter.set_user_id(info.user_id.clone());
@@ -1073,6 +1129,7 @@ impl Root {
         self.queue.replace(tracks, 0);
         self.played_history.clear();
         self.playback_error = None;
+        self.round_exhausted = false;
         self.queue_origin = match source.scene.as_ref() {
             Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
             None => QueueOrigin::Feed,
@@ -1450,6 +1507,7 @@ impl Root {
         self.lyrics_error = None;
         self.loading_lyrics = false;
         self.playback_error = None;
+        self.round_exhausted = false;
     }
 
     /// 歌词滚动过渡的时长范围与换算。
@@ -1746,6 +1804,7 @@ impl Root {
                                 root.queue.replace(tracks, 0);
                                 root.played_history.clear();
                                 root.playback_error = None;
+                                root.round_exhausted = false;
                                 root.queue_origin = QueueOrigin::Radio(card.playlist.id.clone());
                                 root.recommendation = None;
                                 root.sync_queue_cache();
@@ -1808,6 +1867,7 @@ impl Root {
                         root.queue.replace(tracks, 0);
                         root.played_history.clear();
                         root.playback_error = None;
+                        root.round_exhausted = false;
                         root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
                         root.recommendation = None;
                         root.switching_queue = None;
@@ -1921,6 +1981,9 @@ impl Root {
         self.playing = false;
         self.pending_track = None;
         self.playback_error = None;
+        // 不可播结论按账号 × 会话隔离：退出后旧账号的结论一条都不留。
+        self.unplayable.clear();
+        self.round_exhausted = false;
         self.queue = Queue::new(Vec::new());
         self.played_history.clear();
         self.sync_queue_cache();
@@ -2823,6 +2886,38 @@ impl Root {
         self.engine.pause();
     }
 
+    /// 扫一圈都没有可播候选：落闸，并把本轮结论留在常驻错误位。
+    ///
+    /// 条件解除（账号 / 会员状态变化让集合作废、或队列换新）后由心跳自动撤下。
+    pub(crate) fn halt_exhausted_round(&mut self) {
+        let message = self.tr("这一轮没有能播的歌了").to_string();
+        self.round_exhausted = true;
+        self.playback_error = Some(message.clone());
+        self.notify_error_once("round-exhausted", message);
+        self.halt_playback();
+    }
+
+    /// 自动续播（曲目播完）：按不可播集合选下一个候选，不再为已知不可播的曲目打网络。
+    ///
+    /// 与 [`Self::next_track`] 分开，是因为手动「下一首」是用户显式动作，
+    /// 单曲循环下的「播完重播」也仍走 [`Self::next_track`] 的既有语义。
+    pub(crate) fn auto_advance_track(&mut self, cx: &mut Context<Self>) {
+        self.progress_preview = None;
+        let has_candidate = {
+            let unplayable = &self.unplayable;
+            self.queue
+                .advance_playable(|id| unplayable.contains(id))
+                .is_some()
+        };
+        if !has_candidate {
+            self.halt_exhausted_round();
+            cx.notify();
+            return;
+        }
+        self.sync_queue_cache();
+        self.start_track(cx);
+    }
+
     /// 用户明确要求继续播放：熔断回到半开，连败重新数。
     ///
     /// 只在「本来落着闸」时复位，自动跳歌那条路（还没到封顶阈值）不会路过这里，
@@ -2948,6 +3043,7 @@ impl Root {
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
                         root.playback_error = None;
+                        root.round_exhausted = false;
                         // 记录真实播放历史（去重最近一条，避免重复刷屏）
                         if root.played_history.last().map(String::as_str) != Some(track.id.as_str())
                         {
@@ -3005,64 +3101,75 @@ impl Root {
                         // 这次尝试失败了：它之前的「播出去」不再为它抵账。
                         root.progress_token = None;
 
-                        // 「已跳过」只有在真的换到下一首时才能说。封顶落闸、空队列、
-                        // 单曲循环 / 只有一首都不会前进，它们改由常驻错误位或非跳过文案说明。
-                        let skip = should_skip_to_next(&failure);
-                        let cap_reached =
-                            skip && root.consecutive_failures + 1 >= PLAY_FAILURE_HALT_AFTER;
-                        let will_advance =
-                            root.queue.len() > 1 && root.queue.mode != PlayMode::RepeatOne;
-                        let skip_now = skip && !cap_reached && will_advance;
-                        // 按曲目不可播却无处可去（单曲循环 / 只有一首）或已经封顶：
-                        // 这次不会真的前进，原因留在常驻位，不再谎称「已跳过」。
-                        let per_track_stops =
-                            failure.is_per_track() && (!will_advance || cap_reached);
-                        let message = root.tr(play_failure_text(&failure, skip_now)).to_string();
-
                         if failure.is_per_track() {
-                            if per_track_stops {
-                                root.playback_error = Some(message.clone());
-                            } else {
+                            // 按曲目不可播：先写进会话集合，再按「扫一圈」找下一个可播候选。
+                            // 查集合发生在任何网络请求之前——命中集合的曲目不会被装载，
+                            // 同一首在本轮只会产生一次 attempt_start。
+                            root.unplayable.record_failure(&track.id, &failure);
+                            let has_candidate = {
+                                let unplayable = &root.unplayable;
+                                root.queue
+                                    .advance_playable(|id| unplayable.contains(id))
+                                    .is_some()
+                            };
+                            if has_candidate {
+                                let message =
+                                    root.tr(play_failure_text(&failure, true)).to_string();
                                 // 真的前进时撤下与这次结论无关的旧常驻错误。
                                 root.playback_error = None;
+                                root.round_exhausted = false;
                                 root.notify_warning_once("track-unavailable", message);
-                            }
-                        } else if skip_now {
-                            // 可前进的非按曲目失败（网络抖动）：同属一次性反馈，
-                            // 常驻错误位只留给落闸与全局故障。
-                            root.playback_error = None;
-                            root.notify_warning_once("track-stream-failed", message);
-                        } else {
-                            root.playback_error = Some(message.clone());
-                            root.notify_warning_once("track-stream-failed", message);
-                        }
-
-                        if skip {
-                            // 已知中间态（#106）：按曲目类失败本票仍计入连败封顶，
-                            // 由 #108「不可播集合驱动扫一圈」把它从计数里摘出去。
-                            root.consecutive_failures += 1;
-                            if failure.is_per_track() && !will_advance {
-                                // 同一首确定性失败且没有别的歌可换：原地重试只会白等。
-                                // 停在当前曲目，原因已在常驻位；#108 接上真正的前进后再换。
-                                root.halt_playback();
-                            } else if cap_reached {
-                                root.halt_playback();
-                                let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
-                                root.playback_error = Some(halted.clone());
-                                root.notify_error_once("consecutive-stream-failures", halted);
-                            } else if !root.queue.is_empty() {
-                                root.next_track(cx);
+                                root.progress_preview = None;
+                                root.sync_queue_cache();
+                                root.start_track(cx);
                             } else {
-                                // 没有下一首可换：停在当前状态，并把原因留在常驻位。
-                                root.playback_error =
-                                    Some(root.tr(play_failure_text(&failure, false)).to_string());
-                                root.halt_playback();
+                                // 扫一圈都确认放不出来：落闸，并把本轮结论留在常驻位。
+                                root.halt_exhausted_round();
                             }
                         } else {
-                            // 全局性故障（登录 / 签名服务 / 缺 Cookie / 磁盘）：换一首也一样失败。
-                            // 停下并把修复动作留在状态里，别用连续跳过把全局故障
-                            // 伪装成「这几首运气不好」。
-                            root.halt_playback();
+                            // 非确定性失败（网络抖动、传输截断、签名地址过期、限流、
+                            // 服务端 5xx、解密失败）仍按连败封顶停下，别整晚静音空转。
+                            // 「已跳过」只有在真的换到下一首时才能说。封顶落闸、空队列、
+                            // 单曲循环 / 只有一首都不会前进，改由常驻错误位或非跳过文案说明。
+                            let skip = should_skip_to_next(&failure);
+                            let cap_reached =
+                                skip && root.consecutive_failures + 1 >= PLAY_FAILURE_HALT_AFTER;
+                            let will_advance =
+                                root.queue.len() > 1 && root.queue.mode != PlayMode::RepeatOne;
+                            let skip_now = skip && !cap_reached && will_advance;
+                            let message =
+                                root.tr(play_failure_text(&failure, skip_now)).to_string();
+                            if skip_now {
+                                // 可前进的非按曲目失败：同属一次性反馈，
+                                // 常驻错误位只留给落闸与全局故障。
+                                root.playback_error = None;
+                                root.notify_warning_once("track-stream-failed", message);
+                            } else {
+                                root.playback_error = Some(message.clone());
+                                root.notify_warning_once("track-stream-failed", message);
+                            }
+                            if skip {
+                                root.consecutive_failures += 1;
+                                if cap_reached {
+                                    root.halt_playback();
+                                    let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
+                                    root.playback_error = Some(halted.clone());
+                                    root.notify_error_once("consecutive-stream-failures", halted);
+                                } else if !root.queue.is_empty() {
+                                    root.next_track(cx);
+                                } else {
+                                    // 没有下一首可换：停在当前状态，并把原因留在常驻位。
+                                    root.playback_error = Some(
+                                        root.tr(play_failure_text(&failure, false)).to_string(),
+                                    );
+                                    root.halt_playback();
+                                }
+                            } else {
+                                // 全局性故障（登录 / 签名服务 / 缺 Cookie / 磁盘）：换一首也一样失败。
+                                // 停下并把修复动作留在状态里，别用连续跳过把全局故障
+                                // 伪装成「这几首运气不好」。
+                                root.halt_playback();
+                            }
                         }
                     }
                 }
