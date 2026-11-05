@@ -459,6 +459,11 @@ pub struct Root {
         HashMap<String, (std::time::Instant, sodam_core::failure::Retryability)>,
     /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）补一次预取。
     pub(crate) prefetch_patrol: u32,
+    /// 登录凭据代数：重新登录成功或退出登录时 +1。
+    ///
+    /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
+    /// 结论），回来时不能挂起刚恢复的管线，也不能写回已作废的不可播集合。
+    pub(crate) auth_epoch: u64,
     /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
     /// 与 `prefetch_failed`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
@@ -703,6 +708,7 @@ impl Root {
             prefetch_inflight: HashSet::new(),
             prefetch_failed: HashMap::new(),
             prefetch_patrol: 0,
+            auth_epoch: 0,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_maintenance_running: false,

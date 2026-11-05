@@ -74,6 +74,9 @@ impl Root {
             return;
         }
         let log = log_outlet::enabled(LogLevel::Debug, LogTopic::Prefetch);
+        // 这次请求属于哪一份登录凭据：回来时若已经换过（重新登录 / 退出），
+        // 失败结论属于旧身份，不能用来挂起刚恢复的管线。
+        let auth_epoch = self.auth_epoch;
         let ahead = prefetch_ahead_count();
         let max_inflight = prefetch_concurrency().max(1);
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
@@ -200,6 +203,19 @@ impl Root {
                             root.prefetch_failed.remove(&track.id);
                         }
                         Err(failure) => {
+                            // 这次请求跨过一次登录变更：结论属于旧身份，既不挂起
+                            // 已经恢复的管线，也不写回已作废的不可播集合。
+                            if root.auth_epoch != auth_epoch {
+                                if log {
+                                    log_event(
+                                        LogLevel::Debug,
+                                        LogTopic::Prefetch,
+                                        "stale_after_auth_change",
+                                        &[("track_id", track.id.as_str())],
+                                    );
+                                }
+                                return;
+                            }
                             let now = std::time::Instant::now();
                             if failure.is_per_track() {
                                 // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
@@ -794,7 +810,10 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
-                                        // 换了一份登录凭据：旧账号的不可播结论不再适用。
+                                        // 换了一份登录凭据：先推进代数，在途预取回来时
+                                        // 才知道自己属于旧身份。
+                                        root.auth_epoch = root.auth_epoch.wrapping_add(1);
+                                        // 旧账号的不可播结论不再适用。
                                         // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
                                         // 但账号信息读取失败时拿不到新身份，这里先保守作废。
                                         root.unplayable.clear();
@@ -2010,6 +2029,8 @@ impl Root {
         self.pending_track = None;
         self.playback_error = None;
         // 不可播结论按账号 × 会话隔离：退出后旧账号的结论一条都不留。
+        // 在途预取回来后按代数丢弃，不能再写回这张已经清空的表。
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.unplayable.clear();
         self.clear_round_exhaustion();
         self.queue = Queue::new(Vec::new());
@@ -3278,6 +3299,7 @@ impl Root {
         cx.notify();
     }
 
+    /// 用户点了下一首（按钮 / 快捷键 / 媒体键）：算主动播放，自动路径见 [`Self::advance_next`]。
     pub fn next_track(&mut self, cx: &mut Context<Self>) {
         self.advance_next(true, cx);
     }
@@ -3293,6 +3315,7 @@ impl Root {
         self.start_track(user_initiated, cx);
     }
 
+    /// 用户点了上一首：同样算主动播放。
     pub fn prev_track(&mut self, cx: &mut Context<Self>) {
         self.progress_preview = None;
         self.queue.rewind();

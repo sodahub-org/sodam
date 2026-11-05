@@ -104,6 +104,7 @@ impl PrefetchGate {
         self.resume(SuspensionClass::Disk)
     }
 
+    /// 解除指定故障类的挂起：恢复信号只认匹配的那一类，别的类原样保留。
     fn resume(&mut self, class: SuspensionClass) -> Option<SuspensionClass> {
         if self.suspension() == Some(class) {
             self.suspended = None;
