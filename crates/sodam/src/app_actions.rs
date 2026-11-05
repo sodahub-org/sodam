@@ -941,6 +941,9 @@ impl Root {
                             (info.user_id.as_str(), info.vip),
                         );
                         if invalidated {
+                            // 身份变了：在途预取带着旧账号 / 旧会员状态起跑，
+                            // 它们的结论同样不能写回刚作废的集合或挂起管线。
+                            root.auth_epoch = root.auth_epoch.wrapping_add(1);
                             // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
                             root.clear_round_exhaustion();
                         }
@@ -3085,6 +3088,8 @@ impl Root {
 
         let settings = self.settings.clone();
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
+        // 这次尝试属于哪一份登录身份：回来时若已经换过，结论不成立。
+        let auth_epoch = self.auth_epoch;
         let work_track = track.clone();
         // 单层预算：还要不要再来一次由**这次失败的分类**决定。
         // 之前是无条件 3 次线性退避，于是「这首已下架」「签名服务要求鉴权」这类
@@ -3197,6 +3202,12 @@ impl Root {
                         root.pending_track = None;
                         // 这次尝试失败了：它之前的「播出去」不再为它抵账。
                         root.progress_token = None;
+                        // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，别用它
+                        // 落闸、挂预取、写不可播集合，也别替用户跳歌。
+                        if root.auth_epoch != auth_epoch {
+                            root.playing = root.engine.snapshot().playing;
+                            return;
+                        }
                         // 全局故障同样挂起预取：装载这条路先看见了故障，
                         // 预取没理由继续一轮轮重打那台共享签名服务。
                         root.suspend_prefetch(&failure);
