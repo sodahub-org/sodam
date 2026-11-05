@@ -1163,6 +1163,7 @@ impl Root {
         .detach();
     }
 
+    /// 把推荐流 / 听歌模式的曲目装进队列；`autoplay` 为假时停在待播状态。
     pub(crate) fn activate_recommended_queue(
         &mut self,
         source: RecommendationSource,
@@ -3025,6 +3026,7 @@ impl Root {
         }
     }
 
+    /// 播放 / 暂停：引擎没装载当前曲目时先装载，否则只切换播放状态。
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.pending_track.is_some() {
             return;

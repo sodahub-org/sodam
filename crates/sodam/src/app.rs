@@ -523,6 +523,7 @@ pub struct Root {
 }
 
 impl Root {
+    /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut settings = Settings::load().merged_with_env();
         // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
