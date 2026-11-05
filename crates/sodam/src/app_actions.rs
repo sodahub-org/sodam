@@ -2920,6 +2920,18 @@ impl Root {
                 .is_some()
         };
         if !has_candidate {
+            // 扫一圈只剩当前这首：它没被确认不可播就接着放——列表循环绕回自己，
+            // 随机播放视为新一轮只剩这一首。只有当前这首也在不可播集合里时，
+            // 「这一轮没有能播的歌了」才是真话。
+            let current_playable = self
+                .queue
+                .current()
+                .is_some_and(|track| !self.unplayable.contains(&track.id));
+            if current_playable {
+                self.sync_queue_cache();
+                self.start_track(cx);
+                return;
+            }
             self.halt_exhausted_round();
             cx.notify();
             return;
