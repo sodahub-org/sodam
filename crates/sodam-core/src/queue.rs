@@ -241,10 +241,7 @@ impl Queue {
 
     /// 生成一轮随机顺序（不含当前曲目），并从中移除已取走的元素。
     fn build_shuffle_round(&self) -> Vec<usize> {
-        let round: Vec<usize> = (0..self.tracks.len())
-            .filter(|index| *index != self.index)
-            .collect();
-        shuffled_indices(round)
+        self.build_playable_round(&|_: &str| false)
     }
 
     /// 从当前位置之后求**下一个可播曲目**（纯查询，不改队列状态）。
@@ -283,6 +280,21 @@ impl Queue {
     /// 随机播放会同步本轮待播顺序：跳过的已知不可播项从轮次里摘掉，
     /// 本轮确实没得播时只按可播曲目开新一轮，避免下一轮又把这些歌排进来。
     pub fn advance_playable(&mut self, unavailable: impl Fn(&str) -> bool) -> Option<&TrackItem> {
+        // 随机播放里「上一首」之后的下一次前进应回到被放弃的那首，语义与 `advance`
+        // 一致。它若已确认不可播，就丢掉这条回退意图，继续找可播候选。
+        if self.mode == PlayMode::Shuffle {
+            if let Some(redo) = self.redo.take() {
+                let playable = redo < self.tracks.len()
+                    && redo != self.index
+                    && !unavailable(self.tracks[redo].id.as_str());
+                if playable {
+                    self.bump();
+                    self.history.push(self.index);
+                    self.index = redo;
+                    return self.current();
+                }
+            }
+        }
         let candidate = self.next_playable(&unavailable)?;
         self.bump();
         match self.mode {
@@ -750,6 +762,39 @@ mod tests {
         assert_ne!(next.id, current.to_string());
         assert!(!fresh.upcoming().is_empty(), "新一轮要立刻可见，面板不能空");
         assert!(fresh.upcoming().iter().all(|index| *index != current));
+    }
+
+    /// 随机播放的自动续播也要尊重「上一首 → 下一首」的 redo：回到被放弃的那首；
+    /// 那首已确认不可播时，丢掉回退意图继续找候选。
+    #[test]
+    fn shuffle_advance_playable_honors_redo() {
+        let mut queue = Queue::new(tracks(5));
+        queue.mode = PlayMode::Shuffle;
+        queue.prepare_shuffle_round();
+        let first = queue.index();
+        queue.advance();
+        let second = queue.index();
+        queue.rewind();
+        assert_eq!(queue.index(), first);
+        assert_eq!(
+            queue.advance_playable(|_| false).unwrap().id,
+            second.to_string(),
+            "redo 应回到被放弃的那首"
+        );
+        assert_eq!(queue.index(), second);
+
+        // redo 指向已确认不可播的曲目：不再回去，按候选继续前进。
+        let mut blocked = Queue::new(tracks(5));
+        blocked.mode = PlayMode::Shuffle;
+        blocked.prepare_shuffle_round();
+        blocked.advance();
+        let abandoned = blocked.index();
+        blocked.rewind();
+        let next = blocked
+            .advance_playable(|id| id == abandoned.to_string())
+            .expect("还有其他可播曲目");
+        assert_ne!(next.id, abandoned.to_string());
+        assert!(blocked.redo.is_none(), "不可用的回退意图要被丢掉");
     }
 
     #[test]

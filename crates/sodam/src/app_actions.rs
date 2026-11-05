@@ -225,17 +225,8 @@ impl Root {
                 root.play_reporter.observe(&snap);
                 // 「这一轮没有能播的歌了」只在条件仍成立时留着：账号 / 会员状态变化
                 // 让集合作废、或队列换成了一批新歌之后，常驻错误要自己撤下，不等用户关。
-                if root.round_exhausted {
-                    let has_playable = {
-                        let unplayable = &root.unplayable;
-                        root.queue
-                            .next_playable(|id| unplayable.contains(id))
-                            .is_some()
-                    };
-                    if has_playable {
-                        root.round_exhausted = false;
-                        root.playback_error = None;
-                    }
+                if root.round_exhausted.is_some() && root.has_playable_ahead() {
+                    root.clear_round_exhaustion();
                 }
                 // 加载完成：引擎已切到 pending 曲目 → 清 loading 态
                 if root.pending_engine_load == Some(snap.load_seq) {
@@ -772,10 +763,7 @@ impl Root {
                                         // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
                                         // 但账号信息读取失败时拿不到新身份，这里先保守作废。
                                         root.unplayable.clear();
-                                        if root.round_exhausted {
-                                            root.round_exhausted = false;
-                                            root.playback_error = None;
-                                        }
+                                        root.clear_round_exhaustion();
                                         root.set_status_text(
                                             language
                                                 .text("登录成功，正在读取账号信息…")
@@ -894,10 +882,9 @@ impl Root {
                             previous,
                             (info.user_id.as_str(), info.vip),
                         );
-                        if invalidated && root.round_exhausted {
+                        if invalidated {
                             // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
-                            root.round_exhausted = false;
-                            root.playback_error = None;
+                            root.clear_round_exhaustion();
                         }
                         root.account = Some(info.clone());
                         root.play_reporter.set_user_id(info.user_id.clone());
@@ -1129,7 +1116,7 @@ impl Root {
         self.queue.replace(tracks, 0);
         self.played_history.clear();
         self.playback_error = None;
-        self.round_exhausted = false;
+        self.clear_round_exhaustion();
         self.queue_origin = match source.scene.as_ref() {
             Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
             None => QueueOrigin::Feed,
@@ -1507,7 +1494,7 @@ impl Root {
         self.lyrics_error = None;
         self.loading_lyrics = false;
         self.playback_error = None;
-        self.round_exhausted = false;
+        self.clear_round_exhaustion();
     }
 
     /// 歌词滚动过渡的时长范围与换算。
@@ -1804,7 +1791,7 @@ impl Root {
                                 root.queue.replace(tracks, 0);
                                 root.played_history.clear();
                                 root.playback_error = None;
-                                root.round_exhausted = false;
+                                root.clear_round_exhaustion();
                                 root.queue_origin = QueueOrigin::Radio(card.playlist.id.clone());
                                 root.recommendation = None;
                                 root.sync_queue_cache();
@@ -1867,7 +1854,7 @@ impl Root {
                         root.queue.replace(tracks, 0);
                         root.played_history.clear();
                         root.playback_error = None;
-                        root.round_exhausted = false;
+                        root.clear_round_exhaustion();
                         root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
                         root.recommendation = None;
                         root.switching_queue = None;
@@ -1983,7 +1970,7 @@ impl Root {
         self.playback_error = None;
         // 不可播结论按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         self.unplayable.clear();
-        self.round_exhausted = false;
+        self.clear_round_exhaustion();
         self.queue = Queue::new(Vec::new());
         self.played_history.clear();
         self.sync_queue_cache();
@@ -2698,6 +2685,8 @@ impl Root {
             .unwrap_or_default();
         let covers: Vec<String> = tracks.iter().map(|track| track.cover.clone()).collect();
         self.queue.replace(tracks, index);
+        // 换了一轮队列：上一轮的「整圈无候选」结论不再成立。
+        self.clear_round_exhaustion();
         // 列表整体换队时清掉旧播放历史，避免抽屉把上一批队列误标成“已播放”。
         self.played_history.clear();
         // 换队时保留用户选好的播放模式：之前这里强制重置成顺序播放，
@@ -2891,10 +2880,29 @@ impl Root {
     /// 条件解除（账号 / 会员状态变化让集合作废、或队列换新）后由心跳自动撤下。
     pub(crate) fn halt_exhausted_round(&mut self) {
         let message = self.tr("这一轮没有能播的歌了").to_string();
-        self.round_exhausted = true;
+        self.round_exhausted = Some(message.clone());
         self.playback_error = Some(message.clone());
         self.notify_error_once("round-exhausted", message);
         self.halt_playback();
+    }
+
+    /// 撤下「这一轮没有能播的歌了」。
+    ///
+    /// 只在常驻位还挂着这句时才清空：期间它可能已被别的错误占用，不能顺手抹掉。
+    pub(crate) fn clear_round_exhaustion(&mut self) {
+        if let Some(message) = self.round_exhausted.take() {
+            if self.playback_error.as_deref() == Some(message.as_str()) {
+                self.playback_error = None;
+            }
+        }
+    }
+
+    /// 当前位置之后是否还有可播候选（不含当前曲目）。
+    fn has_playable_ahead(&self) -> bool {
+        let unplayable = &self.unplayable;
+        self.queue
+            .next_playable(|id| unplayable.contains(id))
+            .is_some()
     }
 
     /// 自动续播（曲目播完）：按不可播集合选下一个候选，不再为已知不可播的曲目打网络。
@@ -3043,7 +3051,7 @@ impl Root {
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
                         root.playback_error = None;
-                        root.round_exhausted = false;
+                        root.clear_round_exhaustion();
                         // 记录真实播放历史（去重最近一条，避免重复刷屏）
                         if root.played_history.last().map(String::as_str) != Some(track.id.as_str())
                         {
@@ -3117,7 +3125,7 @@ impl Root {
                                     root.tr(play_failure_text(&failure, true)).to_string();
                                 // 真的前进时撤下与这次结论无关的旧常驻错误。
                                 root.playback_error = None;
-                                root.round_exhausted = false;
+                                root.clear_round_exhaustion();
                                 root.notify_warning_once("track-unavailable", message);
                                 root.progress_preview = None;
                                 root.sync_queue_cache();

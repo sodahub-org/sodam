@@ -434,8 +434,11 @@ pub struct Root {
     /// 只由按曲目类失败写入，账号 id / 会员状态变化即整份作废；不落盘，
     /// 也不参与缓存文件的有效性判断。只回答「要不要再为这首打网络」。
     pub(crate) unplayable: UnplayableTracks,
-    /// 「这一轮没有能播的歌了」是否仍然成立：条件解除后常驻错误自动撤下。
-    pub(crate) round_exhausted: bool,
+    /// 「这一轮没有能播的歌了」的常驻文案：`Some` 表示这句话仍挂在常驻错误位。
+    ///
+    /// 存文案而不只存布尔，是为了条件解除时只撤下自己这一句——期间常驻位可能已经
+    /// 被别的错误占用，不能顺手抹掉。
+    pub(crate) round_exhausted: Option<String>,
     /// 最近一次**成功装载**交给引擎的序号；任何一次装载失败都把它作废。
     ///
     /// 连败复位只认「这个序号 == 引擎当前快照的 load_seq」，也就是进展必须归属于
@@ -583,7 +586,7 @@ impl Root {
             playback_error: None,
             consecutive_failures: 0,
             unplayable: UnplayableTracks::default(),
-            round_exhausted: false,
+            round_exhausted: None,
             progress_token: None,
             playback_halted: false,
             playing: false,

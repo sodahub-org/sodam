@@ -76,7 +76,9 @@ TrackItem + cache path
   → snapshot: track_id / title / playing / position / duration / quality / error
 ```
 
-播放结束时音频线程标记 `finished`；GPUI 心跳读取 snapshot，调用 `next_track`。
+播放结束时音频线程标记 `finished`；GPUI 心跳读取 snapshot 自动续播：普通模式先按
+不可播集合选下一个可播候选（`Queue::advance_playable`），单曲循环仍走
+`next_track` 的「播完重播」语义。
 签名不足或设备不匹配时，libresoda 可能只返回试听；错误会进入状态行或播放页重试区。
 
 音频装载成功/失败都回执 `load_seq`，心跳据此退出 loading，不再只比较 track id。
@@ -131,6 +133,11 @@ TrackItem + cache path
 `shuffle_round` 与 `history` 存的都是下标，所以队列变更必须同步：
 `remove` 左移、`insert_next` 右移并把新项插到轮次首位、`jump` 把目标从轮次
 剔除（否则会重播）。「接下来」由 `Queue::upcoming()` 给出，与真实播放顺序一致。
+
+不可播集合（`failure::UnplayableTracks`）记录当前账号在本会话内确认放不出来的曲目：
+只由按曲目类失败写入，全局故障不写，账号 id / 会员状态变化整份作废，仅存内存。
+`next_playable` / `advance_playable` 据此跳过命中项并同步随机轮次；整圈无候选时
+落闸并把「这一轮没有能播的歌了」留在常驻错误位，条件解除后自动撤下。
 
 推荐 / 听歌模式 / 电台这类无限流不显示模式按钮，并强制列表循环——那边的歌
 由服务端持续追加，单曲循环会让流停住。

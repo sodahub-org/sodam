@@ -859,6 +859,11 @@ mod tests {
     #[test]
     fn unplayable_set_only_accepts_per_track_failures() {
         let mut set = UnplayableTracks::default();
+        let per_track = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        // 先放一条按曲目结论，再让全局 / 非确定性失败经过入口：已有条目必须原样保留。
+        assert!(set.record_failure("keep", &per_track));
 
         for error in [
             SodaError::http("signer error: bad token"),
@@ -872,13 +877,13 @@ mod tests {
                 !set.record_failure("track-1", &failure),
                 "全局 / 非确定性失败不该写入：{failure:?}"
             );
-            assert!(set.is_empty(), "{failure:?}");
+            assert_eq!(set.len(), 1, "{failure:?}");
+            assert!(set.contains("keep"), "{failure:?}");
+            assert!(!set.contains("track-1"), "{failure:?}");
         }
 
-        let per_track = failure(SodaError::not_found(
-            "soda pc track_v2 returned preview stream",
-        ));
         assert!(set.record_failure("track-1", &per_track));
+        assert_eq!(set.len(), 2);
         assert!(set.contains("track-1"));
     }
 
