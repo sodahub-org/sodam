@@ -919,11 +919,16 @@ impl Root {
         if self.settings.cookie.trim().is_empty() {
             return;
         }
+        // 发起时的登录身份：回来时若已经换过，这份账号信息属于旧身份，丢弃。
+        let auth_epoch = self.auth_epoch;
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move { Session::new(settings).fetch_account() });
         cx.spawn(async move |this, cx| {
             let account = work.await;
             let _ = this.update(cx, |root, cx| {
+                if root.auth_epoch != auth_epoch {
+                    return;
+                }
                 match account {
                     Ok(info) => {
                         let vip = info.vip;
