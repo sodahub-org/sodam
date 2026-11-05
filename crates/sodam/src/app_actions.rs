@@ -317,20 +317,18 @@ impl Root {
                 // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
-                if root.prefetch_patrol % 25 == 0 {
-                    if !root.playback_halted {
-                        // 冷却从挂起时刻算；判定放在真正会预取的那一拍，落闸期间
-                        // 不预取也不谎报「已恢复」，等用户主动播放后的下一拍再判定。
-                        log_prefetch_resume(
-                            root.prefetch_gate
-                                .expire_cooldown(std::time::Instant::now()),
-                        );
-                        root.prefetch_failed.retain(|_, (failed_at, retryability)| {
-                            *retryability == Retryability::Never
-                                || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
-                        });
-                        root.spawn_prefetch(cx);
-                    }
+                if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
+                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍，落闸期间
+                    // 不预取也不谎报「已恢复」，等用户主动播放后的下一拍再判定。
+                    log_prefetch_resume(
+                        root.prefetch_gate
+                            .expire_cooldown(std::time::Instant::now()),
+                    );
+                    root.prefetch_failed.retain(|_, (failed_at, retryability)| {
+                        *retryability == Retryability::Never
+                            || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
+                    });
+                    root.spawn_prefetch(cx);
                 }
                 if root.prefetch_patrol % 300 == 0 {
                     root.maintain_cache(cx);
