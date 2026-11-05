@@ -83,7 +83,7 @@ impl PrefetchGate {
     /// 冷却类到期自动放行；登录 / 磁盘类只认事件，不随时间恢复。
     ///
     /// 返回恢复原因（用于日志），没有变化时返回 `None`。
-    pub fn review(&mut self, now: Instant) -> Option<SuspensionClass> {
+    pub fn expire_cooldown(&mut self, now: Instant) -> Option<SuspensionClass> {
         let (class, since) = self.suspended?;
         if class != SuspensionClass::Cooldown
             || now.saturating_duration_since(since) < Self::COOLDOWN
@@ -196,7 +196,10 @@ mod tests {
         );
 
         assert_eq!(gate.note_user_playback(), None);
-        assert_eq!(gate.review(now + PrefetchGate::COOLDOWN * 10), None);
+        assert_eq!(
+            gate.expire_cooldown(now + PrefetchGate::COOLDOWN * 10),
+            None
+        );
         assert!(!gate.allows());
 
         assert_eq!(
@@ -220,7 +223,10 @@ mod tests {
         );
 
         assert_eq!(gate.note_login_success(), None);
-        assert_eq!(gate.review(now + PrefetchGate::COOLDOWN * 10), None);
+        assert_eq!(
+            gate.expire_cooldown(now + PrefetchGate::COOLDOWN * 10),
+            None
+        );
         assert!(!gate.allows());
 
         assert_eq!(
@@ -247,17 +253,20 @@ mod tests {
         assert_eq!(gate.note_login_success(), None);
         // 差 1ms 也还不放行：冷却从挂起时刻算，不从巡检时刻累加。
         assert_eq!(
-            gate.review(now + PrefetchGate::COOLDOWN - Duration::from_millis(1)),
+            gate.expire_cooldown(now + PrefetchGate::COOLDOWN - Duration::from_millis(1)),
             None
         );
         assert!(!gate.allows());
 
         assert_eq!(
-            gate.review(now + PrefetchGate::COOLDOWN),
+            gate.expire_cooldown(now + PrefetchGate::COOLDOWN),
             Some(SuspensionClass::Cooldown)
         );
         assert!(gate.allows());
-        assert_eq!(gate.review(now + PrefetchGate::COOLDOWN * 10), None);
+        assert_eq!(
+            gate.expire_cooldown(now + PrefetchGate::COOLDOWN * 10),
+            None
+        );
     }
 
     /// 日志取值稳定：大小写与连字符不随界面语言变化。

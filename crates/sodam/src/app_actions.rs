@@ -70,9 +70,10 @@ impl Root {
     pub(crate) fn spawn_prefetch(&mut self, cx: &mut Context<Self>) {
         // 全局故障期间整条管线挂起：巡检每 5 秒仍会路过这里，但一次请求都不发。
         // 恢复只有三个入口（重新登录 / 用户主动播放 / 冷却到期），都记一行日志。
-        if let Some(reason) = self.prefetch_gate.review(std::time::Instant::now()) {
-            log_prefetch_resume(reason);
-        }
+        log_prefetch_resume(
+            self.prefetch_gate
+                .expire_cooldown(std::time::Instant::now()),
+        );
         if !self.prefetch_gate.allows() {
             return;
         }
@@ -208,21 +209,21 @@ impl Root {
                                 // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
                                 // 后面的歌照常排；集合本身也会让这首不再被预取。
                                 root.unplayable.record_failure(&track.id, failure);
-                            } else if let Some(class) = root.prefetch_gate.suspend_for(failure, now)
-                            {
-                                // 全局故障：整条管线挂起，等对应的恢复事件。
-                                log_prefetch_suspension(class);
-                            } else if root.prefetch_gate.allows() {
-                                // 既不是按曲目、也不是全局故障：抖动类进逐曲冷却。
-                                // 全局故障期间不给单首记永久失败——恢复后它们还要重新参与预取。
+                            } else {
+                                // 全局故障挂起整条管线（只在真的挂上时写一行日志）；
+                                // 抖动类不挂，走下面的逐曲冷却。
+                                root.suspend_prefetch(failure);
+                                // 挂起期间不给单首记永久失败——恢复后它们还要重新参与预取。
                                 // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
-                                if root.prefetch_failed.len() > 256 {
-                                    root.prefetch_failed.retain(|_, (_, retryability)| {
-                                        *retryability == Retryability::Never
-                                    });
+                                if root.prefetch_gate.allows() {
+                                    if root.prefetch_failed.len() > 256 {
+                                        root.prefetch_failed.retain(|_, (_, retryability)| {
+                                            *retryability == Retryability::Never
+                                        });
+                                    }
+                                    root.prefetch_failed
+                                        .insert(track.id.clone(), (now, failure.retryability));
                                 }
-                                root.prefetch_failed
-                                    .insert(track.id.clone(), (now, failure.retryability));
                             }
                         }
                     }
@@ -313,7 +314,7 @@ impl Root {
                 if snap.finished && should_advance && root.pending_track.is_none() {
                     if root.queue.mode == PlayMode::RepeatOne {
                         // 播完重播：单曲循环的正常语义，不能拿「不可播的前进」替换。
-                        root.next_track(cx);
+                        root.advance_next(false, cx);
                     } else {
                         // 自动续播同样先查不可播集合：已确认放不出来的歌不再白打一次网络。
                         root.auto_advance_track(cx);
@@ -322,12 +323,19 @@ impl Root {
                 // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
-                if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
-                    root.prefetch_failed.retain(|_, (failed_at, retryability)| {
-                        *retryability == Retryability::Never
-                            || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
-                    });
-                    root.spawn_prefetch(cx);
+                if root.prefetch_patrol % 25 == 0 {
+                    // 冷却类挂起在落闸期间也要到期：落闸只停预取，不停计时。
+                    log_prefetch_resume(
+                        root.prefetch_gate
+                            .expire_cooldown(std::time::Instant::now()),
+                    );
+                    if !root.playback_halted {
+                        root.prefetch_failed.retain(|_, (failed_at, retryability)| {
+                            *retryability == Retryability::Never
+                                || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
+                        });
+                        root.spawn_prefetch(cx);
+                    }
                 }
                 if root.prefetch_patrol % 300 == 0 {
                     root.maintain_cache(cx);
@@ -799,11 +807,9 @@ impl Root {
                                         root.unplayable.clear();
                                         root.clear_round_exhaustion();
                                         // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
-                                        if let Some(reason) =
-                                            root.prefetch_gate.note_login_success()
-                                        {
-                                            log_prefetch_resume(reason);
-                                        }
+                                        log_prefetch_resume(
+                                            root.prefetch_gate.note_login_success(),
+                                        );
                                         root.set_status_text(
                                             language
                                                 .text("登录成功，正在读取账号信息…")
@@ -3046,13 +3052,9 @@ impl Root {
         // 按了播放/切歌，熔断回半开。自动续播路径在巡检处已被闸门拦住。
         self.release_playback_halt();
         // 恢复信号按故障类分：磁盘类以下一次用户主动播放为事件（票 #112）。
-        let resumed_prefetch = if user_initiated {
-            self.prefetch_gate.note_user_playback()
-        } else {
-            None
-        };
-        if let Some(reason) = resumed_prefetch {
-            log_prefetch_resume(reason);
+        // 自动续播 / 自动跳过不解除：它们可能正被同一个故障卡着。
+        if user_initiated {
+            log_prefetch_resume(self.prefetch_gate.note_user_playback());
         }
         self.playing = true;
         self.play_seq = self.play_seq.wrapping_add(1);
@@ -3243,7 +3245,7 @@ impl Root {
                                     root.notify_error_once("consecutive-stream-failures", halted);
                                 } else if in_place {
                                     // 单曲循环：原地重试同一首，由连败封顶兜底。
-                                    root.next_track(cx);
+                                    root.advance_next(false, cx);
                                 } else if has_candidate {
                                     // 自动跳过同样先查不可播集合，别把已知放不出来的歌
                                     // 再装载一次。
@@ -3284,12 +3286,18 @@ impl Root {
     }
 
     pub fn next_track(&mut self, cx: &mut Context<Self>) {
+        self.advance_next(true, cx);
+    }
+
+    /// 推进到下一首。`user_initiated` 区分用户按钮与自动路径（播完重播、
+    /// 单曲循环原地重试）：只有前者算预取管线磁盘类挂起的恢复事件。
+    fn advance_next(&mut self, user_initiated: bool, cx: &mut Context<Self>) {
         // 切歌时丢掉进度预览，避免「拖到一半换歌」把 seek 用到新歌上。
         // 队列当前项不会被移除（remove 拒绝当前项），所以直接推进即可。
         self.progress_preview = None;
         self.queue.advance();
         self.sync_queue_cache();
-        self.start_track(true, cx);
+        self.start_track(user_initiated, cx);
     }
 
     pub fn prev_track(&mut self, cx: &mut Context<Self>) {
@@ -3369,7 +3377,11 @@ fn log_prefetch_suspension(class: SuspensionClass) {
     );
 }
 
-fn log_prefetch_resume(reason: SuspensionClass) {
+/// `None` 表示这次事件没有解除任何挂起（不写日志）。
+fn log_prefetch_resume(reason: Option<SuspensionClass>) {
+    let Some(reason) = reason else {
+        return;
+    };
     log_event(
         LogLevel::Info,
         LogTopic::Prefetch,
