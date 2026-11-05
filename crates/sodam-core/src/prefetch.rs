@@ -113,6 +113,14 @@ impl PrefetchGate {
     }
 }
 
+/// 这个失败是否属于会挂起整条管线的全局故障。
+///
+/// 调用方据此把「挂管线」「进逐曲冷却」分开；不要用 `allows()` 反推——
+/// 那会把「已经挂着」和「失败本身不是全局」混成同一个答案。
+pub fn is_global_failure(failure: &PlaybackFailure) -> bool {
+    suspension_class(failure).is_some()
+}
+
 /// 哪些失败算「整条管线都该停」的全局故障。
 ///
 /// 判据沿用 [`PlaybackFailure::is_per_track`]：结论关于单首曲目的不挂管线
@@ -164,6 +172,13 @@ mod tests {
         );
         assert_eq!(gate.suspend_for(&transient, now), None);
         assert!(gate.allows());
+
+        // 应用层用同一个谓词分流「挂管线 / 逐曲冷却」，两边必须一致。
+        assert!(!is_global_failure(&global(
+            RecoveryAction::TrackUnavailable
+        )));
+        assert!(!is_global_failure(&transient));
+        assert!(is_global_failure(&global(RecoveryAction::CheckSigner)));
 
         let cases = [
             (RecoveryAction::Relogin, SuspensionClass::Login),

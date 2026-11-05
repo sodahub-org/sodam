@@ -12,7 +12,7 @@ use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
-use sodam_core::prefetch::SuspensionClass;
+use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::quality::TierMismatch;
 use sodam_core::session::Session;
 use sodam_core::Settings;
@@ -69,11 +69,7 @@ impl Root {
     /// （后者自动覆盖 append/remove 等队列变更，不必逐个调用点补）。
     pub(crate) fn spawn_prefetch(&mut self, cx: &mut Context<Self>) {
         // 全局故障期间整条管线挂起：巡检每 5 秒仍会路过这里，但一次请求都不发。
-        // 恢复只有三个入口（重新登录 / 用户主动播放 / 冷却到期），都记一行日志。
-        log_prefetch_resume(
-            self.prefetch_gate
-                .expire_cooldown(std::time::Instant::now()),
-        );
+        // 冷却到期由心跳统一轮询（落闸期间也要计时），这里只问闸开没开。
         if !self.prefetch_gate.allows() {
             return;
         }
@@ -209,21 +205,20 @@ impl Root {
                                 // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
                                 // 后面的歌照常排；集合本身也会让这首不再被预取。
                                 root.unplayable.record_failure(&track.id, failure);
-                            } else {
-                                // 全局故障挂起整条管线（只在真的挂上时写一行日志）；
-                                // 抖动类不挂，走下面的逐曲冷却。
+                            } else if is_global_failure(failure) {
+                                // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
                                 root.suspend_prefetch(failure);
-                                // 挂起期间不给单首记永久失败——恢复后它们还要重新参与预取。
+                            } else if root.prefetch_gate.allows() {
+                                // 抖动类进逐曲冷却。管线挂起期间不给单首记永久失败——
+                                // 恢复后它们还要重新参与预取。
                                 // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
-                                if root.prefetch_gate.allows() {
-                                    if root.prefetch_failed.len() > 256 {
-                                        root.prefetch_failed.retain(|_, (_, retryability)| {
-                                            *retryability == Retryability::Never
-                                        });
-                                    }
-                                    root.prefetch_failed
-                                        .insert(track.id.clone(), (now, failure.retryability));
+                                if root.prefetch_failed.len() > 256 {
+                                    root.prefetch_failed.retain(|_, (_, retryability)| {
+                                        *retryability == Retryability::Never
+                                    });
                                 }
+                                root.prefetch_failed
+                                    .insert(track.id.clone(), (now, failure.retryability));
                             }
                         }
                     }
@@ -330,6 +325,8 @@ impl Root {
                             .expire_cooldown(std::time::Instant::now()),
                     );
                     if !root.playback_halted {
+                        // 落闸（#106 连败封顶 / 全局故障停播）期间照旧不预取，
+                        // 等用户主动播放；即使登录类挂起已因重新登录打开也遵守这条约定。
                         root.prefetch_failed.retain(|_, (failed_at, retryability)| {
                             *retryability == Retryability::Never
                                 || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
@@ -3366,7 +3363,9 @@ fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
 /// 持续打签名服务和网络）。
 const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 预取管线挂起/恢复只在日志里留痕（对用户静默）：同一次故障只写一行，
+/// 预取管线挂起/恢复只在日志里留痕（对用户静默）。
+///
+/// 同一段故障最多每分钟一对（冷却到期后重试仍失败会再挂起一次），
 /// 巡检每 5 秒路过一次不会重复刷屏。
 fn log_prefetch_suspension(class: SuspensionClass) {
     log_event(
