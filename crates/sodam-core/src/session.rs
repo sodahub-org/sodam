@@ -48,6 +48,14 @@ pub struct AccountInfo {
     pub nickname: String,
     pub user_id: String,
     pub vip: bool,
+    /// 会员档位（`vip` / `svip`，空串表示未知或非会员）。
+    pub vip_stage: String,
+    /// 关注数。
+    pub following: u64,
+    /// 粉丝数。
+    pub follower: u64,
+    /// 获赞数（分享与评论）。
+    pub likes: u64,
     /// 登录用户头像 URL（来自 /luna/pc/me 的 larger_avatar_url）
     pub avatar_url: String,
 }
@@ -405,23 +413,92 @@ impl Session {
     /// VIP 判定与 libresoda 的 `IsVipAccount` 一致：先看 `/luna/pc/me` 的
     /// `my_info.is_vip` 与 `vip_stage`，拿不到再回落到探测曲目。
     pub fn fetch_account(&self) -> anyhow::Result<AccountInfo> {
-        let me = libresoda::soda::user_playlist::fetch_pc_me(&self.pumpkin)
-            .map_err(|err| anyhow::anyhow!("读取账号信息失败: {err}"))?;
-        let vip = me.my_info.is_vip
-            || matches!(
-                me.my_info.vip_stage.trim().to_ascii_lowercase().as_str(),
-                "vip" | "svip"
+        let url = libresoda::soda::pc_me_url();
+        let response = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .set("Cookie", &self.pumpkin.cookie())
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) SodaMusic/3.8.0 Chrome/122.0.0.0 Safari/537.36",
             )
-            || self.is_vip().unwrap_or(false);
-        let image = &me.my_info.larger_avatar_url;
-        let mut avatar_url = image.urls.first().cloned().unwrap_or_default();
-        if !avatar_url.is_empty() && !image.uri.is_empty() && !avatar_url.contains(&image.uri) {
-            avatar_url.push_str(&image.uri);
+            .set("x-luna-background-type", "foreground")
+            .set("x-luna-is-background-req", "0")
+            .set("x-luna-is-local-user", "1")
+            .call()
+            .map_err(|err| anyhow::anyhow!("读取账号信息失败: {err}"))?;
+        let body = response
+            .into_string()
+            .map_err(|err| anyhow::anyhow!("读取账号信息失败: {err}"))?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|err| anyhow::anyhow!("账号信息解析失败: {err}"))?;
+        if json
+            .get("status_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            != 0
+        {
+            let message = json
+                .pointer("/status_info/status_msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("读取账号信息失败: {message}");
         }
+        let info = json.get("my_info").cloned().unwrap_or_default();
+        let vip_stage = info
+            .get("vip_stage")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let vip = info
+            .get("is_vip")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || matches!(vip_stage.as_str(), "vip" | "svip");
+        let avatar = info.get("larger_avatar_url").cloned().unwrap_or_default();
+        let mut avatar_url = avatar
+            .get("urls")
+            .and_then(|v| v.as_array())
+            .and_then(|urls| urls.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let uri = avatar
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !avatar_url.is_empty() && !uri.is_empty() && !avatar_url.contains(uri) {
+            avatar_url.push_str(uri);
+        }
+        let stat = |key: &str| -> u64 {
+            json.pointer(&format!("/my_stats/{key}"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let likes = json
+            .pointer("/my_stats/all_comments_liked_detail/count")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         Ok(AccountInfo {
-            nickname: me.my_info.nickname.trim().to_string(),
-            user_id: me.my_info.id.trim().to_string(),
+            nickname: info
+                .get("nickname")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            user_id: info
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             vip,
+            vip_stage,
+            following: stat("count_following"),
+            follower: stat("count_follower"),
+            likes,
             avatar_url,
         })
     }

@@ -1,0 +1,9 @@
+{
+  "uuid": "sodam-lyrics@sodahub.local",
+  "name": "SodaM 桌面歌词",
+  "description": "把 SodaM 当前播放的封面、歌名、歌词与播放控制嵌进 GNOME 顶栏，对应汽水音乐的任务栏歌词。只在 SodaM 运行时显示。",
+  "shell-version": [
+    "50"
+  ],
+  "version": 1
+}

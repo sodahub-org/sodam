@@ -443,7 +443,7 @@ pub const SIDEBAR_W: f32 = 216.0;
 /// 顶部工具条 / 抽屉头高度。
 pub const TOOLBAR_H: f32 = 48.0;
 /// 底部播放条高度。
-pub const PLAYER_H: f32 = 76.0;
+pub const PLAYER_H: f32 = 82.0;
 /// 底部状态行的最大宽度：再长就省略，别横穿整个内容区。
 pub const STATUS_LINE_MAX_W: f32 = 520.0;
 
@@ -475,8 +475,6 @@ pub mod size {
     pub const CONTROL: f32 = 36.0;
     /// 列表行封面。
     pub const ROW_ART: f32 = 40.0;
-    /// 播放条封面。
-    pub const PLAYER_THUMB: f32 = 48.0;
     /// 歌单卡片封面。
     pub const CARD_COVER: f32 = 156.0;
 }

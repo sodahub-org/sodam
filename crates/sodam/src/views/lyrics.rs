@@ -427,10 +427,25 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
 
     let liked = root.liked_ids.contains(&track.id);
     let lines = root.lyrics.clone();
-    // 歌词区高度：滚到中间要给首尾句留出半个视口的空白，所以先算出来。
-    let lyrics_viewport_height =
-        (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
-    let lyric_padding = lyrics_viewport_height / 2.0;
+    // 歌词列和封面同高：先算出封面尺寸，再按它的一半留上下空白，
+    // 当前句才正好落在歌词区的垂直中线上。
+    let viewport_width = f32::from(window.viewport_size().width);
+    let viewport_height = (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
+    let mut cover_size = (viewport_height * 0.40).min(viewport_width * 0.30);
+    let mut lyrics_width = (viewport_width * 0.30).clamp(300.0, 500.0);
+
+    // 窗口被平铺 WM 压得比官方最小尺寸还窄时，按同一比例整体收缩，
+    // 避免固定 300px 歌词下限把内容挤出可视区。
+    let centered_width = (viewport_width - theme::SIDEBAR_W - 100.0).max(220.0);
+    let natural_width = cover_size + 50.0 + lyrics_width;
+    if natural_width > centered_width {
+        let scale = centered_width / natural_width;
+        cover_size *= scale;
+        lyrics_width *= scale;
+    }
+    // 歌词列高度 = 封面 + 32 间距 + 信息区（约 78），和官方 stretch 到 info 列一致。
+    let lyrics_box_height = cover_size + 110.0;
+    let lyric_padding = lyrics_box_height / 2.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
@@ -477,7 +492,25 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                     } else {
                         LyricReveal::None
                     };
+                    let seek_to = line.start_seconds;
+                    // 官方用 mask 在上下边缘渐隐；gpui 没有渐变遮罩，
+                    // 改成按离当前句的行距做透明度衰减，视觉上接近。
+                    let distance = match root.lyrics_active {
+                        Some(active) => (index as i32 - active as i32).unsigned_abs() as f32,
+                        None => 0.0,
+                    };
+                    let fade = (1.0 - distance * 0.16).clamp(0.22, 1.0);
                     div()
+                        .id(gpui::ElementId::Name(format!("lyric-line-{index}").into()))
+                        .cursor_pointer()
+                        .p(px(6.0))
+                        .rounded(px(8.0))
+                        .opacity(fade)
+                        .hover(|style| style.bg(theme::surface_hover()))
+                        .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                            root.seek_seconds(seek_to);
+                            cx.notify();
+                        }))
                         .w_full()
                         // 句间距用内边距表达，不能用 `min_h`：`min_h` 撑出的空当
                         // 会被折行文本吃掉，折成两行时间距就变成 0。
@@ -541,20 +574,6 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
 
     // 汽水播放页的规则：封面取 min(40vh, 30vw)；
     // 歌词列是 30vw，并限制在 300~500px。这里 vh/vw 以可用播放区为准。
-    let viewport_width = f32::from(window.viewport_size().width);
-    let viewport_height = (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
-    let mut cover_size = (viewport_height * 0.40).min(viewport_width * 0.30);
-    let mut lyrics_width = (viewport_width * 0.30).clamp(300.0, 500.0);
-
-    // 窗口被平铺 WM 压得比官方最小尺寸还窄时，按同一比例整体收缩，
-    // 避免固定 300px 歌词下限把内容挤出可视区。
-    let centered_width = (viewport_width - theme::SIDEBAR_W - 100.0).max(220.0);
-    let natural_width = cover_size + 50.0 + lyrics_width;
-    if natural_width > centered_width {
-        let scale = centered_width / natural_width;
-        cover_size *= scale;
-        lyrics_width *= scale;
-    }
 
     let track_info = div()
         .flex()
@@ -622,7 +641,12 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .w(px(lyrics_width))
             .max_w(px(500.0))
             .min_w(px(300.0))
-            .h_full()
+            // 官方歌词区和左侧「封面 + 歌曲信息」同高（lyrics-container
+            // align-self: stretch），不是铺满整页。显式给 h + max_h，
+            // 防止父级 flex 把它拉伸回整页高度。
+            .h(px(lyrics_box_height))
+            .max_h(px(lyrics_box_height))
+            .overflow_hidden()
             .flex_none()
             .min_h(px(0.0))
             .child(if root.loading_lyrics {
@@ -679,20 +703,20 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                         .flex()
                         .flex_row()
                         .h_full()
-                        .items_start()
+                        .items_center()
                         .justify_center()
                         .max_w_full()
                         .flex_none()
                         .min_h(px(0.0))
                         .gap(px(50.0))
                         .child(
+                            // 官方 .info：封面 + 32px 间距 + 信息/操作，自然高度，
+                            // 不用 h_full，否则歌词列无法和它等高。
                             div()
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .justify_center()
-                                .h_full()
-                                .gap(px(theme::space::LG))
+                                .gap(px(32.0))
                                 .w(px(cover_size))
                                 .flex_none()
                                 .child(

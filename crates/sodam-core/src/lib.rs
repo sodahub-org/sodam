@@ -19,6 +19,7 @@ pub mod preferences;
 pub mod quality;
 pub mod queue;
 pub mod session;
+pub mod signer;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;

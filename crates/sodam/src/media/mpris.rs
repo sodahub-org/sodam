@@ -29,8 +29,179 @@ enum Update {
     Playback(PlaybackStatus, Time),
 }
 
+/// 桌面歌词扩展读取的 D-Bus 接口。
+///
+/// MPRIS 只承载播放元数据，没有歌词字段，所以当前歌词行单独走一个接口；
+/// 扩展同时读 MPRIS（封面、歌名、传输控制）和这里（歌词、收藏状态）。
+const LYRICS_BUS: &str = "org.sodahub.SodaM";
+const LYRICS_PATH: &str = "/org/sodahub/SodaM/Lyrics";
+
+/// 公开给桌面歌词扩展的歌词状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LyricsState {
+    pub current: String,
+    pub next: String,
+    pub has_lyrics: bool,
+    pub liked: bool,
+    /// 标题栏开关控制：桌面歌词条是否显示。
+    pub visible: bool,
+}
+
+struct LyricsInterface {
+    state: std::sync::Arc<std::sync::Mutex<LyricsState>>,
+    /// 桌面歌词扩展的按钮命令走回应用的媒体命令通道。
+    commands: Sender<Command>,
+}
+
+#[zbus::interface(name = "org.sodahub.SodaM.Lyrics")]
+impl LyricsInterface {
+    /// 当前正在唱的一句。
+    #[zbus(property)]
+    fn current_line(&self) -> String {
+        self.state
+            .lock()
+            .map(|state| state.current.clone())
+            .unwrap_or_default()
+    }
+
+    /// 下一句，用于提前淡入；没有就是空串。
+    #[zbus(property)]
+    fn next_line(&self) -> String {
+        self.state
+            .lock()
+            .map(|state| state.next.clone())
+            .unwrap_or_default()
+    }
+
+    /// 当前曲目是否有歌词（区分「加载中」与「没有歌词」）。
+    #[zbus(property)]
+    fn has_lyrics(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.has_lyrics)
+            .unwrap_or(false)
+    }
+
+    /// 当前曲目是否已收藏。
+    #[zbus(property)]
+    fn liked(&self) -> bool {
+        self.state.lock().map(|state| state.liked).unwrap_or(false)
+    }
+
+    /// 桌面歌词条是否显示（由 SodaM 标题栏的开关控制）。
+    #[zbus(property)]
+    fn bar_visible(&self) -> bool {
+        self.state.lock().map(|state| state.visible).unwrap_or(true)
+    }
+
+    /// 设置桌面歌词条是否显示；扩展或标题栏开关都可以调。
+    fn set_bar_visible(&self, visible: bool) {
+        self.commands.send(Command::SetBarVisible(visible)).ok();
+    }
+
+    /// 切换当前曲目的收藏状态（桌面歌词条的心形按钮）。
+    fn toggle_liked(&self) {
+        self.commands.send(Command::ToggleLike).ok();
+    }
+}
+
+/// 把歌词状态发布到 D-Bus 的句柄；更新走 channel，由后台任务落到属性上。
+struct LyricsPublisher {
+    updates: mpsc::UnboundedSender<LyricsState>,
+    /// 持有任务：丢掉它等于关掉接口。
+    _task: Task<()>,
+}
+
+impl LyricsPublisher {
+    fn new(cx: &mut App, commands: Sender<Command>) -> Self {
+        let (updates, mut receiver) = mpsc::unbounded_channel::<LyricsState>();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(LyricsState::default()));
+        let interface_state = state.clone();
+        let _task = cx.spawn(async move |_| {
+            let builder = zbus::connection::Builder::session()
+                .and_then(|builder| builder.name(LYRICS_BUS))
+                .and_then(|builder| {
+                    builder.serve_at(
+                        LYRICS_PATH,
+                        LyricsInterface {
+                            state: interface_state,
+                            commands: commands.clone(),
+                        },
+                    )
+                });
+            let connection = match builder {
+                Ok(builder) => match builder.build().await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        log_event(
+                            LogLevel::Warn,
+                            LogTopic::Media,
+                            "lyrics_interface_failed",
+                            &[("stage", "build"), ("detail", detail.as_str())],
+                        );
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let detail = error.to_string();
+                    log_event(
+                        LogLevel::Warn,
+                        LogTopic::Media,
+                        "lyrics_interface_failed",
+                        &[("stage", "setup"), ("detail", detail.as_str())],
+                    );
+                    return;
+                }
+            };
+            let interface = match connection
+                .object_server()
+                .interface::<_, LyricsInterface>(LYRICS_PATH)
+                .await
+            {
+                Ok(interface) => interface,
+                Err(error) => {
+                    let detail = error.to_string();
+                    log_event(
+                        LogLevel::Warn,
+                        LogTopic::Media,
+                        "lyrics_interface_failed",
+                        &[("stage", "lookup"), ("detail", detail.as_str())],
+                    );
+                    return;
+                }
+            };
+            while let Some(next) = receiver.recv().await {
+                {
+                    let Ok(mut current) = state.lock() else {
+                        continue;
+                    };
+                    if *current == next {
+                        continue;
+                    }
+                    *current = next;
+                }
+                let emitter = interface.signal_emitter();
+                let interface_ref = interface.get().await;
+                let _ = interface_ref.current_line_changed(emitter).await;
+                let _ = interface_ref.next_line_changed(emitter).await;
+                let _ = interface_ref.has_lyrics_changed(emitter).await;
+                let _ = interface_ref.liked_changed(emitter).await;
+                let _ = interface_ref.bar_visible_changed(emitter).await;
+            }
+        });
+        Self { updates, _task }
+    }
+
+    fn publish(&self, state: LyricsState) {
+        self.updates.send(state).ok();
+    }
+}
+
 pub struct Controls {
     updates: mpsc::UnboundedSender<Update>,
+    /// 桌面歌词扩展的独立 D-Bus 接口。
+    lyrics: LyricsPublisher,
     /// 持有服务任务：丢掉它等于关掉 MPRIS。
     _server: Task<()>,
 }
@@ -43,6 +214,7 @@ impl Controls {
         cx: &mut App,
     ) -> Result<Self> {
         let (updates, mut receiver) = mpsc::unbounded_channel();
+        let lyrics_commands = commands.clone();
         let _server = cx.spawn(async move |cx| {
             // 抢总线名可能失败：上一个实例还没退出、或者同时开了两个 sodam。
             // 之前失败就直接放弃，于是"第二个启动的实例永远没有 MPRIS"，
@@ -98,7 +270,11 @@ impl Controls {
                 cx.background_executor().timer(backoff).await;
             }
         });
-        Ok(Self { updates, _server })
+        Ok(Self {
+            updates,
+            lyrics: LyricsPublisher::new(cx, lyrics_commands),
+            _server,
+        })
     }
 
     /// 发布曲目元数据（只在曲目或封面变化时调用）。
@@ -127,6 +303,11 @@ impl Controls {
             (true, false) => PlaybackStatus::Paused,
         };
         self.send(Update::Playback(status, time(now.position_seconds)));
+    }
+
+    /// 发布当前歌词行；扩展靠它更新桌面歌词。
+    pub fn publish_lyrics(&mut self, state: LyricsState) {
+        self.lyrics.publish(state);
     }
 
     fn send(&self, update: Update) {

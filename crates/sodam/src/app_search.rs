@@ -12,9 +12,25 @@ use std::sync::Arc;
 use super::{Nav, Root};
 
 impl Root {
+    /// 联想项点击：有歌单实体就直接进歌单，否则按文本搜索。
+    pub fn apply_search_suggestion(
+        &mut self,
+        item: sodam_core::library::SearchSuggestion,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_sug_open = false;
+        if let Some(playlist_id) = item.playlist_id {
+            self.open_playlist(playlist_id, None, cx);
+        } else {
+            self.run_history_search(item.text, cx);
+        }
+    }
+
     pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_field.set_text(query);
         self.search_field.set_caret(self.search_field.len());
+        self.search_sug_open = false;
+        self.search_sug_index = 0;
         self.run_search(cx);
     }
 
@@ -64,7 +80,38 @@ impl Root {
     }
 
     /// 触发搜索：网络调用放在 GPUI 的后台执行器上，结果回灌后 `notify` 重绘。
+    /// 输入变化时拉联想词：序号校验保证只有最后一次请求会写回。
+    pub(crate) fn schedule_search_suggest(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_field.text().trim().to_string();
+        self.search_sug_seq += 1;
+        let seq = self.search_sug_seq;
+        if query.is_empty() {
+            self.search_sug.clear();
+            self.search_sug_open = false;
+            return;
+        }
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::search_suggest(&session, &query).unwrap_or_default()
+        });
+        cx.spawn(async move |this, cx| {
+            let words = work.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.search_sug_seq != seq {
+                    return;
+                }
+                root.search_sug = words;
+                root.search_sug_index = 0;
+                root.search_sug_open = !root.search_sug.is_empty();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.search_sug_open = false;
         let keyword = self.search_field.text().trim().to_string();
         if keyword.is_empty() {
             self.set_status("先输入关键词再回车", &[]);
@@ -73,6 +120,10 @@ impl Root {
         }
         if self.searching {
             return;
+        }
+        // 顶栏搜索是全局入口：提交后要切到搜索结果页，不能只留一条状态提示。
+        if self.nav != Nav::Search {
+            self.set_nav(Nav::Search, cx);
         }
         if self.settings.record_search(&keyword) {
             let _ = self.settings.save();
@@ -307,12 +358,17 @@ impl Root {
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
-        if track.album_id.is_empty() {
+        let album_id = if track.album_id.is_empty() {
+            self.album_ids.get(&track.id).cloned().unwrap_or_default()
+        } else {
+            track.album_id.clone()
+        };
+        if album_id.is_empty() {
             return;
         }
         self.open_album_page(
             AlbumItem {
-                id: track.album_id,
+                id: album_id,
                 title: track.album,
                 cover: track.cover,
                 ..Default::default()
@@ -327,12 +383,17 @@ impl Root {
         track: sodam_core::models::TrackItem,
         cx: &mut Context<Self>,
     ) {
-        if track.artist_id.is_empty() {
+        let artist_id = if track.artist_id.is_empty() {
+            self.artist_ids.get(&track.id).cloned().unwrap_or_default()
+        } else {
+            track.artist_id.clone()
+        };
+        if artist_id.is_empty() {
             return;
         }
         self.open_artist_page(
             ArtistItem {
-                id: track.artist_id,
+                id: artist_id,
                 name: track.artist,
                 ..Default::default()
             },

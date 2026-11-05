@@ -111,6 +111,7 @@ use crate::views;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Nav {
     Home,
+    Me,
     Scenes,
     Search,
     Liked,
@@ -126,6 +127,7 @@ impl Root {
     pub fn nav_display_label(&self, nav: Nav) -> String {
         let label = match nav {
             Nav::Home => self.tr("推荐"),
+            Nav::Me => self.tr("我的"),
             Nav::Scenes => self.tr("听歌模式"),
             Nav::Search => self.tr("搜索"),
             Nav::Liked => self.tr("我喜欢的音乐"),
@@ -227,6 +229,8 @@ pub struct Root {
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
+    /// 「后退」之后可以去「前进」的页面栈；任何新导航都会清空它。
+    pub(crate) nav_forward: Vec<Nav>,
     pub lyrics_return_nav: Option<Nav>,
     pub theme: ThemeKind,
     pub theme_follows_system: bool,
@@ -273,6 +277,8 @@ pub struct Root {
     pub loading_lyrics: bool,
     pub lyrics_error: Option<String>,
     pub lyrics_active: Option<usize>,
+    /// 桌面歌词条是否显示（标题栏开关控制，扩展读取）。
+    pub desktop_lyrics_visible: bool,
     /// 最近一帧的播放位置（秒）；逐字高亮按它决定亮到第几个字。
     ///
     /// 由 `Root::render` 每帧写入，`views::lyrics` 只读。存在这里而不是在渲染函数里
@@ -310,6 +316,39 @@ pub struct Root {
     /// 防止快速换歌时旧歌词请求回写。
     lyrics_request_seq: u64,
     pub search_field: TextField,
+    /// 自绘标题栏是否承担了搜索框：是的话搜索页不再重复画一个输入框。
+    pub(crate) header_owns_search: bool,
+    /// 每首歌的高潮点（秒），进队列后异步补齐。
+    pub chorus_cache: std::collections::HashMap<String, f64>,
+    /// 每首歌的评论数。
+    pub comment_cache: std::collections::HashMap<String, i64>,
+    /// 曲目补齐的专辑 / 音乐人 id（列表数据缺字段时兜底）。
+    pub album_ids: std::collections::HashMap<String, String>,
+    pub artist_ids: std::collections::HashMap<String, String>,
+    /// 顶部轻提示（分享/反馈/举报等即时回执）。
+    pub toast: Option<(String, std::time::Instant)>,
+    /// 切音质后重载当前曲目要恢复的进度与播放状态。
+    pub quality_resume: Option<(f64, bool)>,
+    /// 音质胶囊的实际屏幕区域（由 canvas 每帧写入，菜单用它精确定位）。
+    /// 信息块跑马灯：是否需要逐帧刷新、以及刷新循环是否已在跑。
+    /// 信息块歌名行的实测宽度（canvas 回填，跑马灯用它算无缝周期）。
+    /// 信息块跑马灯的滚动句柄：用滚动偏移做位移，避免每帧重排文字。
+    pub marquee_width: std::rc::Rc<std::cell::Cell<f32>>,
+    pub signer_status: sodam_core::signer::SignerStatus,
+    pub signer_busy: bool,
+    pub quality_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// 音量弹层的开合状态。
+    pub volume_open: bool,
+    /// 鼠标是否在音量浮层内（用于离开按钮后的宽限关闭）。
+    pub volume_inside: bool,
+    /// 静音前的音量，用于再次点击恢复。
+    pub volume_before_mute: f32,
+    /// 搜索联想词与下拉状态。
+    pub search_sug: Vec<sodam_core::library::SearchSuggestion>,
+    pub search_sug_open: bool,
+    pub search_sug_index: usize,
+    pub(crate) search_sug_seq: u64,
+
     /// 搜索框文本区的窗口内 bounds：canvas 绘制时回填，鼠标点击定位用。
     pub(crate) search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 当前鼠标拖拽是否按词扩选（双击起步的拖拽为真；松开鼠标复位）。
@@ -388,7 +427,8 @@ pub struct Root {
     /// 进度条轨道在窗口里的位置（画布测量，鼠标事件据此换算 seek 位置）。
     pub progress_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量轨道在窗口里的位置（画布测量，鼠标事件据此换算音量）。
-    pub volume_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// 竖向音量弹层的轨道 bounds。
+    pub volume_pop_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 打开中的歌单（点卡片后展示曲目）。
     pub open_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
     pub loading_playlist: bool,
@@ -409,12 +449,32 @@ pub struct Root {
     pub played_history: Vec<String>,
     /// 设置页里的登录 modal 是否展开。
     pub login_modal_open: bool,
+    /// 顶栏头像下拉菜单。
+    pub(crate) account_menu_open: bool,
+    /// 退出登录二次确认。
+    pub(crate) logout_confirm_open: bool,
     /// 队列右键菜单：被点中的行下标与鼠标位置。
     pub queue_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// 音质菜单锚点：播放条徽章被点中时的鼠标位置（`None` = 菜单关着）。
     pub quality_menu: Option<gpui::Point<gpui::Pixels>>,
     /// 搜索/歌单/我喜欢等歌曲行右键菜单。
     pub track_menu: Option<TrackMenu>,
+    /// 底部「更多」专属菜单（官方 5 项）。
+    pub more_menu: Option<(sodam_core::models::TrackItem, gpui::Point<gpui::Pixels>)>,
+    /// 「添加到歌单」的歌单选择菜单。
+    pub add_menu: Option<(sodam_core::models::TrackItem, gpui::Point<gpui::Pixels>)>,
+    /// 评论面板。
+    pub comment_panel_open: bool,
+    pub comment_items: Vec<sodam_core::library::CommentItem>,
+    pub comment_cursor: String,
+    pub comment_has_more: bool,
+    pub comment_total: i64,
+    pub comment_loading: bool,
+    pub comment_track: Option<String>,
+    /// 本地点赞过的评论（用于切换与失败回滚）。
+    pub comment_liked: std::collections::HashSet<String>,
+    /// 展开回复的评论 id（回复接口未接入，先做本地展开占位）。
+    pub expanded_comments: std::collections::HashSet<String>,
     /// 播放请求序号：每次 start_track +1。
     ///
     /// 作用：加载是异步的（下载 + 解密），如果用户在 A 加载途中换了 B，
@@ -557,6 +617,7 @@ impl Root {
                 Nav::Settings
             },
             nav_history: Vec::new(),
+            nav_forward: Vec::new(),
             lyrics_return_nav: if logged_in { Some(Nav::Home) } else { None },
             theme,
             theme_follows_system,
@@ -568,9 +629,22 @@ impl Root {
             queue_origin: QueueOrigin::None,
             played_history: Vec::new(),
             login_modal_open: false,
+            account_menu_open: false,
+            logout_confirm_open: false,
             queue_menu: None,
             quality_menu: None,
             track_menu: None,
+            more_menu: None,
+            add_menu: None,
+            comment_panel_open: false,
+            comment_items: Vec::new(),
+            comment_cursor: String::new(),
+            comment_has_more: false,
+            comment_total: 0,
+            comment_loading: false,
+            comment_track: None,
+            comment_liked: std::collections::HashSet::new(),
+            expanded_comments: std::collections::HashSet::new(),
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,
@@ -596,6 +670,7 @@ impl Root {
             loading_lyrics: false,
             lyrics_error: None,
             lyrics_active: None,
+            desktop_lyrics_visible: true,
             lyrics_position_seconds: 0.0,
             lyrics_position_anchor: None,
             lyrics_demo_position: None,
@@ -606,6 +681,24 @@ impl Root {
             lyrics_scroll_tween_index: None,
             lyrics_request_seq: 0,
             search_field: TextField::default(),
+            header_owns_search: false,
+            chorus_cache: std::collections::HashMap::new(),
+            comment_cache: std::collections::HashMap::new(),
+            album_ids: std::collections::HashMap::new(),
+            artist_ids: std::collections::HashMap::new(),
+            toast: None,
+            quality_resume: None,
+            marquee_width: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+            signer_status: sodam_core::signer::detect(),
+            signer_busy: false,
+            quality_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            volume_open: false,
+            volume_inside: false,
+            volume_before_mute: 0.8,
+            search_sug: Vec::new(),
+            search_sug_open: false,
+            search_sug_index: 0,
+            search_sug_seq: 0,
             search_drag_by_word: false,
             search_edit_epoch: std::time::Instant::now(),
             search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -680,7 +773,7 @@ impl Root {
                 Settings::config_path(),
             ),
             progress_track_bounds: Arc::new(Mutex::new(None)),
-            volume_track_bounds: Arc::new(Mutex::new(None)),
+            volume_pop_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
             prefetch_failed: HashMap::new(),
             prefetch_patrol: 0,
@@ -984,6 +1077,12 @@ impl Root {
             })
             .detach();
         }
+        // 依赖齐全就自动拉起签名服务：写接口与整曲取流需要它。
+        let signer = root.signer_status.clone();
+        if signer.wine.is_some() && signer.node && signer.vendor && signer.libmssdk && !signer.ready
+        {
+            root.signer_start(cx);
+        }
         if let Ok(value) = std::env::var("SODAM_POPUP") {
             match value.trim() {
                 "queue" => root.queue_open = true,
@@ -1247,6 +1346,7 @@ impl EntityInputHandler for Root {
         self.search_field.replace(range, text);
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
+        self.schedule_search_suggest(cx);
         cx.notify();
     }
 
@@ -1267,6 +1367,7 @@ impl EntityInputHandler for Root {
         self.search_field.replace_and_mark(range, new_text);
         self.search_field.end_edit(now);
         self.search_fit_caret_in_view(window);
+        self.schedule_search_suggest(cx);
         cx.notify();
     }
 
@@ -1357,7 +1458,12 @@ impl Root {
     /// 是否有弹层开着（右键菜单或档位菜单）。遮罩与关闭逻辑只看这一处，
     /// 加第四个菜单时不必再改两个地方。
     pub(crate) fn any_menu_open(&self) -> bool {
-        self.queue_menu.is_some() || self.track_menu.is_some() || self.quality_menu.is_some()
+        self.queue_menu.is_some()
+            || self.track_menu.is_some()
+            || self.more_menu.is_some()
+            || self.add_menu.is_some()
+            || self.quality_menu.is_some()
+            || self.account_menu_open
     }
 
     /// 普通操作反馈：只进入底部状态行，不触发全局 message。
@@ -1496,6 +1602,7 @@ impl Render for Root {
             )
         };
         let titlebar_anchor = self.titlebar_anchor.clone();
+        self.header_owns_search = own_titlebar;
         // 没有元素聚焦时把焦点收回根元素：gpui 的上下文栈取自聚焦节点的路径，
         // 空栈会让带谓词的快捷键绑定（播放三键）全部失效。
         if window.focused(cx).is_none() {
@@ -1690,13 +1797,108 @@ impl Render for Root {
             // 标题栏覆盖在各面板背景之上；不再单独占一行而截断侧栏底色。
             // 放在普通内容之后、弹层之前，控制按钮可点击，弹层仍能覆盖标题栏。
             .when(own_titlebar, |this| {
-                this.child(ui::titlebar::render(window, &titlebar_anchor))
+                let root = cx.entity();
+                let account_root = cx.entity();
+                let logged_in = !self.settings.cookie.trim().is_empty();
+                let mut extras = ui::titlebar::HeaderExtras::default();
+                if own_titlebar {
+                    let back_root = cx.entity();
+                    let forward_root = cx.entity();
+                    extras.nav = Some(ui::titlebar::NavArrows {
+                        back_enabled: !self.nav_history.is_empty(),
+                        forward_enabled: !self.nav_forward.is_empty(),
+                        on_back: Box::new(move |_window, cx| {
+                            back_root.update(cx, |root, cx| root.go_back(cx));
+                        }),
+                        on_forward: Box::new(move |_window, cx| {
+                            forward_root.update(cx, |root, cx| root.go_forward(cx));
+                        }),
+                    });
+                    extras.search = Some(
+                        crate::views::search::search_box(
+                            self,
+                            window,
+                            cx,
+                            32.0,
+                            crate::views::search::SearchStyle::Header,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                if !logged_in {
+                    let login_root = cx.entity();
+                    extras.on_login_click = Some(Box::new(move |_window, cx| {
+                        login_root.update(cx, |root, cx| {
+                            root.set_nav(Nav::Settings, cx);
+                            root.login_modal_open = true;
+                            cx.notify();
+                        });
+                    }));
+                }
+                if let Some(info) = self.account.as_ref().filter(|_| logged_in) {
+                    let badge = if info.vip_stage == "svip" {
+                        "SVIP"
+                    } else if info.vip {
+                        "VIP"
+                    } else {
+                        "开通 VIP"
+                    };
+                    extras.account = Some(ui::titlebar::HeaderAccount {
+                        badge: Some(gpui::SharedString::from(badge)),
+                        avatar: self.cover_of(&info.avatar_url),
+                    });
+                    extras.on_vip_click = Some(Box::new(|_window, cx| {
+                        // 占位：官方会员页地址要等逆向客户端确认。
+                        cx.open_url("https://qishui.douyin.com/");
+                    }));
+                    extras.on_account_click = Some(Box::new(move |_window, cx| {
+                        account_root.update(cx, |root, cx| {
+                            root.account_menu_open = !root.account_menu_open;
+                            cx.notify();
+                        });
+                    }));
+                }
+                this.child(ui::titlebar::render(
+                    window,
+                    &titlebar_anchor,
+                    self.desktop_lyrics_visible,
+                    move |_window, cx| {
+                        root.update(cx, |root, cx| {
+                            root.desktop_lyrics_visible = !root.desktop_lyrics_visible;
+                            cx.notify();
+                        });
+                    },
+                    extras,
+                ))
+            })
+            .when(self.account_menu_open, |this| {
+                this.child(account_menu(self, cx))
+            })
+            .when(self.logout_confirm_open, |this| {
+                this.child(logout_confirm(self, cx))
+            })
+            .when(self.more_menu.is_some(), |this| {
+                this.child(crate::views::more_menu(self, cx))
+            })
+            .when(self.add_menu.is_some(), |this| {
+                this.child(crate::views::add_to_playlist_menu(self, cx))
+            })
+            .when(self.comment_panel_open, |this| {
+                this.child(crate::views::comment_panel(self, cx))
+            })
+            .when_some(self.toast.clone(), |this, (text, _at)| {
+                this.child(crate::views::toast_overlay(text, cx))
             })
             .when(self.track_menu.is_some(), |this| {
                 this.child(crate::views::track_menu(self, cx))
             })
-            .when_some(self.quality_menu, |this, position| {
-                this.child(ui::player_bar::quality_menu(self, cx, position))
+            .when_some(self.quality_menu, |this, _position| {
+                this.child(ui::player_bar::quality_menu(
+                    self,
+                    cx,
+                    window.viewport_size(),
+                    self.quality_bounds.get(),
+                ))
             })
             .when(
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),
@@ -1718,11 +1920,22 @@ impl Render for Root {
                             .size_full()
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
-                                cx.listener(|root, _event, _window, cx| {
+                                cx.listener(|root, event: &gpui::MouseDownEvent, _window, cx| {
+                                    // 点在音质胶囊上时交给按钮自己处理（第二次点击关闭），
+                                    // 遮罩不要先把它关掉再让按钮重新打开。
+                                    if let Some(bounds) = root.quality_bounds.get() {
+                                        if bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                    }
                                     if root.any_menu_open() {
                                         root.queue_menu = None;
                                         root.track_menu = None;
+                                        root.more_menu = None;
+                                        root.add_menu = None;
+                                        root.comment_panel_open = false;
                                         root.quality_menu = None;
+                                        root.account_menu_open = false;
                                         cx.notify();
                                     }
                                 }),
@@ -1757,4 +1970,203 @@ impl Render for Root {
         }
         element
     }
+}
+
+/// 顶栏头像下拉菜单：我的 / 设置 / 会员中心 / 退出登录。
+fn account_menu(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let menu = div()
+        .id("account-menu")
+        .absolute()
+        .top(px(ui::titlebar::STRIP_HEIGHT + 4.0))
+        .right(px(195.0))
+        .w(px(200.0))
+        .flex()
+        .flex_col()
+        .py(px(4.0))
+        .rounded(px(8.0))
+        .bg(theme::surface_elevated())
+        .border_1()
+        .border_color(theme::border())
+        .shadow_lg()
+        .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+            cx.stop_propagation();
+        })
+        .child(account_menu_item(
+            cx,
+            "account-menu-me",
+            "user",
+            root.tr("我的"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.set_nav(Nav::Me, cx);
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-settings",
+            "settings",
+            root.tr("设置"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.set_nav(Nav::Settings, cx);
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-vip",
+            "crown",
+            root.tr("会员中心"),
+            false,
+            |root, cx| {
+                root.account_menu_open = false;
+                // 官方在这里弹应用内 VIP 窗；网页版会员页先作为占位。
+                cx.open_url("https://qishui.douyin.com/");
+            },
+        ))
+        .child(account_menu_item(
+            cx,
+            "account-menu-logout",
+            "log-out",
+            root.tr("退出登录"),
+            true,
+            |root, cx| {
+                root.account_menu_open = false;
+                root.logout_confirm_open = true;
+                cx.notify();
+            },
+        ));
+    gpui::deferred(menu).with_priority(2).into_any_element()
+}
+
+/// 单条菜单项：40 高、左右 12、图标 20、文字 14。
+fn account_menu_item(
+    cx: &mut Context<Root>,
+    id: &'static str,
+    icon: &'static str,
+    label: &str,
+    danger: bool,
+    action: impl Fn(&mut Root, &mut Context<Root>) + 'static,
+) -> gpui::AnyElement {
+    let color = if danger {
+        theme::danger()
+    } else {
+        gpui::Rgba {
+            a: 0.85,
+            ..theme::text()
+        }
+    };
+    div()
+        .id(id)
+        .h(px(40.0))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .text_size(px(14.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(color)
+        .hover(|style| style.bg(theme::surface_hover()).text_color(theme::text()))
+        .on_click(cx.listener(move |root, _event, _window, cx| action(root, cx)))
+        .child(
+            gpui::svg()
+                .path(ui::icons::path(icon))
+                .size(px(20.0))
+                .text_color(color),
+        )
+        .child(label.to_string())
+        .into_any_element()
+}
+
+/// 退出登录二次确认。
+fn logout_confirm(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let cancel = div()
+        .id("logout-cancel")
+        .h(px(36.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .rounded(px(8.0))
+        .bg(theme::surface_hover())
+        .text_size(px(14.0))
+        .text_color(theme::text())
+        .cursor_pointer()
+        .on_click(cx.listener(|root, _event, _window, cx| {
+            root.logout_confirm_open = false;
+            cx.notify();
+        }))
+        .child(root.tr("取消").to_string());
+
+    let confirm = div()
+        .id("logout-confirm")
+        .h(px(36.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .rounded(px(8.0))
+        .bg(theme::danger())
+        .text_size(px(14.0))
+        .text_color(gpui::white())
+        .cursor_pointer()
+        .on_click(cx.listener(|root, _event, _window, cx| {
+            root.logout_confirm_open = false;
+            root.logout(cx);
+        }))
+        .child(root.tr("退出登录").to_string());
+
+    gpui::deferred(
+        div()
+            .id("logout-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(gpui::rgba(0x00000066))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|root, _event, _window, cx| {
+                    root.logout_confirm_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(320.0))
+                    .p(px(24.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.0))
+                    .rounded(px(12.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(root.tr("确认退出登录吗？").to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(cancel)
+                            .child(confirm),
+                    ),
+            ),
+    )
+    .with_priority(3)
+    .into_any_element()
 }

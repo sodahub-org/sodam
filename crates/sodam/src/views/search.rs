@@ -2,8 +2,22 @@
 
 use super::*;
 use gpui::{MouseMoveEvent, MouseUpEvent};
+/// 搜索框的两种外观：页面内的大输入框、标题栏里的紧凑款。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchStyle {
+    Page,
+    Header,
+}
+
 /// 搜索框：单击定位、拖拽扩选、双击选词、三击全选；按键走 keymap + action（见 `app_text`）。
-fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl IntoElement {
+pub(crate) fn search_box(
+    root: &Root,
+    window: &Window,
+    cx: &mut Context<Root>,
+    height: f32,
+    style: SearchStyle,
+) -> impl IntoElement {
+    let header = style == SearchStyle::Header;
     let focused = root.search_focus.is_focused(window);
     let input_focus = root.search_focus.clone();
     let input_entity = cx.entity();
@@ -12,12 +26,23 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
     // `line.paint`，因为只有这样才能跟着 `scroll_x` 走，而且它和光标、选区用的是
     // 同一条 ShapedLine —— 三者不会互相错位。
     let flow_text = if empty {
-        root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
+        if header {
+            root.tr("歌手、歌曲或专辑名").to_string()
+        } else {
+            root.tr("搜索歌曲、歌手、专辑或歌单").to_string()
+        }
     } else {
         String::new()
     };
     let color = if empty {
-        theme::text_muted()
+        if header {
+            gpui::Rgba {
+                a: 0.3,
+                ..theme::text()
+            }
+        } else {
+            theme::text_muted()
+        }
     } else {
         theme::text()
     };
@@ -44,12 +69,58 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .flex()
         .flex_row()
         .items_center()
-        .h(px(38.0))
-        .px_3()
-        .rounded_md()
-        .bg(theme::surface())
+        .when(header, |this| {
+            this.gap(px(6.0))
+                .text_size(px(13.0))
+                .on_key_down(cx.listener(
+                    |root, event: &gpui::KeyDownEvent, _window, cx| {
+                        if !root.search_sug_open || root.search_sug.is_empty() {
+                            return;
+                        }
+                        let len = root.search_sug.len();
+                        match event.keystroke.key.as_str() {
+                            "down" => {
+                                root.search_sug_index = (root.search_sug_index + 1) % len;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            "up" => {
+                                root.search_sug_index =
+                                    (root.search_sug_index + len - 1) % len;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            "enter" => {
+                                if let Some(item) =
+                                    root.search_sug.get(root.search_sug_index).cloned()
+                                {
+                                    root.apply_search_suggestion(item, cx);
+                                }
+                                cx.stop_propagation();
+                            }
+                            "escape" => {
+                                root.search_sug_open = false;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    },
+                ))
+        })
+        .h(px(height))
+        .px(px(10.0))
+        .when(header, |this| this.rounded(px(12.0)))
+        .when(!header, |this| this.rounded_md())
+        .bg(if header {
+            theme::surface_hover()
+        } else {
+            theme::surface()
+        })
         .border_1()
-        .border_color(if focused {
+        .border_color(if header {
+            theme::surface_hover()
+        } else if focused {
             theme::accent()
         } else {
             theme::border()
@@ -63,6 +134,8 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                 // 单击定位插入点、双击选词、三击全选（Chromium 的单行框三击就是全选）。
                 let changed =
                     root.search_pointer_down(event.position.x, event.click_count, window);
+                // 和官方一致：点搜索框只刷新联想下拉，不直接搜索。
+                root.schedule_search_suggest(cx);
                 if changed {
                     cx.notify();
                 }
@@ -126,6 +199,15 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
         .on_action(cx.listener(Root::text_redo))
         .on_action(cx.listener(Root::text_submit))
         .on_action(cx.listener(Root::text_cancel))
+        .when(header, |this| {
+            this.child(
+                svg()
+                    .path(icons::path("search"))
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme::text_muted()),
+            )
+        })
         .child(
             // 26 = 占位文案的行盒高度，也是原来那条 4 + 18 + 4 的光标几何所暗示的高度；
             // 显式定高之后，真实文本改由 canvas 绘制，盒子才不会塌成 0。
@@ -165,6 +247,24 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                                 );
                                 window.paint_quad(quad);
                             }
+                            if focused {
+                                use std::sync::OnceLock;
+                                use std::time::Instant;
+                                static BLINK_START: OnceLock<Instant> = OnceLock::new();
+                                let start = *BLINK_START.get_or_init(Instant::now);
+                                let phase = (start.elapsed().as_millis() % 1060) as f32 / 1060.0;
+                                if phase < 0.5 {
+                                    let caret = gpui::fill(
+                                        gpui::Bounds::new(
+                                            gpui::point(bounds.origin.x + caret_x, top),
+                                            gpui::size(crate::app::CARET_WIDTH, line_height),
+                                        ),
+                                        theme::accent(),
+                                    );
+                                    window.paint_quad(caret);
+                                }
+                                window.request_animation_frame();
+                            }
                             if let Some(line) = &line {
                                 let _ = line.paint(
                                     gpui::point(bounds.origin.x - scroll, top),
@@ -174,16 +274,6 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                                     window,
                                     cx,
                                 );
-                            }
-                            if focused {
-                                let caret = gpui::fill(
-                                    gpui::Bounds::new(
-                                        gpui::point(bounds.origin.x + caret_x, top),
-                                        gpui::size(crate::app::CARET_WIDTH, line_height),
-                                    ),
-                                    theme::accent(),
-                                );
-                                window.paint_quad(caret);
                             }
                             window.handle_input(
                                 &input_focus,
@@ -196,6 +286,82 @@ fn search_box(root: &Root, window: &Window, cx: &mut Context<Root>) -> impl Into
                     .size_full(),
                 ),
         )
+        .when(header && root.search_sug_open, |this| {
+            this.child(
+                div()
+                    .id("search-sug")
+                    .absolute()
+                    .top(px(36.0))
+                    .left(px(0.0))
+                    .w(px(320.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.0))
+                    .bg(theme::surface_elevated())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .children(root.search_sug.iter().enumerate().map(|(index, item)| {
+                        let selected = index == root.search_sug_index;
+                        let item = item.clone();
+                        let click_item = item.clone();
+                        div()
+                            .id(gpui::ElementId::Name(
+                                format!("search-sug-{index}").into(),
+                            ))
+                            .h(px(40.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .cursor_pointer()
+                            .when(selected, |this| {
+                                this.bg(gpui::Rgba {
+                                    a: 0.1,
+                                    ..theme::text()
+                                })
+                            })
+                            .hover(|style| {
+                                style.bg(gpui::Rgba {
+                                    a: 0.06,
+                                    ..theme::text()
+                                })
+                            })
+                            .on_click(cx.listener(
+                                move |root, _event: &ClickEvent, _window, cx| {
+                                    root.apply_search_suggestion(click_item.clone(), cx);
+                                },
+                            ))
+                            .child(
+                                svg()
+                                    .path(icons::path("search"))
+                                    .size(px(20.0))
+                                    .text_color(theme::text_muted()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if selected {
+                                        gpui::Rgba {
+                                            a: 0.85,
+                                            ..theme::text()
+                                        }
+                                    } else {
+                                        gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        }
+                                    })
+                                    .child(item.text.clone()),
+                            )
+                    })),
+            )
+        })
 }
 
 /// 数字缩写：官方搜索里的“2442.2万人关注”。
@@ -419,7 +585,7 @@ fn artist_row(root: &Root, artist: &ArtistItem, cx: &mut Context<Root>) -> AnyEl
         .flex_row()
         .items_center()
         .gap(px(theme::space::MD))
-        .h(px(72.0))
+        .h(px(66.0))
         .px(px(theme::space::MD))
         .rounded(px(theme::radius::ROW))
         .cursor_pointer()
@@ -490,7 +656,7 @@ fn album_row(root: &Root, album: &AlbumItem, cx: &mut Context<Root>) -> AnyEleme
         .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
             root.open_album_page(item.clone(), cx);
         }))
-        .child(cover(cover_path, 52.0, theme::radius::ART))
+        .child(cover(cover_path, 50.0, theme::radius::ART))
         .child(
             div()
                 .flex_1()
@@ -655,25 +821,85 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .collect(),
             );
             let mut track_index = 0usize;
+            // 官方搜索结果：整组一张浅色圆角卡，左右各留 32，组标题 18/500。
             div()
                 .flex()
                 .flex_col()
-                .gap(px(theme::space::XS))
-                .p(px(theme::space::SM))
-                .rounded(px(theme::radius::CARD))
-                .bg(theme::surface())
-                .border_1()
-                .border_color(theme::border())
+                .gap(px(0.0))
+                .mx(px(32.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .bg(gpui::Rgba {
+                    a: 0.05,
+                    ..theme::text()
+                })
                 .when(!group.title.is_empty(), |this| {
                     this.child(
                         div()
-                            .px(px(theme::space::MD))
-                            .pt(px(theme::space::XS))
-                            .text_size(theme::Text::Small.size())
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text_muted())
+                            .px(px(16.0))
+                            .py(px(8.0))
+                            .text_size(px(18.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(gpui::Rgba {
+                                a: 0.85,
+                                ..theme::text()
+                            })
                             .child(group.title.clone()),
                     )
+                })
+                .when(group.can_view_all, |this| {
+                    let scope = match group.id.as_str() {
+                        "tracks" => Some(SearchScope::Tracks),
+                        "artists" => Some(SearchScope::Artists),
+                        "albums" => Some(SearchScope::Albums),
+                        "playlists" => Some(SearchScope::Playlists),
+                        _ => None,
+                    };
+                    match scope {
+                        Some(scope) => this.child(
+                            div()
+                                .id(gpui::ElementId::Name(
+                                    format!("search-view-all-{}", group.id).into(),
+                                ))
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(gpui::Rgba {
+                                        a: 0.05,
+                                        ..theme::text()
+                                    })
+                                })
+                                .on_click(cx.listener(
+                                    move |root, _event: &ClickEvent, _window, cx| {
+                                        root.set_search_tab(scope, cx);
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .text_color(gpui::Rgba {
+                                            a: 0.35,
+                                            ..theme::text()
+                                        })
+                                        .child(root.localized(
+                                            "查看所有{}",
+                                            std::slice::from_ref(&group.title),
+                                        )),
+                                )
+                                .child(
+                                    svg()
+                                        .path(icons::path("chevron-right"))
+                                        .size(px(24.0))
+                                        .text_color(theme::text_muted()),
+                                ),
+                        ),
+                        None => this,
+                    }
                 })
                 .children(group.entries.iter().map(|entry| match entry {
                     SearchEntry::Track(track) => {
@@ -819,7 +1045,12 @@ fn search_playlist_detail(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
-pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) -> AnyElement {
+pub(crate) fn search_page(
+    root: &Root,
+    window: &Window,
+    cx: &mut Context<Root>,
+    show_input: bool,
+) -> AnyElement {
     if root.search_playlist.is_some() {
         return search_playlist_detail(root, cx);
     }
@@ -835,7 +1066,9 @@ pub(crate) fn search_page(root: &Root, window: &Window, cx: &mut Context<Root>) 
         .flex_1()
         .min_h(px(0.0))
         .gap(px(theme::space::MD))
-        .child(search_box(root, window, cx))
+        .when(show_input, |this| {
+            this.child(search_box(root, window, cx, 38.0, SearchStyle::Page))
+        })
         .when(show_history, |this| {
             this.child(search_history_panel(root, cx))
         })

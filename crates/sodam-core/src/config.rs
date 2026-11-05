@@ -61,6 +61,9 @@ pub struct Settings {
     /// 与环境变量是并集关系——两边都只能「记更多」，不存在谁覆盖谁。
     #[serde(default)]
     pub detailed_logs: bool,
+    /// 是否允许 SodaM 安装并启用 GNOME 顶栏歌词扩展（默认关闭）。
+    #[serde(default)]
+    pub gnome_extension_enabled: bool,
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -267,6 +270,7 @@ impl Default for Settings {
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
             detailed_logs: false,
+            gnome_extension_enabled: false,
         }
     }
 }

@@ -407,12 +407,27 @@ impl Root {
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
         let intent = sodam_core::quality::QualityIntent::parse(quality);
         self.settings.set_quality_intent_by_user(&intent);
-        let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
+        let label = crate::ui::player_bar::official_quality_label(intent.as_setting());
         match self.settings.save() {
             Ok(()) => {
+                // 官方：切换音质立即生效、不中断当前播放位置。
+                let snapshot = self.engine.snapshot();
+                if snapshot.track_id
+                    == self
+                        .queue
+                        .current()
+                        .map(|item| item.id.clone())
+                        .unwrap_or_default()
+                    && !self.queue.is_empty()
+                {
+                    self.quality_resume = Some((snapshot.position_seconds, snapshot.playing));
+                    let tracks = self.queue.tracks().to_vec();
+                    let index = self.queue.index();
+                    self.play_from(tracks, index, cx);
+                }
                 // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
                 // 不值得再弹一条抢注意力的全局提示（见 #83）。
-                let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
+                let message = self.localized("音质已切换为 {}", &[label.to_string()]);
                 self.set_status_text(message);
             }
             Err(err) => {
@@ -468,6 +483,327 @@ impl Root {
         self.align_lyrics_to_position(target);
     }
 
+    /// 重新探测签名服务。
+    pub fn refresh_signer(&mut self, cx: &mut Context<Self>) {
+        self.signer_status = sodam_core::signer::detect();
+        cx.notify();
+    }
+
+    fn run_signer_task(
+        &mut self,
+        label: &'static str,
+        task: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.signer_busy {
+            return;
+        }
+        self.signer_busy = true;
+        cx.notify();
+        let work = cx.background_spawn(async move { task() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.signer_busy = false;
+                root.signer_status = sodam_core::signer::detect();
+                match result {
+                    Ok(()) => root.set_toast(format!("{label}完成"), cx),
+                    Err(err) => root.set_toast(format!("{label}失败：{err}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn signer_install_node(&mut self, cx: &mut Context<Self>) {
+        self.run_signer_task("下载 Node", sodam_core::signer::install_node, cx);
+    }
+
+    pub fn signer_install_libmssdk(&mut self, cx: &mut Context<Self>) {
+        self.run_signer_task("下载 libmssdk", sodam_core::signer::install_libmssdk, cx);
+    }
+
+    pub fn signer_extract_installer(&mut self, cx: &mut Context<Self>) {
+        let path = sodam_core::signer::installer_cache();
+        self.run_signer_task(
+            "提取签名模块",
+            move || sodam_core::signer::extract_vendor_from_installer(&path),
+            cx,
+        );
+    }
+
+    pub fn signer_start(&mut self, cx: &mut Context<Self>) {
+        if self.signer_busy {
+            return;
+        }
+        self.signer_busy = true;
+        cx.notify();
+        let work = cx.background_spawn(async move {
+            sodam_core::signer::start_service(None)?;
+            for _ in 0..60 {
+                if sodam_core::signer::is_ready() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(anyhow::anyhow!("服务在 60 秒内未就绪，请查看 signer.log"))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.signer_busy = false;
+                root.signer_status = sodam_core::signer::detect();
+                match result {
+                    Ok(()) => {
+                        root.settings.signer_url = "http://127.0.0.1:8899/sign".to_string();
+                        root.settings.signer_token = String::new();
+                        let _ = root.settings.save();
+                        root.set_toast("签名服务已就绪".to_string(), cx);
+                    }
+                    Err(err) => root.set_toast(format!("启动签名服务失败：{err}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn signer_stop(&mut self, cx: &mut Context<Self>) {
+        sodam_core::signer::stop_service();
+        self.refresh_signer(cx);
+        self.set_toast("签名服务已停止".to_string(), cx);
+    }
+
+    /// GNOME 顶栏歌词扩展开关：开启时安装并启用，关闭时停用并移除。
+    pub fn set_gnome_extension(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.gnome_extension_enabled = enabled;
+        let _ = self.settings.save();
+        crate::gnome_extension::set_enabled(enabled);
+        self.set_toast(
+            if enabled {
+                "已启用 GNOME 顶栏歌词（需重新登录桌面生效）".to_string()
+            } else {
+                "已停用并移除 GNOME 顶栏歌词扩展".to_string()
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 顶部轻提示，2 秒后自动消失。
+    pub fn set_toast(&mut self, text: String, cx: &mut Context<Self>) {
+        self.toast = Some((text, std::time::Instant::now()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                if root
+                    .toast
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed().as_secs() >= 2)
+                {
+                    root.toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 打开评论面板并拉第一页。
+    pub fn open_comments(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        self.comment_panel_open = true;
+        self.comment_items.clear();
+        self.comment_cursor = "0".to_string();
+        self.comment_has_more = false;
+        self.comment_total = self.comment_cache.get(&track.id).copied().unwrap_or(0);
+        self.comment_track = Some(track.id.clone());
+        self.comment_loading = true;
+        cx.notify();
+        self.fetch_comments(track.id, false, cx);
+    }
+
+    /// 点赞/取消点赞一条评论（本地先回显，失败回滚）。
+    pub fn like_comment(&mut self, comment_id: String, cx: &mut Context<Self>) {
+        let liked = !self.comment_liked.contains(&comment_id);
+        if liked {
+            self.comment_liked.insert(comment_id.clone());
+        } else {
+            self.comment_liked.remove(&comment_id);
+        }
+        if let Some(comment) = self
+            .comment_items
+            .iter_mut()
+            .find(|item| item.id == comment_id)
+        {
+            comment.likes = (comment.likes + if liked { 1 } else { -1 }).max(0);
+        }
+        cx.notify();
+        let Some(track_id) = self.comment_track.clone() else {
+            return;
+        };
+        let settings = self.settings.clone();
+        let work_comment = comment_id.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::like_comment(&session, &track_id, &work_comment, liked)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            if let Err(err) = result {
+                let _ = this.update(cx, |root, cx| {
+                    // 回滚本地状态
+                    if liked {
+                        root.comment_liked.remove(&comment_id);
+                    } else {
+                        root.comment_liked.insert(comment_id.clone());
+                    }
+                    if let Some(comment) = root
+                        .comment_items
+                        .iter_mut()
+                        .find(|item| item.id == comment_id)
+                    {
+                        comment.likes = (comment.likes + if liked { -1 } else { 1 }).max(0);
+                    }
+                    root.set_status("评论操作失败：{}", std::slice::from_ref(&err.to_string()));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn load_more_comments(&mut self, cx: &mut Context<Self>) {
+        if self.comment_loading || !self.comment_has_more {
+            return;
+        }
+        let Some(track_id) = self.comment_track.clone() else {
+            return;
+        };
+        self.comment_loading = true;
+        cx.notify();
+        self.fetch_comments(track_id, true, cx);
+    }
+
+    fn fetch_comments(&mut self, track_id: String, more: bool, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        let cursor = self.comment_cursor.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::list_comments(&session, &track_id, &cursor, 20)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                root.comment_loading = false;
+                match result {
+                    Ok(page) => {
+                        root.comment_total = page.total;
+                        root.comment_cursor = page.cursor;
+                        root.comment_has_more = page.has_more;
+                        if more {
+                            root.comment_items.extend(page.items);
+                        } else {
+                            root.comment_items = page.items;
+                        }
+                    }
+                    Err(err) => {
+                        root.set_status("评论加载失败：{}", std::slice::from_ref(&err.to_string()))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 少推荐：把当前曲目提交给 /luna/track/dislike。
+    pub fn dislike_track(&mut self, track: sodam_core::models::TrackItem, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        let work_id = track.id.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::dislike_track(&session, &work_id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                match result {
+                    Ok(()) => {
+                        root.set_status("已减少推荐：{}", std::slice::from_ref(&track.title));
+                        // 官方行为：少推荐后直接跳过这首。
+                        let current = root.queue.current().map(|item| item.id.clone());
+                        if current.as_deref() == Some(track.id.as_str()) {
+                            root.next_track(cx);
+                        }
+                    }
+                    Err(err) => root.playback_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 新建歌单并加入当前曲目（官方「创建新歌单」）。
+    pub fn create_playlist_with_track(
+        &mut self,
+        track: sodam_core::models::TrackItem,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.settings.clone();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or_default();
+        let name = format!("新歌单 {stamp}");
+        let work_name = name.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::create_playlist_with_track(&session, &work_name, &track.id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                match result {
+                    Ok(()) => root.set_status("已创建歌单：{}", std::slice::from_ref(&name)),
+                    Err(err) => root.playback_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 音量图标点击：静音 / 恢复。
+    pub fn toggle_mute(&mut self) {
+        if self.settings.volume > 0.01 {
+            self.volume_before_mute = self.settings.volume;
+            self.set_volume(0.0);
+        } else {
+            let restored = if self.volume_before_mute > 0.01 {
+                self.volume_before_mute
+            } else {
+                0.8
+            };
+            self.set_volume(restored);
+        }
+    }
+
+    /// 跳到指定秒数：点歌词行时用。
+    pub fn seek_seconds(&mut self, seconds: f64) {
+        let snapshot = self.engine.snapshot();
+        if snapshot.duration_seconds <= 0.0 {
+            return;
+        }
+        let target = seconds.clamp(0.0, snapshot.duration_seconds);
+        self.engine.seek(target);
+        self.align_lyrics_to_position(target);
+    }
+
     /// 把歌词对齐到指定播放位置。
     ///
     /// 切歌与拖动进度都走这里：立刻算出当前句并滚动过去，
@@ -496,13 +832,6 @@ impl Root {
     /// 设置音量（0.0~1.0）。
     pub fn set_volume(&mut self, volume: f32) {
         self.settings.set_volume(volume);
-        self.engine.set_volume(self.settings.volume);
-        self.persist_playback_preferences();
-    }
-
-    /// 静音 / 恢复。以设置中的即时值判断，快速连点不依赖音频线程的回执时机。
-    pub fn toggle_mute(&mut self) {
-        self.settings.toggle_mute();
         self.engine.set_volume(self.settings.volume);
         self.persist_playback_preferences();
     }
@@ -1331,6 +1660,49 @@ impl Root {
         .detach();
     }
 
+    /// 异步取当前歌曲的高潮点，拿到后刷新进度条上的标记。
+    pub(crate) fn load_chorus(
+        &mut self,
+        track: &sodam_core::models::TrackItem,
+        cx: &mut Context<Self>,
+    ) {
+        // 官方行为：评论区开着时切歌，面板保持打开并刷新到新歌的评论。
+        if self.comment_panel_open && self.comment_track.as_deref() != Some(track.id.as_str()) {
+            self.open_comments(track.clone(), cx);
+        }
+        if track.id.is_empty() || self.chorus_cache.contains_key(&track.id) {
+            return;
+        }
+        let settings = self.settings.clone();
+        let id = track.id.clone();
+        let title = track.title.clone();
+        let artist = track.artist.clone();
+        let work_id = id.clone();
+        let work = cx.background_spawn(async move {
+            let session = Session::new(settings);
+            sodam_core::library::track_extras(&session, &work_id, &title, &artist)
+        });
+        cx.spawn(async move |this, cx| {
+            let value = work.await;
+            if let Some(extras) = value {
+                let _ = this.update(cx, |root, cx| {
+                    if extras.chorus_seconds > 0.0 {
+                        root.chorus_cache.insert(id.clone(), extras.chorus_seconds);
+                    }
+                    root.comment_cache.insert(id.clone(), extras.comments);
+                    if !extras.album_id.is_empty() {
+                        root.album_ids.insert(id.clone(), extras.album_id);
+                    }
+                    if !extras.artist_id.is_empty() {
+                        root.artist_ids.insert(id.clone(), extras.artist_id);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// 装载第一首但不播放，停在第一秒等待用户点播放。
     pub(crate) fn pause_pending(&mut self, cx: &mut Context<Self>) {
         self.playing = true;
@@ -1340,6 +1712,7 @@ impl Root {
             return;
         };
         self.pending_track = Some(track.clone());
+        self.load_chorus(&track, cx);
         self.pending_engine_load = None;
         self.progress_preview = Some(0.0);
         self.set_status("已准备播放：{}", std::slice::from_ref(&track.title));
@@ -1974,6 +2347,7 @@ impl Root {
         if self.nav_history.len() > 50 {
             self.nav_history.remove(0);
         }
+        self.nav_forward.clear();
         self.nav = nav;
         if matches!(nav, Nav::Settings) {
             self.refresh_cache_stats(cx);
@@ -2251,6 +2625,21 @@ impl Root {
             Nav::Home
         };
         let nav = self.nav_history.pop().unwrap_or(fallback);
+        self.nav_forward.push(self.nav);
+        self.nav = nav;
+        self.on_nav_changed(cx);
+        cx.notify();
+    }
+
+    /// 前进：与 [`Self::go_back`] 对称，从前进栈里取回页面。
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(nav) = self.nav_forward.pop() else {
+            return;
+        };
+        self.nav_history.push(self.nav);
+        if self.nav_history.len() > 50 {
+            self.nav_history.remove(0);
+        }
         self.nav = nav;
         self.on_nav_changed(cx);
         cx.notify();
@@ -2263,6 +2652,9 @@ impl Root {
         // 状态行是全局反馈，不属于某一页：切页就收走，否则「正在搜索…」会跟着
         // 用户跑到设置页上。本页自己的加载提示在这之后写入，不受影响。
         self.status_line.clear();
+        if self.nav == Nav::Me {
+            self.load_playlists(cx);
+        }
         // 离开设置页时录制态不会自己结束：卡片不在树上时收不到键，但回到设置页那一行
         // 还显示着「按下新的组合键…」，用户随手按一个键就被写进配置。
         self.shortcut_capture = None;
@@ -2883,6 +3275,7 @@ impl Root {
         self.play_seq = self.play_seq.wrapping_add(1);
         let request_seq = self.play_seq;
         self.pending_track = Some(track.clone());
+        self.load_chorus(&track, cx);
         self.pending_engine_load = None;
         self.progress_preview = None;
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
@@ -2948,6 +3341,14 @@ impl Root {
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
                         root.playback_error = None;
+                        if let Some((position, was_playing)) = root.quality_resume.take() {
+                            if position > 0.5 {
+                                root.engine.seek(position);
+                            }
+                            if !was_playing {
+                                root.engine.pause();
+                            }
+                        }
                         // 记录真实播放历史（去重最近一条，避免重复刷屏）
                         if root.played_history.last().map(String::as_str) != Some(track.id.as_str())
                         {

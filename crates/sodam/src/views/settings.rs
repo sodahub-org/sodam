@@ -422,6 +422,52 @@ fn log_toggle_row(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
+/// GNOME 顶栏歌词扩展：默认关闭，开启后才安装并启用。
+fn gnome_extension_row(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .bg(theme::surface())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.0))
+                .flex_1()
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(theme::text())
+                        .child(root.tr("GNOME 顶栏歌词")),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_muted())
+                        .child(
+                            root.tr("开启后安装并启用 GNOME Shell 扩展；关闭会停用并删除扩展目录"),
+                        ),
+                ),
+        )
+        .child(crate::ui::switch::render(
+            "gnome-extension-toggle",
+            root.settings.gnome_extension_enabled,
+            |root, _window, cx| {
+                let enabled = !root.settings.gnome_extension_enabled;
+                root.set_gnome_extension(enabled, cx);
+            },
+            cx,
+        ))
+        .into_any_element()
+}
+
 /// 与「缓存」刻意分开：日志在数据目录，`清空缓存` 不碰它（见 #53）。
 fn diagnostic_log_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let log_dir = sodam_core::log_outlet::log_dir();
@@ -523,14 +569,18 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
             _ => "不设上限，按账号权益和单曲可用档位取最高",
         }
     };
-    let language = root.language;
-    let label_for = |value: &str| crate::ui::player_bar::quality_label(value, language);
+    // 官方音质档位与命名：录音室 / 全景声 / 无损 / 极高 / 标准（另有自动）。
+    const OFFICIAL_TIERS: [&str; 5] = ["hires", "dolby", "lossless", "highest", "medium"];
+    let label_for = |value: &str| {
+        root.tr(crate::ui::player_bar::official_quality_label(value))
+            .to_string()
+    };
     let options: Vec<(&str, String)> = std::iter::once(sodam_core::quality::AUTO)
-        .chain(sodam_core::quality::TIERS)
+        .chain(OFFICIAL_TIERS)
         .map(|value| (value, label_for(value)))
         .collect();
-    // 批量升级同样从 `TIERS` 派生，避免播放档位能选、批量升级却少几档。
-    let batch_tiers: Vec<(&str, String)> = sodam_core::quality::TIERS
+    // 批量升级同样用官方档位，避免播放档位能选、批量升级却少几档。
+    let batch_tiers: Vec<(&str, String)> = OFFICIAL_TIERS
         .into_iter()
         .map(|tier| (tier, label_for(tier)))
         .collect();
@@ -1461,5 +1511,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         }),
                 )
         })
+        .child(gnome_extension_row(root, cx))
+        .child(crate::views::signer::signer_card(root, cx))
         .into_any_element()
 }

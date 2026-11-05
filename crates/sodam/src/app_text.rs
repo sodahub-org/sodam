@@ -129,10 +129,16 @@ impl Root {
         edit: impl FnOnce(&mut TextField) -> bool,
     ) {
         let now = self.search_edit_time();
+        let before = self.search_field.text().to_string();
         self.search_field.begin_edit();
         let changed = edit(&mut self.search_field);
         self.search_field.end_edit(now);
         if changed {
+            // 只有文本真的变了才重新搜；左右移动光标也会返回 changed，
+            // 但内容没变，不该再发一次搜索。
+            if self.search_field.text() != before {
+                self.schedule_search_suggest(cx);
+            }
             self.search_fit_caret_in_view(window);
             cx.notify();
         }
@@ -141,6 +147,7 @@ impl Root {
     /// 撤销与重做不走 `edit_text`：要恢复哪一份快照由状态层自己决定，不需要再开事务。
     pub(crate) fn text_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_field.undo() {
+            self.schedule_search_suggest(cx);
             self.search_fit_caret_in_view(window);
             cx.notify();
         }
@@ -148,6 +155,7 @@ impl Root {
 
     pub(crate) fn text_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_field.redo() {
+            self.schedule_search_suggest(cx);
             self.search_fit_caret_in_view(window);
             cx.notify();
         }
