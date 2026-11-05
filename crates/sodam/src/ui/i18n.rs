@@ -142,6 +142,7 @@ impl Language {
             "解密落盘" => "unpacking",
             "参数" => "input",
             "连续 3 首没播出来，已暂停" => "Paused after 3 tracks failed.",
+            "这一轮没有能播的歌了" => "No playable tracks in this queue.",
             "暂时连不上，检查网络后重试。" => "Can't connect. Check your network and retry.",
             "出现了一点问题，检查网络后重试。" => "Something went wrong. Check your network.",
             "出现了一点问题，请重试。" => "Something went wrong. Try again.",

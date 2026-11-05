@@ -11,6 +11,7 @@ use gpui::{
     Window,
 };
 use sodam_core::{
+    failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
     login::{LoginStatus, QrMatrix},
@@ -428,6 +429,16 @@ pub struct Root {
     /// 清零判据是「最近一次成功装载真的播出去若干秒」，不是「此刻有声」：
     /// 见 `AttemptProgress::recovered` 与下面的 `progress_token`。
     pub(crate) consecutive_failures: u32,
+    /// 会话内已确认「当前账号放不出来」的曲目集合。
+    ///
+    /// 只由按曲目类失败写入，账号 id / 会员状态变化即整份作废；不落盘，
+    /// 也不参与缓存文件的有效性判断。只回答「要不要再为这首打网络」。
+    pub(crate) unplayable: UnplayableTracks,
+    /// 「这一轮没有能播的歌了」的常驻文案：`Some` 表示这句话仍挂在常驻错误位。
+    ///
+    /// 存文案而不只存布尔，是为了条件解除时只撤下自己这一句——期间常驻位可能已经
+    /// 被别的错误占用，不能顺手抹掉。
+    pub(crate) round_exhausted: Option<String>,
     /// 最近一次**成功装载**交给引擎的序号；任何一次装载失败都把它作废。
     ///
     /// 连败复位只认「这个序号 == 引擎当前快照的 load_seq」，也就是进展必须归属于
@@ -574,6 +585,8 @@ impl Root {
             play_seq: 0,
             playback_error: None,
             consecutive_failures: 0,
+            unplayable: UnplayableTracks::default(),
+            round_exhausted: None,
             progress_token: None,
             playback_halted: false,
             playing: false,
