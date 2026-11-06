@@ -50,6 +50,26 @@ fn vip_badge() -> AnyElement {
         .into_any_element()
 }
 
+/// 不可播标记：禁播图标 + 既有二级文本色。
+///
+/// 不新增第三级灰阶——浅色主题下 `text_muted` 与 `text_faint` 已经撞值，
+/// 再分一层分不出来。标记只说「是哪一首」，且**不改变可点击性**：
+/// 条目照常点得动，点了由播放路径给出原因。
+pub(crate) fn unplayable_mark() -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(icons::path("ban"))
+                .size(px(theme::ICON_SM))
+                .text_color(theme::text_muted()),
+        )
+        .into_any_element()
+}
+
 /// 表头：# / 歌曲 / 歌手 / 专辑 / 时长。
 /// 宽度不够时的折叠顺序（按用户要求）：先专辑 → 再时长 → 再歌手。
 /// 列间距与行内左右内边距（与下面的 flex 设置保持一致）。
@@ -57,6 +77,8 @@ const COL_GAP: f32 = 12.0;
 const ROW_PAD: f32 = 12.0;
 /// 内联 VIP 徽章的宽度（含间距），标题文本需要先让出这一段。
 const VIP_WIDTH: f32 = 76.0;
+/// 不可播标记的宽度（图标 + 间距），标题文本同样要先让出这一段。
+const UNPLAYABLE_MARK_W: f32 = theme::ICON_SM + theme::space::SM;
 
 /// 当前可用宽度下各列是否显示 + **标题列的具体宽度**。
 ///
@@ -196,6 +218,8 @@ fn track_row(
     covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     current_track_id: Option<String>,
+    // 这首在当前账号下已被确认放不出来：只加标记，不禁用、不隐藏。
+    unplayable: bool,
 ) -> AnyElement {
     let play_entity = entity.clone();
     let like_entity = entity.clone();
@@ -298,12 +322,10 @@ fn track_row(
         })
         .child({
             // 标题列宽度由 columns_for 显式算出（与表头同宽）；
-            // 有 VIP 徽章时先给徽章让出固定宽度，避免挤掉标题。
-            let text_width = if track.vip {
-                (cols.title - VIP_WIDTH).max(40.0)
-            } else {
-                cols.title
-            };
+            // 有 VIP 徽章 / 不可播标记时先给它们让出固定宽度，避免挤掉标题。
+            let reserved = (if track.vip { VIP_WIDTH } else { 0.0 })
+                + (if unplayable { UNPLAYABLE_MARK_W } else { 0.0 });
+            let text_width = (cols.title - reserved).max(40.0);
             div()
                 .w(px(cols.title))
                 .flex_none()
@@ -314,7 +336,10 @@ fn track_row(
                 .child(
                     div()
                         .id(("track-title-link", index))
-                        .w(px(text_width))
+                        // 标题按内容取宽、以列宽为上限：短标题后面的 VIP / 不可播标记
+                        // 紧贴歌名，长标题照旧截断（不能固定列宽，否则标记会漂到列尾，
+                        // 读起来像是挂在歌手列上）。
+                        .max_w(px(text_width))
                         .flex_none()
                         .min_w(px(0.0))
                         .truncate()
@@ -337,6 +362,7 @@ fn track_row(
                         .child(track.title.clone()),
                 )
                 .when(track.vip, |this| this.child(vip_badge()))
+                .when(unplayable, |this| this.child(unplayable_mark()))
         })
         .when(cols.artist, |this| {
             this.child(
@@ -410,6 +436,8 @@ fn track_list(
     let current_track_id = root.queue.current().map(|track| track.id.clone());
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
+    // 已确认不可播的曲目 id 快照：只含「有结论」的条目，行渲染只读。
+    let unplayable = root.unplayable.confirmed_ids();
 
     let list = uniform_list(
         ("track-list", nav as usize),
@@ -428,6 +456,7 @@ fn track_list(
                         covers.clone(),
                         cover_requests.clone(),
                         current_track_id.clone(),
+                        unplayable.contains(&track.id),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -493,6 +522,8 @@ pub(crate) fn scrolling_detail_page(
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
     let detail_covers = root.covers.clone();
+    // 已确认不可播的曲目 id 快照：只含「有结论」的条目，行渲染只读。
+    let unplayable = root.unplayable.confirmed_ids();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
         if index == 0 {
             return div()
@@ -627,6 +658,7 @@ pub(crate) fn scrolling_detail_page(
                 covers.clone(),
                 cover_requests.clone(),
                 current_track_id.clone(),
+                unplayable.contains(&track.id),
             );
         }
 

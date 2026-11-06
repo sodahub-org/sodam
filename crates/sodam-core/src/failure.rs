@@ -195,6 +195,16 @@ impl UnplayableTracks {
         self.entries.contains_key(track_id) || self.attempted.contains(track_id)
     }
 
+    /// 已确认「当前账号放不出来」的曲目 id 快照，供列表渲染只读。
+    ///
+    /// 只含**有结论**的条目，不含本轮试过但已被容量淘汰的 `attempted`：
+    /// 列表标记说的是「这首放不出来」，不是「这一轮试过它」。
+    /// 渲染路径不能借用 `&self`（虚拟列表闭包要求 `'static`），所以这里给出
+    /// 一份快照；条目上限 [`Self::CAPACITY`]（256），每帧重建的成本可忽略。
+    pub fn confirmed_ids(&self) -> HashSet<String> {
+        self.entries.keys().cloned().collect()
+    }
+
     /// 开始新一轮扫描：保留结论，只忘掉「本轮试过哪些」。
     ///
     /// 成功装载或换队列时调用；账号作废用 [`Self::clear`] 连结论一起清。
@@ -1009,6 +1019,33 @@ mod tests {
 
         set.clear();
         assert!(!set.is_unavailable("track-1"));
+    }
+
+    /// 列表标记的数据源只认「有结论」的条目：被容量淘汰、只剩扫描游标的曲目不算。
+    #[test]
+    fn confirmed_ids_mirror_recorded_conclusions_not_the_scan_cursor() {
+        let mut set = UnplayableTracks::default();
+        let per_track = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        set.record_failure("marked", &per_track);
+        let ids = set.confirmed_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("marked"));
+
+        // 塞到容量之外：最早的结论被淘汰。它仍在扫描游标里（本轮不再重试），
+        // 但「放不出来」的结论已经不在表上，列表不该继续标它。
+        for index in 0..UnplayableTracks::CAPACITY {
+            set.record_failure(&format!("filler-{index}"), &per_track);
+        }
+        let ids = set.confirmed_ids();
+        assert_eq!(ids.len(), set.len());
+        assert!(!ids.contains("marked"), "被容量淘汰的结论不该继续标记");
+        assert!(set.is_unavailable("marked"), "扫描游标仍应记得试过它");
+
+        // 账号作废：标记与结论一起消失。
+        set.clear();
+        assert!(set.confirmed_ids().is_empty());
     }
 
     /// 队列比容量长、且整队都按曲目不可播时，扫描必须停在整圈处，

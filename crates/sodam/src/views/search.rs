@@ -598,6 +598,7 @@ fn search_track_row(
         root.covers.clone(),
         root.cover_requests.clone(),
         root.queue.current().map(|track| track.id.clone()),
+        root.unplayable.contains(&track.id),
     )
 }
 
