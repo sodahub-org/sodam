@@ -12,6 +12,7 @@ use crate::ui::icons;
 use crate::ui::spinner::loading_state;
 use crate::ui::theme;
 use crate::ui::theme::ThemeKind;
+use crate::ui::unplayable_mark;
 
 pub use login::login_modal;
 pub mod login;
@@ -47,26 +48,6 @@ fn vip_badge() -> AnyElement {
         .text_size(theme::Text::Tiny.size())
         .text_color(theme::accent())
         .child("VIP")
-        .into_any_element()
-}
-
-/// 不可播标记：禁播图标 + 既有二级文本色。
-///
-/// 不新增第三级灰阶——浅色主题下 `text_muted` 与 `text_faint` 已经撞值，
-/// 再分一层分不出来。标记只说「是哪一首」，且**不改变可点击性**：
-/// 条目照常点得动，点了由播放路径给出原因。
-pub(crate) fn unplayable_mark() -> AnyElement {
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            svg()
-                .path(icons::path("ban"))
-                .size(px(theme::ICON_SM))
-                .text_color(theme::text_muted()),
-        )
         .into_any_element()
 }
 
@@ -435,8 +416,8 @@ fn track_list(
     let current_track_id = root.queue.current().map(|track| track.id.clone());
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
-    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
-    let unplayable = root.unplayable.confirmed_ids();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
 
     let list = uniform_list(
         ("track-list", nav as usize),
@@ -521,8 +502,8 @@ pub(crate) fn scrolling_detail_page(
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
     let detail_covers = root.covers.clone();
-    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
-    let unplayable = root.unplayable.confirmed_ids();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
         if index == 0 {
             return div()

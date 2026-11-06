@@ -887,8 +887,8 @@ fn queue_drawer_inner(
     let covers = root.covers.clone();
     let cover_requests = root.cover_requests.clone();
     let liked_ids = root.liked_ids.clone();
-    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
-    let unplayable = root.unplayable.confirmed_ids();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
     let entity = cx.entity();
     let count = slots.len();
     let total = root.queue.len();
@@ -983,7 +983,7 @@ fn queue_drawer_inner(
                                             // 与列表行一致：标记前置，歌名再长也不会
                                             // 把图标推到行尾、读成挂在时长上。
                                             .when(marked, |this| {
-                                                this.child(crate::views::unplayable_mark())
+                                                this.child(super::unplayable_mark())
                                             })
                                             .child(
                                                 div()

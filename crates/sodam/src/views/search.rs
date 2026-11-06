@@ -583,7 +583,7 @@ fn search_track_row(
     track: &sodam_core::models::TrackItem,
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     index: usize,
-    // 与其它列表同源：由调用方按 `UnplayableTracks::confirmed_ids()` 快照判定。
+    // 与其它列表同源：由调用方按 `UnplayableTracks::snapshot()` 快照判定。
     unplayable: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
@@ -613,7 +613,7 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let groups = root.search_results.groups.clone();
     let width_slot = root.list_width.clone();
     // 与其它列表同源的一次快照：整页渲染只克隆一次 Arc，不逐行深拷贝。
-    let unplayable = root.unplayable.confirmed_ids();
+    let unplayable = root.unplayable.snapshot();
     div()
         .id("search-groups")
         .relative()
