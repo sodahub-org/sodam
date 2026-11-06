@@ -1444,8 +1444,8 @@ impl Root {
 
     /// 装载第一首但不播放，停在第一秒等待用户点播放。
     ///
-    /// 第一首恰好不可播时不会停在失败曲上：按播放路径同一套分派换到下一个可播
-    /// 候选（票 #109），换完仍然只做装载，不替用户按下播放。
+    /// 第一首正好放不出来时不停在这首上：照播放路径的做法换到下一首能播的
+    /// （票 #109），换过去之后仍然只装载，不替用户按下播放。
     pub(crate) fn pause_pending(&mut self, cx: &mut Context<Self>) {
         self.playing = true;
         self.play_seq = self.play_seq.wrapping_add(1);
@@ -1473,60 +1473,54 @@ impl Root {
                 if root.play_seq != request_seq {
                     return;
                 }
+                // 这次尝试横跨了一次登录 / 换账号：结果说的是旧账号，不能拿它
+                // 记不可播、挂预取、落闸，也不能替用户换歌或改写错误提示。
+                // 和 `start_track` 一样先丢掉旧结果，再动界面上的状态（#108 定的顺序）。
+                if root.auth_epoch != auth_epoch {
+                    root.playing = root.engine.snapshot().playing;
+                    return;
+                }
                 root.pending_track = None;
                 root.playing = false;
                 root.progress_preview = None;
+                // 第一首准备好也是一次成功的装载：上一轮「扫一圈」的游标该作废，
+                // 不该把上一轮的尝试痕迹带给下一轮（与 `start_track` 的成功分支一致）。
+                root.new_playback_round();
                 if let Err(err) = result {
                     let context = load_failure_context(err.stage, root.language);
                     root.log_failure(&context, &err);
-                    // 尝试跨过一次登录 / 账号身份变更：这次结论属于旧身份——不写不可播
-                    // 集合、不挂预取、不落闸，也不替用户换歌或改写错误位。与 `start_track`
-                    // 同一口径（票 #108 成文的守卫顺序：先作废，再处置）。
-                    if root.auth_epoch != auth_epoch {
-                        return;
-                    }
                     // 全局故障同样挂起预取：这条路先看见了故障，预取没理由继续重打。
                     root.suspend_prefetch(&err);
-                    // 分派判据与播放路径同源（票 #109）：按曲目类换下一个可播候选，
-                    // 换完仍然只是装载、不替用户按下播放。
-                    match pending_load_route(&err, root.has_playable_ahead()) {
-                        PendingLoadRoute::SkipToCandidate => {
-                            root.unplayable.record_failure(&track.id, &err);
-                            // 「已跳过」只在队列真的前进之后才能说：判据取
-                            // `advance_playable` 的返回值，与播放路径共用同一处真相。
-                            let advanced = {
-                                let unplayable = &root.unplayable;
-                                root.queue
-                                    .advance_playable(|id| unplayable.is_unavailable(id))
-                                    .is_some()
-                            };
-                            if advanced {
-                                let message = root.tr(play_failure_text(&err, true)).to_string();
-                                // 真的前进：撤下与这次结论无关的旧常驻错误，轻提示一次。
-                                root.playback_error = None;
-                                root.clear_round_exhaustion();
-                                root.notify_warning_once("track-unavailable", message);
-                                root.sync_queue_cache();
-                                root.pause_pending(cx);
-                            } else {
-                                // 候选判断说「还有得播」，队列推进却说没有：同一个曲目 id
-                                // 在队列里出现两次时才会这样（结论按 id 记，预查按下标找）。
-                                // 与播放路径同一处置——落闸并说整圈无候选，不能停在
-                                // 「已准备播放」这条死路上，也不能重放刚确认失败的那一首。
-                                root.halt_exhausted_round();
-                            }
-                        }
-                        PendingLoadRoute::ExhaustedRound => {
-                            // 扫一圈都确认放不出来：与播放路径同一句落闸结论。
-                            root.unplayable.record_failure(&track.id, &err);
+                    // 换不换歌只看失败的结论是关于这一首还是关于整个账号 / 环境，
+                    // 与 `start_track` 同一个判据（票 #109）。换过去之后仍然只装载，
+                    // 不替用户按下播放。
+                    if err.is_per_track() {
+                        root.unplayable.record_failure(&track.id, &err);
+                        // 有没有真的换过去，以队列推进的返回值为准：它内部本来就是
+                        // 同一个查找，先问一遍再问一遍只会得到两个答案。
+                        let advanced = {
+                            let unplayable = &root.unplayable;
+                            root.queue
+                                .advance_playable(|id| unplayable.is_unavailable(id))
+                                .is_some()
+                        };
+                        if advanced {
+                            let message = root.tr(play_failure_text(&err, true)).to_string();
+                            // 换到了：这条轻提示属于一次性反馈，与这次结论无关的
+                            // 旧错误提示同时撤下。
+                            root.playback_error = None;
+                            root.clear_round_exhaustion();
+                            root.notify_warning_once("track-unavailable", message);
+                            root.sync_queue_cache();
+                            root.pause_pending(cx);
+                        } else {
+                            // 扫一圈都确认放不出来：和播放路径同一句落闸结论。
                             root.halt_exhausted_round();
                         }
-                        PendingLoadRoute::Other => {
-                            // 全局故障与抖动类：不换歌，把该做的动作留在常驻错误位。
-                            // 这条路没有播过声音，也不能说「已跳过」或「已停止播放」。
-                            root.playback_error =
-                                Some(root.tr(pending_failure_text(&err)).to_string());
-                        }
+                    } else {
+                        // 全局故障与网络抖动：不换歌，把该做的动作留在错误提示里。
+                        // 这条路没播过声音，不能说「已跳过」，也不能说「已停止播放」。
+                        root.playback_error = Some(root.tr(pending_failure_text(&err)).to_string());
                     }
                 }
                 cx.notify();
@@ -3503,7 +3497,7 @@ fn load_failure_context(stage: Stage, language: Language) -> String {
 /// 三条共用说法 `REMOTE_TEXT` / `SAVE_TEXT` / `RETRY_TEXT` 定义在 [`super`]。
 ///
 /// `skipped` 表示这次失败真的已经换到了下一首：只有此时才能说「已跳过」。
-/// 自动装载第一首那条路只在真的换成候选时传 `true`（见 [`pending_load_route`]）。
+/// 自动装载第一首那条路也照这条规矩来（`pause_pending`）。
 fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
     match failure.action {
         // 登录类（登录过期、缺 Cookie / 缺登录用户 id）是全局故障，换一首也一样。
@@ -3536,43 +3530,10 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
     }
 }
 
-/// 自动装载第一首（不自动开播）时的失败分派。判据与播放路径同源：
+/// 自动装载第一首、但不换歌时（全局故障与网络抖动）给用户看的那一句。
 ///
-/// * 按曲目类失败（[`PlaybackFailure::is_per_track`]）且队列里还有可播候选
-///   → 换候选（`SkipToCandidate`）；候选装载成功后同样不再说「已跳过」，
-///   因为「已跳过」只属于真正失败那一次的轻提示；
-/// * 按曲目类失败但扫一圈没有候选 → 与播放路径共用「这一轮没有能播的歌了」
-///   的落闸（`ExhaustedRound`）；
-/// * 全局故障（登录、签名服务、磁盘、缺 Cookie）与抖动类 → 维持既有提示
-///   （`Other`），不套用跳过：换一首结论不变。
-///
-/// 只有第一支箭头需要队列知识，因此由调用方把「有没有候选」算好传进来，
-/// 判定本身仍是纯函数，可以离线喂数据。
-#[derive(Debug, PartialEq, Eq)]
-enum PendingLoadRoute {
-    /// 换到下一个可播候选，装载完仍停在待播状态。
-    SkipToCandidate,
-    /// 整圈都确认放不出来：与播放路径同一个落闸。
-    ExhaustedRound,
-    /// 按现有方式提示，不换歌。
-    Other,
-}
-
-/// 自动装载第一首那条路的失败分派：只有按曲目类失败会换歌。
-fn pending_load_route(failure: &PlaybackFailure, has_candidate: bool) -> PendingLoadRoute {
-    if !failure.is_per_track() {
-        return PendingLoadRoute::Other;
-    }
-    if has_candidate {
-        return PendingLoadRoute::SkipToCandidate;
-    }
-    PendingLoadRoute::ExhaustedRound
-}
-
-/// 自动装载第一首、但不换歌时（全局故障与抖动类）给用户看的那一句。
-///
-/// 这条路没有播过声音，登录类不能说「已停止播放」；按曲目类走
-/// [`play_failure_text`] 的 `skipped=true`，不经过这里。
+/// 这条路没有播过声音，登录类不能说「已停止播放」；关于某一首的失败走
+/// [`play_failure_text`] 的 `skipped=true`（真的换到下一首时），不经过这里。
 fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
     match failure.action {
         RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => {
@@ -3795,7 +3756,8 @@ mod failure_text_tests {
         }
     }
 
-    /// 没有真正前进的路径（全局故障、整圈无候选、封顶落闸）不能说「已跳过」。
+    /// 没换到下一首的那些情况（全局故障、整圈都没有能播的歌、封顶落闸）
+    /// 不能说「已跳过」。
     #[test]
     fn non_skipping_copy_does_not_claim_skipped() {
         let at = |action| {
@@ -3858,88 +3820,6 @@ mod failure_text_tests {
         for text in [REMOTE_TEXT, SAVE_TEXT, RETRY_TEXT] {
             assert!(!text.contains("{err}"), "{text}");
             assert!(!text.contains("：:"), "{text}");
-        }
-    }
-
-    /// 自动装载第一首的失败分派与播放路径同一判据：按曲目类换候选，
-    /// 全局故障与抖动类都不套用跳过（票 #109）。
-    #[test]
-    fn pending_load_advances_only_for_per_track_failures() {
-        let at = |action| {
-            PlaybackFailure::new(Stage::ResolveStream, Retryability::Never, action, "detail")
-        };
-        for action in [
-            RecoveryAction::TrackUnavailable,
-            RecoveryAction::PickAnother,
-        ] {
-            assert_eq!(
-                pending_load_route(&at(action), true),
-                PendingLoadRoute::SkipToCandidate,
-                "{action:?}"
-            );
-            assert_eq!(
-                pending_load_route(&at(action), false),
-                PendingLoadRoute::ExhaustedRound,
-                "{action:?}"
-            );
-        }
-        // 全局故障：换一首结论不变，维持既有提示，不写不可播集合、不换歌。
-        for action in [
-            RecoveryAction::Relogin,
-            RecoveryAction::CheckSigner,
-            RecoveryAction::CheckEntitlement,
-            RecoveryAction::FreeSpace,
-        ] {
-            assert_eq!(
-                pending_load_route(&at(action), true),
-                PendingLoadRoute::Other
-            );
-            assert_eq!(
-                pending_load_route(&at(action), false),
-                PendingLoadRoute::Other
-            );
-        }
-        // 抖动类（网络超时那一族）同样不在这条路上换歌。
-        let transient = PlaybackFailure::new(
-            Stage::Transfer,
-            Retryability::Transient,
-            RecoveryAction::Nothing,
-            "io: timed out reading response",
-        );
-        assert_eq!(
-            pending_load_route(&transient, true),
-            PendingLoadRoute::Other
-        );
-    }
-
-    /// 真的换到候选才说「已跳过」；全局故障照旧提示，且这条路没播过声音，
-    /// 既不能说「已跳过」也不能说「已停止播放」（票 #109）。
-    #[test]
-    fn pending_load_copy_claims_skipped_only_when_it_advanced() {
-        let per_track = PlaybackFailure::new(
-            Stage::ResolveStream,
-            Retryability::Never,
-            RecoveryAction::TrackUnavailable,
-            "returned preview stream",
-        );
-        // 换成候选：走播放路径那句「已跳过」。
-        let advanced = play_failure_text(&per_track, true);
-        assert!(advanced.contains("已跳过"), "{advanced}");
-        let english = Language::English.text(advanced);
-        assert_ne!(english, advanced, "英文词典缺少：{advanced}");
-
-        // 全局故障：这条路上没有播过声音，不能说「已停止播放」。
-        for action in [RecoveryAction::Relogin, RecoveryAction::CheckEntitlement] {
-            let text = pending_failure_text(&PlaybackFailure::new(
-                Stage::ResolveStream,
-                Retryability::Never,
-                action,
-                "require cookie",
-            ));
-            assert!(!text.contains("已停止播放"), "{text}");
-            assert!(!text.contains("已跳过"), "{text}");
-            let english = Language::English.text(text);
-            assert_ne!(english, text, "英文词典缺少：{text}");
         }
     }
 }

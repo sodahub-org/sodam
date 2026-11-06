@@ -726,29 +726,6 @@ mod tests {
         assert!(all.advance_playable(|_| true).is_none());
     }
 
-    /// 队列里同一个曲目 id 出现两次（推荐流实测会撞）：结论按 id 记，
-    /// 候选按下标找，于是「找到候选」与「推进成功」可以给出不同答案。
-    /// 调用方必须以 `advance_playable` 的返回值为准，不能只信 `next_playable`。
-    #[test]
-    fn duplicate_ids_can_make_the_query_and_the_advance_disagree() {
-        let mut items = tracks(2);
-        // 第 1 首与第 0 首是同一首歌。
-        items.push(TrackItem {
-            id: "0".into(),
-            title: "t0 again".into(),
-            ..Default::default()
-        });
-        let mut queue = Queue::default();
-        queue.replace(items, 1);
-        queue.mode = PlayMode::ListLoop;
-
-        // 按 id 判不可播：绕开 0 之后只剩这一首，纯查询会指到它。
-        assert_eq!(queue.next_playable(|id| id == "1"), Some(2));
-        // 同一份谓词下真正推进：绕完一圈没有别的结果。
-        assert!(queue.advance_playable(|id| id == "1").is_none());
-        assert_eq!(queue.index(), 0);
-    }
-
     /// 随机播放：按本轮顺序跳过不可播项；本轮没有可播项时按整圈判断，
     /// 有可播项就开新一轮，不能误报「没有能播的歌」。
     #[test]
