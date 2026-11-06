@@ -1483,9 +1483,11 @@ impl Root {
                 root.pending_track = None;
                 root.playing = false;
                 root.progress_preview = None;
-                // 第一首准备好也是一次成功的装载：上一轮「扫一圈」的游标该作废，
-                // 不该把上一轮的尝试痕迹带给下一轮（与 `start_track` 的成功分支一致）。
-                root.new_playback_round();
+                if result.is_ok() {
+                    // 第一首准备好也算一次成功的装载：作废旧一轮「扫一圈」的游标。
+                    // 只在成功时做，与 `start_track` 成功分支的位置一致。
+                    root.new_playback_round();
+                }
                 if let Err(err) = result {
                     let context = load_failure_context(err.stage, root.language);
                     root.log_failure(&context, &err);
