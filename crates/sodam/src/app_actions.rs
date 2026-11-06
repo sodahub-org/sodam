@@ -1471,11 +1471,6 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 if root.play_seq != request_seq {
-                    // 被更新的播放取代：这次的 loading 不能留着，否则播放栏的转圈
-                    // 要等下一次装载才收得掉（`start_track` 的同序号分支靠自己的
-                    // 装载回执收尾，这条路没有引擎装载）。
-                    root.pending_track = None;
-                    root.progress_preview = None;
                     return;
                 }
                 root.pending_track = None;
