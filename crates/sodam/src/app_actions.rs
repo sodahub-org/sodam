@@ -3758,8 +3758,8 @@ mod failure_text_tests {
         }
     }
 
-    /// 没换到下一首的那些情况（全局故障、整圈都没有能播的歌、封顶落闸）
-    /// 不能说「已跳过」。
+    /// 没有真的换到下一首时用的那套措辞（`skipped=false`）不能说「已跳过」；
+    /// 自动装载第一首那条路的登录类提示也不能说「已停止播放」。
     #[test]
     fn non_skipping_copy_does_not_claim_skipped() {
         let at = |action| {
