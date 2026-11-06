@@ -457,7 +457,7 @@ pub struct Root {
     /// 60 秒内不再为同一首重排，到期自然过期。按曲目结论进不可播集合（永久拦截），
     /// 全局故障挂 `prefetch_gate`——这张表不承担这两种职责，也不会产生永不过期的条目。
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
-    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）补一次预取。
+    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）在**未落闸**时补一次预取。
     pub(crate) prefetch_patrol: u32,
     /// 登录凭据代数：重新登录成功或退出登录时 +1。
     ///

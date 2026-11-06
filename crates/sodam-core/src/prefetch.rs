@@ -288,6 +288,25 @@ mod tests {
         );
     }
 
+    /// 无法归类的失败既不是按曲目、也不是全局：调用方只能把它送去逐曲冷却。
+    ///
+    /// 这三类曾经被当作 `Retryability::Never` 写进「永久不再预取」表（#117）。
+    #[test]
+    fn unclassified_failures_are_neither_per_track_nor_global() {
+        use crate::failure::classify;
+        use libresoda::SodaError;
+
+        for error in [
+            SodaError::crypto("bad key"),
+            SodaError::api(1, "business error"),
+            SodaError::http("http request failed: status 400 (https://x.test)"),
+        ] {
+            let failure = classify(&error);
+            assert!(!failure.is_per_track(), "不该按曲目：{failure:?}");
+            assert!(!is_global_failure(&failure), "不该全局挂起：{failure:?}");
+        }
+    }
+
     /// 日志取值稳定：大小写与连字符不随界面语言变化。
     #[test]
     fn suspension_log_values_are_stable() {

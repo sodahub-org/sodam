@@ -16,7 +16,7 @@ use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::quality::TierMismatch;
 use sodam_core::session::Session;
 use sodam_core::Settings;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -74,6 +74,8 @@ impl Root {
             return;
         }
         let log = log_outlet::enabled(LogLevel::Debug, LogTopic::Prefetch);
+        // 这一轮预取使用同一个时刻判断冷却，避免逐首重采样把同一批候选判成不同状态。
+        let cooldown_now = std::time::Instant::now();
         // 这次请求属于哪一份登录凭据：回来时若已经换过（重新登录 / 退出），
         // 失败结论属于旧身份，不能用来挂起刚恢复的管线。
         let auth_epoch = self.auth_epoch;
@@ -145,9 +147,7 @@ impl Root {
             if self
                 .prefetch_cooldown_since
                 .get(&next.id)
-                .is_some_and(|failed_at| {
-                    prefetch_cooldown_active(*failed_at, std::time::Instant::now())
-                })
+                .is_some_and(|failed_at| prefetch_cooldown_active(*failed_at, cooldown_now))
             {
                 continue;
             }
@@ -232,18 +232,11 @@ impl Root {
                                 PrefetchFailureRoute::Cooldown => {
                                     // 抖动 / 限流 / 无法归类的失败只影响这一首：60 秒冷却，
                                     // 不做永久记录，也不随 `retryability` 改变含义。
-                                    root.prefetch_cooldown_since.insert(track.id.clone(), now);
-                                    // 内存封顶：只淘汰最旧的一条；冷却表本身会自然过期。
-                                    if root.prefetch_cooldown_since.len() > 256 {
-                                        let oldest = root
-                                            .prefetch_cooldown_since
-                                            .iter()
-                                            .min_by_key(|(_, failed_at)| **failed_at)
-                                            .map(|(track_id, _)| track_id.clone());
-                                        if let Some(oldest) = oldest {
-                                            root.prefetch_cooldown_since.remove(&oldest);
-                                        }
-                                    }
+                                    note_prefetch_cooldown(
+                                        &mut root.prefetch_cooldown_since,
+                                        &track.id,
+                                        now,
+                                    );
                                 }
                             }
                         }
@@ -3543,6 +3536,27 @@ fn prefetch_cooldown_active(failed_at: std::time::Instant, now: std::time::Insta
     now.saturating_duration_since(failed_at) < PREFETCH_RETRY_COOLDOWN
 }
 
+/// 记下一次逐曲冷却；超过上限时淘汰最旧的一条。
+///
+/// 冷却表只影响下一轮重排，淘汰最旧条目最多让某一首早一点重试，不会产生永久黑名单。
+fn note_prefetch_cooldown(
+    cooldown: &mut HashMap<String, std::time::Instant>,
+    track_id: &str,
+    now: std::time::Instant,
+) {
+    cooldown.insert(track_id.to_string(), now);
+    if cooldown.len() <= 256 {
+        return;
+    }
+    let oldest = cooldown
+        .iter()
+        .min_by_key(|(_, failed_at)| **failed_at)
+        .map(|(track_id, _)| track_id.clone());
+    if let Some(oldest) = oldest {
+        cooldown.remove(&oldest);
+    }
+}
+
 /// 预取路径对一次失败的三种处置，与 `is_per_track` / `is_global_failure` 同一判据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrefetchFailureRoute {
@@ -3958,6 +3972,7 @@ mod failure_text_tests {
 mod prefetch_policy_tests {
     use super::*;
     use sodam_core::failure::Retryability;
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     /// 逐曲冷却只按时间判定，60 秒到点即放行，没有「永久」分支。
@@ -3977,6 +3992,24 @@ mod prefetch_policy_tests {
             failed_at,
             failed_at + Duration::from_secs(3600)
         ));
+    }
+
+    /// 冷却表到上限时淘汰最旧的一条：只影响重试顺序，不形成永久条目。
+    #[test]
+    fn cooldown_table_caps_at_256_and_evicts_the_oldest() {
+        let base = Instant::now();
+        let mut cooldown = HashMap::new();
+        for index in 0..=256 {
+            note_prefetch_cooldown(
+                &mut cooldown,
+                &format!("track-{index}"),
+                base + Duration::from_millis(index as u64),
+            );
+        }
+        assert_eq!(cooldown.len(), 256);
+        assert!(!cooldown.contains_key("track-0"), "最旧的条目应先出局");
+        assert!(cooldown.contains_key("track-1"));
+        assert!(cooldown.contains_key("track-256"));
     }
 
     /// 无法归类、可重试性为 `Never` 的失败不能变成永久黑名单：它只进冷却。
