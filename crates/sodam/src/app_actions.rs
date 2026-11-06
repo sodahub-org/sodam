@@ -1471,18 +1471,23 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 if root.play_seq != request_seq {
-                    return;
-                }
-                // 这次尝试横跨了一次登录 / 换账号：结果说的是旧账号，不能拿它
-                // 记不可播、挂预取、落闸，也不能替用户换歌或改写错误提示。
-                // 和 `start_track` 一样先丢掉旧结果，再动界面上的状态（#108 定的顺序）。
-                if root.auth_epoch != auth_epoch {
-                    root.playing = root.engine.snapshot().playing;
+                    // 被更新的播放取代：这次的 loading 不能留着，否则播放栏的转圈
+                    // 要等下一次装载才收得掉（`start_track` 的同序号分支靠自己的
+                    // 装载回执收尾，这条路没有引擎装载）。
+                    root.pending_track = None;
+                    root.progress_preview = None;
                     return;
                 }
                 root.pending_track = None;
                 root.playing = false;
                 root.progress_preview = None;
+                // 这次尝试横跨了一次登录 / 换账号：旧账号的结论不能拿来记不可播、
+                // 挂预取、落闸或替用户换歌，提示也一起丢掉，新一轮会重写（#108 的做法）。
+                // 装载没成功，引擎里还是原来那首，`playing` 交还给引擎快照。
+                if root.auth_epoch != auth_epoch {
+                    root.playing = root.engine.snapshot().playing;
+                    return;
+                }
                 if result.is_ok() {
                     // 第一首准备好也算一次成功的装载：作废旧一轮「扫一圈」的游标。
                     // 只在成功时做，与 `start_track` 成功分支的位置一致。
