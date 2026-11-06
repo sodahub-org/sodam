@@ -1762,6 +1762,14 @@ impl Root {
         if self.loading_recommendation || self.settings.cookie.trim().is_empty() {
             return;
         }
+        // 开发/验证便利：`SODAM_PENDING_START=1` 时，推荐队列一律只装载、不自动开播，
+        // 走的正是「进队列自动装载第一首」那条路（票 #109）。
+        //
+        // 平时这条路只有启动时那一次调用会走到，第一首由服务端给，不可播的样本未必排在
+        // 第一位，验收就只能碰运气；挂上这个开关后，点左栏「推荐」或失败后的「重试」都会
+        // 停在待播状态，可以反复验证。和 `SODAM_QUERY` / `SODAM_NAV` 同级：不设就等于不存在。
+        // 听歌模式不在这里改：它的「点进去就播」是既有语义。
+        let autoplay = autoplay && std::env::var("SODAM_PENDING_START").is_err();
         self.loading_recommendation = true;
         // 重试时先把上一次的失败终态清掉：页面要回到加载态，而不是一边加载
         // 一边还挂着上一轮的失败提示。
