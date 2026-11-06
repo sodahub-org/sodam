@@ -333,13 +333,13 @@ fn track_row(
                 .flex_row()
                 .items_center()
                 .gap(px(theme::space::SM))
+                // 标记放在歌名前面：固定列宽下跟在歌名后面会漂到列尾，
+                // 读起来像是挂在歌手列上；前置也不影响未标记行的排版。
+                .when(unplayable, |this| this.child(unplayable_mark()))
                 .child(
                     div()
                         .id(("track-title-link", index))
-                        // 标题按内容取宽、以列宽为上限：短标题后面的 VIP / 不可播标记
-                        // 紧贴歌名，长标题照旧截断（不能固定列宽，否则标记会漂到列尾，
-                        // 读起来像是挂在歌手列上）。
-                        .max_w(px(text_width))
+                        .w(px(text_width))
                         .flex_none()
                         .min_w(px(0.0))
                         .truncate()
@@ -362,7 +362,6 @@ fn track_row(
                         .child(track.title.clone()),
                 )
                 .when(track.vip, |this| this.child(vip_badge()))
-                .when(unplayable, |this| this.child(unplayable_mark()))
         })
         .when(cols.artist, |this| {
             this.child(
@@ -436,7 +435,7 @@ fn track_list(
     let current_track_id = root.queue.current().map(|track| track.id.clone());
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
-    // 已确认不可播的曲目 id 快照：只含「有结论」的条目，行渲染只读。
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
     let unplayable = root.unplayable.confirmed_ids();
 
     let list = uniform_list(
@@ -522,7 +521,7 @@ pub(crate) fn scrolling_detail_page(
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
     let detail_covers = root.covers.clone();
-    // 已确认不可播的曲目 id 快照：只含「有结论」的条目，行渲染只读。
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
     let unplayable = root.unplayable.confirmed_ids();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
         if index == 0 {

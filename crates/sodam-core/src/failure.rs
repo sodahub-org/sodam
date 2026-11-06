@@ -10,6 +10,7 @@
 use libresoda::SodaError;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 失败发生的阶段。
@@ -180,6 +181,11 @@ pub struct UnplayableTracks {
     /// 增长到队列长度，并在成功装载 / 换队列 / 账号作废时清空——它不是结论，
     /// 只是「这一轮别再试同一首」的记忆。
     attempted: HashSet<String>,
+    /// `entries` 的键快照：列表渲染每帧直接克隆这个 `Arc`，不深拷贝集合。
+    ///
+    /// 只在结论集合变化时随 `entries` 一起重建（[`Self::record_at`] / [`Self::clear`]），
+    /// 渲染路径只读，不参与任何判定——同一份事实仍以 `entries` 为准。
+    confirmed: Arc<HashSet<String>>,
 }
 
 impl UnplayableTracks {
@@ -199,10 +205,15 @@ impl UnplayableTracks {
     ///
     /// 只含**有结论**的条目，不含本轮试过但已被容量淘汰的 `attempted`：
     /// 列表标记说的是「这首放不出来」，不是「这一轮试过它」。
-    /// 渲染路径不能借用 `&self`（虚拟列表闭包要求 `'static`），所以这里给出
-    /// 一份快照；条目上限 [`Self::CAPACITY`]（256），每帧重建的成本可忽略。
-    pub fn confirmed_ids(&self) -> HashSet<String> {
-        self.entries.keys().cloned().collect()
+    /// 返回共享的 `Arc`：虚拟列表闭包要求 `'static`，而渲染路径不能每帧深拷贝
+    /// 集合（参见 UI-SPEC 的性能约束），所以快照只在集合变化时重建一次。
+    pub fn confirmed_ids(&self) -> Arc<HashSet<String>> {
+        self.confirmed.clone()
+    }
+
+    /// 按 `entries` 重建渲染快照。结论集合的每条写入 / 清空路径都要经过这里。
+    fn refresh_confirmed(&mut self) {
+        self.confirmed = Arc::new(self.entries.keys().cloned().collect());
     }
 
     /// 开始新一轮扫描：保留结论，只忘掉「本轮试过哪些」。
@@ -223,6 +234,7 @@ impl UnplayableTracks {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.attempted.clear();
+        self.refresh_confirmed();
     }
 
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻。
@@ -255,6 +267,7 @@ impl UnplayableTracks {
             },
         );
         self.evict_over_capacity();
+        self.refresh_confirmed();
     }
 
     /// 账号 id 或会员状态任一变化 → 整份作废。返回是否真的作废过。

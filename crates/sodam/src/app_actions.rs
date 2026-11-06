@@ -222,9 +222,8 @@ impl Root {
                                 // 后面的歌照常排；集合本身也会让这首不再被预取。
                                 // 标记要立刻出现在各列表里：心跳只在播放中刷新，
                                 // 预取失败后停着不动时也得让用户看到结论。
-                                if root.unplayable.record_failure(&track.id, failure) {
-                                    cx.notify();
-                                }
+                                root.unplayable.record_failure(&track.id, failure);
+                                cx.notify();
                             } else if is_global_failure(failure) {
                                 // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
                                 root.suspend_prefetch(failure);

@@ -887,7 +887,7 @@ fn queue_drawer_inner(
     let covers = root.covers.clone();
     let cover_requests = root.cover_requests.clone();
     let liked_ids = root.liked_ids.clone();
-    // 已确认不可播的曲目 id 快照：只含「有结论」的条目，行渲染只读。
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::confirmed_ids。
     let unplayable = root.unplayable.confirmed_ids();
     let entity = cx.entity();
     let count = slots.len();
@@ -980,6 +980,11 @@ fn queue_drawer_inner(
                                             .flex_row()
                                             .items_center()
                                             .gap(px(theme::space::XS))
+                                            // 与列表行一致：标记前置，歌名再长也不会
+                                            // 把图标推到行尾、读成挂在时长上。
+                                            .when(marked, |this| {
+                                                this.child(crate::views::unplayable_mark())
+                                            })
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -992,10 +997,7 @@ fn queue_drawer_inner(
                                                         theme::text()
                                                     })
                                                     .child(title),
-                                            )
-                                            .when(marked, |this| {
-                                                this.child(crate::views::unplayable_mark())
-                                            }),
+                                            ),
                                     )
                                     .child(
                                         div()
