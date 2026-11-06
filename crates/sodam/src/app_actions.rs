@@ -1479,18 +1479,18 @@ impl Root {
                 if let Err(err) = result {
                     let context = load_failure_context(err.stage, root.language);
                     root.log_failure(&context, &err);
+                    // 尝试跨过一次登录 / 账号身份变更：这次结论属于旧身份——不写不可播
+                    // 集合、不挂预取、不落闸，也不替用户换歌或改写错误位。与 `start_track`
+                    // 同一口径（票 #108 成文的守卫顺序：先作废，再处置）。
+                    if root.auth_epoch != auth_epoch {
+                        return;
+                    }
                     // 全局故障同样挂起预取：这条路先看见了故障，预取没理由继续重打。
-                    // 挂的是整条管线，与「这次尝试属于哪一份登录身份」无关。
                     root.suspend_prefetch(&err);
                     // 分派判据与播放路径同源（票 #109）：按曲目类换下一个可播候选，
                     // 换完仍然只是装载、不替用户按下播放。
                     match pending_load_route(&err, root.has_playable_ahead()) {
                         PendingLoadRoute::SkipToCandidate => {
-                            // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，
-                            // 不写不可播集合，也不替用户换歌（与 `start_track` 同一口径）。
-                            if root.auth_epoch != auth_epoch {
-                                return;
-                            }
                             root.unplayable.record_failure(&track.id, &err);
                             // 「已跳过」只在队列真的前进之后才能说：判据取
                             // `advance_playable` 的返回值，与播放路径共用同一处真相。
@@ -1508,22 +1508,18 @@ impl Root {
                                 root.notify_warning_once("track-unavailable", message);
                                 root.sync_queue_cache();
                                 root.pause_pending(cx);
+                            } else {
+                                // 候选判断说「还有得播」，队列推进却说没有：同一个曲目 id
+                                // 在队列里出现两次时才会这样（结论按 id 记，预查按下标找）。
+                                // 与播放路径同一处置——落闸并说整圈无候选，不能停在
+                                // 「已准备播放」这条死路上，也不能重放刚确认失败的那一首。
+                                root.halt_exhausted_round();
                             }
-                            // `advanced == false` 时不再装载：那会绕回同一首，
-                            // 白打一次网络，还说不出「已跳过」。
                         }
                         PendingLoadRoute::ExhaustedRound => {
-                            // 尝试跨过一次登录 / 账号身份变更：这句结论同样属于旧身份。
-                            if root.auth_epoch != auth_epoch {
-                                return;
-                            }
                             // 扫一圈都确认放不出来：与播放路径同一句落闸结论。
                             root.unplayable.record_failure(&track.id, &err);
                             root.halt_exhausted_round();
-                            // 状态行不能停在失败那一首的「已准备播放」上：
-                            // 装载已经停住，两处界面不能互相打架。
-                            let exhausted = root.tr("这一轮没有能播的歌了").to_string();
-                            root.set_status_text(exhausted);
                         }
                         PendingLoadRoute::Other => {
                             // 全局故障与抖动类：不换歌，把该做的动作留在常驻错误位。
@@ -3916,7 +3912,8 @@ mod failure_text_tests {
         );
     }
 
-    /// 换成候选时说的是「已跳过」；没换成的两条路都不许说，且登录类仍不说「已停止播放」。
+    /// 真的换到候选才说「已跳过」；全局故障照旧提示，且这条路没播过声音，
+    /// 既不能说「已跳过」也不能说「已停止播放」（票 #109）。
     #[test]
     fn pending_load_copy_claims_skipped_only_when_it_advanced() {
         let per_track = PlaybackFailure::new(
@@ -3925,14 +3922,11 @@ mod failure_text_tests {
             RecoveryAction::TrackUnavailable,
             "returned preview stream",
         );
+        // 换成候选：走播放路径那句「已跳过」。
         let advanced = play_failure_text(&per_track, true);
         assert!(advanced.contains("已跳过"), "{advanced}");
-        let stayed = pending_failure_text(&per_track);
-        assert!(!stayed.contains("已跳过"), "{stayed}");
-
-        // 整圈无候选那条路共用播放路径的落闸句，不另造文案。
-        let exhausted = Language::English.text("这一轮没有能播的歌了");
-        assert_ne!(exhausted, "这一轮没有能播的歌了");
+        let english = Language::English.text(advanced);
+        assert_ne!(english, advanced, "英文词典缺少：{advanced}");
 
         // 全局故障：这条路上没有播过声音，不能说「已停止播放」。
         for action in [RecoveryAction::Relogin, RecoveryAction::CheckEntitlement] {
@@ -3943,6 +3937,7 @@ mod failure_text_tests {
                 "require cookie",
             ));
             assert!(!text.contains("已停止播放"), "{text}");
+            assert!(!text.contains("已跳过"), "{text}");
             let english = Language::English.text(text);
             assert_ne!(english, text, "英文词典缺少：{text}");
         }
