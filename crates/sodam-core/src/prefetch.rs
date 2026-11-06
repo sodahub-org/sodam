@@ -12,6 +12,10 @@
 //!
 //! 60 秒是**拍的**：各来源只给量级，没有可直接抄的推荐值。它不改变重试策略，
 //! 只是让无人值守的管线有一次自愈机会；恢复后的第一次预取若再失败，会重新挂起。
+//!
+//! 冷却不自己在后台计时：调用方在巡检时询问 [`PrefetchGate::expire_cooldown`]。
+//! 落闸期间调用方不巡检、也不预取，所以实际恢复会顺延到下一次巡检——这是调用方的
+//! 前提，不是闸门本身的隐藏行为。
 
 use crate::failure::{PlaybackFailure, RecoveryAction};
 use std::time::{Duration, Instant};
@@ -80,8 +84,9 @@ impl PrefetchGate {
         Some(class)
     }
 
-    /// 冷却类到期自动放行；登录 / 磁盘类只认事件，不随时间恢复。
+    /// 调用时若冷却类已到期则放行；登录 / 磁盘类只认事件，不随时间恢复。
     ///
+    /// 闸门不会自己定时：什么时候来问由调用方决定（落闸期间调用方不巡检）。
     /// 返回恢复原因（用于日志），没有变化时返回 `None`。
     pub fn expire_cooldown(&mut self, now: Instant) -> Option<SuspensionClass> {
         let (class, since) = self.suspended?;

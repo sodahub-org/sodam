@@ -7,9 +7,7 @@ use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
-use sodam_core::failure::{
-    PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage, UnplayableReason,
-};
+use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
@@ -140,18 +138,13 @@ impl Root {
             {
                 continue;
             }
-            // 失败过的曲目按分类处置：
-            // * 永久失败（下架 / 无权益 / 签名服务鉴权）——**不再自动排队**。巡检每 5 秒
-            //   重排一次就是在持续打扰那台共享签名服务，而这正是预取路径最容易犯的错；
-            // * 瞬时 / 限流——进冷却，期满再试。
-            if self
-                .prefetch_failed
-                .get(&next.id)
-                .is_some_and(|(failed_at, retryability)| match retryability {
-                    Retryability::Never => true,
-                    _ => failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN,
-                })
-            {
+            // 失败过的曲目只做 60 秒冷却：这张表刻意不区分可重试性，也不留永久条目。
+            // 按曲目结论已进不可播集合，全局故障已挂管线；能走到这里的只剩抖动、限流
+            // 与无法归类的失败——等一个冷却周期，比给单首留一张永不过期的黑名单更符合
+            // #112 的意图。
+            if self.prefetch_failed.get(&next.id).is_some_and(|failed_at| {
+                prefetch_cooldown_active(*failed_at, std::time::Instant::now())
+            }) {
                 continue;
             }
             if log {
@@ -219,26 +212,35 @@ impl Root {
                                 return;
                             }
                             let now = std::time::Instant::now();
-                            if failure.is_per_track() {
-                                // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
-                                // 后面的歌照常排；集合本身也会让这首不再被预取。
-                                // 标记要立刻出现在各列表里：心跳只在播放中刷新，
-                                // 预取失败后停着不动时也得让用户看到结论。
-                                root.unplayable.record_failure(&track.id, failure);
-                                cx.notify();
-                            } else if is_global_failure(failure) {
-                                // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
-                                root.suspend_prefetch(failure);
-                            } else {
-                                // 抖动类进逐曲冷却（与管线是否挂起无关：它只影响这一首）。
-                                // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
-                                if root.prefetch_failed.len() > 256 {
-                                    root.prefetch_failed.retain(|_, (_, retryability)| {
-                                        *retryability == Retryability::Never
-                                    });
+                            match prefetch_failure_route(failure) {
+                                PrefetchFailureRoute::PerTrack => {
+                                    // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
+                                    // 后面的歌照常排；集合本身也会让这首不再被预取。
+                                    // 标记要立刻出现在各列表里：心跳只在播放中刷新，
+                                    // 预取失败后停着不动时也得让用户看到结论。
+                                    root.unplayable.record_failure(&track.id, failure);
+                                    cx.notify();
                                 }
-                                root.prefetch_failed
-                                    .insert(track.id.clone(), (now, failure.retryability));
+                                PrefetchFailureRoute::Suspend => {
+                                    // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
+                                    root.suspend_prefetch(failure);
+                                }
+                                PrefetchFailureRoute::Cooldown => {
+                                    // 抖动 / 限流 / 无法归类的失败只影响这一首：60 秒冷却，
+                                    // 不做永久记录，也不随 `retryability` 改变含义。
+                                    root.prefetch_failed.insert(track.id.clone(), now);
+                                    // 内存封顶：只淘汰最旧的一条；冷却表本身会自然过期。
+                                    if root.prefetch_failed.len() > 256 {
+                                        let oldest = root
+                                            .prefetch_failed
+                                            .iter()
+                                            .min_by_key(|(_, failed_at)| **failed_at)
+                                            .map(|(track_id, _)| track_id.clone());
+                                        if let Some(oldest) = oldest {
+                                            root.prefetch_failed.remove(&oldest);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -339,16 +341,13 @@ impl Root {
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
                 if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
-                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍，落闸期间
-                    // 不预取也不谎报「已恢复」，等用户主动播放后的下一拍再判定。
-                    log_prefetch_resume(
-                        root.prefetch_gate
-                            .expire_cooldown(std::time::Instant::now()),
-                    );
-                    root.prefetch_failed.retain(|_, (failed_at, retryability)| {
-                        *retryability == Retryability::Never
-                            || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
-                    });
+                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍。落闸期间不预取，
+                    // 因此也不检查冷却、不写 resumed 日志——实际恢复顺延到用户主动播放
+                    // 后的下一拍（docs/ARCHITECTURE.md 已写明这条前提）。
+                    let now = std::time::Instant::now();
+                    log_prefetch_resume(root.prefetch_gate.expire_cooldown(now));
+                    root.prefetch_failed
+                        .retain(|_, failed_at| prefetch_cooldown_active(*failed_at, now));
                     root.spawn_prefetch(cx);
                 }
                 if root.prefetch_patrol % 300 == 0 {
@@ -825,10 +824,11 @@ impl Root {
                                         // 换了一份登录凭据：先推进代数，在途预取回来时
                                         // 才知道自己属于旧身份。
                                         root.auth_epoch = root.auth_epoch.wrapping_add(1);
-                                        // 旧账号的不可播结论不再适用。
+                                        // 旧账号的不可播结论与逐曲冷却不再适用。
                                         // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
                                         // 但账号信息读取失败时拿不到新身份，这里先保守作废。
                                         root.unplayable.clear();
+                                        root.prefetch_failed.clear();
                                         root.clear_round_exhaustion();
                                         // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
                                         log_prefetch_resume(
@@ -961,6 +961,8 @@ impl Root {
                             // 身份变了：在途预取带着旧账号 / 旧会员状态起跑，
                             // 它们的结论同样不能写回刚作废的集合或挂起管线。
                             root.auth_epoch = root.auth_epoch.wrapping_add(1);
+                            // 逐曲冷却也属于旧身份：新账号不该继承旧账号的等待时间。
+                            root.prefetch_failed.clear();
                             // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
                             root.clear_round_exhaustion();
                         }
@@ -2103,10 +2105,11 @@ impl Root {
         self.playing = false;
         self.pending_track = None;
         self.playback_error = None;
-        // 不可播结论按账号 × 会话隔离：退出后旧账号的结论一条都不留。
+        // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这张已经清空的表。
         self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.unplayable.clear();
+        self.prefetch_failed.clear();
         self.clear_round_exhaustion();
         self.queue = Queue::new(Vec::new());
         self.played_history.clear();
@@ -3140,6 +3143,11 @@ impl Root {
         self.release_playback_halt();
         self.engine.toggle();
         self.playing = !snapshot.playing;
+        if self.playing {
+            // 已装载曲目的「按播放」同样是用户主动播放：磁盘类预取挂起由它解除，
+            // 与 `start_track(user_initiated = true)` 保持同一语义（票 #117）。
+            log_prefetch_resume(self.prefetch_gate.note_user_playback());
+        }
         let message = if self.playing {
             self.tr("播放中").to_string()
         } else {
@@ -3516,9 +3524,37 @@ fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
     }
 }
 
-/// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
-/// 持续打签名服务和网络）。
+/// 预取逐曲冷却：非按曲目、非全局的失败在 60 秒内不再重排。
+///
+/// 按曲目结论由不可播集合永久拦截，全局故障由管线闸门挂起——这张冷却表两者都不收，
+/// 所以它没有「永久失败」这一档，也不该用 `Retryability::Never` 当跳过判据。
 const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 冷却是否仍在生效。只按时间判定：这里没有「永久」分支（见上面的常量注释）。
+fn prefetch_cooldown_active(failed_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(failed_at) < PREFETCH_RETRY_COOLDOWN
+}
+
+/// 预取路径对一次失败的三种处置，与 `is_per_track` / `is_global_failure` 同一判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefetchFailureRoute {
+    /// 按曲目不可播：进不可播集合，后面的歌照常排。
+    PerTrack,
+    /// 全局故障：挂起整条管线。
+    Suspend,
+    /// 其余失败：只给这一首 60 秒冷却。
+    Cooldown,
+}
+
+fn prefetch_failure_route(failure: &PlaybackFailure) -> PrefetchFailureRoute {
+    if failure.is_per_track() {
+        PrefetchFailureRoute::PerTrack
+    } else if is_global_failure(failure) {
+        PrefetchFailureRoute::Suspend
+    } else {
+        PrefetchFailureRoute::Cooldown
+    }
+}
 
 /// 预取管线挂起/恢复只在日志里留痕（对用户静默）。
 ///
@@ -3759,6 +3795,7 @@ fn prefetch_concurrency() -> usize {
 #[cfg(test)]
 mod failure_text_tests {
     use super::*;
+    use sodam_core::failure::Retryability;
 
     /// 界面只说人话：不复述上游技术原文，也不带接口地址。
     #[test]
@@ -3906,6 +3943,89 @@ mod failure_text_tests {
             assert!(!text.contains("{err}"), "{text}");
             assert!(!text.contains("：:"), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod prefetch_policy_tests {
+    use super::*;
+    use sodam_core::failure::Retryability;
+    use std::time::{Duration, Instant};
+
+    /// 逐曲冷却只按时间判定，60 秒到点即放行，没有「永久」分支。
+    #[test]
+    fn cooldown_expires_and_has_no_permanent_branch() {
+        let failed_at = Instant::now();
+        assert!(prefetch_cooldown_active(failed_at, failed_at));
+        assert!(prefetch_cooldown_active(
+            failed_at,
+            failed_at + PREFETCH_RETRY_COOLDOWN - Duration::from_millis(1)
+        ));
+        assert!(!prefetch_cooldown_active(
+            failed_at,
+            failed_at + PREFETCH_RETRY_COOLDOWN
+        ));
+        assert!(!prefetch_cooldown_active(
+            failed_at,
+            failed_at + Duration::from_secs(3600)
+        ));
+    }
+
+    /// 无法归类、可重试性为 `Never` 的失败不能变成永久黑名单：它只进冷却。
+    ///
+    /// 对应 #117 的三种来源：解密失败、非鉴权业务码、未识别的 HTTP 状态码。
+    /// 按曲目类与全局类仍各走自己的出口，三者的判据是同一份失败分类。
+    #[test]
+    fn unclassified_never_failures_route_to_cooldown_not_a_permanent_ban() {
+        let cooldown = [
+            PlaybackFailure::new(
+                Stage::Unpack,
+                Retryability::Never,
+                RecoveryAction::Nothing,
+                "crypto failure",
+            ),
+            PlaybackFailure::new(
+                Stage::ResolveStream,
+                Retryability::Never,
+                RecoveryAction::Nothing,
+                "api business code",
+            ),
+            PlaybackFailure::new(
+                Stage::ResolveStream,
+                Retryability::Never,
+                RecoveryAction::Nothing,
+                "http request failed: status 400",
+            ),
+        ];
+        for failure in cooldown {
+            assert_eq!(
+                prefetch_failure_route(&failure),
+                PrefetchFailureRoute::Cooldown,
+                "{failure:?}"
+            );
+        }
+
+        let per_track = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            "returned preview stream",
+        );
+        assert_eq!(
+            prefetch_failure_route(&per_track),
+            PrefetchFailureRoute::PerTrack
+        );
+
+        let signer = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::CheckSigner,
+            "signer error",
+        );
+        assert_eq!(
+            prefetch_failure_route(&signer),
+            PrefetchFailureRoute::Suspend
+        );
     }
 }
 
