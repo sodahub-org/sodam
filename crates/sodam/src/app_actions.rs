@@ -12,6 +12,7 @@ use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
+use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::quality::TierMismatch;
 use sodam_core::session::Session;
 use sodam_core::Settings;
@@ -67,7 +68,15 @@ impl Root {
     /// 触发点：装载成功、切音质、「下一首播放」，以及心跳每 ~5s 的巡检
     /// （后者自动覆盖 append/remove 等队列变更，不必逐个调用点补）。
     pub(crate) fn spawn_prefetch(&mut self, cx: &mut Context<Self>) {
+        // 全局故障期间整条管线挂起：巡检每 5 秒仍会路过这里，但一次请求都不发。
+        // 冷却到期由心跳在未落闸的巡检里轮询，这里只问闸开没开。
+        if !self.prefetch_gate.allows() {
+            return;
+        }
         let log = log_outlet::enabled(LogLevel::Debug, LogTopic::Prefetch);
+        // 这次请求属于哪一份登录凭据：回来时若已经换过（重新登录 / 退出），
+        // 失败结论属于旧身份，不能用来挂起刚恢复的管线。
+        let auth_epoch = self.auth_epoch;
         let ahead = prefetch_ahead_count();
         let max_inflight = prefetch_concurrency().max(1);
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
@@ -194,22 +203,58 @@ impl Root {
                             root.prefetch_failed.remove(&track.id);
                         }
                         Err(failure) => {
-                            // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
-                            if root.prefetch_failed.len() > 256 {
-                                root.prefetch_failed.retain(|_, (_, retryability)| {
-                                    *retryability == Retryability::Never
-                                });
+                            // 这次请求跨过一次登录变更：结论属于旧身份，既不挂起
+                            // 已经恢复的管线，也不写回已作废的不可播集合。
+                            if root.auth_epoch != auth_epoch {
+                                if log {
+                                    log_event(
+                                        LogLevel::Debug,
+                                        LogTopic::Prefetch,
+                                        "stale_after_auth_change",
+                                        &[("track_id", track.id.as_str())],
+                                    );
+                                }
+                                return;
                             }
-                            root.prefetch_failed.insert(
-                                track.id.clone(),
-                                (std::time::Instant::now(), failure.retryability),
-                            );
+                            let now = std::time::Instant::now();
+                            if failure.is_per_track() {
+                                // 按曲目类失败不挂管线：结论只关于这一首，进不可播集合，
+                                // 后面的歌照常排；集合本身也会让这首不再被预取。
+                                root.unplayable.record_failure(&track.id, failure);
+                            } else if is_global_failure(failure) {
+                                // 全局故障挂起整条管线（只在真的挂上时写一行日志）。
+                                root.suspend_prefetch(failure);
+                            } else {
+                                // 抖动类进逐曲冷却（与管线是否挂起无关：它只影响这一首）。
+                                // 只做内存封顶：清掉冷却类，永久类留着当「别再自动排队」。
+                                if root.prefetch_failed.len() > 256 {
+                                    root.prefetch_failed.retain(|_, (_, retryability)| {
+                                        *retryability == Retryability::Never
+                                    });
+                                }
+                                root.prefetch_failed
+                                    .insert(track.id.clone(), (now, failure.retryability));
+                            }
                         }
                     }
                 });
             })
             .detach();
         }
+    }
+
+    /// 播放装载遇到全局故障时同样挂起预取管线。
+    ///
+    /// 装载这条路先看见了故障，预取没理由继续巡检。按曲目类与抖动类不挂：
+    /// 前者只进不可播集合，后者有逐曲冷却。
+    fn suspend_prefetch(&mut self, failure: &PlaybackFailure) {
+        let Some(class) = self
+            .prefetch_gate
+            .suspend_for(failure, std::time::Instant::now())
+        else {
+            return;
+        };
+        log_prefetch_suspension(class);
     }
 
     /// UI 心跳：播放中每 200ms 刷新一次（进度条需要持续重绘），
@@ -279,7 +324,7 @@ impl Root {
                 if snap.finished && should_advance && root.pending_track.is_none() {
                     if root.queue.mode == PlayMode::RepeatOne {
                         // 播完重播：单曲循环的正常语义，不能拿「不可播的前进」替换。
-                        root.next_track(cx);
+                        root.advance_next(false, cx);
                     } else {
                         // 自动续播同样先查不可播集合：已确认放不出来的歌不再白打一次网络。
                         root.auto_advance_track(cx);
@@ -289,6 +334,12 @@ impl Root {
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
                 if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
+                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍，落闸期间
+                    // 不预取也不谎报「已恢复」，等用户主动播放后的下一拍再判定。
+                    log_prefetch_resume(
+                        root.prefetch_gate
+                            .expire_cooldown(std::time::Instant::now()),
+                    );
                     root.prefetch_failed.retain(|_, (failed_at, retryability)| {
                         *retryability == Retryability::Never
                             || failed_at.elapsed() < PREFETCH_RETRY_COOLDOWN
@@ -655,7 +706,7 @@ impl Root {
         }
         if self.queue.jump(index).is_some() {
             self.sync_queue_cache();
-            self.start_track(cx);
+            self.start_track(true, cx);
         }
     }
 
@@ -759,11 +810,18 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
-                                        // 换了一份登录凭据：旧账号的不可播结论不再适用。
+                                        // 换了一份登录凭据：先推进代数，在途预取回来时
+                                        // 才知道自己属于旧身份。
+                                        root.auth_epoch = root.auth_epoch.wrapping_add(1);
+                                        // 旧账号的不可播结论不再适用。
                                         // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
                                         // 但账号信息读取失败时拿不到新身份，这里先保守作废。
                                         root.unplayable.clear();
                                         root.clear_round_exhaustion();
+                                        // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
+                                        log_prefetch_resume(
+                                            root.prefetch_gate.note_login_success(),
+                                        );
                                         root.set_status_text(
                                             language
                                                 .text("登录成功，正在读取账号信息…")
@@ -861,11 +919,16 @@ impl Root {
         if self.settings.cookie.trim().is_empty() {
             return;
         }
+        // 发起时的登录身份：回来时若已经换过，这份账号信息属于旧身份，丢弃。
+        let auth_epoch = self.auth_epoch;
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move { Session::new(settings).fetch_account() });
         cx.spawn(async move |this, cx| {
             let account = work.await;
             let _ = this.update(cx, |root, cx| {
+                if root.auth_epoch != auth_epoch {
+                    return;
+                }
                 match account {
                     Ok(info) => {
                         let vip = info.vip;
@@ -883,6 +946,9 @@ impl Root {
                             (info.user_id.as_str(), info.vip),
                         );
                         if invalidated {
+                            // 身份变了：在途预取带着旧账号 / 旧会员状态起跑，
+                            // 它们的结论同样不能写回刚作废的集合或挂起管线。
+                            root.auth_epoch = root.auth_epoch.wrapping_add(1);
                             // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
                             root.clear_round_exhaustion();
                         }
@@ -1097,6 +1163,7 @@ impl Root {
         .detach();
     }
 
+    /// 把推荐流 / 听歌模式的曲目装进队列；`autoplay` 为假时停在待播状态。
     pub(crate) fn activate_recommended_queue(
         &mut self,
         source: RecommendationSource,
@@ -1138,7 +1205,7 @@ impl Root {
         // （内部 `set_nav(Nav::Lyrics)`）之前等于刚写上就被收走。
         self.set_status("已切换到{}队列", &[label.to_string()]);
         if autoplay {
-            self.start_track(cx);
+            self.start_track(true, cx);
         } else {
             self.pause_pending(cx);
         }
@@ -1805,7 +1872,7 @@ impl Root {
                                     .collect();
                                 root.ensure_covers(&covers, cx);
                                 root.open_lyrics(cx);
-                                root.start_track(cx);
+                                root.start_track(true, cx);
                             }
                             Ok(_) => {
                                 let message = root.localized(
@@ -1869,7 +1936,7 @@ impl Root {
                             .collect();
                         root.ensure_covers(&covers, cx);
                         root.open_lyrics(cx);
-                        root.start_track(cx);
+                        root.start_track(true, cx);
                     }
                     Ok(_) => root.set_status(
                         "歌单「{}」没有可播放曲目",
@@ -1971,6 +2038,8 @@ impl Root {
         self.pending_track = None;
         self.playback_error = None;
         // 不可播结论按账号 × 会话隔离：退出后旧账号的结论一条都不留。
+        // 在途预取回来后按代数丢弃，不能再写回这张已经清空的表。
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.unplayable.clear();
         self.clear_round_exhaustion();
         self.queue = Queue::new(Vec::new());
@@ -2721,7 +2790,7 @@ impl Root {
         self.queue.prepare_shuffle_round();
         self.sync_queue_cache();
         self.ensure_covers(&covers, cx);
-        self.start_track(cx);
+        self.start_track(true, cx);
     }
 
     /// 打开搜索结果里的歌单：带着已知标题，切换到歌单详情页。
@@ -2783,7 +2852,7 @@ impl Root {
         self.sync_queue_cache();
         self.ensure_covers(std::slice::from_ref(&cover), cx);
         if was_empty {
-            self.start_track(cx);
+            self.start_track(true, cx);
         } else {
             self.spawn_prefetch(cx);
         }
@@ -2935,7 +3004,7 @@ impl Root {
                 .is_some_and(|track| !self.unplayable.is_unavailable(&track.id));
             if current_playable {
                 self.sync_queue_cache();
-                self.start_track(cx);
+                self.start_track(false, cx);
                 return;
             }
             self.halt_exhausted_round();
@@ -2943,7 +3012,7 @@ impl Root {
             return;
         }
         self.sync_queue_cache();
-        self.start_track(cx);
+        self.start_track(false, cx);
     }
 
     /// 用户明确要求继续播放：熔断回到半开，连败重新数。
@@ -2957,6 +3026,7 @@ impl Root {
         }
     }
 
+    /// 播放 / 暂停：引擎没装载当前曲目时先装载，否则只切换播放状态。
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.pending_track.is_some() {
             return;
@@ -2978,7 +3048,7 @@ impl Root {
                 return;
             }
             // 队列里有歌但引擎还没装载 → 装载当前曲目
-            self.start_track(cx);
+            self.start_track(true, cx);
             return;
         }
         self.engine.toggle();
@@ -2993,7 +3063,10 @@ impl Root {
     }
 
     /// 装载并播放「当前队列曲目」：后台下载+解密 → 回 UI 线程交给引擎。
-    pub fn start_track(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `user_initiated` 只用于预取管线的恢复信号：磁盘类挂起等的是「下一次用户
+    /// 主动播放」，自动续播 / 自动跳过不算——它们可能正被同一个故障卡着。
+    pub fn start_track(&mut self, user_initiated: bool, cx: &mut Context<Self>) {
         let Some(track) = self.queue.current().cloned() else {
             self.set_status_text(self.tr("队列是空的：先去搜索或打开一张歌单"));
             cx.notify();
@@ -3002,6 +3075,11 @@ impl Root {
         // 走到这里就是一次被明确要求（或被允许）的播放尝试：闸门若开着，说明是用户
         // 按了播放/切歌，熔断回半开。自动续播路径在巡检处已被闸门拦住。
         self.release_playback_halt();
+        // 恢复信号按故障类分：磁盘类以下一次用户主动播放为事件（票 #112）。
+        // 自动续播 / 自动跳过不解除：它们可能正被同一个故障卡着。
+        if user_initiated {
+            log_prefetch_resume(self.prefetch_gate.note_user_playback());
+        }
         self.playing = true;
         self.play_seq = self.play_seq.wrapping_add(1);
         let request_seq = self.play_seq;
@@ -3017,6 +3095,8 @@ impl Root {
 
         let settings = self.settings.clone();
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
+        // 这次尝试属于哪一份登录身份：回来时若已经换过，结论不成立。
+        let auth_epoch = self.auth_epoch;
         let work_track = track.clone();
         // 单层预算：还要不要再来一次由**这次失败的分类**决定。
         // 之前是无条件 3 次线性退避，于是「这首已下架」「签名服务要求鉴权」这类
@@ -3129,6 +3209,15 @@ impl Root {
                         root.pending_track = None;
                         // 这次尝试失败了：它之前的「播出去」不再为它抵账。
                         root.progress_token = None;
+                        // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，别用它
+                        // 落闸、挂预取、写不可播集合，也别替用户跳歌。
+                        if root.auth_epoch != auth_epoch {
+                            root.playing = root.engine.snapshot().playing;
+                            return;
+                        }
+                        // 全局故障同样挂起预取：装载这条路先看见了故障，
+                        // 预取没理由继续一轮轮重打那台共享签名服务。
+                        root.suspend_prefetch(&failure);
 
                         if failure.is_per_track() {
                             // 按曲目不可播：先写进会话集合，再按「扫一圈」找下一个可播候选。
@@ -3150,7 +3239,7 @@ impl Root {
                                 root.notify_warning_once("track-unavailable", message);
                                 root.progress_preview = None;
                                 root.sync_queue_cache();
-                                root.start_track(cx);
+                                root.start_track(false, cx);
                             } else {
                                 // 扫一圈都确认放不出来：落闸，并把本轮结论留在常驻位。
                                 root.halt_exhausted_round();
@@ -3188,7 +3277,7 @@ impl Root {
                                     root.notify_error_once("consecutive-stream-failures", halted);
                                 } else if in_place {
                                     // 单曲循环：原地重试同一首，由连败封顶兜底。
-                                    root.next_track(cx);
+                                    root.advance_next(false, cx);
                                 } else if has_candidate {
                                     // 自动跳过同样先查不可播集合，别把已知放不出来的歌
                                     // 再装载一次。
@@ -3228,20 +3317,28 @@ impl Root {
         cx.notify();
     }
 
+    /// 用户点了下一首（按钮 / 快捷键 / 媒体键）：算主动播放，自动路径见 [`Self::advance_next`]。
     pub fn next_track(&mut self, cx: &mut Context<Self>) {
+        self.advance_next(true, cx);
+    }
+
+    /// 推进到下一首。`user_initiated` 区分用户按钮与自动路径（播完重播、
+    /// 单曲循环原地重试）：只有前者算预取管线磁盘类挂起的恢复事件。
+    fn advance_next(&mut self, user_initiated: bool, cx: &mut Context<Self>) {
         // 切歌时丢掉进度预览，避免「拖到一半换歌」把 seek 用到新歌上。
         // 队列当前项不会被移除（remove 拒绝当前项），所以直接推进即可。
         self.progress_preview = None;
         self.queue.advance();
         self.sync_queue_cache();
-        self.start_track(cx);
+        self.start_track(user_initiated, cx);
     }
 
+    /// 用户点了上一首：同样算主动播放。
     pub fn prev_track(&mut self, cx: &mut Context<Self>) {
         self.progress_preview = None;
         self.queue.rewind();
         self.sync_queue_cache();
-        self.start_track(cx);
+        self.start_track(true, cx);
     }
 
     /// 设置页保存后调用：落盘并重建会话。
@@ -3302,6 +3399,33 @@ fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
 /// 预取失败冷却：失败的曲目 60s 内不再重试（巡检会把永久失败的歌无限重试，
 /// 持续打签名服务和网络）。
 const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 预取管线挂起/恢复只在日志里留痕（对用户静默）。
+///
+/// 同一段故障最多每分钟一对（冷却到期后重试仍失败会再挂起一次），
+/// 巡检每 5 秒路过一次不会重复刷屏。
+fn log_prefetch_suspension(class: SuspensionClass) {
+    log_event(
+        LogLevel::Info,
+        LogTopic::Prefetch,
+        "suspended",
+        &[("class", class.as_str())],
+    );
+}
+
+/// `None` 表示这次事件没有解除任何挂起（不写日志）。
+fn log_prefetch_resume(reason: Option<SuspensionClass>) {
+    let Some(reason) = reason else {
+        return;
+    };
+    log_event(
+        LogLevel::Info,
+        LogTopic::Prefetch,
+        "resumed",
+        &[("reason", reason.as_str())],
+    );
+}
+
 /// 阶段名的中文原文（稳定 i18n key）。
 ///
 /// 「地址解析（含签名）」不是笔误：上游把这两步的失败压成了同一个无相位错误，
