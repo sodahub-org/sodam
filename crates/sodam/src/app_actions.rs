@@ -142,9 +142,13 @@ impl Root {
             // 按曲目结论已进不可播集合，全局故障已挂管线；能走到这里的只剩抖动、限流
             // 与无法归类的失败——等一个冷却周期，比给单首留一张永不过期的黑名单更符合
             // #112 的意图。
-            if self.prefetch_failed.get(&next.id).is_some_and(|failed_at| {
-                prefetch_cooldown_active(*failed_at, std::time::Instant::now())
-            }) {
+            if self
+                .prefetch_cooldown_since
+                .get(&next.id)
+                .is_some_and(|failed_at| {
+                    prefetch_cooldown_active(*failed_at, std::time::Instant::now())
+                })
+            {
                 continue;
             }
             if log {
@@ -195,7 +199,7 @@ impl Root {
                     root.prefetch_inflight.remove(&track.id);
                     match &outcome {
                         Ok(_) => {
-                            root.prefetch_failed.remove(&track.id);
+                            root.prefetch_cooldown_since.remove(&track.id);
                         }
                         Err(failure) => {
                             // 这次请求跨过一次登录变更：结论属于旧身份，既不挂起
@@ -228,16 +232,16 @@ impl Root {
                                 PrefetchFailureRoute::Cooldown => {
                                     // 抖动 / 限流 / 无法归类的失败只影响这一首：60 秒冷却，
                                     // 不做永久记录，也不随 `retryability` 改变含义。
-                                    root.prefetch_failed.insert(track.id.clone(), now);
+                                    root.prefetch_cooldown_since.insert(track.id.clone(), now);
                                     // 内存封顶：只淘汰最旧的一条；冷却表本身会自然过期。
-                                    if root.prefetch_failed.len() > 256 {
+                                    if root.prefetch_cooldown_since.len() > 256 {
                                         let oldest = root
-                                            .prefetch_failed
+                                            .prefetch_cooldown_since
                                             .iter()
                                             .min_by_key(|(_, failed_at)| **failed_at)
                                             .map(|(track_id, _)| track_id.clone());
                                         if let Some(oldest) = oldest {
-                                            root.prefetch_failed.remove(&oldest);
+                                            root.prefetch_cooldown_since.remove(&oldest);
                                         }
                                     }
                                 }
@@ -341,12 +345,12 @@ impl Root {
                 // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
                 root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
                 if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
-                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍。落闸期间不预取，
-                    // 因此也不检查冷却、不写 resumed 日志——实际恢复顺延到用户主动播放
-                    // 后的下一拍（docs/ARCHITECTURE.md 已写明这条前提）。
+                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍。落闸期间这条预取
+                    // 巡检不执行，因此也不检查冷却、不写 resumed 日志——实际恢复顺延到
+                    // 用户主动播放后的下一拍（docs/ARCHITECTURE.md 已写明这条前提）。
                     let now = std::time::Instant::now();
                     log_prefetch_resume(root.prefetch_gate.expire_cooldown(now));
-                    root.prefetch_failed
+                    root.prefetch_cooldown_since
                         .retain(|_, failed_at| prefetch_cooldown_active(*failed_at, now));
                     root.spawn_prefetch(cx);
                 }
@@ -821,15 +825,11 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
-                                        // 换了一份登录凭据：先推进代数，在途预取回来时
-                                        // 才知道自己属于旧身份。
-                                        root.auth_epoch = root.auth_epoch.wrapping_add(1);
-                                        // 旧账号的不可播结论与逐曲冷却不再适用。
-                                        // 账号 id / 会员状态的逐项比较在 `refresh_account` 里，
-                                        // 但账号信息读取失败时拿不到新身份，这里先保守作废。
-                                        root.unplayable.clear();
-                                        root.prefetch_failed.clear();
-                                        root.clear_round_exhaustion();
+                                        // 换了一份登录凭据：旧账号的不可播结论与逐曲冷却
+                                        // 一并作废。账号 id / 会员状态的逐项比较在
+                                        // `refresh_account` 里，但账号信息读取失败时拿不到
+                                        // 新身份，这里先保守作废。
+                                        root.invalidate_identity_conclusions();
                                         // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
                                         log_prefetch_resume(
                                             root.prefetch_gate.note_login_success(),
@@ -958,13 +958,10 @@ impl Root {
                             (info.user_id.as_str(), info.vip),
                         );
                         if invalidated {
-                            // 身份变了：在途预取带着旧账号 / 旧会员状态起跑，
-                            // 它们的结论同样不能写回刚作废的集合或挂起管线。
-                            root.auth_epoch = root.auth_epoch.wrapping_add(1);
-                            // 逐曲冷却也属于旧身份：新账号不该继承旧账号的等待时间。
-                            root.prefetch_failed.clear();
-                            // 条件解除：整圈无候选的常驻错误立刻撤下，不等用户关。
-                            root.clear_round_exhaustion();
+                            // 身份变了：旧账号的不可播结论与逐曲冷却一并作废；
+                            // 在途预取带着旧身份起跑，代数推进后它们不能再写回
+                            // 新集合或挂起管线。
+                            root.invalidate_identity_conclusions();
                         }
                         root.account = Some(info.clone());
                         root.play_reporter.set_user_id(info.user_id.clone());
@@ -2093,6 +2090,17 @@ impl Root {
         .detach();
     }
 
+    /// 账号身份变化：不可播结论与逐曲冷却都属于旧身份，必须一起作废。
+    ///
+    /// 三个入口（重新登录成功、账号信息刷新、退出登录）都走这里，避免只清其中一张表；
+    /// 同时推进 `auth_epoch`，让在途预取回来时知道自己属于旧身份。
+    fn invalidate_identity_conclusions(&mut self) {
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
+        self.unplayable.clear();
+        self.prefetch_cooldown_since.clear();
+        self.clear_round_exhaustion();
+    }
+
     /// 退出登录：清除 Cookie 并立即回到未登录状态。
     ///
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
@@ -2106,11 +2114,8 @@ impl Root {
         self.pending_track = None;
         self.playback_error = None;
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
-        // 在途预取回来后按代数丢弃，不能再写回这张已经清空的表。
-        self.auth_epoch = self.auth_epoch.wrapping_add(1);
-        self.unplayable.clear();
-        self.prefetch_failed.clear();
-        self.clear_round_exhaustion();
+        // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
+        self.invalidate_identity_conclusions();
         self.queue = Queue::new(Vec::new());
         self.played_history.clear();
         self.sync_queue_cache();
@@ -3528,6 +3533,9 @@ fn apply_external_open(cx: &mut Context<Root>, target: ExternalOpen) {
 ///
 /// 按曲目结论由不可播集合永久拦截，全局故障由管线闸门挂起——这张冷却表两者都不收，
 /// 所以它没有「永久失败」这一档，也不该用 `Retryability::Never` 当跳过判据。
+///
+/// 与 `PrefetchGate::COOLDOWN` 数值相同但作用域不同（逐曲 vs 整条管线），刻意各留
+/// 一个常量：以后调一处时不该被动改另一处。
 const PREFETCH_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 冷却是否仍在生效。只按时间判定：这里没有「永久」分支（见上面的常量注释）。
