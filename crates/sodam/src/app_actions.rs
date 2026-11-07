@@ -1443,6 +1443,9 @@ impl Root {
     }
 
     /// 装载第一首但不播放，停在第一秒等待用户点播放。
+    ///
+    /// 第一首正好放不出来时不停在这首上：照播放路径的做法换到下一首能播的
+    /// （票 #109），换过去之后仍然只装载，不替用户按下播放。
     pub(crate) fn pause_pending(&mut self, cx: &mut Context<Self>) {
         self.playing = true;
         self.play_seq = self.play_seq.wrapping_add(1);
@@ -1458,6 +1461,8 @@ impl Root {
         cx.notify();
         let settings = self.settings.clone();
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
+        // 这次装载属于哪一份登录身份：回来时若已经换过，结论不成立。
+        let auth_epoch = self.auth_epoch;
         let work_track = track.clone();
         let work = cx.background_spawn(async move {
             Session::new(settings).download_to_cache(&work_track, account_is_vip)
@@ -1471,13 +1476,54 @@ impl Root {
                 root.pending_track = None;
                 root.playing = false;
                 root.progress_preview = None;
+                // 这次尝试横跨了一次登录 / 换账号：旧账号的结论不能拿来记不可播、
+                // 挂预取、落闸或替用户换歌，提示也一起丢掉，新一轮会重写（#108 的做法）。
+                // 装载没成功，引擎里还是原来那首，`playing` 交还给引擎快照。
+                if root.auth_epoch != auth_epoch {
+                    root.playing = root.engine.snapshot().playing;
+                    return;
+                }
+                if result.is_ok() {
+                    // 第一首准备好也算一次成功的装载：作废旧一轮「扫一圈」的游标。
+                    // 只在成功时做，与 `start_track` 成功分支的位置一致。
+                    root.new_playback_round();
+                }
                 if let Err(err) = result {
                     let context = load_failure_context(err.stage, root.language);
                     root.log_failure(&context, &err);
-                    // 这条路径不前进，也不能说「已跳过」或「已停止播放」；
-                    // 等 #109 接入换候选后再改。
-                    root.playback_error = Some(root.tr(pending_failure_text(&err)).to_string());
-                    root.playing = false;
+                    // 全局故障同样挂起预取：这条路先看见了故障，预取没理由继续重打。
+                    root.suspend_prefetch(&err);
+                    // 换不换歌只看失败的结论是关于这一首还是关于整个账号 / 环境，
+                    // 与 `start_track` 同一个判据（票 #109）。换过去之后仍然只装载，
+                    // 不替用户按下播放。
+                    if err.is_per_track() {
+                        root.unplayable.record_failure(&track.id, &err);
+                        // 有没有真的换过去，以队列推进的返回值为准：它内部本来就是
+                        // 同一个查找，先问一遍再问一遍只会得到两个答案。
+                        let advanced = {
+                            let unplayable = &root.unplayable;
+                            root.queue
+                                .advance_playable(|id| unplayable.is_unavailable(id))
+                                .is_some()
+                        };
+                        if advanced {
+                            let message = root.tr(play_failure_text(&err, true)).to_string();
+                            // 换到了：这条轻提示属于一次性反馈，与这次结论无关的
+                            // 旧错误提示同时撤下。
+                            root.playback_error = None;
+                            root.clear_round_exhaustion();
+                            root.notify_warning_once("track-unavailable", message);
+                            root.sync_queue_cache();
+                            root.pause_pending(cx);
+                        } else {
+                            // 扫一圈都确认放不出来：和播放路径同一句落闸结论。
+                            root.halt_exhausted_round();
+                        }
+                    } else {
+                        // 全局故障与网络抖动：不换歌，把该做的动作留在错误提示里。
+                        // 这条路没播过声音，不能说「已跳过」，也不能说「已停止播放」。
+                        root.playback_error = Some(root.tr(pending_failure_text(&err)).to_string());
+                    }
                 }
                 cx.notify();
             });
@@ -1716,6 +1762,14 @@ impl Root {
         if self.loading_recommendation || self.settings.cookie.trim().is_empty() {
             return;
         }
+        // 开发/验证便利：`SODAM_PENDING_START=1` 时，推荐队列一律只装载、不自动开播，
+        // 走的正是「进队列自动装载第一首」那条路（票 #109）。
+        //
+        // 平时这条路只有启动时那一次调用会走到，第一首由服务端给，不可播的样本未必排在
+        // 第一位，验收就只能碰运气；挂上这个开关后，点左栏「推荐」或失败后的「重试」都会
+        // 停在待播状态，可以反复验证。和 `SODAM_QUERY` / `SODAM_NAV` 同级：不设就等于不存在。
+        // 听歌模式不在这里改：它的「点进去就播」是既有语义。
+        let autoplay = autoplay && std::env::var("SODAM_PENDING_START").is_err();
         self.loading_recommendation = true;
         // 重试时先把上一次的失败终态清掉：页面要回到加载态，而不是一边加载
         // 一边还挂着上一轮的失败提示。
@@ -3453,7 +3507,7 @@ fn load_failure_context(stage: Stage, language: Language) -> String {
 /// 三条共用说法 `REMOTE_TEXT` / `SAVE_TEXT` / `RETRY_TEXT` 定义在 [`super`]。
 ///
 /// `skipped` 表示这次失败真的已经换到了下一首：只有此时才能说「已跳过」。
-/// 同一份分类也用于「装载第一首但不播放」等不会前进的路径。
+/// 自动装载第一首那条路也照这条规矩来（`pause_pending`）。
 fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
     match failure.action {
         // 登录类（登录过期、缺 Cookie / 缺登录用户 id）是全局故障，换一首也一样。
@@ -3486,9 +3540,10 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
     }
 }
 
-/// 自动装载第一首（不前进）时给用户看的失败说明。
+/// 自动装载第一首、但不换歌时（全局故障与网络抖动）给用户看的那一句。
 ///
-/// 这条路径没有开始播放，登录类文案不能说「已停止播放」；按曲目类同样不能说「已跳过」。
+/// 这条路没有播过声音，登录类不能说「已停止播放」；关于某一首的失败走
+/// [`play_failure_text`] 的 `skipped=true`（真的换到下一首时），不经过这里。
 fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
     match failure.action {
         RecoveryAction::Relogin | RecoveryAction::CheckEntitlement => {
@@ -3711,7 +3766,8 @@ mod failure_text_tests {
         }
     }
 
-    /// 没有真正前进的路径（自动装载第一首、封顶落闸）不能说「已跳过」。
+    /// 没有真的换到下一首时用的那套措辞（`skipped=false`）不能说「已跳过」；
+    /// 自动装载第一首那条路的登录类提示也不能说「已停止播放」。
     #[test]
     fn non_skipping_copy_does_not_claim_skipped() {
         let at = |action| {
