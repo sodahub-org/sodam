@@ -155,13 +155,15 @@ impl fmt::Display for PlaybackFailure {
 
 impl std::error::Error for PlaybackFailure {}
 
-/// 一条不可播结论：何时确认、当时的可重试性。
+/// 一条不可播结论：何时确认、当时的可重试性与成因。
 ///
-/// 时间用来做容量淘汰的先进先出；可重试性用来决定「先淘汰谁」。
+/// 时间用来做容量淘汰的先进先出；可重试性用来决定「先淘汰谁」；
+/// 成因用来让显式点播不必重打网络就能说出「为什么」。
 #[derive(Debug, Clone, Copy)]
 struct UnplayableEntry {
     recorded_at: Instant,
     retryability: Retryability,
+    action: RecoveryAction,
 }
 
 /// 结论集合的只读快照，供列表渲染共享。
@@ -219,6 +221,14 @@ impl UnplayableTracks {
         self.entries.contains_key(track_id) || self.attempted.contains(track_id)
     }
 
+    /// 已确认结论的成因（供显式点播不重打网络就给出原因）。
+    ///
+    /// 只认结论集合，不含「本轮试过但结论已被容量淘汰」的扫描游标——
+    /// 那种情况已经不知道当初为什么放不出来，不能凭游标编一个理由。
+    pub fn reason(&self, track_id: &str) -> Option<RecoveryAction> {
+        self.entries.get(track_id).map(|entry| entry.action)
+    }
+
     /// 已确认「当前账号放不出来」的只读快照，供列表渲染共享。
     ///
     /// 返回 `Arc` 的克隆（零拷贝）：虚拟列表闭包要求 `'static`，
@@ -247,11 +257,11 @@ impl UnplayableTracks {
         self.attempted.clear();
     }
 
-    /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻。
+    /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻与成因。
     ///
     /// 私有：外部只能经 [`Self::record_failure`] 进来，避免绕开「只收按曲目类」的判据。
-    fn record(&mut self, track_id: &str, retryability: Retryability) {
-        self.record_at(track_id, retryability, Instant::now());
+    fn record(&mut self, track_id: &str, retryability: Retryability, action: RecoveryAction) {
+        self.record_at(track_id, retryability, action, Instant::now());
     }
 
     /// 按失败分类写入：**只有按曲目类写**，全局故障一律不写。
@@ -264,16 +274,23 @@ impl UnplayableTracks {
             return false;
         }
         self.attempted.insert(track_id.to_string());
-        self.record(track_id, failure.retryability);
+        self.record(track_id, failure.retryability, failure.action);
         true
     }
 
-    fn record_at(&mut self, track_id: &str, retryability: Retryability, at: Instant) {
+    fn record_at(
+        &mut self,
+        track_id: &str,
+        retryability: Retryability,
+        action: RecoveryAction,
+        at: Instant,
+    ) {
         Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
             UnplayableEntry {
                 recorded_at: at,
                 retryability,
+                action,
             },
         );
         self.evict_over_capacity();
@@ -899,14 +916,41 @@ mod tests {
     fn unplayable_set_records_and_clears() {
         let mut set = UnplayableTracks::default();
         assert!(set.is_empty());
-        set.record("track-1", Retryability::Never);
-        set.record("track-2", Retryability::Never);
+        set.record(
+            "track-1",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+        );
+        set.record("track-2", Retryability::Never, RecoveryAction::PickAnother);
         assert!(set.contains("track-1"));
         assert!(set.contains("track-2"));
         assert_eq!(set.len(), 2);
         assert!(!set.contains("track-3"));
         set.clear();
         assert!(set.is_empty());
+    }
+
+    /// 显式点播要能不重打网络就说出原因：集合记住的是成因，不只是「不可播」。
+    #[test]
+    fn unplayable_set_remembers_the_reason() {
+        let mut set = UnplayableTracks::default();
+        let no_full = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        let gone = failure(SodaError::not_found("track removed"));
+        assert!(set.record_failure("no-full", &no_full));
+        assert!(set.record_failure("gone", &gone));
+        assert_eq!(
+            set.reason("no-full"),
+            Some(RecoveryAction::TrackUnavailable)
+        );
+        assert_eq!(set.reason("gone"), Some(RecoveryAction::PickAnother));
+
+        // 全局故障不写结论，也就没有原因可说。
+        let signer = failure(SodaError::http("signer error: bad token"));
+        assert!(!set.record_failure("signer", &signer));
+        assert_eq!(set.reason("signer"), None);
+        assert_eq!(set.reason("never-seen"), None);
     }
 
     /// 集合只由按曲目类失败写入：一次签名服务故障不能把整屏曲目标成不可播。
@@ -945,7 +989,11 @@ mod tests {
     #[test]
     fn unplayable_set_invalidates_only_when_account_identity_changes() {
         let mut set = UnplayableTracks::default();
-        set.record("track-1", Retryability::Never);
+        set.record(
+            "track-1",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+        );
 
         // 同一账号、同一会员状态：保留。
         assert!(!set.invalidate_if_account_changed(Some(("user-a", true)), ("user-a", true)));
@@ -956,12 +1004,20 @@ mod tests {
         assert!(set.is_empty());
 
         // 换账号：作废。
-        set.record("track-2", Retryability::Never);
+        set.record(
+            "track-2",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+        );
         assert!(set.invalidate_if_account_changed(Some(("user-a", false)), ("user-b", false)));
         assert!(set.is_empty());
 
         // 此前没有账号身份（刚启动 / 退出登录后）：没有可作废的结论。
-        set.record("track-3", Retryability::Never);
+        set.record(
+            "track-3",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+        );
         assert!(!set.invalidate_if_account_changed(None, ("user-b", false)));
         assert!(set.contains("track-3"));
     }
@@ -973,18 +1029,34 @@ mod tests {
         let at = |millis: u64| base + Duration::from_millis(millis);
         let mut set = UnplayableTracks::default();
         // 两条确定性结论最早写入，但不应先于瞬时条目被淘汰。
-        set.record_at("keep-a", Retryability::Never, at(0));
-        set.record_at("keep-b", Retryability::Never, at(1));
+        set.record_at(
+            "keep-a",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            at(0),
+        );
+        set.record_at(
+            "keep-b",
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            at(1),
+        );
         for index in 0..(UnplayableTracks::CAPACITY - 2) {
             set.record_at(
                 &format!("transient-{index}"),
                 Retryability::Transient,
+                RecoveryAction::TrackUnavailable,
                 at(10 + index as u64),
             );
         }
         assert_eq!(set.len(), UnplayableTracks::CAPACITY);
 
-        set.record_at("overflow", Retryability::Transient, at(9_000));
+        set.record_at(
+            "overflow",
+            Retryability::Transient,
+            RecoveryAction::TrackUnavailable,
+            at(9_000),
+        );
         assert_eq!(set.len(), UnplayableTracks::CAPACITY);
         assert!(set.contains("keep-a"), "确定性条目不该先被淘汰");
         assert!(set.contains("keep-b"), "确定性条目不该先被淘汰");
@@ -1000,12 +1072,14 @@ mod tests {
             set.record_at(
                 &format!("track-{index}"),
                 Retryability::Never,
+                RecoveryAction::TrackUnavailable,
                 base + Duration::from_millis(index as u64),
             );
         }
         set.record_at(
             "newest",
             Retryability::Never,
+            RecoveryAction::TrackUnavailable,
             base + Duration::from_millis(9_000),
         );
         assert_eq!(set.len(), UnplayableTracks::CAPACITY);

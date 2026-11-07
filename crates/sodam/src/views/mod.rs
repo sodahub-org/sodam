@@ -229,7 +229,7 @@ fn track_row(
             let tracks = tracks.clone();
             play_entity.update(cx, |root, cx| {
                 root.track_menu = None;
-                root.play_from_arc(tracks, index, cx);
+                root.play_selected_arc(tracks, index, cx);
             });
         })
         .on_mouse_down(
