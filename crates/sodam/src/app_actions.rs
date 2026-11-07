@@ -3163,7 +3163,7 @@ impl Root {
         if self
             .session
             .as_ref()
-            .is_some_and(|session| session.has_full_cached(&track.id))
+            .is_some_and(|session| session.has_full_track_cached(&track.id))
         {
             return false;
         }
