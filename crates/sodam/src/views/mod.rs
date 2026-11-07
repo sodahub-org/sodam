@@ -573,7 +573,7 @@ pub(crate) fn scrolling_detail_page(
                                             move |_event: &ClickEvent, _window, cx| {
                                                 let tracks = tracks.clone();
                                                 entity.update(cx, |root, cx| {
-                                                    root.play_from_arc(tracks.clone(), 0, cx);
+                                                    root.play_from(tracks.as_ref().clone(), 0, cx);
                                                 });
                                             }
                                         })

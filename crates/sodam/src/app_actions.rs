@@ -2772,12 +2772,10 @@ impl Root {
         .detach();
     }
 
-    /// 点列表行播放（列表以 `Arc` 共享，避免每次点击都深拷贝整张表）。
+    /// 点列表行播放：用户明确点了**这一首**。
     ///
-    /// 与 [`Self::play_from_arc`] 的区别只在意图：这是用户明确点了**这一首**，
-    /// 命中不可播集合时停在原地给原因，不替他跳、也不重打网络。
-    /// 拦截发生在队列替换之前：播放状态与当前曲目都不动，避免界面指向新曲目、
-    /// 声音还停在旧曲目这种不一致。
+    /// 命中不可播集合时在改队列之前返回：播放状态与当前曲目都不动，
+    /// 不替他跳、也不重打网络。其余情况与 [`Self::play_from`] 相同（复制一份入队）。
     pub fn play_selected_arc(
         &mut self,
         tracks: std::sync::Arc<Vec<TrackItem>>,
@@ -2790,16 +2788,6 @@ impl Root {
         if self.block_explicit_play(track, cx) {
             return;
         }
-        self.play_from(tracks.as_ref().clone(), index, cx);
-    }
-
-    /// 播放整张列表（「播放全部」等入口，起始下标由调用方决定）。
-    pub fn play_from_arc(
-        &mut self,
-        tracks: std::sync::Arc<Vec<TrackItem>>,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) {
         self.play_from(tracks.as_ref().clone(), index, cx);
     }
 
@@ -3120,18 +3108,18 @@ impl Root {
         if self.pending_track.is_some() {
             return;
         }
-        self.release_playback_halt();
         let snapshot = self.engine.snapshot();
-        if snapshot.track_id.is_empty()
+        let needs_load = snapshot.track_id.is_empty()
             || !snapshot.error.is_empty()
             || snapshot.finished
             || self
                 .queue
                 .current()
-                .is_some_and(|track| track.id != snapshot.track_id)
-        {
-            self.consecutive_failures = 0;
+                .is_some_and(|track| track.id != snapshot.track_id);
+        if needs_load {
             if self.queue.is_empty() {
+                self.release_playback_halt();
+                self.consecutive_failures = 0;
                 self.set_status_text(self.tr("队列是空的：先去搜索或打开一张歌单"));
                 cx.notify();
                 return;
@@ -3140,12 +3128,16 @@ impl Root {
             let Some(track) = self.queue.current().cloned() else {
                 return;
             };
+            // 先拦再复位闸门：被拦下的点播没有尝试装载，不构成「用户要求重试」。
             if self.block_explicit_play(&track, cx) {
                 return;
             }
+            self.release_playback_halt();
+            self.consecutive_failures = 0;
             self.start_track(true, cx);
             return;
         }
+        self.release_playback_halt();
         self.engine.toggle();
         self.playing = !snapshot.playing;
         let message = if self.playing {
