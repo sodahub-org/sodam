@@ -123,6 +123,19 @@ impl Session {
         // 这里只是调度提示，不返回可播放文件，也不建立租约或刷新 LRU 时间。
         self.cached_info(track_id).is_some()
     }
+
+    /// 这首是否有**整曲**缓存：试听片段不算。
+    ///
+    /// 显式点播的不可播拦截只给已落盘的整曲让路（父票边界）；试听片段是
+    /// 「这一次只拿到试听」的证据，不能反过来当作整曲可播。
+    pub fn has_full_track_cached(&self, track_id: &str) -> bool {
+        Self::full_track_cached(self.cached_info(track_id))
+    }
+
+    /// 判定单独拆出来，让「试听片段不算整曲」这条边界能被离线测试。
+    fn full_track_cached(info: Option<CachedInfo>) -> bool {
+        info.is_some_and(|info| !info.preview)
+    }
 }
 
 /// 一次播放要用的本地文件 + 它实际是什么音质。
@@ -945,6 +958,21 @@ mod tests {
         let session = Session::new(settings);
         assert!(session.has_cookie());
         assert_eq!(session.settings().quality, "lossless");
+    }
+
+    /// 试听片段不算整曲缓存：显式点播的不可播拦截只给整曲让路（父票边界）。
+    #[test]
+    fn full_track_cached_excludes_preview_fragments() {
+        let info = |preview| CachedInfo {
+            path: std::path::PathBuf::new(),
+            quality: String::new(),
+            preview,
+            quality_rank: None,
+            checked_rank: None,
+        };
+        assert!(Session::full_track_cached(Some(info(false))));
+        assert!(!Session::full_track_cached(Some(info(true))));
+        assert!(!Session::full_track_cached(None));
     }
 
     /// 重建会话不写音质配置：登录/换 Cookie 之后「自动」仍然是自动，

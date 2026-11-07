@@ -927,7 +927,7 @@ impl Root {
                     .await;
                 this.update(cx, |root, cx| {
                     if !root.liked.is_empty() {
-                        root.play_from_arc(root.liked.clone(), 0, cx);
+                        root.play_from(root.liked.as_ref().clone(), 0, cx);
                     }
                 });
             })

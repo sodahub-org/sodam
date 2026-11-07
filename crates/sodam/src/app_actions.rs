@@ -7,7 +7,9 @@ use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
-use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage};
+use sodam_core::failure::{
+    PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage, UnplayableReason,
+};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
@@ -698,6 +700,13 @@ impl Root {
 
     /// 跳到队列中的某一首并播放。
     pub fn jump_in_queue(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(track) = self.queue.tracks().get(index).cloned() else {
+            return;
+        };
+        // 用户点了「接下来」里已知不可播的那一首：不跳、不重打网络，原地给原因。
+        if self.block_explicit_play(&track, cx) {
+            return;
+        }
         if log_outlet::enabled(LogLevel::Debug, LogTopic::Player) {
             let index = index.to_string();
             log_event(
@@ -2763,13 +2772,22 @@ impl Root {
         .detach();
     }
 
-    /// 点列表行播放（列表以 `Arc` 共享，避免每次点击都深拷贝整张表）。
-    pub fn play_from_arc(
+    /// 点列表行播放：用户明确点了**这一首**。
+    ///
+    /// 命中不可播集合时在改队列之前返回：播放状态与当前曲目都不动，
+    /// 不替他跳、也不重打网络。其余情况与 [`Self::play_from`] 相同（复制一份入队）。
+    pub fn play_selected_arc(
         &mut self,
         tracks: std::sync::Arc<Vec<TrackItem>>,
         index: usize,
         cx: &mut Context<Self>,
     ) {
+        let Some(track) = tracks.get(index) else {
+            return;
+        };
+        if self.block_explicit_play(track, cx) {
+            return;
+        }
         self.play_from(tracks.as_ref().clone(), index, cx);
     }
 
@@ -2801,8 +2819,10 @@ impl Root {
         cx.notify();
     }
 
-    /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
-    /// 点歌单/收藏列表里的某一行播放（把该列表整体入队）。
+    /// 把整张列表入队并从 `index` 开始播放（「播放全部」与开发入口）。
+    ///
+    /// 这不是点某一首：起点命中不可播集合时仍走真实装载，由失败分支按 #109 的
+    /// 「自动装载第一首也换歌」处理。用户点单首请用 [`Self::play_selected_arc`]。
     pub fn play_from(&mut self, tracks: Vec<TrackItem>, index: usize, cx: &mut Context<Self>) {
         if tracks.is_empty() {
             return;
@@ -3088,26 +3108,36 @@ impl Root {
         if self.pending_track.is_some() {
             return;
         }
-        self.release_playback_halt();
         let snapshot = self.engine.snapshot();
-        if snapshot.track_id.is_empty()
+        let needs_load = snapshot.track_id.is_empty()
             || !snapshot.error.is_empty()
             || snapshot.finished
             || self
                 .queue
                 .current()
-                .is_some_and(|track| track.id != snapshot.track_id)
-        {
-            self.consecutive_failures = 0;
+                .is_some_and(|track| track.id != snapshot.track_id);
+        if needs_load {
             if self.queue.is_empty() {
+                self.release_playback_halt();
+                self.consecutive_failures = 0;
                 self.set_status_text(self.tr("队列是空的：先去搜索或打开一张歌单"));
                 cx.notify();
                 return;
             }
             // 队列里有歌但引擎还没装载 → 装载当前曲目
+            let Some(track) = self.queue.current().cloned() else {
+                return;
+            };
+            // 先拦再复位闸门：被拦下的点播没有尝试装载，不构成「用户要求重试」。
+            if self.block_explicit_play(&track, cx) {
+                return;
+            }
+            self.release_playback_halt();
+            self.consecutive_failures = 0;
             self.start_track(true, cx);
             return;
         }
+        self.release_playback_halt();
         self.engine.toggle();
         self.playing = !snapshot.playing;
         let message = if self.playing {
@@ -3117,6 +3147,39 @@ impl Root {
         };
         self.set_status_text(message);
         cx.notify();
+    }
+
+    /// 用户显式点播命中不可播集合：不发起装载、不换歌，直接给按曲目类的原因。
+    ///
+    /// 返回 `true` 表示已拦截；调用方必须在**改队列之前**调用，播放状态才不会
+    /// 指向新曲目、声音还停在旧曲目。两条边界：
+    /// * 已落盘的**整曲**缓存先于结论（试听片段不算），装载它是本地读文件；
+    /// * 账号 id 或会员状态变化即整份作废，作废后 `reason` 返回 `None`，
+    ///   点播自然回到真实装载请求。
+    fn block_explicit_play(&mut self, track: &TrackItem, cx: &mut Context<Self>) -> bool {
+        let Some(reason) = self.unplayable.reason(&track.id) else {
+            return false;
+        };
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.has_full_track_cached(&track.id))
+        {
+            return false;
+        }
+        if log_outlet::enabled(LogLevel::Info, LogTopic::Player) {
+            log_event(
+                LogLevel::Info,
+                LogTopic::Player,
+                "explicit_unplayable",
+                &[("track_id", track.id.as_str()), ("reason", reason.as_str())],
+            );
+        }
+        let message = self.tr(per_track_reason_text(reason)).to_string();
+        // 一次性反馈：状态行 + 轻提示，不占用常驻错误位。
+        self.notify_warning_once("track-unavailable-explicit", message);
+        cx.notify();
+        true
     }
 
     /// 装载并播放「当前队列曲目」：后台下载+解密 → 回 UI 线程交给引擎。
@@ -3523,14 +3586,14 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
             if skipped {
                 "这首在你的账号下没有整曲，已跳过。"
             } else {
-                "这首在你的账号下没有整曲。"
+                per_track_reason_text(UnplayableReason::NoFullTrack)
             }
         }
         RecoveryAction::PickAnother => {
             if skipped {
                 "这首当前取不到，已跳过。"
             } else {
-                "这首当前取不到。"
+                per_track_reason_text(UnplayableReason::Unavailable)
             }
         }
         RecoveryAction::FreeSpace => "本地缓存写入失败，检查磁盘空间。",
@@ -3540,6 +3603,15 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
             Stage::Input => "这首歌暂时放不出来。",
             _ => "暂时连不上，检查网络后重试。",
         },
+    }
+}
+
+/// 按曲目不可播的成因文案（不含「已跳过」）：显式点播没有跳过这个动作，
+/// 用户点的是这首歌，程序替他跳到别处就违背了意图。
+fn per_track_reason_text(reason: UnplayableReason) -> &'static str {
+    match reason {
+        UnplayableReason::NoFullTrack => "这首在你的账号下没有整曲。",
+        UnplayableReason::Unavailable => "这首当前取不到。",
     }
 }
 

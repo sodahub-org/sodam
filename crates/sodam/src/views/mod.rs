@@ -229,7 +229,7 @@ fn track_row(
             let tracks = tracks.clone();
             play_entity.update(cx, |root, cx| {
                 root.track_menu = None;
-                root.play_from_arc(tracks, index, cx);
+                root.play_selected_arc(tracks, index, cx);
             });
         })
         .on_mouse_down(
@@ -573,7 +573,7 @@ pub(crate) fn scrolling_detail_page(
                                             move |_event: &ClickEvent, _window, cx| {
                                                 let tracks = tracks.clone();
                                                 entity.update(cx, |root, cx| {
-                                                    root.play_from_arc(tracks.clone(), 0, cx);
+                                                    root.play_from(tracks.as_ref().clone(), 0, cx);
                                                 });
                                             }
                                         })
