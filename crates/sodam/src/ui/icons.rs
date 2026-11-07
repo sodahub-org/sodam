@@ -134,6 +134,7 @@ icon_set!(
     "restore",
     "disc-3",
     "check",
+    "ban",
 );
 
 /// 听歌模式内置图标路径。
@@ -204,6 +205,16 @@ mod tests {
             .load(&path("restore"))
             .expect("restore asset load")
             .expect("restore SVG bytes");
+        assert!(bytes.starts_with(b"<svg"));
+    }
+
+    /// 列表用 `ban` 标出当前账号不可播的曲目；未注册时标记会静默消失。
+    #[test]
+    fn ban_icon_is_registered() {
+        let bytes = Assets
+            .load(&path("ban"))
+            .expect("ban asset load")
+            .expect("ban SVG bytes");
         assert!(bytes.starts_with(b"<svg"));
     }
 

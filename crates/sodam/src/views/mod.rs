@@ -12,6 +12,7 @@ use crate::ui::icons;
 use crate::ui::spinner::loading_state;
 use crate::ui::theme;
 use crate::ui::theme::ThemeKind;
+use crate::ui::unplayable_mark;
 
 pub use login::login_modal;
 pub mod login;
@@ -57,6 +58,8 @@ const COL_GAP: f32 = 12.0;
 const ROW_PAD: f32 = 12.0;
 /// 内联 VIP 徽章的宽度（含间距），标题文本需要先让出这一段。
 const VIP_WIDTH: f32 = 76.0;
+/// 不可播标记的宽度（图标 + 间距），标题文本同样要先让出这一段。
+const UNPLAYABLE_MARK_W: f32 = theme::ICON_SM + theme::space::SM;
 
 /// 当前可用宽度下各列是否显示 + **标题列的具体宽度**。
 ///
@@ -196,6 +199,8 @@ fn track_row(
     covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     current_track_id: Option<String>,
+    // 这首在当前账号下已被确认放不出来：只加标记，不禁用、不隐藏。
+    unplayable: bool,
 ) -> AnyElement {
     let play_entity = entity.clone();
     let like_entity = entity.clone();
@@ -298,12 +303,10 @@ fn track_row(
         })
         .child({
             // 标题列宽度由 columns_for 显式算出（与表头同宽）；
-            // 有 VIP 徽章时先给徽章让出固定宽度，避免挤掉标题。
-            let text_width = if track.vip {
-                (cols.title - VIP_WIDTH).max(40.0)
-            } else {
-                cols.title
-            };
+            // 有 VIP 徽章 / 不可播标记时先给它们让出固定宽度，避免挤掉标题。
+            let reserved = (if track.vip { VIP_WIDTH } else { 0.0 })
+                + (if unplayable { UNPLAYABLE_MARK_W } else { 0.0 });
+            let text_width = (cols.title - reserved).max(40.0);
             div()
                 .w(px(cols.title))
                 .flex_none()
@@ -311,6 +314,9 @@ fn track_row(
                 .flex_row()
                 .items_center()
                 .gap(px(theme::space::SM))
+                // 标记放在歌名前面：固定列宽下跟在歌名后面会漂到列尾，
+                // 读起来像是挂在歌手列上；前置也不影响未标记行的排版。
+                .when(unplayable, |this| this.child(unplayable_mark()))
                 .child(
                     div()
                         .id(("track-title-link", index))
@@ -410,6 +416,8 @@ fn track_list(
     let current_track_id = root.queue.current().map(|track| track.id.clone());
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
 
     let list = uniform_list(
         ("track-list", nav as usize),
@@ -428,6 +436,7 @@ fn track_list(
                         covers.clone(),
                         cover_requests.clone(),
                         current_track_id.clone(),
+                        unplayable.contains(&track.id),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -493,6 +502,8 @@ pub(crate) fn scrolling_detail_page(
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
     let detail_covers = root.covers.clone();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
         if index == 0 {
             return div()
@@ -627,6 +638,7 @@ pub(crate) fn scrolling_detail_page(
                 covers.clone(),
                 cover_requests.clone(),
                 current_track_id.clone(),
+                unplayable.contains(&track.id),
             );
         }
 

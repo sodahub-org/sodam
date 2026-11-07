@@ -887,6 +887,8 @@ fn queue_drawer_inner(
     let covers = root.covers.clone();
     let cover_requests = root.cover_requests.clone();
     let liked_ids = root.liked_ids.clone();
+    // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
+    let unplayable = root.unplayable.snapshot();
     let entity = cx.entity();
     let count = slots.len();
     let total = root.queue.len();
@@ -920,6 +922,8 @@ fn queue_drawer_inner(
                         let title = track.title.clone();
                         let artist = track.artist.clone();
                         let duration = track.duration_label();
+                        // 标记只说「是哪一首」，不禁用、不隐藏：点击行为保持不变。
+                        let marked = unplayable.contains(&track.id);
                         let entity = entity.clone();
                         div()
                             .id(("queue-slot", slot_index))
@@ -972,14 +976,28 @@ fn queue_drawer_inner(
                                     .min_w(px(0.0))
                                     .child(
                                         div()
-                                            .truncate()
-                                            .text_size(theme::Text::Body.size())
-                                            .text_color(if playing {
-                                                theme::accent()
-                                            } else {
-                                                theme::text()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(theme::space::XS))
+                                            // 与列表行一致：标记前置，歌名再长也不会
+                                            // 把图标推到行尾、读成挂在时长上。
+                                            .when(marked, |this| {
+                                                this.child(super::unplayable_mark())
                                             })
-                                            .child(title),
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_size(theme::Text::Body.size())
+                                                    .text_color(if playing {
+                                                        theme::accent()
+                                                    } else {
+                                                        theme::text()
+                                                    })
+                                                    .child(title),
+                                            ),
                                     )
                                     .child(
                                         div()

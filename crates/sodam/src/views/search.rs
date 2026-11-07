@@ -583,6 +583,8 @@ fn search_track_row(
     track: &sodam_core::models::TrackItem,
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     index: usize,
+    // 与其它列表同源：由调用方按 `UnplayableTracks::snapshot()` 快照判定。
+    unplayable: bool,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let entity = cx.entity();
@@ -598,6 +600,7 @@ fn search_track_row(
         root.covers.clone(),
         root.cover_requests.clone(),
         root.queue.current().map(|track| track.id.clone()),
+        unplayable,
     )
 }
 
@@ -609,6 +612,8 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
 
     let groups = root.search_results.groups.clone();
     let width_slot = root.list_width.clone();
+    // 与其它列表同源的一次快照：整页渲染只克隆一次 Arc，不逐行深拷贝。
+    let unplayable = root.unplayable.snapshot();
     div()
         .id("search-groups")
         .relative()
@@ -679,7 +684,8 @@ fn search_groups_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     SearchEntry::Track(track) => {
                         let index = track_index;
                         track_index += 1;
-                        search_track_row(root, track, tracks.clone(), index, cx)
+                        let marked = unplayable.contains(&track.id);
+                        search_track_row(root, track, tracks.clone(), index, marked, cx)
                     }
                     SearchEntry::Artist(artist) => artist_row(root, artist, cx),
                     SearchEntry::Album(album) => album_row(root, album, cx),

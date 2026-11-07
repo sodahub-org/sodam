@@ -10,6 +10,7 @@
 use libresoda::SodaError;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 失败发生的阶段。
@@ -163,6 +164,27 @@ struct UnplayableEntry {
     retryability: Retryability,
 }
 
+/// 结论集合的只读快照，供列表渲染共享。
+///
+/// 只回答「这首有没有已确认的不可播结论」；不含本轮试过、但已被容量淘汰的
+/// 扫描游标——标记说的是「放不出来」，不是「这一轮试过它」。
+#[derive(Debug, Clone, Default)]
+pub struct UnplayableSnapshot(Arc<HashMap<String, UnplayableEntry>>);
+
+impl UnplayableSnapshot {
+    pub fn contains(&self, track_id: &str) -> bool {
+        self.0.contains_key(track_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// 会话内的「按曲目不可播」集合：只回答「要不要再为这首打网络」。
 ///
 /// 作用域是**账号 × 本次会话**：
@@ -172,7 +194,9 @@ struct UnplayableEntry {
 /// * 不落盘，也不参与缓存文件的有效性判断——缓存命中发生在任何网络请求之前。
 #[derive(Debug, Clone, Default)]
 pub struct UnplayableTracks {
-    entries: HashMap<String, UnplayableEntry>,
+    /// 结论集合。用 `Arc` 让渲染快照零拷贝共享：写入走 `Arc::make_mut`，
+    /// 只在快照还活着时安静地复制一次，不产生第二份可写真相。
+    entries: Arc<HashMap<String, UnplayableEntry>>,
     /// 本轮扫描已经尝试过的曲目 id。
     ///
     /// 容量上限只约束上面的结论集合；队列比上限更长时，被淘汰的旧条目会重新
@@ -195,6 +219,14 @@ impl UnplayableTracks {
         self.entries.contains_key(track_id) || self.attempted.contains(track_id)
     }
 
+    /// 已确认「当前账号放不出来」的只读快照，供列表渲染共享。
+    ///
+    /// 返回 `Arc` 的克隆（零拷贝）：虚拟列表闭包要求 `'static`，
+    /// 而渲染路径不能每帧深拷贝集合（UI-SPEC 的性能约束）。
+    pub fn snapshot(&self) -> UnplayableSnapshot {
+        UnplayableSnapshot(self.entries.clone())
+    }
+
     /// 开始新一轮扫描：保留结论，只忘掉「本轮试过哪些」。
     ///
     /// 成功装载或换队列时调用；账号作废用 [`Self::clear`] 连结论一起清。
@@ -211,7 +243,7 @@ impl UnplayableTracks {
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.entries = Arc::default();
         self.attempted.clear();
     }
 
@@ -237,7 +269,7 @@ impl UnplayableTracks {
     }
 
     fn record_at(&mut self, track_id: &str, retryability: Retryability, at: Instant) {
-        self.entries.insert(
+        Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
             UnplayableEntry {
                 recorded_at: at,
@@ -268,21 +300,20 @@ impl UnplayableTracks {
     /// 确定性的按曲目结论留得久一点，避免刚确认过又去白打一次网络。
     fn evict_over_capacity(&mut self) {
         while self.entries.len() > Self::CAPACITY {
-            let transient = self
-                .entries
+            let entries = Arc::make_mut(&mut self.entries);
+            let transient = entries
                 .iter()
                 .filter(|(_, entry)| entry.retryability != Retryability::Never)
                 .min_by_key(|(_, entry)| entry.recorded_at)
                 .map(|(track_id, _)| track_id.clone());
-            let oldest = self
-                .entries
+            let oldest = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.recorded_at)
                 .map(|(track_id, _)| track_id.clone());
             let Some(victim) = transient.or(oldest) else {
                 break;
             };
-            self.entries.remove(&victim);
+            entries.remove(&victim);
         }
     }
 }
@@ -1009,6 +1040,33 @@ mod tests {
 
         set.clear();
         assert!(!set.is_unavailable("track-1"));
+    }
+
+    /// 列表标记的数据源只认「有结论」的条目：被容量淘汰、只剩扫描游标的曲目不算。
+    #[test]
+    fn snapshot_mirrors_recorded_conclusions_not_the_scan_cursor() {
+        let mut set = UnplayableTracks::default();
+        let per_track = failure(SodaError::not_found(
+            "soda pc track_v2 returned preview stream",
+        ));
+        set.record_failure("marked", &per_track);
+        let ids = set.snapshot();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("marked"));
+
+        // 塞到容量之外：最早的结论被淘汰。它仍在扫描游标里（本轮不再重试），
+        // 但「放不出来」的结论已经不在表上，列表不该继续标它。
+        for index in 0..UnplayableTracks::CAPACITY {
+            set.record_failure(&format!("filler-{index}"), &per_track);
+        }
+        let ids = set.snapshot();
+        assert_eq!(ids.len(), set.len());
+        assert!(!ids.contains("marked"), "被容量淘汰的结论不该继续标记");
+        assert!(set.is_unavailable("marked"), "扫描游标仍应记得试过它");
+
+        // 账号作废：标记与结论一起消失。
+        set.clear();
+        assert!(set.snapshot().is_empty());
     }
 
     /// 队列比容量长、且整队都按曲目不可播时，扫描必须停在整圈处，
