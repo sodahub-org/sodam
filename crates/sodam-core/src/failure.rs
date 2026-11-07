@@ -100,6 +100,37 @@ impl RecoveryAction {
     }
 }
 
+/// 已确认的「按曲目不可播」成因。
+///
+/// 不可播集合只存这两种，`PlaybackFailure::is_per_track` 也由同一映射判定，
+/// 避免「判据说关于单曲、集合却不知道成因」的两处真相。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnplayableReason {
+    /// 当前账号拿不到这一首的整曲流（上游只回试听流 / 没有可用试听地址）。
+    NoFullTrack,
+    /// 曲目已下架或当前取不到。
+    Unavailable,
+}
+
+impl UnplayableReason {
+    /// 修复动作 → 成因；非按曲目类返回 `None`。
+    pub const fn from_action(action: RecoveryAction) -> Option<Self> {
+        match action {
+            RecoveryAction::TrackUnavailable => Some(Self::NoFullTrack),
+            RecoveryAction::PickAnother => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    /// 日志字段 `reason=` 的稳定取值（小写下划线，不随界面语言变化）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoFullTrack => "no_full_track",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// 一次播放尝试的失败：阶段 + 可否重试 + 修复动作 + 已脱敏的原始信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaybackFailure {
@@ -133,10 +164,7 @@ impl PlaybackFailure {
     /// [`Retryability::Never`]，但它是全局故障；反过来，按曲目不可播里也可能出现
     /// 可重试形态。调用方据此决定「跳过」还是「落闸」，两者不能互相推导。
     pub fn is_per_track(&self) -> bool {
-        matches!(
-            self.action,
-            RecoveryAction::TrackUnavailable | RecoveryAction::PickAnother
-        )
+        UnplayableReason::from_action(self.action).is_some()
     }
 }
 
@@ -163,7 +191,7 @@ impl std::error::Error for PlaybackFailure {}
 struct UnplayableEntry {
     recorded_at: Instant,
     retryability: Retryability,
-    action: RecoveryAction,
+    reason: UnplayableReason,
 }
 
 /// 结论集合的只读快照，供列表渲染共享。
@@ -225,8 +253,8 @@ impl UnplayableTracks {
     ///
     /// 只认结论集合，不含「本轮试过但结论已被容量淘汰」的扫描游标——
     /// 那种情况已经不知道当初为什么放不出来，不能凭游标编一个理由。
-    pub fn reason(&self, track_id: &str) -> Option<RecoveryAction> {
-        self.entries.get(track_id).map(|entry| entry.action)
+    pub fn reason(&self, track_id: &str) -> Option<UnplayableReason> {
+        self.entries.get(track_id).map(|entry| entry.reason)
     }
 
     /// 已确认「当前账号放不出来」的只读快照，供列表渲染共享。
@@ -260,8 +288,8 @@ impl UnplayableTracks {
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻与成因。
     ///
     /// 私有：外部只能经 [`Self::record_failure`] 进来，避免绕开「只收按曲目类」的判据。
-    fn record(&mut self, track_id: &str, retryability: Retryability, action: RecoveryAction) {
-        self.record_at(track_id, retryability, action, Instant::now());
+    fn record(&mut self, track_id: &str, retryability: Retryability, reason: UnplayableReason) {
+        self.record_at(track_id, retryability, reason, Instant::now());
     }
 
     /// 按失败分类写入：**只有按曲目类写**，全局故障一律不写。
@@ -270,11 +298,11 @@ impl UnplayableTracks {
     /// 所以这条判据必须留在集合自己的入口上，而不是指望每个调用点记得先判断。
     /// 返回是否真的写入。
     pub fn record_failure(&mut self, track_id: &str, failure: &PlaybackFailure) -> bool {
-        if !failure.is_per_track() {
+        let Some(reason) = UnplayableReason::from_action(failure.action) else {
             return false;
-        }
+        };
         self.attempted.insert(track_id.to_string());
-        self.record(track_id, failure.retryability, failure.action);
+        self.record(track_id, failure.retryability, reason);
         true
     }
 
@@ -282,7 +310,7 @@ impl UnplayableTracks {
         &mut self,
         track_id: &str,
         retryability: Retryability,
-        action: RecoveryAction,
+        reason: UnplayableReason,
         at: Instant,
     ) {
         Arc::make_mut(&mut self.entries).insert(
@@ -290,7 +318,7 @@ impl UnplayableTracks {
             UnplayableEntry {
                 recorded_at: at,
                 retryability,
-                action,
+                reason,
             },
         );
         self.evict_over_capacity();
@@ -919,9 +947,13 @@ mod tests {
         set.record(
             "track-1",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
         );
-        set.record("track-2", Retryability::Never, RecoveryAction::PickAnother);
+        set.record(
+            "track-2",
+            Retryability::Never,
+            UnplayableReason::Unavailable,
+        );
         assert!(set.contains("track-1"));
         assert!(set.contains("track-2"));
         assert_eq!(set.len(), 2);
@@ -940,17 +972,39 @@ mod tests {
         let gone = failure(SodaError::not_found("track removed"));
         assert!(set.record_failure("no-full", &no_full));
         assert!(set.record_failure("gone", &gone));
-        assert_eq!(
-            set.reason("no-full"),
-            Some(RecoveryAction::TrackUnavailable)
-        );
-        assert_eq!(set.reason("gone"), Some(RecoveryAction::PickAnother));
+        assert_eq!(set.reason("no-full"), Some(UnplayableReason::NoFullTrack));
+        assert_eq!(set.reason("gone"), Some(UnplayableReason::Unavailable));
 
         // 全局故障不写结论，也就没有原因可说。
         let signer = failure(SodaError::http("signer error: bad token"));
         assert!(!set.record_failure("signer", &signer));
         assert_eq!(set.reason("signer"), None);
         assert_eq!(set.reason("never-seen"), None);
+    }
+
+    /// 成因映射与「是否按曲目」必须共用同一判据，否则集合会收进不知道成因的条目。
+    #[test]
+    fn per_track_verdict_and_reason_share_one_mapping() {
+        let at = |action| {
+            PlaybackFailure::new(Stage::ResolveStream, Retryability::Never, action, "detail")
+        };
+        for action in [
+            RecoveryAction::TrackUnavailable,
+            RecoveryAction::PickAnother,
+        ] {
+            assert!(at(action).is_per_track(), "{action:?}");
+            assert!(UnplayableReason::from_action(action).is_some());
+        }
+        for action in [
+            RecoveryAction::Nothing,
+            RecoveryAction::Relogin,
+            RecoveryAction::CheckSigner,
+            RecoveryAction::CheckEntitlement,
+            RecoveryAction::FreeSpace,
+        ] {
+            assert!(!at(action).is_per_track(), "{action:?}");
+            assert_eq!(UnplayableReason::from_action(action), None);
+        }
     }
 
     /// 集合只由按曲目类失败写入：一次签名服务故障不能把整屏曲目标成不可播。
@@ -992,7 +1046,7 @@ mod tests {
         set.record(
             "track-1",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
         );
 
         // 同一账号、同一会员状态：保留。
@@ -1007,7 +1061,7 @@ mod tests {
         set.record(
             "track-2",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
         );
         assert!(set.invalidate_if_account_changed(Some(("user-a", false)), ("user-b", false)));
         assert!(set.is_empty());
@@ -1016,7 +1070,7 @@ mod tests {
         set.record(
             "track-3",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
         );
         assert!(!set.invalidate_if_account_changed(None, ("user-b", false)));
         assert!(set.contains("track-3"));
@@ -1032,20 +1086,20 @@ mod tests {
         set.record_at(
             "keep-a",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
             at(0),
         );
         set.record_at(
             "keep-b",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
             at(1),
         );
         for index in 0..(UnplayableTracks::CAPACITY - 2) {
             set.record_at(
                 &format!("transient-{index}"),
                 Retryability::Transient,
-                RecoveryAction::TrackUnavailable,
+                UnplayableReason::NoFullTrack,
                 at(10 + index as u64),
             );
         }
@@ -1054,7 +1108,7 @@ mod tests {
         set.record_at(
             "overflow",
             Retryability::Transient,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
             at(9_000),
         );
         assert_eq!(set.len(), UnplayableTracks::CAPACITY);
@@ -1072,14 +1126,14 @@ mod tests {
             set.record_at(
                 &format!("track-{index}"),
                 Retryability::Never,
-                RecoveryAction::TrackUnavailable,
+                UnplayableReason::NoFullTrack,
                 base + Duration::from_millis(index as u64),
             );
         }
         set.record_at(
             "newest",
             Retryability::Never,
-            RecoveryAction::TrackUnavailable,
+            UnplayableReason::NoFullTrack,
             base + Duration::from_millis(9_000),
         );
         assert_eq!(set.len(), UnplayableTracks::CAPACITY);

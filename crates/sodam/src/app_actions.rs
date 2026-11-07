@@ -7,7 +7,9 @@ use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
-use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage};
+use sodam_core::failure::{
+    PlayBudget, PlaybackFailure, RecoveryAction, Retryability, Stage, UnplayableReason,
+};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
@@ -698,6 +700,13 @@ impl Root {
 
     /// 跳到队列中的某一首并播放。
     pub fn jump_in_queue(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(track) = self.queue.tracks().get(index).cloned() else {
+            return;
+        };
+        // 用户点了「接下来」里已知不可播的那一首：不跳、不重打网络，原地给原因。
+        if self.block_explicit_play(&track, cx) {
+            return;
+        }
         if log_outlet::enabled(LogLevel::Debug, LogTopic::Player) {
             let index = index.to_string();
             log_event(
@@ -709,10 +718,6 @@ impl Root {
         }
         if self.queue.jump(index).is_some() {
             self.sync_queue_cache();
-            // 用户点了「接下来」里已知不可播的那一首：停在它上面给原因，不替他跳。
-            if self.block_explicit_unplayable(cx) {
-                return;
-            }
             self.start_track(true, cx);
         }
     }
@@ -2770,14 +2775,22 @@ impl Root {
     /// 点列表行播放（列表以 `Arc` 共享，避免每次点击都深拷贝整张表）。
     ///
     /// 与 [`Self::play_from_arc`] 的区别只在意图：这是用户明确点了**这一首**，
-    /// 命中不可播集合时要立刻给原因，不替他跳、也不重打网络。
+    /// 命中不可播集合时停在原地给原因，不替他跳、也不重打网络。
+    /// 拦截发生在队列替换之前：播放状态与当前曲目都不动，避免界面指向新曲目、
+    /// 声音还停在旧曲目这种不一致。
     pub fn play_selected_arc(
         &mut self,
         tracks: std::sync::Arc<Vec<TrackItem>>,
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        self.play_from_inner(tracks.as_ref().clone(), index, true, cx);
+        let Some(track) = tracks.get(index) else {
+            return;
+        };
+        if self.block_explicit_play(track, cx) {
+            return;
+        }
+        self.play_from(tracks.as_ref().clone(), index, cx);
     }
 
     /// 播放整张列表（「播放全部」等入口，起始下标由调用方决定）。
@@ -2787,7 +2800,7 @@ impl Root {
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        self.play_from_inner(tracks.as_ref().clone(), index, false, cx);
+        self.play_from(tracks.as_ref().clone(), index, cx);
     }
 
     /// 随机播放整张歌单：按原顺序入队，并把播放模式切到随机。
@@ -2823,17 +2836,6 @@ impl Root {
     /// 这不是点某一首：起点命中不可播集合时仍走真实装载，由失败分支按 #109 的
     /// 「自动装载第一首也换歌」处理。用户点单首请用 [`Self::play_selected_arc`]。
     pub fn play_from(&mut self, tracks: Vec<TrackItem>, index: usize, cx: &mut Context<Self>) {
-        self.play_from_inner(tracks, index, false, cx);
-    }
-
-    /// `explicit` 表示用户明确点了这一首（列表行），而不是「播放全部」这类整批入口。
-    fn play_from_inner(
-        &mut self,
-        tracks: Vec<TrackItem>,
-        index: usize,
-        explicit: bool,
-        cx: &mut Context<Self>,
-    ) {
         if tracks.is_empty() {
             return;
         }
@@ -2877,10 +2879,6 @@ impl Root {
         self.queue.prepare_shuffle_round();
         self.sync_queue_cache();
         self.ensure_covers(&covers, cx);
-        // 显式点了已知不可播的那一首：队列停在这一首，但不发起装载、也不自动换歌。
-        if explicit && self.block_explicit_unplayable(cx) {
-            return;
-        }
         self.start_track(true, cx);
     }
 
@@ -2943,10 +2941,6 @@ impl Root {
         self.sync_queue_cache();
         self.ensure_covers(std::slice::from_ref(&cover), cx);
         if was_empty {
-            // 空队列时「下一首播放」会立刻开始播放：命中不可播集合同样只给原因。
-            if self.block_explicit_unplayable(cx) {
-                return;
-            }
             self.start_track(true, cx);
         } else {
             self.spawn_prefetch(cx);
@@ -3143,7 +3137,10 @@ impl Root {
                 return;
             }
             // 队列里有歌但引擎还没装载 → 装载当前曲目
-            if self.block_explicit_unplayable(cx) {
+            let Some(track) = self.queue.current().cloned() else {
+                return;
+            };
+            if self.block_explicit_play(&track, cx) {
                 return;
             }
             self.start_track(true, cx);
@@ -3160,23 +3157,21 @@ impl Root {
         cx.notify();
     }
 
-    /// 用户显式点播命中不可播集合：不自动跳、不发起装载请求，直接给按曲目类的原因。
+    /// 用户显式点播命中不可播集合：不发起装载、不换歌，直接给按曲目类的原因。
     ///
-    /// 返回 `true` 表示已拦截。两条边界：
-    /// * 缓存命中先于结论——已落盘的整曲不受不可播结论影响，装载它是本地读文件；
+    /// 返回 `true` 表示已拦截；调用方必须在**改队列之前**调用，播放状态才不会
+    /// 指向新曲目、声音还停在旧曲目。两条边界：
+    /// * 已落盘的**整曲**缓存先于结论（试听片段不算），装载它是本地读文件；
     /// * 账号 id 或会员状态变化即整份作废，作废后 `reason` 返回 `None`，
     ///   点播自然回到真实装载请求。
-    fn block_explicit_unplayable(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(track_id) = self.queue.current().map(|track| track.id.clone()) else {
-            return false;
-        };
-        let Some(action) = self.unplayable.reason(&track_id) else {
+    fn block_explicit_play(&mut self, track: &TrackItem, cx: &mut Context<Self>) -> bool {
+        let Some(reason) = self.unplayable.reason(&track.id) else {
             return false;
         };
         if self
             .session
             .as_ref()
-            .is_some_and(|session| session.is_cached(&track_id))
+            .is_some_and(|session| session.has_full_cached(&track.id))
         {
             return false;
         }
@@ -3185,10 +3180,10 @@ impl Root {
                 LogLevel::Info,
                 LogTopic::Player,
                 "explicit_unplayable",
-                &[("track_id", track_id.as_str()), ("action", action.as_str())],
+                &[("track_id", track.id.as_str()), ("reason", reason.as_str())],
             );
         }
-        let message = self.tr(per_track_failure_text(action, false)).to_string();
+        let message = self.tr(per_track_reason_text(reason)).to_string();
         // 一次性反馈：状态行 + 轻提示，不占用常驻错误位。
         self.notify_warning_once("track-unavailable-explicit", message);
         cx.notify();
@@ -3595,8 +3590,19 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
         }
         RecoveryAction::CheckSigner => "这首歌暂时放不出来。签名服务不可用，可在设置里更换。",
         // 按曲目不可播的两种成因分成两句话；都不报歌名，识别交给列表标记。
-        RecoveryAction::TrackUnavailable | RecoveryAction::PickAnother => {
-            per_track_failure_text(failure.action, skipped)
+        RecoveryAction::TrackUnavailable => {
+            if skipped {
+                "这首在你的账号下没有整曲，已跳过。"
+            } else {
+                per_track_reason_text(UnplayableReason::NoFullTrack)
+            }
+        }
+        RecoveryAction::PickAnother => {
+            if skipped {
+                "这首当前取不到，已跳过。"
+            } else {
+                per_track_reason_text(UnplayableReason::Unavailable)
+            }
         }
         RecoveryAction::FreeSpace => "本地缓存写入失败，检查磁盘空间。",
         RecoveryAction::Nothing => match failure.stage {
@@ -3608,28 +3614,12 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
     }
 }
 
-/// 按曲目类失败的成因文案：`TrackUnavailable` 与 `PickAnother` 是两件事。
-///
-/// 显式点播命中不可播集合时没有「跳过」这个动作，只能拿 `skipped=false` 的那句——
+/// 按曲目不可播的成因文案（不含「已跳过」）：显式点播没有跳过这个动作，
 /// 用户点的是这首歌，程序替他跳到别处就违背了意图。
-fn per_track_failure_text(action: RecoveryAction, skipped: bool) -> &'static str {
-    match action {
-        RecoveryAction::TrackUnavailable => {
-            if skipped {
-                "这首在你的账号下没有整曲，已跳过。"
-            } else {
-                "这首在你的账号下没有整曲。"
-            }
-        }
-        RecoveryAction::PickAnother => {
-            if skipped {
-                "这首当前取不到，已跳过。"
-            } else {
-                "这首当前取不到。"
-            }
-        }
-        // 集合只收按曲目类失败（`is_per_track`），其余动作走不到这里。
-        _ => "这首歌暂时放不出来。",
+fn per_track_reason_text(reason: UnplayableReason) -> &'static str {
+    match reason {
+        UnplayableReason::NoFullTrack => "这首在你的账号下没有整曲。",
+        UnplayableReason::Unavailable => "这首当前取不到。",
     }
 }
 

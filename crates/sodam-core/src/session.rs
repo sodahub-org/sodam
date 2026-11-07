@@ -123,6 +123,14 @@ impl Session {
         // 这里只是调度提示，不返回可播放文件，也不建立租约或刷新 LRU 时间。
         self.cached_info(track_id).is_some()
     }
+
+    /// 这首是否有**整曲**缓存：试听片段不算。
+    ///
+    /// 显式点播的不可播拦截只给已落盘的整曲让路（父票边界）；试听片段是
+    /// 「这一次只拿到试听」的证据，不能反过来当作整曲可播。
+    pub fn has_full_cached(&self, track_id: &str) -> bool {
+        self.cached_info(track_id).is_some_and(|info| !info.preview)
+    }
 }
 
 /// 一次播放要用的本地文件 + 它实际是什么音质。
