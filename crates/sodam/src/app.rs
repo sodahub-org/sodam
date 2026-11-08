@@ -451,13 +451,13 @@ pub struct Root {
     pub(crate) playback_halted: bool,
     /// 正在预取的曲目 id 集合（多首并行去重；预取结果只写缓存，不改 UI）。
     pub(crate) prefetch_inflight: HashSet<String>,
-    /// 预取失败表（曲目 id →（最近失败时刻，可否重试））。
+    /// 预取逐曲冷却表（曲目 id → 最近失败时刻）。
     ///
-    /// 冷却类期满可以再排；**永久失败（下架 / 无权益 / 签名服务鉴权）不再自动排**——
-    /// 巡检每 5 秒重排一次就是在持续打扰全体用户共享的那台签名服务。
-    pub(crate) prefetch_failed:
-        HashMap<String, (std::time::Instant, sodam_core::failure::Retryability)>,
-    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）补一次预取。
+    /// 只收**非按曲目、非全局**的失败（网络抖动、限流、以及无法归类的错误）：
+    /// 60 秒内不再为同一首重排，到期自然过期。按曲目结论进不可播集合（永久拦截），
+    /// 全局故障挂 `prefetch_gate`——这张表不承担这两种职责，也不会产生永不过期的条目。
+    pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
+    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）在**未落闸**时补一次预取。
     pub(crate) prefetch_patrol: u32,
     /// 登录凭据代数：重新登录成功或退出登录时 +1。
     ///
@@ -466,7 +466,7 @@ pub struct Root {
     pub(crate) auth_epoch: u64,
     /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
-    /// 与 `prefetch_failed`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
+    /// 与 `prefetch_cooldown_since`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
     /// 是两件事：前者管整条预取管线，后者管自动续播与巡检本身。
     pub(crate) prefetch_gate: PrefetchGate,
     /// 缓存统计快照（音频字节, 歌曲数, 封面字节, 封面张数）：
@@ -707,7 +707,7 @@ impl Root {
             progress_track_bounds: Arc::new(Mutex::new(None)),
             volume_track_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
-            prefetch_failed: HashMap::new(),
+            prefetch_cooldown_since: HashMap::new(),
             prefetch_patrol: 0,
             auth_epoch: 0,
             prefetch_gate: PrefetchGate::default(),

@@ -12,6 +12,10 @@
 //!
 //! 60 秒是**拍的**：各来源只给量级，没有可直接抄的推荐值。它不改变重试策略，
 //! 只是让无人值守的管线有一次自愈机会；恢复后的第一次预取若再失败，会重新挂起。
+//!
+//! 冷却不自己在后台计时：调用方在预取巡检时询问 [`PrefetchGate::expire_cooldown`]。
+//! 落闸期间这条巡检不执行，也就不问冷却；实际恢复会顺延到解除落闸后的第一次巡检——
+//! 这是调用方的前提，不是闸门本身的隐藏行为。
 
 use crate::failure::{PlaybackFailure, RecoveryAction};
 use std::time::{Duration, Instant};
@@ -80,8 +84,9 @@ impl PrefetchGate {
         Some(class)
     }
 
-    /// 冷却类到期自动放行；登录 / 磁盘类只认事件，不随时间恢复。
+    /// 调用时若冷却类已到期则放行；登录 / 磁盘类只认事件，不随时间恢复。
     ///
+    /// 闸门不会自己定时：什么时候来问由调用方决定（播放落闸期间预取巡检不执行）。
     /// 返回恢复原因（用于日志），没有变化时返回 `None`。
     pub fn expire_cooldown(&mut self, now: Instant) -> Option<SuspensionClass> {
         let (class, since) = self.suspended?;
@@ -281,6 +286,25 @@ mod tests {
             gate.expire_cooldown(now + PrefetchGate::COOLDOWN * 10),
             None
         );
+    }
+
+    /// 无法归类的失败既不是按曲目、也不是全局：调用方只能把它送去逐曲冷却。
+    ///
+    /// 这三类曾经被当作 `Retryability::Never` 写进「永久不再预取」表（#117）。
+    #[test]
+    fn unclassified_failures_are_neither_per_track_nor_global() {
+        use crate::failure::classify;
+        use libresoda::SodaError;
+
+        for error in [
+            SodaError::crypto("bad key"),
+            SodaError::api(1, "business error"),
+            SodaError::http("http request failed: status 400 (https://x.test)"),
+        ] {
+            let failure = classify(&error);
+            assert!(!failure.is_per_track(), "不该按曲目：{failure:?}");
+            assert!(!is_global_failure(&failure), "不该全局挂起：{failure:?}");
+        }
     }
 
     /// 日志取值稳定：大小写与连字符不随界面语言变化。
