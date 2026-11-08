@@ -393,7 +393,7 @@ pub struct CachedAudioRecord {
     pub quality_label: String,
     /// 是否为试听片段
     pub preview: bool,
-    /// 实际档位分数（旧缓存缺失时为 None）
+    /// 实际档位分数（旧缓存缺失时为 `None`；记了 0 分表示认不出档位，两者都算未知）
     pub actual_rank: Option<i64>,
     /// 仍在有效期内、已确认没有更高档位的目标分数；过期记录不入此字段
     pub checked_rank: Option<i64>,
@@ -409,8 +409,9 @@ impl CachedAudioRecord {
 
     /// 这份缓存需不需要重新取一次更高的流。
     ///
-    /// 档位未知（旧三字段缓存）时不再算「不用重下」：按 sidecar 的档位标签看能否证明达标，
-    /// 证明不了就当作需要重下（见 [`crate::quality::cache_needs_higher_stream`]）。
+    /// 没记分数（旧三字段缓存）时不再算「不用重下」：按 sidecar 的档位标签看能否证明达标，
+    /// 证明不了就当作需要重下。记了 0 分（认不出档位）的不重下——再取一次还是同一条流
+    /// （见 [`crate::quality::cache_needs_higher_stream`]）。
     pub fn needs_higher_stream(&self, target_rank: i64) -> bool {
         crate::quality::cache_needs_higher_stream(
             self.actual_rank,
@@ -1016,6 +1017,35 @@ mod tests {
         // preview 试听文件不应被计入升级
         assert_eq!(est.upgradeable_count, 1);
         assert_eq!(est.current_bytes, 4 * 1024 * 1024);
+    }
+
+    /// #96：sidecar 记了 0 分（认不出档位）的缓存不计入批量升级——重下拿回的还是同一条
+    /// 认不出的流，白跑一遍流量。同一批里没记分数的那首仍按 #89 参与升级。
+    #[test]
+    fn estimate_upgrade_skips_unreadable_zero_rank() {
+        let record = |id: &str, label: &str, rank: Option<i64>| CachedAudioRecord {
+            track_id: id.into(),
+            quality_tag: "auto".into(),
+            path: PathBuf::from(format!("{id}-auto.m4a")),
+            quality_label: label.into(),
+            preview: false,
+            actual_rank: rank,
+            checked_rank: None,
+            file_size: 4 * 1024 * 1024,
+        };
+        let unreadable = record("1", "未知 128k", Some(0));
+        assert_eq!(unreadable.actual_tier(), Some("未知"));
+        assert!(!unreadable.needs_higher_stream(100));
+        assert!(!unreadable.is_upgradeable_to(100));
+
+        let records = vec![
+            unreadable,
+            record("2", "极高 320k", None),
+            record("3", "流畅 128k", Some(50)),
+        ];
+        let est = estimate_upgrade(&records, 100);
+        assert_eq!(est.upgradeable_count, 2, "0 分那首不进批量升级");
+        assert_eq!(est.current_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

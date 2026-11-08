@@ -6,8 +6,9 @@
 //! * 缓存标签——同一个意图永远落到同一个文件名，`auto` 与空串共享 `auto`；
 //! * 不符判定——实际档位**低于**或**高于**所选档位时都要说出来；`auto` 永不提示，
 //!   实际档位未知（旧缓存没记分数，或分数算成 0）也不提示。
-//! * 升级判定——这份缓存该不该重新取流。与不符判定相反，档位未知不能算「不用重下」，
-//!   只有旧标签能证明已达目标时才抑制（见 [`legacy_label_floor_rank`]）。
+//! * 升级判定——这份缓存该不该重新取流。**没记分数**的旧缓存不能算「不用重下」，
+//!   只有旧标签能证明已达目标时才抑制（见 [`legacy_label_floor_rank`]）；**记了 0 分**
+//!   是已经量过、量不出来，重下拿回的还是同一条流，不重下（见 [`cache_needs_higher_stream`]）。
 //!
 //! 这里的档位分数直接沿用 libresoda 的 [`quality_rank`] / [`preference_rank`]：
 //! 取流时的筛选就发生在那边，界面若另算一套，两边迟早会对同一个文件给出不同结论。
@@ -341,14 +342,19 @@ pub fn legacy_label_bitrate_kbps(label: &str) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|bitrate| *bitrate > 0)
 }
 
-/// 这份缓存要不要重新取一次更高的流：档位已知就比分数，未知（旧三字段）看标签能否证明已达目标。
+/// 这份缓存要不要重新取一次更高的流。
 ///
-/// 未知不再算「不用重下」（#89 要修的就是这一条）：既然证明不了达标，就重下一次，
-/// 取完流会把实际档位写进 sidecar，之后走已知分支。唯一例外是标签已经证明达标，
-/// 那次重下注定没有收益。
+/// 「没记分数」与「记了 0 分」是两件事，不能一起当未知：
+/// * 认得出来的分数：低于目标才重下；
+/// * 记了 0 分：已经量过、量不出来（见 `readable_rank`），不重下——再取一次还是同一条
+///   认不出的流，而 0 分又写不进「已确认无更高档」（见 `session::confirmed_miss_rank`），
+///   去重挡不住，等于每次命中都整曲下一遍再丢掉（#96）；
+/// * 没记分数（旧三字段）：看标签能否证明已达目标，证明不了就重下一次，取完流会把实际
+///   档位写进 sidecar，之后走前两条。未知不再算「不用重下」是 #89 要修的那一条。
 pub fn cache_needs_higher_stream(actual: Option<i64>, label: &str, target: i64) -> bool {
-    match actual {
+    match readable_rank(actual) {
         Some(rank) => rank < target,
+        None if actual.is_some() => false,
         None => !legacy_label_floor_rank(label).is_some_and(|floor| floor >= target),
     }
 }
@@ -357,8 +363,8 @@ pub fn cache_needs_higher_stream(actual: Option<i64>, label: &str, target: i64) 
 ///
 /// * 所选为具体档位：实际档位低于该档位即为真；
 /// * 所选为「自动」且为 VIP：实际档位低于无损（100）即为真（非会员时期缓存的低档流在会员后可升级）；
-/// * 实际档位未知（旧三字段缓存）时看 `label`：标签证明不了达标就要重下
-///   （见 [`cache_needs_higher_stream`]），不再一律判「不需要升级」。
+/// * 没记分数的旧三字段缓存看 `label`：标签证明不了达标就要重下；记了 0 分的不重下
+///   （两种情形都见 [`cache_needs_higher_stream`]）。
 pub fn is_tier_below_selected(
     actual: Option<i64>,
     label: &str,
@@ -1024,6 +1030,38 @@ mod tests {
         // 已知分数时标签不参与判定，仍按分数比
         assert!(!cache_needs_higher_stream(Some(100), "流畅 128k", 100));
         assert!(cache_needs_higher_stream(Some(70), "无损 871k", 100));
+    }
+
+    /// #96：记了 0 分是「量过、认不出来」，不是「没量过」。重下拿回的还是同一条认不出的流，
+    /// 而 0 分写不进「已确认无更高档」，去重挡不住，会变成每次命中都整曲下一遍再丢掉。
+    /// #89 那条「没记分数就重下一次去量」的规则不动，两者必须分得开。
+    #[test]
+    fn unreadable_zero_rank_cache_is_not_redownloaded() {
+        // 标签写成什么都不影响：0 分已经是一次测量结果，标签倒推不出比它更好的结论。
+        for label in ["未知", "未知 128k", "极高 320k", "无损 871k"] {
+            for target in [50, 80, 100, 110] {
+                assert!(
+                    !cache_needs_higher_stream(Some(0), label, target),
+                    "0 分的「{label}」不该为目标 {target} 重下"
+                );
+            }
+        }
+        let lossless = QualityIntent::parse("lossless");
+        assert!(!is_tier_below_selected(
+            Some(0),
+            "未知 128k",
+            &lossless,
+            Some(true)
+        ));
+        assert!(!is_tier_below_selected(
+            Some(0),
+            "未知 128k",
+            &QualityIntent::Auto,
+            Some(true)
+        ));
+        // 没记分数的那条规则原样保留（#89）：证明不了达标就重下，标签证明达标才抑制。
+        assert!(cache_needs_higher_stream(None, "极高 320k", 100));
+        assert!(!cache_needs_higher_stream(None, "无损 871k", 100));
     }
 
     /// 旧标签的下限只认「无损」：更低的标签在两代旧刻度里边界不同，证不出分数。

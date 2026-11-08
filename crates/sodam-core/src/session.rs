@@ -150,7 +150,8 @@ pub struct CachedTrack {
     /// 「为什么三十秒就切歌了」。签名服务不可用或账号没有整曲权益时都会走到这里，
     /// 而且上游是**静默**降级的（返回 `Ok`），所以这个布尔必须一路带到界面。
     pub preview: bool,
-    /// 这条流的档位分数（与取流筛选同一套刻度）；`None` = 旧缓存没记，未知。
+    /// 这条流的档位分数（与取流筛选同一套刻度）；`None` = 旧缓存没记，`Some(0)` = 记了但
+    /// 认不出档位。两者都算未知，但只有前者值得重下一次去量（见 [`CachedTrack::needs_upgrade`]）。
     ///
     /// 与所选是否相符是**每次读取时现算**的：用当前意图与这里的实际档位比较，
     /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
@@ -171,7 +172,8 @@ impl CachedTrack {
     /// 命中缓存后是否还需要向服务端要更高档位。
     ///
     /// 实际档位已达目标、或最近已经确认过该目标没有更高流时，都不再请求。
-    /// 档位未知的旧缓存（#89）按 sidecar 的档位标签判断：证明不了达标就重下。
+    /// 没记分数的旧缓存（#89）按 sidecar 的档位标签判断：证明不了达标就重下；
+    /// 记了 0 分（认不出档位）的不重下，重下拿回的还是同一条流（#96）。
     pub fn needs_upgrade(
         &self,
         intent: &crate::quality::QualityIntent,
@@ -1178,6 +1180,32 @@ mod tests {
             ..legacy("流畅 128k", None)
         };
         assert!(measured.needs_auto_upgrade(&lossless, Some(false)));
+    }
+
+    /// #96：记了 0 分（认不出档位）的缓存两条升级路都不走。重下拿回的还是同一条认不出的流，
+    /// 而 0 分写不进「已确认无更高档」（见 `confirmed_miss_rank`），去重挡不住，
+    /// 放行就等于每次命中都整曲下一遍再丢掉。没记分数的旧缓存不受影响，仍按 #89 去量一次。
+    #[test]
+    fn unreadable_zero_rank_never_upgrades() {
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("unreadable.m4a"));
+        let cached = |rank: Option<i64>, quality: &str| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: quality.into(),
+            preview: false,
+            quality_rank: rank,
+            checked_rank: None,
+            lease: lease.clone(),
+        };
+        let lossless = crate::quality::QualityIntent::parse("lossless");
+        let auto = crate::quality::QualityIntent::Auto;
+        let unreadable = cached(Some(0), "未知 128k");
+        assert!(!unreadable.needs_upgrade(&lossless, Some(true)));
+        assert!(!unreadable.needs_upgrade(&auto, Some(true)));
+        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(true)));
+        // 权益未确认时也不探：本来 `needs_auto_upgrade` 会因「结论记不住」放行已知档位的记录，
+        // 0 分必须在那道闸之前就挡住。
+        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(false)));
+        assert!(cached(None, "极高 320k").needs_upgrade(&lossless, Some(true)));
     }
 
     /// #89：新流值不值得换掉本地这份缓存——档位未知的旧文件不能被更差的流顶掉。
