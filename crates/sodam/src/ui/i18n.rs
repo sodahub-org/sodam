@@ -957,6 +957,27 @@ mod tests {
         }
     }
 
+    /// 不符文案的模板放在核心层（状态行与档位菜单共用），也必须进词典：
+    /// 调用点是 `direction.notice_key()`，守卫扫不到字面量，靠这一条兜底。
+    #[test]
+    fn quality_mismatch_notice_templates_have_english_entries() {
+        use sodam_core::quality::TierMismatch;
+
+        for direction in [TierMismatch::Below, TierMismatch::Above] {
+            let key = direction.notice_key();
+            let english = Language::english_text(key)
+                .unwrap_or_else(|| panic!("英文词典缺少不符文案：{key}"));
+            // `textf` 按顺序替换占位符：少写一个 `{}` 会静默吞掉一个参数，
+            // 界面上就成了「所选 X，实际」这种半句话。
+            assert_eq!(key.matches("{}").count(), 2, "中文模板要两个占位符：{key}");
+            assert_eq!(
+                english.matches("{}").count(),
+                2,
+                "英文模板要两个占位符：{english}"
+            );
+        }
+    }
+
     /// 确保 sodam-core 中 QualitySource 的所有标签在词典中都有英文翻译，杜绝核心层与 UI 词典漂移。
     #[test]
     fn quality_source_label_keys_have_english_entries() {

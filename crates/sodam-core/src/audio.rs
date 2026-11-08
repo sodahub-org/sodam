@@ -180,6 +180,17 @@ impl PlaybackEngine {
             .unwrap_or_default()
     }
 
+    /// 当前曲目的身份与实际档位分数。只拷贝这两个字段，渲染路径不必克隆整份快照。
+    ///
+    /// 切歌装载期间，引擎快照可能还停留在上一首；调用方要先用 `track_id`
+    /// 确认这份快照属于当前曲目，再拿 `quality_rank` 说话。
+    pub fn quality_state(&self) -> (String, Option<i64>) {
+        self.snapshot
+            .lock()
+            .map(|snap| (snap.track_id.clone(), snap.quality_rank))
+            .unwrap_or_default()
+    }
+
     /// 播放一个**已经下载并解密**到本地的文件。
     /// 装载并播放：`quality` 是这次实际拉到的流音质（显示用）。
     pub fn load(&self, track: TrackItem, cached: CachedTrack) -> u64 {

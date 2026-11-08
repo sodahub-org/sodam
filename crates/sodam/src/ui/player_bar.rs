@@ -282,6 +282,32 @@ pub(crate) fn quality_menu(
 ) -> impl IntoElement {
     let current = root.settings.quality_intent();
     let language = root.language;
+    // 常驻的「所选 vs 实际」（#97）：状态行只有一个槽、只停 5 秒，又会被歌词加载、
+    // 切档确认这些写入顶掉，方向说完就没了。菜单是意图的唯一入口，每次打开都现算，
+    // 5 秒后、被顶掉后都还读得到。判定与两侧名字都来自核心层，这里只负责排版。
+    // 只认当前这首自己的档位：切歌装载期间引擎快照可能还是上一首，拿它写「本曲」
+    // 会把上一首的结论安到新曲目头上；下载失败后旧快照同理。
+    let (snapshot_track_id, actual_rank) = root.engine.quality_state();
+    let snapshot_is_current = root.pending_track.is_none()
+        && root
+            .queue
+            .current()
+            .is_some_and(|track| track.id == snapshot_track_id);
+    let comparison = if snapshot_is_current {
+        sodam_core::quality::visible_tier_comparison(&current, actual_rank)
+    } else {
+        None
+    };
+    let mismatch_notice = comparison.map(|mismatch| {
+        // 与状态行同一句模板，参数用菜单里的短档名：读到的就是「所选 X，实际 Y」。
+        root.localized(
+            mismatch.direction.notice_key(),
+            &[
+                language.text(mismatch.selected).to_string(),
+                language.text(mismatch.actual).to_string(),
+            ],
+        )
+    });
     let rows = std::iter::once(sodam_core::quality::AUTO)
         .chain(sodam_core::quality::TIERS)
         .map(|value| {
@@ -371,6 +397,23 @@ pub(crate) fn quality_menu(
                         .text_color(theme::text_faint())
                         .child(root.tr("音质：从下一首生效")),
                 )
+                // 常驻的「所选 vs 实际」：不可点，只读当前这首的事实。放在表头下、选项上：
+                // 表头讲意图与生效时机，这一行讲当前这首的实际情况；没有不符
+                // （自动 / 未知 / 同名）时整行不出现。
+                .when_some(mismatch_notice, |this, notice| {
+                    this.child(
+                        div()
+                            .id("quality-menu-mismatch")
+                            .px(px(theme::space::SM))
+                            .pt(px(theme::space::XS))
+                            .pb(px(theme::space::SM))
+                            .border_b_1()
+                            .border_color(theme::border())
+                            .text_size(theme::Text::Tiny.size())
+                            .text_color(theme::text_muted())
+                            .child(notice),
+                    )
+                })
                 .children(rows),
         ),
     )
@@ -416,9 +459,10 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
         quality.push_str(&format!(" · {}", root.tr("试听")));
     }
     // 与所选不符：实际档位低于或高于所选，两个方向共用同一个标记（#82）。
-    // 每次现算——用户改了意图，旧结论就不该继续成立。实际档位未知（旧缓存）、
-    // 意图为「自动」、两侧显示名相同时一律不标。方向只在状态行里说：徽章
-    // 只有几厘米宽，放不下两个方向各自的短词。
+    // 每次现算——用户改了意图，旧结论就不该继续成立。实际档位未知（旧缓存没记分数、
+    // 或分数算成 0）、意图为「自动」、两侧显示名相同时一律不标。
+    // 方向与两侧由档位菜单顶部那行常驻说明给出（#97），状态行只在装载时播一次；
+    // 徽章保持 #82 定下的单一「不符」标记，不再加方向。
     let intent = root.settings.quality_intent();
     let mismatch =
         sodam_core::quality::visible_tier_mismatch(&intent, snapshot.quality_rank).is_some();
@@ -593,9 +637,8 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                                             })
                                             // 徽章没有 flex 容器：两个 child 会上下堆叠成两行，
                                             // 在固定高度的播放条里把文字挤出可视区，所以合成一段。
-                                            // 用短词「不符」而不是整句：徽章只有几厘米宽，
-                                            // 拼成「Higher tier than selected」这类长句会被挤断。
-                                            // 方向（低于还是高于所选）在状态行里说。
+                                            // 方向不放进徽章：徽章保持 #82 定下的单一「不符」标记，
+                                            // 方向与两侧由档位菜单顶部那行常驻说明给出（#97）。
                                             .child(if mismatch {
                                                 format!("{}·{}", root.tr("不符"), quality)
                                             } else {
