@@ -5,7 +5,7 @@
 //!   （与 libresoda 的 `preference_rank` 一致），免得用户手写一个错字就被锁进低档；
 //! * 缓存标签——同一个意图永远落到同一个文件名，`auto` 与空串共享 `auto`；
 //! * 不符判定——实际档位**低于**或**高于**所选档位时都要说出来；`auto` 永不提示，
-//!   实际档位未知（旧缓存）也不提示。
+//!   实际档位未知（旧缓存没记分数，或分数算成 0）也不提示。
 //! * 升级判定——这份缓存该不该重新取流。与不符判定相反，档位未知不能算「不用重下」，
 //!   只有旧标签能证明已达目标时才抑制（见 [`legacy_label_floor_rank`]）。
 //!
@@ -215,15 +215,31 @@ pub enum TierMismatch {
     Above,
 }
 
+impl TierMismatch {
+    /// 说明不符的文案模板（i18n 的 key，两个占位符依次是所选与实际）。
+    ///
+    /// 状态行与档位菜单共用这一条：同一件事两处各写一句，迟早会漂成两种叫法。
+    /// 方向本身仍由 [`visible_tier_mismatch`] 判定，这里只管怎么说。
+    pub fn notice_key(self) -> &'static str {
+        match self {
+            Self::Below => "已降档：所选 {}，实际 {}",
+            Self::Above => "高于所选：所选 {}，实际 {}",
+        }
+    }
+}
+
 /// 是否值得向用户说明「实际与所选不符」，并给出方向。
 ///
-/// 三个不说的条件：意图为「自动」（不设上限）、实际档位未知（旧缓存没有记录分数）、
-/// 以及两侧落在同一个显示名上——后者照实说只会得到「所选 流畅，实际 流畅」，
-/// 读起来像没不符。判定不落盘，每次现算：用户改了意图，旧结论就不该继续成立。
+/// 三个不说的条件：意图为「自动」（不设上限）、实际档位未知（旧缓存没有记录分数，
+/// 或分数算成 0——`quality_rank` 认不出档位标签与码率）、以及两侧落在同一个显示名上
+/// ——后者照实说只会得到「所选 流畅，实际 流畅」，读起来像没不符。判定不落盘，每次现算：
+/// 用户改了意图，旧结论就不该继续成立。
 ///
-/// 徽章与状态行都只读这一个出处，两边共用同一套刻度与同一道显示名闸。
+/// 徽章、状态行与档位菜单都只读这一个出处，三边共用同一套刻度与同一道显示名闸。
 pub fn visible_tier_mismatch(intent: &QualityIntent, actual: Option<i64>) -> Option<TierMismatch> {
-    let actual = actual?;
+    // 分数 0 不是「比谁都低」，是 `quality_rank` 没认出这条流（档位标签与码率都对不上）。
+    // 把认不出来说成降档，是向用户断言查不到的事（#96）。未知就不出现在任何承载面上。
+    let actual = actual.filter(|rank| *rank > 0)?;
     let direction = if is_downgraded(intent, Some(actual)) {
         TierMismatch::Below
     } else if is_above_selected(intent, Some(actual)) {
@@ -237,6 +253,33 @@ pub fn visible_tier_mismatch(intent: &QualityIntent, actual: Option<i64>) -> Opt
         return None;
     }
     Some(direction)
+}
+
+/// 不符时两侧的显示名，供常驻承载面使用。
+///
+/// 徽章与状态行只需要方向；档位菜单要一次写全「所选 X，实际 Y」，否则用户还是得
+/// 把两处的名字自己比（#97）。两侧名字与判定同源：名字走这里，菜单不再自己拼一套刻度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierComparison {
+    /// 实际低于还是高于所选。
+    pub direction: TierMismatch,
+    /// 所选档位的显示名（i18n 的 key）。
+    pub selected: &'static str,
+    /// 实际档位的显示名（i18n 的 key）。
+    pub actual: &'static str,
+}
+
+/// 不符时给出方向与两侧显示名；自动、档位未知、两侧同名时返回 `None`。
+pub fn visible_tier_comparison(
+    intent: &QualityIntent,
+    actual: Option<i64>,
+) -> Option<TierComparison> {
+    let direction = visible_tier_mismatch(intent, actual)?;
+    Some(TierComparison {
+        direction,
+        selected: intent.label_key()?,
+        actual: tier_label(actual?),
+    })
 }
 
 /// 获取音质意图在给定账号 VIP 状态下的目标档位分数。
@@ -542,6 +585,53 @@ mod tests {
         let unknown = visible_tier_mismatch(&low, None);
         assert_eq!(unknown, None);
         assert!(!is_above_selected(&low, None));
+    }
+
+    /// #96：分数 0 是 `quality_rank` 认不出这条流，不是最低档。
+    ///
+    /// 认不出来就不该说「不符」——档位菜单、徽章、状态行共用这一道闸，
+    /// 任何承载面都不出现「不符·未知」。
+    #[test]
+    fn unreadable_zero_rank_is_unknown_not_a_mismatch() {
+        for tier in TIERS {
+            assert_eq!(
+                visible_tier_mismatch(&QualityIntent::parse(tier), Some(0)),
+                None,
+                "所选 {tier}、实际分数 0 不能说成不符"
+            );
+        }
+        assert_eq!(visible_tier_mismatch(&QualityIntent::Auto, Some(0)), None);
+        assert_eq!(
+            visible_tier_comparison(&QualityIntent::parse("lossless"), Some(0)),
+            None
+        );
+    }
+
+    /// 常驻承载面一次读全两侧：方向与名字同源，菜单不再自己拼一套刻度。
+    #[test]
+    fn comparison_names_both_sides_for_the_persistent_surface() {
+        let low = QualityIntent::parse("low");
+
+        let above = visible_tier_comparison(&low, Some(70)).expect("流畅 拿到较高应说明");
+        assert_eq!(above.direction, TierMismatch::Above);
+        assert_eq!(above.selected, "流畅");
+        assert_eq!(above.actual, "较高");
+        assert_eq!(above.direction.notice_key(), "高于所选：所选 {}，实际 {}");
+
+        let below = visible_tier_comparison(&QualityIntent::parse("medium"), Some(50))
+            .expect("较高 拿到流畅应说明");
+        assert_eq!(below.direction, TierMismatch::Below);
+        assert_eq!(below.selected, "较高");
+        assert_eq!(below.actual, "流畅");
+        assert_eq!(below.direction.notice_key(), "已降档：所选 {}，实际 {}");
+
+        // 自动、档位未知、两侧同名：这一行不出现
+        assert_eq!(
+            visible_tier_comparison(&QualityIntent::Auto, Some(70)),
+            None
+        );
+        assert_eq!(visible_tier_comparison(&low, None), None);
+        assert_eq!(visible_tier_comparison(&low, Some(50)), None);
     }
 
     /// 不符提示按显示名去重：分数不同但两侧同名就不提示。

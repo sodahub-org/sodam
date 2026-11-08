@@ -13,7 +13,6 @@ use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
-use sodam_core::quality::TierMismatch;
 use sodam_core::session::Session;
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
@@ -3311,14 +3310,12 @@ impl Root {
                         let actual_name =
                             crate::ui::player_bar::localized_quality(actual_quality, root.language);
                         let both = [selected_name, actual_name];
-                        // 三条文案都写状态行，字面量留在 `.set_status(` 后面，
+                        // 三条文案都写状态行。不符的两句模板放在核心层（`TierMismatch::notice_key`），
+                        // 与档位菜单共用同一条叫法；「播放中」这条字面量留在 `.set_status(` 后面，
                         // 好让 i18n 守卫 `every_static_ui_key_has_an_english_entry` 扫到。
                         match mismatch {
-                            Some(TierMismatch::Below) => {
-                                root.set_status("已降档：所选 {}，实际 {}", &both);
-                            }
-                            Some(TierMismatch::Above) => {
-                                root.set_status("高于所选：所选 {}，实际 {}", &both);
+                            Some(direction) => {
+                                root.set_status(direction.notice_key(), &both);
                             }
                             None => {
                                 root.set_status("播放中：{}", std::slice::from_ref(&track.title));
