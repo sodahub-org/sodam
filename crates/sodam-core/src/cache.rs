@@ -14,6 +14,13 @@ const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// 再也不参与升级；30 天后重新问一次，代价最多是一次请求。
 pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// 「上次为补整曲重新取流」记录的有效期。
+///
+/// 试听不是「没有更高档位」的结论：权益变化或签名服务恢复后同一首歌就能拿到整曲，
+/// 所以不能借用 30 天的确认记录。这里只做退避，挡住应用每次启动、每次播放命中都
+/// 把整曲下一遍再丢掉；六小时后自动再试，用户买了会员不必等到第二天。
+pub const PREVIEW_RETRY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
 type Leases = HashMap<PathBuf, std::sync::Weak<PathBuf>>;
 fn leases() -> &'static Mutex<Leases> {
     static LEASES: OnceLock<Mutex<Leases>> = OnceLock::new();
@@ -188,13 +195,15 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
     Some((track_id.to_string(), tag.to_string()))
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}`，
+/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}`，
 /// 与实际字节数核对后给出完整记录。
 ///
 /// 尺寸不符或档位为空一律返回 `None`。
-/// 第四到第六个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
+/// 第四到第七个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
 /// 不影响前三字段的命中判定。第 4 字段也可能是空串——档位未知的旧缓存
 /// 记下「已探测」结论之后就是这个样子，读回来仍然是「档位未知」。
+/// 第 7 字段只对试听片段有意义：它记的是「上次为补整曲重新取流的时间」，
+/// 与第 5 字段「已确认没有更高档位」是两件事，不能互相冒充。
 /// 旧缓存把 50 分档写作「标准」，这里按记录里的实际分数洗成当前显示名
 ///（50 分档是「流畅」、更低分是「省流」），只换档位前缀、保留码率，旧文件不必重下。
 pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
@@ -213,6 +222,9 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
     let checked_at = fields
         .next()
         .and_then(|value| value.trim().parse::<u64>().ok());
+    let preview_attempt_at = fields
+        .next()
+        .and_then(|value| value.trim().parse::<u64>().ok());
     // 只改显示名，不动文件与分数：50 分档曾经叫「标准」，与 libresoda 的 standard(70) 撞名。
     let quality = normalize_quality_label(&quality, actual_rank);
     Some(SidecarMeta {
@@ -221,6 +233,7 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
         actual_rank,
         checked_rank,
         checked_at,
+        preview_attempt_at,
     })
 }
 
@@ -238,8 +251,9 @@ fn strip_preview_marker(quality: &str) -> String {
     quality.replace(" · 试听", "")
 }
 
-/// 一条 sidecar 记录。前四个字段是旧格式，后两个记录升级探测结果：
-/// 曾经向服务端要过哪个目标档位、以及什么时候确认没有更高流。
+/// 一条 sidecar 记录。前四个字段是旧格式，后三个记录升级探测结果：
+/// 曾经向服务端要过哪个目标档位、什么时候确认没有更高流，以及上次为补整曲
+/// 重新取流的时间（只对试听片段）。后两件事不能混：试听不是曲库结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarMeta {
     /// 档位显示文本（含码率，不含试听标记）
@@ -252,6 +266,8 @@ pub struct SidecarMeta {
     pub checked_rank: Option<i64>,
     /// 上次探测时间（Unix 秒）
     pub checked_at: Option<u64>,
+    /// 上次为补整曲重新取流的时间（Unix 秒）；整曲不用这个字段
+    pub preview_attempt_at: Option<u64>,
 }
 
 impl SidecarMeta {
@@ -262,6 +278,18 @@ impl SidecarMeta {
         let (rank, checked_at) = (self.checked_rank?, self.checked_at?);
         if now >= checked_at && now - checked_at < UPGRADE_CHECK_TTL.as_secs() {
             Some(rank)
+        } else {
+            None
+        }
+    }
+
+    /// 上次补整曲的尝试是否还在退避期内；没记录、过期或时钟回拨时返回 `None`。
+    ///
+    /// 只在试听片段上使用。返回 `Some(时间)` 表示这段时间内不必再自动重下。
+    pub fn fresh_preview_attempt_at(&self, now: u64) -> Option<u64> {
+        let attempted_at = self.preview_attempt_at?;
+        if self.preview && now >= attempted_at && now - attempted_at < PREVIEW_RETRY_TTL.as_secs() {
+            Some(attempted_at)
         } else {
             None
         }
@@ -328,19 +356,88 @@ pub(crate) fn record_upgrade_check(
         }
     };
     let rank_field = fields.get(3).copied().unwrap_or("").trim();
+    // 第 7 字段（补整曲尝试时间）与本次结论无关，原样保留，免得一次「无更高档位」
+    // 记录把试听的退避时间抹掉。
+    let preview_attempt = fields
+        .get(6)
+        .copied()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let content = match preview_attempt {
+        Some(attempted_at) => format!(
+            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}\t{attempted_at}",
+            quality_field,
+            fields[1].trim(),
+        ),
+        None => format!(
+            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}",
+            quality_field,
+            fields[1].trim(),
+        ),
+    };
+    replace_sidecar_file(sidecar_path, &content)
+}
+
+/// 在 sidecar 上记录「刚刚为补整曲重新取过一次流」。
+///
+/// 只写时间，不写「没有更高档位」：这次拿回来的可能还是试听，而试听会随账号权益
+/// 或签名服务恢复变成整曲，不能当成曲库结论（见 `session::confirmed_miss_rank`）。
+/// 下一次自动尝试要等 [`PREVIEW_RETRY_TTL`] 之后，避免每次启动、每次命中都整曲下一遍。
+///
+/// `expected_actual_rank` 的用法与 [`record_upgrade_check`] 相同：与现有分数不一致
+/// 说明文件已经被另一个写者替换，旧尝试记录不该落到新文件上。
+/// 调用方必须持有该文件的 `download_lock`，避免与替换序列交错。
+pub(crate) fn record_preview_attempt(
+    sidecar_path: &Path,
+    expected_actual_rank: Option<i64>,
+    now: u64,
+) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(sidecar_path)?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let fields: Vec<&str> = trimmed.split('\t').collect();
+    if fields.len() < 2 || fields[1].trim().parse::<u64>().is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sidecar is missing the quality or size field",
+        ));
+    }
+    if parse_rank(fields.get(3).copied()) != expected_actual_rank {
+        return Ok(());
+    }
+    let (quality_field, preview_field) = match fields.get(2).copied() {
+        Some(flag) => (fields[0].trim().to_string(), flag.trim().to_string()),
+        None => {
+            let raw = fields[0].trim();
+            (
+                strip_preview_marker(raw),
+                u8::from(preview_from_label(raw)).to_string(),
+            )
+        }
+    };
+    // 只有试听记录才需要退避；文件已经被换成整曲时什么都不写。
+    if preview_field != "1" {
+        return Ok(());
+    }
+    let rank_field = fields.get(3).copied().unwrap_or("").trim();
+    let checked_rank = fields.get(4).copied().unwrap_or("").trim();
+    let checked_at = fields.get(5).copied().unwrap_or("").trim();
+    // 第 4、5 字段可能为空，但位置必须留着，后面的时间才不会错位。
     let content = format!(
-        "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}",
+        "{}\t{}\t1\t{rank_field}\t{checked_rank}\t{checked_at}\t{now}",
         quality_field,
         fields[1].trim(),
     );
+    replace_sidecar_file(sidecar_path, &content)
+}
+
+/// 先写临时文件再备份替换；失败回滚，绝不把有效的缓存元数据删掉换一条记录。
+/// 备份名与 `atomic_replace_cache` 共用，二者都由同一把 `download_lock` 串行化。
+fn replace_sidecar_file(sidecar_path: &Path, content: &str) -> std::io::Result<()> {
     let tmp = sidecar_path.with_extension("quality.tmp");
     if let Err(err) = std::fs::write(&tmp, content) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
-    // 负结果只是可选优化：先备份旧 sidecar，替换失败就回滚，绝不把有效的
-    // 缓存元数据删掉换一条记录。备份名与 atomic_replace_cache 共用，二者都
-    // 由同一把 download_lock 串行化。
     let backup = sidecar_path.with_extension("quality.old");
     let _ = std::fs::remove_file(&backup);
     let had_sidecar = sidecar_path.exists();
@@ -424,6 +521,8 @@ impl CachedAudioRecord {
     ///
     /// 排除试听片段、已达到或超过目标的记录，以及最近已经确认过「没有更高档位」的目标：
     /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
+    /// 试听片段仍不纳入批量升级（#130）：补整曲由播放命中时的自动路径负责，
+    /// 并有自己的退避记录；批量升级纳入与否是单独的产品决定，不能在这里悄悄扩大流量。
     /// 档位未知的旧缓存计入可升级——它证明不了自己达标；其中标签已证明达标的
     /// （旧「无损」标签）由 [`CachedAudioRecord::needs_higher_stream`] 挡掉，不白花流量。
     /// 同时受该缓存文件自身的 quality_tag 意图上限约束：
@@ -763,6 +862,7 @@ mod tests {
         assert_eq!(parsed.actual_rank, Some(100));
         assert_eq!(parsed.checked_rank, None);
         assert_eq!(parsed.checked_at, None);
+        assert_eq!(parsed.preview_attempt_at, None);
 
         // 试听标志为1
         let preview = parse_sidecar("标准 128k\t500\t1\t50", 500).unwrap();
@@ -772,6 +872,22 @@ mod tests {
         );
         assert!(preview.preview);
         assert_eq!(preview.actual_rank, Some(50));
+
+        // 第 7 字段是补整曲的尝试时间：认不出档位的 0 分试听也能被读出来。
+        let attempted = parse_sidecar("未知 128k\t500\t1\t0\t\t\t1700000000", 500).unwrap();
+        assert!(attempted.preview);
+        assert_eq!(attempted.actual_rank, Some(0));
+        assert_eq!(attempted.checked_rank, None);
+        assert_eq!(attempted.preview_attempt_at, Some(1_700_000_000));
+        assert_eq!(
+            attempted.fresh_preview_attempt_at(1_700_000_000 + 60),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            attempted.fresh_preview_attempt_at(1_700_000_000 + PREVIEW_RETRY_TTL.as_secs() + 1),
+            None,
+            "过了退避期就该再试一次"
+        );
 
         // 尺寸不符返回None
         assert_eq!(parse_sidecar(sidecar, 999), None);
@@ -1012,11 +1128,26 @@ mod tests {
                 checked_rank: None,
                 file_size: 1024 * 1024,
             },
+            // #130 的两种试听：认得出档位与认不出（0 分）都不进批量升级。
+            CachedAudioRecord {
+                track_id: "3".into(),
+                quality_tag: "auto".into(),
+                path: PathBuf::from("3-auto.m4a"),
+                quality_label: "未知 128k".into(),
+                preview: true,
+                actual_rank: Some(0),
+                checked_rank: None,
+                file_size: 1024 * 1024,
+            },
         ];
         let est = estimate_upgrade(&records, 100);
-        // preview 试听文件不应被计入升级
+        // preview 试听文件不应被计入升级，也不该被报成「档位未知的旧缓存」：
+        // 它本来就不参与批量升级，报了也没法处理。
         assert_eq!(est.upgradeable_count, 1);
+        assert_eq!(est.unknown_rank_count, 0);
         assert_eq!(est.current_bytes, 4 * 1024 * 1024);
+        assert!(!records[1].is_upgradeable_to(100));
+        assert!(!records[2].is_upgradeable_to(100));
     }
 
     /// #96：sidecar 记了 0 分（认不出档位）的缓存不计入批量升级——重下拿回的还是同一条
@@ -1140,6 +1271,7 @@ mod tests {
             actual_rank: Some(80),
             checked_rank: Some(100),
             checked_at: Some(1_700_000_000),
+            preview_attempt_at: None,
         };
         assert_eq!(meta.fresh_checked_rank(1_700_000_001), Some(100));
         let edge = 1_700_000_000 + UPGRADE_CHECK_TTL.as_secs() - 1;
@@ -1154,6 +1286,36 @@ mod tests {
             ..meta
         };
         assert_eq!(no_time.fresh_checked_rank(1_700_000_001), None);
+    }
+
+    /// #130：补整曲的退避只对试听生效，过期、时钟回拨或整曲记录都不挡路。
+    #[test]
+    fn preview_retry_backoff_expires_and_only_applies_to_previews() {
+        let meta = SidecarMeta {
+            quality: "未知 128k".into(),
+            preview: true,
+            actual_rank: Some(0),
+            checked_rank: None,
+            checked_at: None,
+            preview_attempt_at: Some(1_700_000_000),
+        };
+        assert_eq!(
+            meta.fresh_preview_attempt_at(1_700_000_001),
+            Some(1_700_000_000)
+        );
+        let expired = 1_700_000_000 + PREVIEW_RETRY_TTL.as_secs();
+        assert_eq!(meta.fresh_preview_attempt_at(expired), None);
+        assert_eq!(meta.fresh_preview_attempt_at(1_700_000_000 - 1), None);
+
+        let full_track = SidecarMeta {
+            preview: false,
+            ..meta
+        };
+        assert_eq!(
+            full_track.fresh_preview_attempt_at(1_700_000_001),
+            None,
+            "整曲不需要补整曲退避"
+        );
     }
 
     /// 写回探测结论时保留原来的前四个字段，且不覆盖已被替换的文件。
@@ -1242,6 +1404,71 @@ mod tests {
         assert_eq!(parsed.quality, "无损", "档位文本不再拖着试听标记");
         assert_eq!(parsed.actual_rank, None);
         assert_eq!(parsed.checked_rank, Some(100));
+    }
+
+    /// #130：补整曲的尝试只写时间，不写「没有更高档位」，也不碰第 5、6 字段。
+    #[test]
+    fn record_preview_attempt_writes_backoff_without_forging_checked_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "未知 128k\t9000\t1\t0").unwrap();
+
+        record_preview_attempt(&sidecar, Some(0), 1_700_000_000).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "未知 128k\t9000\t1\t0\t\t\t1700000000");
+        let parsed = parse_sidecar(&text, 9000).unwrap();
+        assert!(parsed.preview);
+        assert_eq!(parsed.actual_rank, Some(0));
+        assert_eq!(parsed.checked_rank, None, "试听不能冒充「无更高档位」");
+        assert_eq!(parsed.checked_at, None);
+        assert_eq!(
+            parsed.fresh_preview_attempt_at(1_700_000_000 + 60),
+            Some(1_700_000_000)
+        );
+
+        // 文件已经被替换成整曲时，旧尝试记录不能落到新文件上。
+        std::fs::write(&sidecar, "无损 871k\t9000\t0\t100").unwrap();
+        record_preview_attempt(&sidecar, Some(0), 1_700_000_100).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "无损 871k\t9000\t0\t100"
+        );
+
+        // 档位分数变了（换成了另一条试听）同样跳过，避免给新流贴上旧退避。
+        std::fs::write(&sidecar, "流畅 128k\t9000\t1\t50").unwrap();
+        record_preview_attempt(&sidecar, Some(0), 1_700_000_200).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "流畅 128k\t9000\t1\t50"
+        );
+    }
+
+    /// 试听拼接在档位里的旧格式也能补出试听标志并写入退避。
+    #[test]
+    fn record_preview_attempt_fills_the_missing_preview_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "无损 · 试听\t9000").unwrap();
+        record_preview_attempt(&sidecar, None, 1_700_000_000).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "无损\t9000\t1\t\t\t\t1700000000");
+        let parsed = parse_sidecar(&text, 9000).unwrap();
+        assert!(parsed.preview);
+        assert_eq!(parsed.preview_attempt_at, Some(1_700_000_000));
+    }
+
+    /// 写「没有更高档位」时不能顺手抹掉第 7 字段的补整曲退避时间。
+    #[test]
+    fn record_upgrade_check_preserves_preview_attempt_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "未知 128k\t2000\t1\t0\t\t\t1700000000").unwrap();
+        record_upgrade_check(&sidecar, Some(0), 100, 1_700_000_100).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "未知 128k\t2000\t1\t0\t100\t1700000100\t1700000000");
+        let parsed = parse_sidecar(&text, 2000).unwrap();
+        assert_eq!(parsed.checked_rank, Some(100));
+        assert_eq!(parsed.preview_attempt_at, Some(1_700_000_000));
     }
 
     /// 写回成功时清掉可能遗留的旧备份，不留下临时文件。
