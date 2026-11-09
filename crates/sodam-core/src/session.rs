@@ -317,8 +317,12 @@ fn confirmed_miss_rank(
 ///
 /// 这条护栏与档位高低无关：整曲永远比试听完整，哪怕试听那条流的档位分数更高。
 /// 单独拆出来是为了让「试听不覆盖整曲」能离线测（`upgrade_cached_track` 本身要网络）。
-fn would_downgrade_to_preview(new_is_preview: bool, current_is_preview: bool) -> bool {
-    new_is_preview && !current_is_preview
+/// 参数用真实类型而不是两个布尔，调用点写反顺序编译不过。
+fn would_downgrade_to_preview(
+    info: &libresoda::soda::types::DownloadInfo,
+    current: &CachedTrack,
+) -> bool {
+    info.is_preview && !current.preview
 }
 
 /// 这次取到的新流是否值得换掉本地已有的那一份缓存。
@@ -706,7 +710,7 @@ impl Session {
         let _writer = upgrade_lock.lock().unwrap_or_else(|err| err.into_inner());
 
         // 获取锁后重读当前缓存，防止并发升级已将其提升
-        let current = match self.cached_track(&track.id) {
+        let mut current = match self.cached_track(&track.id) {
             Some(c) => c,
             None => {
                 return Err(PlaybackFailure::new(
@@ -774,7 +778,7 @@ impl Session {
         }
 
         // 核心安全护栏：试听流绝不允许覆盖已有非试听整曲缓存（即便试听流档位分数更高）
-        if would_downgrade_to_preview(info.is_preview, current.preview) {
+        if would_downgrade_to_preview(&info, &current) {
             let _ = std::fs::remove_file(&part);
             return Ok(current);
         }
@@ -792,6 +796,8 @@ impl Session {
             // 会随会员权益或网络变化，不能写成「没有更高档位」。
             if current.preview {
                 record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
+                // 磁盘上已经记了退避，返回的对象也跟上，别让内存和 sidecar 说两套话。
+                current.preview_retry_blocked = true;
             } else if let Some(checked_rank) = checked_rank {
                 record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
             }
@@ -836,7 +842,8 @@ impl Session {
             preview,
             quality_rank: Some(new_rank),
             checked_rank,
-            preview_retry_blocked: false,
+            // 换成另一条试听时 sidecar 已经写了退避时间；换成整曲则不需要。
+            preview_retry_blocked: preview,
             lease: target_lease,
         })
     }
@@ -1348,10 +1355,31 @@ mod tests {
     /// #130：试听流绝不覆盖已有整曲，哪怕它的档位分数更高。
     #[test]
     fn preview_stream_never_replaces_a_full_track() {
-        assert!(would_downgrade_to_preview(true, false));
-        assert!(!would_downgrade_to_preview(true, true));
-        assert!(!would_downgrade_to_preview(false, false));
-        assert!(!would_downgrade_to_preview(false, true));
+        use libresoda::soda::types::DownloadInfo;
+
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("guard.m4a"));
+        let cached = |preview: bool| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: "流畅 128k".into(),
+            preview,
+            quality_rank: Some(50),
+            checked_rank: None,
+            preview_retry_blocked: false,
+            lease: lease.clone(),
+        };
+        let preview_stream = DownloadInfo {
+            is_preview: true,
+            ..Default::default()
+        };
+        let full_stream = DownloadInfo {
+            is_preview: false,
+            ..Default::default()
+        };
+
+        assert!(would_downgrade_to_preview(&preview_stream, &cached(false)));
+        assert!(!would_downgrade_to_preview(&preview_stream, &cached(true)));
+        assert!(!would_downgrade_to_preview(&full_stream, &cached(false)));
+        assert!(!would_downgrade_to_preview(&full_stream, &cached(true)));
     }
 
     /// #89：新流值不值得换掉本地这份缓存——档位未知的旧文件不能被更差的流顶掉。
