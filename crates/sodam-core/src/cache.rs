@@ -1140,15 +1140,27 @@ mod tests {
                 checked_rank: None,
                 file_size: 1024 * 1024,
             },
+            // 旧格式试听没有档位分数：同样不能报成「档位未知的旧缓存」，
+            // 它本来就不参与批量升级，报了也没法处理。
+            CachedAudioRecord {
+                track_id: "4".into(),
+                quality_tag: "auto".into(),
+                path: PathBuf::from("4-auto.m4a"),
+                quality_label: "试听 128k".into(),
+                preview: true,
+                actual_rank: None,
+                checked_rank: None,
+                file_size: 1024 * 1024,
+            },
         ];
         let est = estimate_upgrade(&records, 100);
-        // preview 试听文件不应被计入升级，也不该被报成「档位未知的旧缓存」：
-        // 它本来就不参与批量升级，报了也没法处理。
+        // preview 试听文件不应被计入升级，也不该被报成「档位未知的旧缓存」。
         assert_eq!(est.upgradeable_count, 1);
         assert_eq!(est.unknown_rank_count, 0);
         assert_eq!(est.current_bytes, 4 * 1024 * 1024);
         assert!(!records[1].is_upgradeable_to(100));
         assert!(!records[2].is_upgradeable_to(100));
+        assert!(!records[3].is_upgradeable_to(100));
     }
 
     /// #96：sidecar 记了 0 分（认不出档位）的缓存不计入批量升级——重下拿回的还是同一条

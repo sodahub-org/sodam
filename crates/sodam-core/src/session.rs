@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     /// #130：试听补整曲有自己的出口，不被 `actual_rank`（尤其 0 分）连坐；
-    /// 退避期内不再自动重下，但用户主动路径仍能再试。
+    /// 退避期内不再重下，退避过后仍会再试。
     #[test]
     fn preview_cache_exits_regardless_of_unreadable_rank() {
         let lease = crate::cache::CacheLease::acquire(std::path::Path::new("preview.m4a"));
