@@ -386,12 +386,13 @@ pub(crate) fn record_upgrade_check(
 ///
 /// `expected_actual_rank` 的用法与 [`record_upgrade_check`] 相同：与现有分数不一致
 /// 说明文件已经被另一个写者替换，旧尝试记录不该落到新文件上。
+/// 返回 `Ok(true)` 表示退避确实写进了 sidecar；`Ok(false)` 表示按上面的规则跳过。
 /// 调用方必须持有该文件的 `download_lock`，避免与替换序列交错。
 pub(crate) fn record_preview_attempt(
     sidecar_path: &Path,
     expected_actual_rank: Option<i64>,
     now: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let text = std::fs::read_to_string(sidecar_path)?;
     let trimmed = text.trim_end_matches(['\r', '\n']);
     let fields: Vec<&str> = trimmed.split('\t').collect();
@@ -402,7 +403,7 @@ pub(crate) fn record_preview_attempt(
         ));
     }
     if parse_rank(fields.get(3).copied()) != expected_actual_rank {
-        return Ok(());
+        return Ok(false);
     }
     let (quality_field, preview_field) = match fields.get(2).copied() {
         Some(flag) => (fields[0].trim().to_string(), flag.trim().to_string()),
@@ -416,7 +417,7 @@ pub(crate) fn record_preview_attempt(
     };
     // 只有试听记录才需要退避；文件已经被换成整曲时什么都不写。
     if preview_field != "1" {
-        return Ok(());
+        return Ok(false);
     }
     let rank_field = fields.get(3).copied().unwrap_or("").trim();
     let checked_rank = fields.get(4).copied().unwrap_or("").trim();
@@ -427,7 +428,7 @@ pub(crate) fn record_preview_attempt(
         quality_field,
         fields[1].trim(),
     );
-    replace_sidecar_file(sidecar_path, &content)
+    replace_sidecar_file(sidecar_path, &content).map(|()| true)
 }
 
 /// 先写临时文件再备份替换；失败回滚，绝不把有效的缓存元数据删掉换一条记录。
@@ -1413,7 +1414,7 @@ mod tests {
         let sidecar = dir.path().join("song-auto.quality");
         std::fs::write(&sidecar, "未知 128k\t9000\t1\t0").unwrap();
 
-        record_preview_attempt(&sidecar, Some(0), 1_700_000_000).unwrap();
+        assert!(record_preview_attempt(&sidecar, Some(0), 1_700_000_000).unwrap());
         let text = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(text, "未知 128k\t9000\t1\t0\t\t\t1700000000");
         let parsed = parse_sidecar(&text, 9000).unwrap();
@@ -1428,7 +1429,7 @@ mod tests {
 
         // 文件已经被替换成整曲时，旧尝试记录不能落到新文件上。
         std::fs::write(&sidecar, "无损 871k\t9000\t0\t100").unwrap();
-        record_preview_attempt(&sidecar, Some(0), 1_700_000_100).unwrap();
+        assert!(!record_preview_attempt(&sidecar, Some(0), 1_700_000_100).unwrap());
         assert_eq!(
             std::fs::read_to_string(&sidecar).unwrap(),
             "无损 871k\t9000\t0\t100"
@@ -1436,7 +1437,7 @@ mod tests {
 
         // 档位分数变了（换成了另一条试听）同样跳过，避免给新流贴上旧退避。
         std::fs::write(&sidecar, "流畅 128k\t9000\t1\t50").unwrap();
-        record_preview_attempt(&sidecar, Some(0), 1_700_000_200).unwrap();
+        assert!(!record_preview_attempt(&sidecar, Some(0), 1_700_000_200).unwrap());
         assert_eq!(
             std::fs::read_to_string(&sidecar).unwrap(),
             "流畅 128k\t9000\t1\t50"
@@ -1449,7 +1450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = dir.path().join("song-auto.quality");
         std::fs::write(&sidecar, "无损 · 试听\t9000").unwrap();
-        record_preview_attempt(&sidecar, None, 1_700_000_000).unwrap();
+        assert!(record_preview_attempt(&sidecar, None, 1_700_000_000).unwrap());
         let text = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(text, "无损\t9000\t1\t\t\t\t1700000000");
         let parsed = parse_sidecar(&text, 9000).unwrap();

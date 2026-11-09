@@ -283,15 +283,12 @@ fn record_preview_upgrade_attempt(
     quality_path: &std::path::Path,
     audio_path: &std::path::Path,
     actual_rank: Option<i64>,
-) {
+) -> bool {
     // 与替换路径共用同一把写锁，避免退避时间落到并发替换后的新文件上。
     let lock = crate::cache::download_lock(audio_path);
     let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
-    let _ = crate::cache::record_preview_attempt(
-        quality_path,
-        actual_rank,
-        crate::cache::now_epoch_secs(),
-    );
+    crate::cache::record_preview_attempt(quality_path, actual_rank, crate::cache::now_epoch_secs())
+        .unwrap_or(false)
 }
 
 /// 确认性 miss：拿到完整流、档位可识别、目标存在、权益已确认，且实际档位低于目标。
@@ -795,9 +792,10 @@ impl Session {
             // 整曲：只有「拿到完整流、档位仍没提升」才是确认性结论；试听回退与下载失败
             // 会随会员权益或网络变化，不能写成「没有更高档位」。
             if current.preview {
-                record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
-                // 磁盘上已经记了退避，返回的对象也跟上，别让内存和 sidecar 说两套话。
-                current.preview_retry_blocked = true;
+                // 只有退避真的写进 sidecar，返回的对象才跟着标；写失败或跳过时
+                // 内存保持原样，别让两边说两套话。
+                current.preview_retry_blocked |=
+                    record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
             } else if let Some(checked_rank) = checked_rank {
                 record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
             }
