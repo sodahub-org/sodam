@@ -252,8 +252,9 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 
 ## Debian / Ubuntu 下载安装
 
-SodaM 的 GitHub Release 同时提供 Debian / Ubuntu 的 `.deb` 包，当前版本为
-[`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)。
+从下一个版本起，SodaM 的 GitHub Release 会同时提供 Debian / Ubuntu 的 `.deb` 包。
+`v0.3.8` 及更早的 Release **没有** `.deb`；下面用 GitHub API 取最新 Release 的版本号，
+若它还没有 deb（即仍是 v0.3.8），请等下一个版本。
 
 ### 1. 确认系统架构
 
@@ -271,7 +272,9 @@ mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
 arch=$(dpkg --print-architecture)
-version=0.3.8
+# 最新 Release 的版本号（首个带 deb 的版本；v0.3.8 没有 deb）
+version=$(curl -fsSL https://api.github.com/repos/sodahub-org/sodam/releases/latest \
+  | grep -o '"tag_name": *"v[^"]*"' | head -1 | sed 's/.*"v//; s/"$//')
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -282,7 +285,7 @@ grep "sodam_${version}_${arch}\.deb$" SHA256SUMS | sha256sum -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam_0.3.8_amd64.deb: OK
+sodam_${version}_amd64.deb: OK
 ```
 
 ### 3. 安装
