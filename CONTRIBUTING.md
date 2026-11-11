@@ -40,6 +40,7 @@ scripts/run.sh     # 启动 GUI（带 MemoryMax 护栏）
 | `crates/sodam-core/` | 领域层：配置、会话、队列、音乐库、播放引擎（**不依赖 GPUI**） |
 | `crates/sodam/` | GPUI 应用：入口、Root 状态、动作、托盘、`ui/`、`views/` |
 | `packaging/arch/` | PKGBUILD、desktop 文件、`mkrepo.sh`（生成 pacman 源） |
+| `packaging/deb/` | `make-deb.sh`（从 release 二进制打 `.deb`） |
 | `packaging/homebrew/` | Homebrew Cask |
 | `website/` | 官网静态页面（CI 部署到 GitHub Pages） |
 | `docs/` | ARCHITECTURE / ROADMAP / UI-SPEC |

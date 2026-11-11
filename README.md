@@ -66,6 +66,7 @@ SodaM 是**汽水音乐的第三方桌面客户端**，面向 Linux / macOS / Wi
 | 平台 | 状态 |
 | --- | --- |
 | Linux / Omarchy | 已实测 |
+| Linux（Debian / Ubuntu） | 提供 `.deb` 包 |
 | macOS（Apple Silicon） | 已实测，提供 Homebrew Cask 与 `.app` 下载 |
 | Windows（x64） | 已实测，提供安装包 |
 
@@ -248,6 +249,73 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 ```
 
 不要在 GUI 运行时编译；不要绕过脚本反复执行全量 cargo 构建。
+
+## Debian / Ubuntu 下载安装
+
+SodaM 的 GitHub Release 同时提供 Debian / Ubuntu 的 `.deb` 包，当前版本为
+[`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)。
+
+### 1. 确认系统架构
+
+```bash
+dpkg --print-architecture   # amd64 或 arm64
+```
+
+- `x86_64` 机器对应 `amd64`
+- `aarch64` 机器对应 `arm64`
+
+### 2. 下载并校验安装包
+
+```bash
+mkdir -p /tmp/sodam-install
+cd /tmp/sodam-install
+
+arch=$(dpkg --print-architecture)
+version=0.3.8
+base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
+
+curl -fLO ${base_url}/SHA256SUMS
+curl -fLO ${base_url}/sodam_${version}_${arch}.deb
+grep "sodam_${version}_${arch}\.deb$" SHA256SUMS | sha256sum -c -
+```
+
+校验输出必须包含 `OK`：
+
+```text
+sodam_0.3.8_amd64.deb: OK
+```
+
+### 3. 安装
+
+```bash
+sudo apt install ./sodam_${version}_${arch}.deb
+```
+
+`apt` 会自动处理 `libasound2`、`libdbus-1-3`、`libfontconfig1`、`libfreetype6`、
+`libxkbcommon0`、`libxcb1`、`hicolor-icon-theme` 等依赖。包未做 GPG 签名、也没有
+apt 源，所以用 `apt install ./包路径` 直接装本地文件，不要先 `apt update` 再按包名安装。
+
+> Debian 12/13 与 Ubuntu 24.04+ 的 `t64` 包都带传统包名的 `Provides:`，上面这些依赖名都能满足。
+
+### 4. 启动
+
+命令行启动：
+
+```bash
+sodam
+```
+
+也可以从桌面环境的应用菜单中启动 **SodaM**。首次启动会进入设置页，按提示扫码登录后即可使用。
+
+### 升级与卸载
+
+```bash
+# 升级：从 Releases 下载新版本 .deb 后覆盖安装
+sudo apt install ./sodam_<新版本>_${arch}.deb
+
+# 卸载；~/.config/sodam 里的配置和登录状态会保留
+sudo apt remove sodam
+```
 
 ## Arch Linux 下载安装
 
@@ -445,19 +513,34 @@ if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
 
 ## 打包
 
+### Arch Linux（pacman）
+
 ```bash
 cd packaging/arch
 PKGEXT='.pkg.tar.zst' makepkg -f
 sudo pacman -U ./sodam-<version>-<arch>.pkg.tar.zst
 ```
 
-安装后会得到：
+### Debian / Ubuntu（deb）
+
+从已构建的 release 二进制直接打包，不重新编译：
+
+```bash
+cargo build --release --locked --workspace
+packaging/deb/make-deb.sh <x86_64|aarch64>
+sudo apt install ./sodam_<version>_<amd64|arm64>.deb
+```
+
+细节见 [`packaging/deb/README.md`](packaging/deb/README.md)。两种包装完都会得到：
 
 ```text
 /usr/bin/sodam
 /usr/share/applications/sodam.desktop
 /usr/share/icons/hicolor/256x256/apps/sodam.png
 ```
+
+`.deb` 另外带 `/usr/share/doc/sodam/{copyright,LICENSE,NOTICE.md}`，pacman 包对应的是
+`/usr/share/licenses/sodam/LICENSE`。
 
 ## 文档
 

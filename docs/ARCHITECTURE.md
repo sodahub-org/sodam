@@ -172,7 +172,8 @@ TrackItem + cache path
 
 ## 打包与运行时
 
-- Linux ARM64 使用 `packaging/arch/PKGBUILD` 生成 pacman 包。
+- Linux ARM64 使用 `packaging/arch/PKGBUILD` 生成 pacman 包；
+  x86_64 / aarch64 另用 `packaging/deb/make-deb.sh` 从同一份 release 二进制打 `.deb`。
 - 安装内容：`/usr/bin/sodam`、desktop entry、hicolor icon。
 - GUI 通过 `scripts/run.sh` 启动时带 `MemoryMax=2G` 护栏。
 - 托盘和窗口关闭逻辑使用显式退出模式：关闭主窗口保留进程，退出走托盘菜单。
