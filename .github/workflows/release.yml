@@ -59,6 +59,21 @@ jobs:
           mkdir -p release
           mv "$package" "$package.sha256" release/
 
+      - name: Create Debian package
+        run: |
+          package=$(packaging/deb/make-deb.sh '${{ matrix.arch }}')
+          test -s "$package"
+          test -s "$package.sha256"
+          case '${{ matrix.arch }}' in
+            x86_64) deb_arch=amd64 ;;
+            aarch64) deb_arch=arm64 ;;
+            *) echo "unsupported architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          test "$(dpkg-deb --field "$package" Architecture)" = "$deb_arch"
+          dpkg-deb --contents "$package" | grep -Eq ' \./usr/bin/sodam$'
+          dpkg-deb --info "$package"
+          mv "$package" "$package.sha256" release/
+
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -171,7 +186,7 @@ jobs:
         run: |
           cd release
           rm -f SHA256SUMS
-          sha256sum *.pkg.tar.zst *.zip *.exe > SHA256SUMS
+          sha256sum *.pkg.tar.zst *.deb *.zip *.exe > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -189,6 +204,10 @@ jobs:
             - `x86_64` pacman package
             - `aarch64` pacman package
 
+            Linux (Debian/Ubuntu):
+            - `amd64` deb package (x86_64)
+            - `arm64` deb package (aarch64)
+
             macOS (Apple Silicon, unsigned / ad-hoc signed):
             - `aarch64` `.app` zip，首次打开见 README「macOS 下载安装」
 
@@ -198,6 +217,7 @@ jobs:
             - `SHA256SUMS`
           files: |
             release/*.pkg.tar.zst
+            release/*.deb
             release/*.zip
             release/*.exe
             release/SHA256SUMS
