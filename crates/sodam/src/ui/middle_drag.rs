@@ -5,6 +5,16 @@
 
 use crate::app::Nav;
 
+/// 这次中键拖动绑在哪个滚动区。只用来决定偏移最终写回哪个句柄，
+/// 不做任何「写不了就退而求其次」的回退分支。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DragTarget {
+    /// 设置页（用 `settings_scroll`）。
+    Settings,
+    /// 队列抽屉（用 `queue_scroll` 内部的 `base_handle`）。
+    Queue,
+}
+
 /// 起步死区：鼠标没挪够 2px 就不滚，免得中键轻点让页面抖一下。
 const DEAD_ZONE: f32 = 2.0;
 
@@ -14,6 +24,8 @@ struct Anchor {
     y: f32,
     top: f32,
     page: Nav,
+    /// 这次拖动绑在哪个滚动区（设置页 / 队列抽屉），写回时按它分流。
+    target: DragTarget,
     /// 已经挪够 2px、开始滚了。起步之后不再判死区，否则拖回起点会卡住。
     started: bool,
 }
@@ -24,15 +36,22 @@ pub struct MiddleDrag(Option<Anchor>);
 
 impl MiddleDrag {
     /// 按下中键。已经按着就忽略：重复按下不会把起点挪走，也不会叠加位移。
-    pub fn begin(&mut self, y: f32, top: f32, page: Nav) {
+    pub fn begin(&mut self, y: f32, top: f32, page: Nav, target: DragTarget) {
         if self.0.is_none() {
             self.0 = Some(Anchor {
                 y,
                 top,
                 page,
+                target,
                 started: false,
             });
         }
+    }
+
+    /// 当前拖动绑在哪个滚动区；没在拖就是 `None`。
+    /// `move_to` 只负责算偏移，真正写回交给上层按这个目标分流。
+    pub fn target(&self) -> Option<DragTarget> {
+        self.0.map(|anchor| anchor.target)
     }
 
     /// 松开中键、切页、窗口失焦，都走这里收尾。
@@ -79,7 +98,7 @@ mod tests {
 
     fn dragging(at: f32, top: f32) -> MiddleDrag {
         let mut drag = MiddleDrag::default();
-        drag.begin(at, top, SETTINGS);
+        drag.begin(at, top, SETTINGS, DragTarget::Settings);
         drag
     }
 
@@ -172,7 +191,7 @@ mod tests {
     #[test]
     fn pressing_again_does_not_restart_or_stack() {
         let mut drag = dragging(100.0, 50.0);
-        drag.begin(180.0, 10.0, SETTINGS);
+        drag.begin(180.0, 10.0, SETTINGS, DragTarget::Settings);
         assert_eq!(drag.move_to(130.0, 500.0, SETTINGS, true), Some(20.0));
     }
 }

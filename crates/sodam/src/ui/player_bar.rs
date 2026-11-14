@@ -1105,7 +1105,15 @@ fn queue_drawer_inner(
     })
     .flex_1()
     .min_h(px(0.0))
-    .track_scroll(&root.queue_scroll);
+    .track_scroll(&root.queue_scroll)
+    // 按下时上报自己是这次拖动的目标；移动、松开由根元素统一收，
+    // 这样鼠标拖出抽屉也还滚这一个列表，不误滚后面的页面。
+    .on_mouse_down(
+        MouseButton::Middle,
+        cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+            root.begin_middle_drag_queue(f32::from(event.position.y));
+        }),
+    );
 
     let menu_tracks = root.queue_cache.1.clone();
     let menu = root.queue_menu.and_then(|(index, position)| {
