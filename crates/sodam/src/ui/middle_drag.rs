@@ -13,6 +13,18 @@ pub enum DragTarget {
     Settings,
     /// 队列抽屉（用 `queue_scroll` 内部的 `base_handle`）。
     Queue,
+    /// 搜索页「综合」分组列表（用 `search_groups_scroll`）。
+    SearchGroups,
+    /// 搜索页「歌曲」列表（用 `search_tracks_scroll` 内部的 `base_handle`）。
+    SearchTracks,
+    /// 搜索页「音乐人」列表（用 `search_artists_scroll`）。
+    SearchArtists,
+    /// 搜索页「专辑」列表（用 `search_albums_scroll`）。
+    SearchAlbums,
+    /// 搜索页「歌单」列表（用 `search_playlists_scroll`）。
+    SearchPlaylists,
+    /// 我的歌单卡片网格（用 `playlist_grid_scroll`）。
+    PlaylistGrid,
     /// 歌词页（用 `lyrics_scroll`）。
     Lyrics,
 }
@@ -208,5 +220,28 @@ mod tests {
         assert_eq!(drag.move_to(130.0, 500.0, LYRICS, true), Some(10.0));
         drag.finish();
         assert_eq!(drag.target(), None);
+    }
+
+    /// 搜索页各处列表和歌单网格各报各的目标；按下之后就锁住，
+    /// 别处再按一次中键也换不掉。
+    #[test]
+    fn area_targets_are_reported_and_locked() {
+        let cases = [
+            (Nav::Search, DragTarget::SearchGroups),
+            (Nav::Search, DragTarget::SearchTracks),
+            (Nav::Search, DragTarget::SearchArtists),
+            (Nav::Search, DragTarget::SearchAlbums),
+            (Nav::Search, DragTarget::SearchPlaylists),
+            (Nav::Library, DragTarget::PlaylistGrid),
+        ];
+        for (page, target) in cases {
+            let mut drag = MiddleDrag::default();
+            drag.begin(100.0, 50.0, page, target);
+            assert_eq!(drag.target(), Some(target));
+            // 按住不放时在别处又点一次中键：目标还是最先按下那一个。
+            drag.begin(180.0, 10.0, page, DragTarget::PlaylistGrid);
+            assert_eq!(drag.target(), Some(target));
+            assert_eq!(drag.move_to(130.0, 500.0, page, true), Some(20.0));
+        }
     }
 }

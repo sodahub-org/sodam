@@ -226,6 +226,18 @@ pub struct Root {
     pub nav: Nav,
     /// 设置页内容区的滚动句柄：中键拖动时按像素改它的偏移。
     pub settings_scroll: gpui::ScrollHandle,
+    /// 搜索页「综合」分组列表的滚动句柄。
+    pub search_groups_scroll: gpui::ScrollHandle,
+    /// 搜索页「歌曲」列表的滚动句柄（虚拟列表，像素滚动走内部 `base_handle`）。
+    pub search_tracks_scroll: gpui::UniformListScrollHandle,
+    /// 搜索页「音乐人」列表的滚动句柄。
+    pub search_artists_scroll: gpui::ScrollHandle,
+    /// 搜索页「专辑」列表的滚动句柄。
+    pub search_albums_scroll: gpui::ScrollHandle,
+    /// 搜索页「歌单」列表的滚动句柄。
+    pub search_playlists_scroll: gpui::ScrollHandle,
+    /// 我的歌单卡片网格外层的滚动句柄。
+    pub playlist_grid_scroll: gpui::ScrollHandle,
     /// 中键拖动的状态，只算数不碰窗口（见 ui::middle_drag）。
     pub(crate) middle_drag: ui::middle_drag::MiddleDrag,
     /// 自绘标题栏拖拽区的按下锚点：按下只记录，移动超过阈值才交给合成器，
@@ -629,6 +641,12 @@ impl Root {
             lyrics_position_anchor: None,
             lyrics_demo_position: None,
             settings_scroll: gpui::ScrollHandle::new(),
+            search_groups_scroll: gpui::ScrollHandle::new(),
+            search_tracks_scroll: gpui::UniformListScrollHandle::new(),
+            search_artists_scroll: gpui::ScrollHandle::new(),
+            search_albums_scroll: gpui::ScrollHandle::new(),
+            search_playlists_scroll: gpui::ScrollHandle::new(),
+            playlist_grid_scroll: gpui::ScrollHandle::new(),
             middle_drag: ui::middle_drag::MiddleDrag::default(),
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
