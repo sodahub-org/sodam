@@ -3,6 +3,7 @@
 //! [`Root`] 的字段定义在 [`super`]，这里按领域拆分实现，避免单文件继续膨胀。
 
 use crate::ui::i18n::Language;
+use crate::ui::middle_drag::DragTarget;
 use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
@@ -2152,24 +2153,56 @@ impl Root {
         }
     }
 
+    /// 队列抽屉内部滚动由 `UniformListScrollHandle` 的 `base_handle` 驱动，
+    /// 抽出来当成一个普通 `ScrollHandle` 用，避免到处穿透 `UniformListScrollHandle` 内部。
+    fn queue_base_handle(&self) -> gpui::ScrollHandle {
+        self.queue_scroll.0.borrow().base_handle.clone()
+    }
+
     /// 设置页上报「中键按下」：记下起点和当时的滚动位置。
     pub(crate) fn begin_middle_drag(&mut self, y: f32) {
         // GPUI 的偏移是负的：0 在最顶上，越往下滚越负。
         let top = -f32::from(self.settings_scroll.offset().y);
         let nav = self.nav;
-        self.middle_drag.begin(y, top, nav);
+        self.middle_drag.begin(y, top, nav, DragTarget::Settings);
     }
 
-    /// 中键按着移动时推进一次：算出新偏移，写回设置页的滚动句柄。
+    /// 队列抽屉上报「中键按下」：记下起点和抽屉当时的滚动位置。
+    pub(crate) fn begin_middle_drag_queue(&mut self, y: f32) {
+        // 队列用 `UniformListScrollHandle`，内部滚动由 `base_handle` 驱动，
+        // 偏移同样是负的：0 在最顶上，越往下滚越负。
+        let top = -f32::from(self.queue_base_handle().offset().y);
+        let nav = self.nav;
+        self.middle_drag.begin(y, top, nav, DragTarget::Queue);
+    }
+
+    /// 中键按着移动时推进一次：算出新偏移，按当前拖动绑定的滚动区写回。
     pub(crate) fn middle_drag_move(&mut self, y: f32, window_active: bool, cx: &mut Context<Self>) {
         let nav = self.nav;
-        let max_top = f32::from(self.settings_scroll.max_offset().y);
+        let Some(target) = self.middle_drag.target() else {
+            return;
+        };
+        // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
+        let max_top = match target {
+            DragTarget::Settings => f32::from(self.settings_scroll.max_offset().y),
+            DragTarget::Queue => f32::from(self.queue_base_handle().max_offset().y),
+        };
         let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
             return;
         };
-        let mut offset = self.settings_scroll.offset();
-        offset.y = gpui::px(-top);
-        self.settings_scroll.set_offset(offset);
+        // 再按同一目标写回对应句柄：1:1 跟手、不跳项、不回弹、不越界。
+        match target {
+            DragTarget::Settings => {
+                let mut offset = self.settings_scroll.offset();
+                offset.y = gpui::px(-top);
+                self.settings_scroll.set_offset(offset);
+            }
+            DragTarget::Queue => {
+                let mut offset = self.queue_base_handle().offset();
+                offset.y = gpui::px(-top);
+                self.queue_base_handle().set_offset(offset);
+            }
+        }
         cx.notify();
     }
 
