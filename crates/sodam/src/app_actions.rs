@@ -2182,27 +2182,22 @@ impl Root {
         let Some(target) = self.middle_drag.target() else {
             return;
         };
-        // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
-        let max_top = match target {
-            DragTarget::Settings => f32::from(self.settings_scroll.max_offset().y),
-            DragTarget::Queue => f32::from(self.queue_base_handle().max_offset().y),
+        // 先按目标取出滚动句柄的可变引用：Settings 用字段，Queue 用 `base_handle` 克隆。
+        // 取一次、算一次 max_top、写回一次，避免对 DragTarget 重复 match 和重复写回。
+        let settings = &mut self.settings_scroll;
+        let mut queue = self.queue_base_handle();
+        let handle: &mut gpui::ScrollHandle = match target {
+            DragTarget::Settings => settings,
+            DragTarget::Queue => &mut queue,
         };
+        let max_top = f32::from(handle.max_offset().y);
         let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
             return;
         };
-        // 再按同一目标写回对应句柄：1:1 跟手、不跳项、不回弹、不越界。
-        match target {
-            DragTarget::Settings => {
-                let mut offset = self.settings_scroll.offset();
-                offset.y = gpui::px(-top);
-                self.settings_scroll.set_offset(offset);
-            }
-            DragTarget::Queue => {
-                let mut offset = self.queue_base_handle().offset();
-                offset.y = gpui::px(-top);
-                self.queue_base_handle().set_offset(offset);
-            }
-        }
+        // 按 move_to 算出的离顶距离写回：1:1 跟手、不跳项、不回弹、不越界。
+        let mut offset = handle.offset();
+        offset.y = gpui::px(-top);
+        handle.set_offset(offset);
         cx.notify();
     }
 
