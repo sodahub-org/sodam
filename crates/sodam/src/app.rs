@@ -224,6 +224,10 @@ pub(crate) struct BatchUpgradeProgress {
 /// 根视图状态。
 pub struct Root {
     pub nav: Nav,
+    /// 设置页内容区的滚动句柄：中键拖动时按像素改它的偏移。
+    pub settings_scroll: gpui::ScrollHandle,
+    /// 中键拖动的状态，只算数不碰窗口（见 ui::middle_drag）。
+    pub(crate) middle_drag: ui::middle_drag::MiddleDrag,
     /// 自绘标题栏拖拽区的按下锚点：按下只记录，移动超过阈值才交给合成器，
     /// 否则合成器会抢走指针，双击最大化收不到第二次按下（见 ui::titlebar）。
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
@@ -624,6 +628,8 @@ impl Root {
             lyrics_position_seconds: 0.0,
             lyrics_position_anchor: None,
             lyrics_demo_position: None,
+            settings_scroll: gpui::ScrollHandle::new(),
+            middle_drag: ui::middle_drag::MiddleDrag::default(),
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
@@ -1509,6 +1515,10 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 切页或窗口失焦后，不等鼠标事件也立刻停手。
+        let current_nav = self.nav;
+        self.middle_drag
+            .sync_context(current_nav, window.is_window_active());
         // Windows 自绘标题栏（系统标题栏被 WM_NCCALCSIZE 去掉）；macOS 用系统红绿灯。
         // Linux 交给设置项：默认 auto 跟随桌面协商结果 —— GNOME 这类要求客户端装饰的
         // 桌面需要自绘，Hyprland/sway 这类平铺桌面协商成服务端装饰但不画标题栏，
@@ -1683,6 +1693,33 @@ impl Render for Root {
             // 根元素持焦点 + 挂基础上下文：带谓词的快捷键绑定要有非空上下文栈才生效。
             .track_focus(&self.workspace_focus)
             .key_context(crate::shortcuts::BASE_CONTEXT)
+            // 中键按下由各个滚动区自己上报；移动、松开、窗口外松开统一在根上收，
+            // 这样鼠标拖出原来的区域也还滚同一个目标。
+            .on_mouse_move(
+                cx.listener(|root, event: &gpui::MouseMoveEvent, window, cx| {
+                    if event.pressed_button != Some(gpui::MouseButton::Middle) {
+                        root.middle_drag.finish();
+                        return;
+                    }
+                    root.middle_drag_move(
+                        f32::from(event.position.y),
+                        window.is_window_active(),
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Middle,
+                cx.listener(|root, _event: &gpui::MouseUpEvent, _window, _cx| {
+                    root.middle_drag.finish();
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Middle,
+                cx.listener(|root, _event: &gpui::MouseUpEvent, _window, _cx| {
+                    root.middle_drag.finish();
+                }),
+            )
             // 焦点在窗口内的任何地方都能命中：根元素是全部聚焦节点的共同祖先。
             .on_action(cx.listener(Root::focus_search))
             .bg(theme::ambient_background())

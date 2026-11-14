@@ -8,6 +8,7 @@ pub mod cover_cache;
 pub mod i18n;
 pub mod icons;
 pub mod message;
+pub mod middle_drag;
 pub mod player_bar;
 pub mod sidebar;
 pub mod spinner;
