@@ -57,6 +57,12 @@ pub enum RecoveryAction {
     /// 按曲目不可播的另一半：曲目已下架或取不到（含非 Cookie 的参数不合法）。
     /// 与 [`Self::TrackUnavailable`] 一起由 [`PlaybackFailure::is_per_track`] 判定。
     PickAnother,
+    /// 按曲目不可播的第三种成因：音频解不开（解密失败，如多轨样本的
+    /// 「decrypted size mismatch」）。同一首每次播都这样，换网络换时间都不变好；
+    /// 与磁盘写失败无关，跳过这首即可，上游修好解密后重启即恢复。
+    /// 与 [`Self::TrackUnavailable`] / [`Self::PickAnother`] 一起由
+    /// [`PlaybackFailure::is_per_track`] 判定。
+    Undecodable,
     /// 本地磁盘或文件写入问题。
     FreeSpace,
 }
@@ -95,6 +101,7 @@ impl RecoveryAction {
             Self::CheckEntitlement => "check_entitlement",
             Self::TrackUnavailable => "track_unavailable",
             Self::PickAnother => "pick_another",
+            Self::Undecodable => "undecodable",
             Self::FreeSpace => "free_space",
         }
     }
@@ -102,7 +109,7 @@ impl RecoveryAction {
 
 /// 已确认的「按曲目不可播」成因。
 ///
-/// 不可播集合只存这两种，`PlaybackFailure::is_per_track` 也由同一映射判定，
+/// 不可播集合只存这三种，`PlaybackFailure::is_per_track` 也由同一映射判定，
 /// 避免「判据说关于单曲、集合却不知道成因」的两处真相。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnplayableReason {
@@ -110,6 +117,8 @@ pub enum UnplayableReason {
     NoFullTrack,
     /// 曲目已下架或当前取不到。
     Unavailable,
+    /// 音频解不开：解密失败，同一首每次播都一样（如多轨样本表导致的大小不符）。
+    DecodeFailed,
 }
 
 impl UnplayableReason {
@@ -118,6 +127,7 @@ impl UnplayableReason {
         match action {
             RecoveryAction::TrackUnavailable => Some(Self::NoFullTrack),
             RecoveryAction::PickAnother => Some(Self::Unavailable),
+            RecoveryAction::Undecodable => Some(Self::DecodeFailed),
             _ => None,
         }
     }
@@ -127,6 +137,7 @@ impl UnplayableReason {
         match self {
             Self::NoFullTrack => "no_full_track",
             Self::Unavailable => "unavailable",
+            Self::DecodeFailed => "decode_failed",
         }
     }
 }
@@ -446,12 +457,16 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
             RecoveryAction::FreeSpace,
             detail,
         ),
-        SodaError::Crypto(_) => PlaybackFailure::new(
-            Stage::Unpack,
-            Retryability::Never,
-            RecoveryAction::Nothing,
-            detail,
-        ),
+        SodaError::Crypto(_) => {
+            // 解密失败不是磁盘问题：同一首每次播都解不开（见 libresoda#42 的多轨样本），
+            // 归成按曲目不可播的第三种成因，跳过这首即可，别再为它反复下载。
+            PlaybackFailure::new(
+                Stage::Unpack,
+                Retryability::Never,
+                RecoveryAction::Undecodable,
+                detail,
+            )
+        }
         SodaError::Api { status_code, .. } => {
             // 汽水业务码：未登录一类要重新登录。业务码语义我们没实测过，
             // 所以一律不自动重试——猜错方向的代价是打爆接口，收益只是省一次重登。
@@ -674,6 +689,11 @@ mod tests {
                 SodaError::invalid_input("track id is empty"),
                 RecoveryAction::PickAnother,
             ),
+            // 解密失败归「解不开」：不落磁盘话术，也不落「什么都不用做」。
+            (
+                SodaError::crypto("decrypted size mismatch"),
+                RecoveryAction::Undecodable,
+            ),
         ];
         for (error, action) in cases {
             let classified = failure(error);
@@ -702,6 +722,8 @@ mod tests {
             SodaError::http("http request failed: status 404 (https://x.test/track)"),
             // 非 Cookie 类的参数不合法。
             SodaError::invalid_input("track id is empty"),
+            // 音频解不开：结论只关于这一首，与磁盘无关。
+            SodaError::crypto("decrypted size mismatch"),
         ];
         for error in per_track {
             let failure = failure(error);
@@ -721,6 +743,18 @@ mod tests {
             );
             assert!(failure.is_per_track(), "{failure:?}");
         }
+
+        // 解密失败归「解不开」：阶段仍是解密落盘，上游原文留在日志详情里，
+        // 界面话术由 UI 层翻译（不在这里混进来）。
+        let crypto = failure(SodaError::crypto("decrypted size mismatch"));
+        assert_eq!(crypto.action, RecoveryAction::Undecodable);
+        assert_eq!(crypto.stage, Stage::Unpack);
+        assert_eq!(crypto.retryability, Retryability::Never);
+        assert!(
+            crypto.detail.contains("decrypted size mismatch"),
+            "{}",
+            crypto.detail
+        );
 
         // 样本曲目的实际形态：不可重试，但结论只关于这一首。
         let sample = failure(SodaError::not_found(
@@ -754,7 +788,7 @@ mod tests {
         assert_eq!(network.retryability, Retryability::Transient);
     }
 
-    /// 日志里的动作值既有的一字不改，新增的固定为 `track_unavailable`。
+    /// 日志里的动作值与成因值既有的一字不改，新增的固定为 `undecodable` / `decode_failed`。
     #[test]
     fn action_log_values_are_stable_and_additive() {
         let values = [
@@ -764,10 +798,20 @@ mod tests {
             (RecoveryAction::CheckEntitlement, "check_entitlement"),
             (RecoveryAction::TrackUnavailable, "track_unavailable"),
             (RecoveryAction::PickAnother, "pick_another"),
+            (RecoveryAction::Undecodable, "undecodable"),
             (RecoveryAction::FreeSpace, "free_space"),
         ];
         for (action, expected) in values {
             assert_eq!(action.as_str(), expected);
+        }
+
+        let reasons = [
+            (UnplayableReason::NoFullTrack, "no_full_track"),
+            (UnplayableReason::Unavailable, "unavailable"),
+            (UnplayableReason::DecodeFailed, "decode_failed"),
+        ];
+        for (reason, expected) in reasons {
+            assert_eq!(reason.as_str(), expected);
         }
     }
 
@@ -970,10 +1014,13 @@ mod tests {
             "soda pc track_v2 returned preview stream",
         ));
         let gone = failure(SodaError::not_found("track removed"));
+        let decode = failure(SodaError::crypto("decrypted size mismatch"));
         assert!(set.record_failure("no-full", &no_full));
         assert!(set.record_failure("gone", &gone));
+        assert!(set.record_failure("decode", &decode));
         assert_eq!(set.reason("no-full"), Some(UnplayableReason::NoFullTrack));
         assert_eq!(set.reason("gone"), Some(UnplayableReason::Unavailable));
+        assert_eq!(set.reason("decode"), Some(UnplayableReason::DecodeFailed));
 
         // 全局故障不写结论，也就没有原因可说。
         let signer = failure(SodaError::http("signer error: bad token"));
@@ -991,6 +1038,7 @@ mod tests {
         for action in [
             RecoveryAction::TrackUnavailable,
             RecoveryAction::PickAnother,
+            RecoveryAction::Undecodable,
         ] {
             assert!(at(action).is_per_track(), "{action:?}");
             assert!(UnplayableReason::from_action(action).is_some());
@@ -1037,6 +1085,12 @@ mod tests {
         assert!(set.record_failure("track-1", &per_track));
         assert_eq!(set.len(), 2);
         assert!(set.contains("track-1"));
+
+        // 解密失败同样是按曲目类：写进集合，快照能标出这首。
+        let decode = failure(SodaError::crypto("decrypted size mismatch"));
+        assert!(set.record_failure("track-2", &decode));
+        assert!(set.contains("track-2"));
+        assert!(set.snapshot().contains("track-2"));
     }
 
     /// 账号 id 或会员状态任一变化就整份作废；没变时一条都不能丢。

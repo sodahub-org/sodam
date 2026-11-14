@@ -130,7 +130,7 @@ pub fn is_global_failure(failure: &PlaybackFailure) -> bool {
 /// 哪些失败算「整条管线都该停」的全局故障。
 ///
 /// 与 [`PlaybackFailure::is_per_track`] 同一判据：结论关于单首曲目的
-/// （`TrackUnavailable` / `PickAnother`）不挂管线，只进不可播集合；
+/// （`TrackUnavailable` / `PickAnother` / `Undecodable`）不挂管线，只进不可播集合；
 /// 换一首都可能变好的抖动类（`Nothing`）也不挂——那是逐曲冷却的职责。
 fn suspension_class(failure: &PlaybackFailure) -> Option<SuspensionClass> {
     match failure.action {
@@ -139,7 +139,8 @@ fn suspension_class(failure: &PlaybackFailure) -> Option<SuspensionClass> {
         RecoveryAction::CheckSigner => Some(SuspensionClass::Cooldown),
         RecoveryAction::Nothing
         | RecoveryAction::TrackUnavailable
-        | RecoveryAction::PickAnother => None,
+        | RecoveryAction::PickAnother
+        | RecoveryAction::Undecodable => None,
     }
 }
 
@@ -163,6 +164,7 @@ mod tests {
         for action in [
             RecoveryAction::TrackUnavailable,
             RecoveryAction::PickAnother,
+            RecoveryAction::Undecodable,
         ] {
             assert_eq!(gate.suspend_for(&global(action), now), None, "{action:?}");
             assert!(gate.allows(), "{action:?}");
@@ -291,13 +293,13 @@ mod tests {
     /// 无法归类的失败既不是按曲目、也不是全局：调用方只能把它送去逐曲冷却。
     ///
     /// 这三类曾经被当作 `Retryability::Never` 写进「永久不再预取」表（#117）。
+    /// 解密失败后来归成了「解不开」（按曲目），不再属于这一组。
     #[test]
     fn unclassified_failures_are_neither_per_track_nor_global() {
         use crate::failure::classify;
         use libresoda::SodaError;
 
         for error in [
-            SodaError::crypto("bad key"),
             SodaError::api(1, "business error"),
             SodaError::http("http request failed: status 400 (https://x.test)"),
         ] {
@@ -305,6 +307,25 @@ mod tests {
             assert!(!failure.is_per_track(), "不该按曲目：{failure:?}");
             assert!(!is_global_failure(&failure), "不该全局挂起：{failure:?}");
         }
+    }
+
+    /// 解密失败按「解不开」归成按曲目：不挂管线、不走 60 秒逐曲冷却，
+    /// 走的是进不可播集合的按曲目分支。
+    #[test]
+    fn crypto_failure_is_per_track_and_never_suspends_the_pipeline() {
+        use crate::failure::classify;
+        use libresoda::SodaError;
+
+        let failure = classify(&SodaError::crypto("decrypted size mismatch"));
+        assert!(failure.is_per_track(), "{failure:?}");
+        assert!(!is_global_failure(&failure), "{failure:?}");
+
+        // 挂起判定的穷举匹配要显式认下这个名字，而不是靠默认分支蒙混。
+        let now = Instant::now();
+        let mut gate = PrefetchGate::default();
+        assert_eq!(gate.suspend_for(&failure, now), None);
+        assert!(gate.allows());
+        assert_eq!(gate.suspension(), None);
     }
 
     /// 日志取值稳定：大小写与连字符不随界面语言变化。

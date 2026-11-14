@@ -163,6 +163,8 @@ impl Language {
             "这首在你的账号下没有整曲。" => "Your account doesn't have the full track.",
             "这首当前取不到，已跳过。" => "This track isn't available right now. Skipped.",
             "这首当前取不到。" => "This track isn't available right now.",
+            "这首的音频解不开，已跳过。" => "This track's audio can't be decoded. Skipped.",
+            "这首的音频解不开。" => "This track's audio can't be decoded.",
             "本地缓存写入失败，检查磁盘空间。" => "Cache write failed. Check disk space.",
             "打开验证窗口失败，请改用官方客户端导出 Cookie。" => {
                 "Couldn't open the verification window. Export your cookie from the official app instead."

@@ -3672,6 +3672,13 @@ fn play_failure_text(failure: &PlaybackFailure, skipped: bool) -> &'static str {
                 per_track_reason_text(UnplayableReason::Unavailable)
             }
         }
+        RecoveryAction::Undecodable => {
+            if skipped {
+                "这首的音频解不开，已跳过。"
+            } else {
+                per_track_reason_text(UnplayableReason::DecodeFailed)
+            }
+        }
         RecoveryAction::FreeSpace => "本地缓存写入失败，检查磁盘空间。",
         RecoveryAction::Nothing => match failure.stage {
             Stage::Unpack => "本地缓存写入失败，检查磁盘空间。",
@@ -3688,6 +3695,7 @@ fn per_track_reason_text(reason: UnplayableReason) -> &'static str {
     match reason {
         UnplayableReason::NoFullTrack => "这首在你的账号下没有整曲。",
         UnplayableReason::Unavailable => "这首当前取不到。",
+        UnplayableReason::DecodeFailed => "这首的音频解不开。",
     }
 }
 
@@ -3706,8 +3714,8 @@ fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
 
 /// 这类失败要不要换一首再试。
 ///
-/// * 按曲目不可播（[`PlaybackFailure::is_per_track`]：无整曲权益 / 下架取不到 / 参数不合法）
-///   与纯网络抖动（`Nothing`）→ 换，队列里还有别的歌；
+/// * 按曲目不可播（[`PlaybackFailure::is_per_track`]：无整曲权益 / 下架取不到 /
+///   参数不合法 / 音频解不开）与纯网络抖动（`Nothing`）→ 换，队列里还有别的歌；
 /// * 登录、签名服务、缺 Cookie、磁盘 → 换一首也一样失败，停下来把动作告诉用户，
 ///   别用「跳过」把同一个全局故障伪装成单首曲目的问题。
 fn should_skip_to_next(failure: &PlaybackFailure) -> bool {
@@ -3846,6 +3854,7 @@ mod failure_text_tests {
         let no_full_track = "这首在你的账号下没有整曲，已跳过。";
         let unavailable = "这首当前取不到，已跳过。";
         let cache = "本地缓存写入失败，检查磁盘空间。";
+        let undecodable_skipped = "这首的音频解不开，已跳过。";
         let offline = "暂时连不上，检查网络后重试。";
         let cant_play = "这首歌暂时放不出来。";
         let at = |stage, action| {
@@ -3877,6 +3886,23 @@ mod failure_text_tests {
             unavailable
         );
         assert_eq!(at(Stage::ResolveStream, RecoveryAction::FreeSpace), cache);
+        // 解密失败不再借磁盘话术：说「解不开」。
+        assert_eq!(
+            at(Stage::Unpack, RecoveryAction::Undecodable),
+            undecodable_skipped
+        );
+        assert_eq!(
+            play_failure_text(
+                &PlaybackFailure::new(
+                    Stage::Unpack,
+                    Retryability::Never,
+                    RecoveryAction::Undecodable,
+                    raw
+                ),
+                false
+            ),
+            "这首的音频解不开。"
+        );
 
         for stage in [Stage::Network, Stage::Transfer, Stage::ResolveStream] {
             let text = at(stage, RecoveryAction::Nothing);
@@ -3903,14 +3929,20 @@ mod failure_text_tests {
         let login = at(RecoveryAction::Relogin);
         let no_full_track = at(RecoveryAction::TrackUnavailable);
         let unavailable = at(RecoveryAction::PickAnother);
+        let decode_failed = at(RecoveryAction::Undecodable);
 
         assert_ne!(login, no_full_track);
         assert_ne!(no_full_track, unavailable);
         assert_ne!(login, unavailable);
+        assert_ne!(decode_failed, no_full_track);
+        assert_ne!(decode_failed, unavailable);
+        // 解密失败不再借「检查磁盘空间」的话术。
+        assert_ne!(decode_failed, "本地缓存写入失败，检查磁盘空间。");
         assert!(no_full_track.contains("已跳过"), "{no_full_track}");
         assert!(unavailable.contains("已跳过"), "{unavailable}");
+        assert!(decode_failed.contains("已跳过"), "{decode_failed}");
 
-        for key in [login, no_full_track, unavailable] {
+        for key in [login, no_full_track, unavailable, decode_failed] {
             let english = Language::English.text(key);
             assert_ne!(english, key, "英文词典缺少：{key}");
             // 被跳过的曲目不报歌名：文案是静态的，不含任何曲目标题占位符。
@@ -3931,6 +3963,7 @@ mod failure_text_tests {
         for key in [
             at(RecoveryAction::TrackUnavailable),
             at(RecoveryAction::PickAnother),
+            at(RecoveryAction::Undecodable),
         ] {
             assert!(!key.contains("已跳过"), "{key}");
             let english = Language::English.text(key);
@@ -3958,6 +3991,8 @@ mod failure_text_tests {
         };
         assert!(should_skip_to_next(&at(RecoveryAction::TrackUnavailable)));
         assert!(should_skip_to_next(&at(RecoveryAction::PickAnother)));
+        // 解密失败是按曲目不可播：自动跳下一首。
+        assert!(should_skip_to_next(&at(RecoveryAction::Undecodable)));
         // 网络抖动仍然换一首（既有行为）。
         assert!(should_skip_to_next(&PlaybackFailure::new(
             Stage::Network,
@@ -4032,17 +4067,12 @@ mod prefetch_policy_tests {
 
     /// 无法归类、可重试性为 `Never` 的失败不能变成永久黑名单：它只进冷却。
     ///
-    /// 对应 #117 的三种来源：解密失败、非鉴权业务码、未识别的 HTTP 状态码。
-    /// 按曲目类与全局类仍各走自己的出口，三者的判据是同一份失败分类。
+    /// 对应 #117 的三种来源：非鉴权业务码、未识别的 HTTP 状态码。
+    /// （解密失败后来归成了「解不开」，按曲目走，见下。）按曲目类与全局类
+    /// 仍各走自己的出口，三者的判据是同一份失败分类。
     #[test]
     fn unclassified_never_failures_route_to_cooldown_not_a_permanent_ban() {
         let cooldown = [
-            PlaybackFailure::new(
-                Stage::Unpack,
-                Retryability::Never,
-                RecoveryAction::Nothing,
-                "crypto failure",
-            ),
             PlaybackFailure::new(
                 Stage::ResolveStream,
                 Retryability::Never,
@@ -4073,6 +4103,20 @@ mod prefetch_policy_tests {
         assert_eq!(
             prefetch_failure_route(&per_track),
             PrefetchFailureRoute::PerTrack
+        );
+
+        // 解密失败归成的「解不开」走按曲目分支：进不可播集合，不进 60 秒逐曲冷却。
+        // （真实 SodaError → Undecodable 的分类断言在 sodam-core 的 failure / prefetch 测试里。）
+        let decode = PlaybackFailure::new(
+            Stage::Unpack,
+            Retryability::Never,
+            RecoveryAction::Undecodable,
+            "decrypted size mismatch",
+        );
+        assert_eq!(
+            prefetch_failure_route(&decode),
+            PrefetchFailureRoute::PerTrack,
+            "{decode:?}"
         );
 
         let signer = PlaybackFailure::new(
