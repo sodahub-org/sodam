@@ -2156,7 +2156,7 @@ impl Root {
     /// 队列抽屉内部滚动由 `UniformListScrollHandle` 的 `base_handle` 驱动，
     /// 抽出来当成一个普通 `ScrollHandle` 用，避免到处穿透 `UniformListScrollHandle` 内部。
     fn queue_base_handle(&self) -> gpui::ScrollHandle {
-        self.queue_scroll.0.borrow().base_handle
+        self.queue_scroll.0.borrow().base_handle.clone()
     }
 
     /// 设置页上报「中键按下」：记下起点和当时的滚动位置。

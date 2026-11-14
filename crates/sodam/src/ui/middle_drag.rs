@@ -90,7 +90,7 @@ impl MiddleDrag {
 
 #[cfg(test)]
 mod tests {
-    use super::MiddleDrag;
+    use super::{DragTarget, MiddleDrag};
     use crate::app::Nav;
 
     const SETTINGS: Nav = Nav::Settings;
