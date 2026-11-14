@@ -1,6 +1,7 @@
-# 空白 issue 关掉：模板里的字段（版本、环境、复现）少问一轮就能定位问题。
+# 空白 issue 打开：两个模板都套不上的时候，可以不填表直接写（#138）。
+# 入口由 GitHub 自己排在模板列表最下面；报 bug、提功能还是优先用上面的模板，字段填全了少问一轮。
 # 纯提问 / 使用交流走下面的链接，不占 issue。
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
   - name: 安装、使用与常见问题
     url: https://sodahub-org.github.io/sodam/install.html

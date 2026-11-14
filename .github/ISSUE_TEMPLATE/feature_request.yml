@@ -6,8 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        提之前建议先对照一下 [官方客户端](https://www.qishui.com/) 与
-        [ROADMAP](https://github.com/sodahub-org/sodam/blob/main/docs/ROADMAP.md)，
+        提之前建议先对照一下 [官方客户端](https://www.qishui.com/) 与 [ROADMAP](https://github.com/sodahub-org/sodam/blob/main/docs/ROADMAP.md)，
         有些功能已经在计划里了。
 
   - type: textarea
