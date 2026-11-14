@@ -14,6 +14,8 @@ struct Anchor {
     y: f32,
     top: f32,
     page: Nav,
+    /// 已经挪够 2px、开始滚了。起步之后不再判死区，否则拖回起点会卡住。
+    started: bool,
 }
 
 /// 一次中键拖动。`None` 表示现在没在拖。
@@ -24,7 +26,12 @@ impl MiddleDrag {
     /// 按下中键。已经按着就忽略：重复按下不会把起点挪走，也不会叠加位移。
     pub fn begin(&mut self, y: f32, top: f32, page: Nav) {
         if self.0.is_none() {
-            self.0 = Some(Anchor { y, top, page });
+            self.0 = Some(Anchor {
+                y,
+                top,
+                page,
+                started: false,
+            });
         }
     }
 
@@ -47,10 +54,15 @@ impl MiddleDrag {
     /// 返回 `None` 就是这次不用滚：没在拖、还没过死区，或者上下文已经失效。
     pub fn move_to(&mut self, y: f32, max_top: f32, page: Nav, window_active: bool) -> Option<f32> {
         self.sync_context(page, window_active);
-        let anchor = self.0?;
+        let mut anchor = self.0?;
         let moved = y - anchor.y;
-        if moved.abs() < DEAD_ZONE {
-            return None;
+        // 死区只在起步前判一次。起步之后哪怕拖回按下点，也要继续 1:1 跟手。
+        if !anchor.started {
+            if moved.abs() < DEAD_ZONE {
+                return None;
+            }
+            anchor.started = true;
+            self.0 = Some(anchor);
         }
         // 往下拖，内容跟着往下走，离顶部就近了；往上拖反过来。
         Some((anchor.top - moved).clamp(0.0, max_top))
@@ -79,6 +91,19 @@ mod tests {
         assert_eq!(drag.move_to(99.5, 500.0, SETTINGS, true), None);
         assert_eq!(drag.move_to(102.0, 500.0, SETTINGS, true), Some(48.0));
         assert_eq!(drag.move_to(98.0, 500.0, SETTINGS, true), Some(52.0));
+    }
+
+    /// 起步之后往回拖也跟手，不会再被 2px 死区拦住。
+    #[test]
+    fn moving_back_after_start_still_follows_the_pointer() {
+        let mut drag = dragging(100.0, 50.0);
+        assert_eq!(drag.move_to(130.0, 500.0, SETTINGS, true), Some(20.0));
+        // 拖回按下点：必须给出 50，不能因为「总位移不到 2px」又停下。
+        assert_eq!(drag.move_to(100.0, 500.0, SETTINGS, true), Some(50.0));
+        assert_eq!(drag.move_to(101.0, 500.0, SETTINGS, true), Some(49.0));
+        assert_eq!(drag.move_to(99.0, 500.0, SETTINGS, true), Some(51.0));
+        // 越过起点继续往上拖也一样跟手。
+        assert_eq!(drag.move_to(80.0, 500.0, SETTINGS, true), Some(70.0));
     }
 
     /// 鼠标移多少内容就移多少：往下拖内容往下走，往上拖内容往上走。
