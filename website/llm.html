@@ -79,7 +79,8 @@
      优先 `brew install --cask sodahub-org/tap/sodam`；
      没有 Homebrew 就下载 .zip，解压后把 SodaM.app 放进 /Applications，并说明 Gatekeeper 的放行步骤。
    - Windows：
-     下载 sodam-&lt;version&gt;-windows-x64-setup.exe，说明如何用 PowerShell 校验 SHA256、如何静默/交互安装，以及 SmartScreen 提示怎么处理。
+     优先 `winget install --id sodahub-org.SodaM -e`（winget 自带，来源是官方 winget-pkgs，安装器是同一个 Inno Setup 包）；
+     没有 winget 或它还没跟上最新版时，下载 sodam-&lt;version&gt;-windows-x64-setup.exe，说明如何用 PowerShell 校验 SHA256、如何静默/交互安装，以及 SmartScreen 提示怎么处理。
    - 其它 Linux 发行版：
      目前只发布 pacman 包，请告诉我这一步需要从源码构建（Rust 1.85+，scripts/build.sh），先征求我同意再动手。
 3. 每一步执行前先说明**你要运行什么、为什么**；涉及 sudo、修改系统配置、写入 /etc 的操作必须先让我确认。

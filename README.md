@@ -477,7 +477,23 @@ Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Se
 （按用户安装，无需管理员权限），当前版本为
 [`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)。
 
-### 1. 下载并校验
+### 方式一：winget（推荐）
+
+Windows 10/11 自带的 winget 会从官方包仓库安装同一个 Inno Setup 安装包：
+
+```powershell
+winget install --id sodahub-org.SodaM -e
+winget upgrade --id sodahub-org.SodaM -e
+```
+
+- 包名是 `sodahub-org.SodaM`，收录在官方的
+  [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs)（社区提交、微软审核合并）。
+- `winget show --id sodahub-org.SodaM -e` 可以核对版本、安装器类型与发行信息。
+- 新版本通常由官方 `wingetbot` 自动跟进；如果它还没跟上最新 Release，用下面的方式二直接装最新版。
+
+### 方式二：下载安装包
+
+#### 1. 下载并校验
 
 ```powershell
 mkdir C:\sodam-install; cd C:\sodam-install
@@ -495,14 +511,14 @@ if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
 
 输出 `SHA256 OK` 即校验通过。
 
-### 2. 安装
+#### 2. 安装
 
 双击运行安装包，按向导完成安装：
 
 - 默认安装目录 `%LOCALAPPDATA%\Programs\SodaM`
 - 自动创建开始菜单快捷方式，可选创建桌面快捷方式
 
-### 3. 首次启动（SmartScreen 提示）
+#### 3. 首次启动（SmartScreen 提示）
 
 当前发行包未经代码签名，首次运行可能弹出
 **「Windows 已保护你的电脑」**：点击「更多信息」→「仍要运行」即可。
@@ -512,7 +528,11 @@ if ($expected -ne $actual) { throw "SHA256 mismatch!" } else { "SHA256 OK" }
 
 ### 卸载
 
-在「设置 → 应用」或「控制面板 → 程序和功能」中卸载 SodaM。
+在「设置 → 应用」或「控制面板 → 程序和功能」中卸载 SodaM；用 winget 装的也可以：
+
+```powershell
+winget uninstall --id sodahub-org.SodaM -e
+```
 
 ## 打包
 

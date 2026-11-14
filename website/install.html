@@ -111,6 +111,19 @@ brew upgrade --cask sodam</pre>
   <section id="windows">
     <h2>Windows（x64）</h2>
     <p>Windows 10/11 x64。安装包按用户安装，不需要管理员权限。</p>
+
+    <h3>方式一：winget（推荐）</h3>
+    <div class="code">
+      <header><span>安装 / 升级</span><button class="copy" data-copy="self">复制</button></header>
+      <pre>winget install --id sodahub-org.SodaM -e
+winget upgrade --id sodahub-org.SodaM -e</pre>
+    </div>
+    <p class="lead-inline">包名 <code>sodahub-org.SodaM</code>，收录在官方的
+      <a href="https://github.com/microsoft/winget-pkgs">microsoft/winget-pkgs</a>（社区提交、微软审核合并）。
+      <code>winget show --id sodahub-org.SodaM -e</code> 可核对版本；新版本通常由官方
+      <code>wingetbot</code> 自动跟进，若还没跟上最新 Release，用下面的方式二。</p>
+
+    <h3>方式二：下载安装包</h3>
     <ol>
       <li>从 <a data-download="windows" href="https://github.com/sodahub-org/sodam/releases/latest">Releases</a>
         下载 <code>sodam-&lt;version&gt;-windows-x64-setup.exe</code>。</li>
@@ -144,7 +157,7 @@ if ($expected -eq $actual) { "SHA256 OK" } else { throw "SHA256 mismatch" }</pre
         <tbody>
           <tr><td>Arch Linux</td><td><code>sudo pacman -Rns sodam</code>（从 pacman.conf 里删掉 <code>[sodam]</code> 段即为断开源）</td></tr>
           <tr><td>macOS</td><td><code>brew uninstall --cask --zap sodam</code>，或把 app 拖进废纸篓</td></tr>
-          <tr><td>Windows</td><td>设置 → 应用 → SodaM → 卸载</td></tr>
+          <tr><td>Windows</td><td>设置 → 应用 → SodaM → 卸载，或 <code>winget uninstall --id sodahub-org.SodaM -e</code></td></tr>
         </tbody>
       </table>
     </div>
