@@ -252,9 +252,8 @@ scripts/run.sh     # 启动 GUI，带 MemoryMax 护栏
 
 ## Debian / Ubuntu 下载安装
 
-从下一个版本起，SodaM 的 GitHub Release 会同时提供 Debian / Ubuntu 的 `.deb` 包。
-`v0.3.8` 及更早的 Release **没有** `.deb`；下面用 GitHub API 取最新 Release 的版本号，
-若它还没有 deb（即仍是 v0.3.8），请等下一个版本。
+从 `v0.3.9` 起，SodaM 的 GitHub Release 同时提供 Debian / Ubuntu 的 `.deb` 包。
+`v0.3.8` 及更早的 Release **没有** `.deb`；下面用 GitHub API 取最新 Release 的版本号。
 
 ### 1. 确认系统架构
 
@@ -272,7 +271,7 @@ mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
 arch=$(dpkg --print-architecture)
-# 最新 Release 的版本号（首个带 deb 的版本；v0.3.8 没有 deb）
+# 最新 Release 的版本号（v0.3.9 起提供 deb；更早的没有）
 version=$(curl -fsSL https://api.github.com/repos/sodahub-org/sodam/releases/latest \
   | grep -o '"tag_name": *"v[^"]*"' | head -1 | sed 's/.*"v//; s/"$//')
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
@@ -322,7 +321,7 @@ sudo apt remove sodam
 
 ## Arch Linux 下载安装
 
-SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)。
+SodaM 的 GitHub Release 提供 Arch Linux `pacman` 安装包，当前版本为 [`v0.3.9`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.9)。
 
 ### 1. 确认系统架构
 
@@ -340,7 +339,7 @@ mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
 arch=$(uname -m)
-version=0.3.8
+version=0.3.9
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -351,7 +350,7 @@ grep "sodam-${version}-1-${arch}\.pkg\.tar\.zst$" SHA256SUMS | sha256sum -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.3.8-1-x86_64.pkg.tar.zst: OK
+sodam-0.3.9-1-x86_64.pkg.tar.zst: OK
 ```
 
 ### 3. 安装
@@ -399,7 +398,7 @@ sudo pacman -Syu               # 之后随系统一起升级
 ## macOS 下载安装（Apple Silicon）
 
 macOS 版已在 Apple Silicon（M 系列）真机实测。当前版本为
-[`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)，两种安装方式任选。
+[`v0.3.9`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.9)，两种安装方式任选。
 
 ### 方式一：Homebrew（推荐，预编译 `.app`）
 
@@ -427,7 +426,7 @@ Homebrew 按架构要求拦下。安装后如仍被 Gatekeeper 拦截，用下�
 mkdir -p /tmp/sodam-install
 cd /tmp/sodam-install
 
-version=0.3.8
+version=0.3.9
 base_url=https://github.com/sodahub-org/sodam/releases/download/v${version}
 
 curl -fLO ${base_url}/SHA256SUMS
@@ -438,7 +437,7 @@ grep "sodam-${version}-macos-aarch64\.zip$" SHA256SUMS | shasum -a 256 -c -
 校验输出必须包含 `OK`：
 
 ```text
-sodam-0.3.8-macos-aarch64.zip: OK
+sodam-0.3.9-macos-aarch64.zip: OK
 ```
 
 #### 2. 安装
@@ -475,7 +474,7 @@ open -a SodaM
 
 Windows 版已在 Windows 10/11 x64 真机实测，GitHub Release 提供 Inno Setup 安装包
 （按用户安装，无需管理员权限），当前版本为
-[`v0.3.8`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.8)。
+[`v0.3.9`](https://github.com/sodahub-org/sodam/releases/tag/v0.3.9)。
 
 ### 方式一：winget（推荐）
 
@@ -498,7 +497,7 @@ winget upgrade --id sodahub-org.SodaM -e
 ```powershell
 mkdir C:\sodam-install; cd C:\sodam-install
 
-$version = "0.3.8"
+$version = "0.3.9"
 $base = "https://github.com/sodahub-org/sodam/releases/download/v$version"
 
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS

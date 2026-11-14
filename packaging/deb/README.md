@@ -42,7 +42,7 @@ desktop 入口与图标和 pacman 包共用 `packaging/arch/sodam.desktop` 与
 | `libxkbcommon` | `libxkbcommon0` |
 | `libxcb` | `libxcb1` |
 
-包版本是 `<upstream>-<release>`（例如 `0.3.8-1`），文件名按发布约定只带 upstream 版本。
+包版本是 `<upstream>-<release>`（例如 `0.3.9-1`），文件名按发布约定只带 upstream 版本。
 Debian 与 Ubuntu 上都没有 GPG 签名的 apt 源，所以只提供单包下载 + `SHA256SUMS` 校验，
 安装/升级/卸载都用 `apt install ./…deb` 与 `apt remove sodam`（见 README「Debian / Ubuntu 下载安装」）。
 
