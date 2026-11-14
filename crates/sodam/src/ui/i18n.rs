@@ -350,7 +350,7 @@ impl Language {
             "签名服务：{}" => "Signer: {}",
             "（未配置）" => "(not configured)",
             "配置：{}" => "Config: {}",
-            "Edit" => "Edit",
+            "编辑" => "Edit",
             "GitHub: {}" => "GitHub: {}",
             "Author: ZephyrCheung" => "Author: ZephyrCheung",
             "歌手" => "Artist",

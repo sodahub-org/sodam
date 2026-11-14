@@ -1301,7 +1301,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     div()
                                         .text_size(theme::Text::Tiny.size())
                                         .text_color(theme::text_muted())
-                                        .child(root.tr("Edit")),
+                                        .child(root.tr("编辑")),
                                 ),
                         ),
                 ),
