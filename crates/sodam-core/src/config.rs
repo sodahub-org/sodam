@@ -185,7 +185,8 @@ fn normalize_legacy_keystroke(value: &str) -> Option<String> {
 }
 
 /// 项目自建的签名服务（sodahub-org 部署）：开箱即用，可在设置里改成别的实例。
-pub const DEFAULT_SIGNER_URL: &str = "http://103.236.75.83:8899/sign";
+/// 2026-11 起默认走 Cloudflare Tunnel + HTTPS，源站不再直接暴露公网。
+pub const DEFAULT_SIGNER_URL: &str = "https://signer.lingchuanbio.com/sign";
 /// 上面那台服务的 token（等同取流能力，别外传；换服务时在设置里替换）。
 pub const DEFAULT_SIGNER_TOKEN: &str = "b356ad402bc31ee9e5a99cfdbf41eaa39961a562251c3359";
 
@@ -194,6 +195,10 @@ pub const DEFAULT_SIGNER_TOKEN: &str = "b356ad402bc31ee9e5a99cfdbf41eaa39961a562
 /// 否则老用户会一直指着一台死掉的服务。
 const LEGACY_SIGNER_URL: &str = "http://222.186.10.201:8921/sign";
 const LEGACY_SIGNER_TOKEN: &str = "05f8089b8c5f60c63f2a6dcfe1028d28ee2725a504f3e59b";
+
+/// 上一版的内置实例（明文 HTTP，transition 期仍对老客户端开放）。
+/// 读取到它时只把地址换成当前默认值，token 不变。
+const PREVIOUS_SIGNER_URL: &str = "http://103.236.75.83:8899/sign";
 
 /// Linux 下自绘窗口控制按钮（标题栏）的策略。
 ///
@@ -318,6 +323,10 @@ impl Settings {
             if self.signer_token.trim() == LEGACY_SIGNER_TOKEN {
                 self.signer_token = DEFAULT_SIGNER_TOKEN.to_string();
             }
+            changed = true;
+        } else if self.signer_url.trim() == PREVIOUS_SIGNER_URL {
+            // 上一版默认地址：只换 URL，token 与当前默认一致，其它字段原样保留。
+            self.signer_url = DEFAULT_SIGNER_URL.to_string();
             changed = true;
         }
 
@@ -686,6 +695,29 @@ mod tests {
         assert_eq!(loaded.signer_token, "my-own-token");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上一版默认地址（明文 HTTP）迁到新的 HTTPS 默认值，token 保持不变并落盘。
+    #[test]
+    fn migrates_previous_default_signer_to_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"signer_url":"{PREVIOUS_SIGNER_URL}","signer_token":"{DEFAULT_SIGNER_TOKEN}","cookie":"sessionid_ss=x"}}"#
+            ),
+        )
+        .expect("write");
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.signer_url, DEFAULT_SIGNER_URL);
+        assert_eq!(loaded.signer_token, DEFAULT_SIGNER_TOKEN);
+        assert_eq!(loaded.cookie, "sessionid_ss=x");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains(DEFAULT_SIGNER_URL));
+        assert!(!text.contains(PREVIOUS_SIGNER_URL));
     }
 
     /// 窗口按钮策略：默认 auto，未知值也回退 auto，老配置缺字段不影响。
