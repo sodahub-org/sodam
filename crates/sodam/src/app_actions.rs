@@ -2152,6 +2152,27 @@ impl Root {
         }
     }
 
+    /// 设置页上报「中键按下」：记下起点和当时的滚动位置。
+    pub(crate) fn begin_middle_drag(&mut self, y: f32) {
+        // GPUI 的偏移是负的：0 在最顶上，越往下滚越负。
+        let top = -f32::from(self.settings_scroll.offset().y);
+        let nav = self.nav;
+        self.middle_drag.begin(y, top, nav);
+    }
+
+    /// 中键按着移动时推进一次：算出新偏移，写回设置页的滚动句柄。
+    pub(crate) fn middle_drag_move(&mut self, y: f32, window_active: bool, cx: &mut Context<Self>) {
+        let nav = self.nav;
+        let max_top = f32::from(self.settings_scroll.max_offset().y);
+        let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
+            return;
+        };
+        let mut offset = self.settings_scroll.offset();
+        offset.y = gpui::px(-top);
+        self.settings_scroll.set_offset(offset);
+        cx.notify();
+    }
+
     /// 统一页面切换：保留返回栈，详情页使用通用返回组件。
     pub(crate) fn set_nav(&mut self, nav: Nav, cx: &mut Context<Self>) {
         if self.nav == nav {

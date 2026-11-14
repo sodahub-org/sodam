@@ -772,6 +772,14 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         .min_h(px(0.0))
         .gap(px(theme::space::LG))
         .overflow_y_scroll()
+        .track_scroll(&root.settings_scroll)
+        // 按下时上报自己是这次拖动的目标；之后移动、松开由根元素统一收。
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+                root.begin_middle_drag(f32::from(event.position.y));
+            }),
+        )
         .child(account_card)
         .child(
             div()
