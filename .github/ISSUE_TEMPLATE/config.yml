@@ -1,7 +1,8 @@
-# 空白 issue 打开：两个模板都套不上的时候，可以不填表直接写（#138）。
-# 入口由 GitHub 自己排在模板列表最下面；报 bug、提功能还是优先用上面的模板，字段填全了少问一轮。
+# GitHub 自带的空白 issue 入口关掉：它的名字是英文的，改不了。
+# 想不填表直接写，用 zz_blank.md 那张中文名的「空白议题」（#138）；
+# 模板按文件名排序，zz_ 开头是为了让它排在所有模板的最后。
 # 纯提问 / 使用交流走下面的链接，不占 issue。
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: 安装、使用与常见问题
     url: https://sodahub-org.github.io/sodam/install.html
