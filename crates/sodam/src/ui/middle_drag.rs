@@ -13,6 +13,8 @@ pub enum DragTarget {
     Settings,
     /// 队列抽屉（用 `queue_scroll` 内部的 `base_handle`）。
     Queue,
+    /// 歌词页（用 `lyrics_scroll`）。
+    Lyrics,
 }
 
 /// 起步死区：鼠标没挪够 2px 就不滚，免得中键轻点让页面抖一下。
@@ -24,7 +26,7 @@ struct Anchor {
     y: f32,
     top: f32,
     page: Nav,
-    /// 这次拖动绑在哪个滚动区（设置页 / 队列抽屉），写回时按它分流。
+    /// 这次拖动绑在哪个滚动区（设置页 / 队列抽屉 / 歌词页），写回时按它分流。
     target: DragTarget,
     /// 已经挪够 2px、开始滚了。起步之后不再判死区，否则拖回起点会卡住。
     started: bool,
@@ -95,6 +97,7 @@ mod tests {
 
     const SETTINGS: Nav = Nav::Settings;
     const HOME: Nav = Nav::Home;
+    const LYRICS: Nav = Nav::Lyrics;
 
     fn dragging(at: f32, top: f32) -> MiddleDrag {
         let mut drag = MiddleDrag::default();
@@ -193,5 +196,17 @@ mod tests {
         let mut drag = dragging(100.0, 50.0);
         drag.begin(180.0, 10.0, SETTINGS, DragTarget::Settings);
         assert_eq!(drag.move_to(130.0, 500.0, SETTINGS, true), Some(20.0));
+    }
+
+    /// 歌词页按下时上报的是歌词区，上层靠它把偏移写回 `lyrics_scroll`；
+    /// 松手之后目标也要跟着清掉。
+    #[test]
+    fn lyrics_drag_reports_its_target() {
+        let mut drag = MiddleDrag::default();
+        drag.begin(100.0, 40.0, LYRICS, DragTarget::Lyrics);
+        assert_eq!(drag.target(), Some(DragTarget::Lyrics));
+        assert_eq!(drag.move_to(130.0, 500.0, LYRICS, true), Some(10.0));
+        drag.finish();
+        assert_eq!(drag.target(), None);
     }
 }

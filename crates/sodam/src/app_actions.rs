@@ -2176,6 +2176,27 @@ impl Root {
         self.middle_drag.begin(y, top, nav, DragTarget::Queue);
     }
 
+    /// 歌词页上报「中键按下」：只记下起点和歌词当时的滚动位置。
+    ///
+    /// 这里**不动**自动跟唱：按下没拖（或者抖动不到 2px）就什么都不该发生，
+    /// 让位留到真正滚起来那一刻（见 [`Self::middle_drag_move`]）。
+    pub(crate) fn begin_middle_drag_lyrics(&mut self, y: f32) {
+        // 偏移同样是负的：0 在最顶上，越往下滚越负。
+        let top = -f32::from(self.lyrics_scroll.offset().y);
+        let nav = self.nav;
+        self.middle_drag.begin(y, top, nav, DragTarget::Lyrics);
+    }
+
+    /// 用户自己动手了（滚轮或中键拖动）：先停 5 秒自动跟唱，再停掉滚动动画。
+    ///
+    /// 两处入口共用同一份逻辑，行为保持一致：跟唱停 5 秒是官方的手感，
+    /// 而动画不停会和手势抢同一个偏移，看起来就是拖一下被拽回去一下。
+    pub(crate) fn pause_lyrics_follow(&mut self) {
+        self.lyrics_user_scroll_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        self.cancel_lyrics_scroll_tween();
+    }
+
     /// 中键按着移动时推进一次：算出新偏移，按当前拖动绑定的滚动区写回。
     pub(crate) fn middle_drag_move(&mut self, y: f32, window_active: bool, cx: &mut Context<Self>) {
         let nav = self.nav;
@@ -2186,6 +2207,7 @@ impl Root {
         let max_top = match target {
             DragTarget::Settings => f32::from(self.settings_scroll.max_offset().y),
             DragTarget::Queue => f32::from(self.queue_base_handle().max_offset().y),
+            DragTarget::Lyrics => f32::from(self.lyrics_scroll.max_offset().y),
         };
         let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
             return;
@@ -2201,6 +2223,15 @@ impl Root {
                 let mut offset = self.queue_base_handle().offset();
                 offset.y = gpui::px(-top);
                 self.queue_base_handle().set_offset(offset);
+            }
+            DragTarget::Lyrics => {
+                // 真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
+                // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
+                // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
+                self.pause_lyrics_follow();
+                let mut offset = self.lyrics_scroll.offset();
+                offset.y = gpui::px(-top);
+                self.lyrics_scroll.set_offset(offset);
             }
         }
         cx.notify();
