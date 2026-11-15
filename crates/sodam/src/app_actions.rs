@@ -2370,14 +2370,17 @@ impl Root {
             settle.y = y;
             return;
         }
+        self.middle_drag_settle_seq += 1;
+        let id = self.middle_drag_settle_seq;
         self.middle_drag_settle = Some(MiddleDragSettle {
             target,
             y,
+            id,
             frames: 0,
             stalled: 0,
         });
         cx.on_next_frame(window, move |root, window, cx| {
-            root.settle_list_drag(target, window, cx);
+            root.settle_list_drag(target, id, window, cx);
         });
     }
 
@@ -2385,6 +2388,7 @@ impl Root {
     fn settle_list_drag(
         &mut self,
         target: DragTarget,
+        id: u64,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
@@ -2393,7 +2397,8 @@ impl Root {
             return;
         };
         let y = settle.y;
-        if settle.target != target {
+        // 这是上一轮排的旧回调：这一轮已经换过编号，直接作废。
+        if settle.target != target || settle.id != id {
             return;
         }
         // 松手、切页、失焦、换目标：欠账作废，别再滚。
@@ -2430,11 +2435,12 @@ impl Root {
         self.middle_drag_settle = Some(MiddleDragSettle {
             target,
             y,
+            id,
             frames,
             stalled,
         });
         cx.on_next_frame(window, move |root, window, cx| {
-            root.settle_list_drag(target, window, cx);
+            root.settle_list_drag(target, id, window, cx);
         });
     }
 
