@@ -3,6 +3,8 @@
 ;   ISCC.exe /DMyAppVersion=<version> packaging/windows/sodam.iss
 ; Output: release/sodam-<version>-windows-x64-setup.exe
 ; Per-user install (no admin required), default dir {localappdata}\Programs\SodaM.
+; Before copying files, the installer force-closes the sodam.exe under the
+; install directory (issue #184): no Restart Manager prompt, no 30s wait.
 ; NOTE: this file is UTF-8 with BOM: it carries Simplified Chinese messages below,
 ; and Inno reads a non-BOM script in the ANSI codepage.
 
@@ -28,7 +30,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\sodam.exe
-CloseApplications=force
+CloseApplications=no
 RestartApplications=no
 ShowLanguageDialog=no
 UsePreviousLanguage=no
@@ -44,7 +46,7 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\..\target\release\sodam.exe"; DestDir: "{app}"; Flags: ignoreversion; BeforeInstall: SodamBeforeInstall
+Source: "..\..\target\release\sodam.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\SodaM"; Filename: "{app}\sodam.exe"
@@ -53,15 +55,9 @@ Name: "{autodesktop}\SodaM"; Filename: "{app}\sodam.exe"; Tasks: desktopicon
 [Run]
 Filename: "{app}\sodam.exe"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
 
-[Messages]
-DontCloseApplications=&Cancel installation
-chinesesimplified.DontCloseApplications=取消安装(&C)
-
 [CustomMessages]
 SodamStillRunning=Unable to close SodaM. Quit it from the tray menu (or end sodam.exe in Task Manager), then run Setup again.
-SodamCancelled=Installation cancelled. SodaM was not closed.
 chinesesimplified.SodamStillRunning=无法关闭 SodaM，安装已中止。请从托盘菜单退出 SodaM（必要时在任务管理器中结束 sodam.exe），然后重新运行安装程序。
-chinesesimplified.SodamCancelled=安装已取消，SodaM 未被关闭。
 
 [Code]
 const
@@ -69,9 +65,6 @@ const
   OPEN_EXISTING = 3;
   ERROR_SHARING_VIOLATION = 32;
   INVALID_HANDLE_VALUE = -1;
-
-var
-  SodamPromptShown: Boolean;
 
 function CreateFileW(lpFileName: String; dwDesiredAccess: Cardinal;
   dwShareMode: Cardinal; lpSecurityAttributes: Cardinal;
@@ -102,67 +95,64 @@ begin
   end;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  Result := '';
-  if WizardSilent and SodamExeRunning then
-    Result := CustomMessage('SodamStillRunning');
-end;
-
-procedure StopSodamProcess;
+{ Force-close the sodam.exe under the install directory and wait (up to 5s)
+  for it to go away. Matched by full ExecutablePath, not just the process
+  name, so a SodaM installed elsewhere is never touched. The helper script
+  polls until no matching process remains AND the exe file can be opened
+  again (lock released). Returns True only when the script confirms that;
+  False covers both "still running" and "the helper itself failed" (the
+  caller falls back to a final CreateFileW probe to tell those apart). }
+function StopSodamProcess: Boolean;
 var
   ScriptPath: String;
   Script: String;
   ResultCode: Integer;
 begin
+  Result := False;
   ScriptPath := ExpandConstant('{tmp}\sodam-close.ps1');
   Script :=
     '$target = $args[0]' + #13#10 +
     'Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" | ' +
     'Where-Object { $_.ExecutablePath -eq $target } | ' +
-    'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }';
-  if SaveStringToFile(ScriptPath, Script, False) then
-    Exec('powershell.exe',
+    'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }' + #13#10 +
+    '$sw = [System.Diagnostics.Stopwatch]::StartNew()' + #13#10 +
+    'while ($sw.ElapsedMilliseconds -lt 5000) {' + #13#10 +
+    '  $alive = Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" ' +
+    '-OperationTimeoutSec 3 | ' +
+    'Where-Object { $_.ExecutablePath -eq $target }' + #13#10 +
+    '  $locked = $false' + #13#10 +
+    '  if (Test-Path -LiteralPath $target) {' + #13#10 +
+    '    try { $fs = [System.IO.File]::Open($target, ''Open'', ''ReadWrite'', ''None''); $fs.Close() } catch {' + #13#10 +
+    '      $inner = $_.Exception.InnerException' + #13#10 +
+    '      if ($inner -is [System.UnauthorizedAccessException]) { $locked = $false }' + #13#10 +
+    '      elseif ($inner -is [System.IO.FileNotFoundException]) { $locked = $false }' + #13#10 +
+    '      else { $locked = $true }' + #13#10 +
+    '    }' + #13#10 +
+    '  }' + #13#10 +
+    '  if (-not $alive -and -not $locked) { exit 0 }' + #13#10 +
+    '  Start-Sleep -Milliseconds 200' + #13#10 +
+    '}' + #13#10 +
+    'exit 1';
+  if not SaveStringToFile(ScriptPath, Script, False) then
+    Exit;
+  if not Exec('powershell.exe',
       '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" "' +
       ExpandConstant('{app}\sodam.exe') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  Result := (ResultCode = 0);
 end;
 
-function NextButtonClick(CurPageID: Integer): Boolean;
+{ Runs right before files are copied, in both wizard and silent mode.
+  Cancelling earlier never kills anything: this only executes after the user
+  has clicked Install. On failure it reports an error and aborts without
+  touching any file. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  Result := True;
-  if (CurPageID = wpPreparing) and WizardForm.PreparingYesRadio.Checked then
+  Result := '';
+  if FileExists(ExpandConstant('{app}\sodam.exe')) then
   begin
-    StopSodamProcess;
-    if SodamExeRunning then
-    begin
-      MsgBox(CustomMessage('SodamStillRunning'), mbError, MB_OK);
-      Result := False;
-    end;
-  end;
-end;
-
-procedure CurPageChanged(CurPageID: Integer);
-begin
-  if CurPageID = wpPreparing then
-    SodamPromptShown := True;
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if (CurStep = ssInstall) and SodamPromptShown and
-     (not WizardForm.PreparingYesRadio.Checked) and SodamExeRunning then
-  begin
-    MsgBox(CustomMessage('SodamCancelled'), mbError, MB_OK);
-    Abort;
-  end;
-end;
-
-procedure SodamBeforeInstall;
-begin
-  if SodamExeRunning then
-  begin
-    MsgBox(CustomMessage('SodamStillRunning'), mbError, MB_OK);
-    Abort;
+    if (not StopSodamProcess) and SodamExeRunning then
+      Result := CustomMessage('SodamStillRunning');
   end;
 end;
