@@ -1086,13 +1086,28 @@ impl Root {
         .detach();
     }
 
+    /// 只应用主题、不保存：设置页与热重载共用这一套应用逻辑（#185）。
+    ///
+    /// 空/未识别的值回退到跟随系统；调用方自己决定要不要回写 `settings.theme`。
+    pub(crate) fn apply_theme_state(&mut self, key: &str, cx: &mut Context<Self>) {
+        match ThemeKind::from_key(key) {
+            Some(theme) => {
+                self.theme = theme;
+                self.theme_follows_system = false;
+            }
+            None => {
+                self.theme_follows_system = true;
+                self.theme = theme::theme_from_appearance(cx.window_appearance());
+            }
+        }
+        theme::set_theme(self.theme);
+    }
+
     /// 设置界面主题并写入配置；一旦手动选择，不再跟随系统。
     pub fn set_ui_theme(&mut self, theme: ThemeKind, cx: &mut Context<Self>) {
-        self.theme = theme;
-        self.theme_follows_system = false;
+        self.apply_theme_state(theme.key(), cx);
         self.settings.theme = theme.key().to_string();
         let save_result = self.settings.save();
-        theme::set_theme(theme);
         match save_result {
             Ok(()) => {
                 // 文案要过词典：状态行现在真的会显示，英文界面不能露出中文。
@@ -1116,11 +1131,9 @@ impl Root {
 
     /// 主题恢复为跟随系统：清空配置里的 theme（空串 = auto），渲染时按窗口外观取值。
     pub fn set_ui_theme_system(&mut self, cx: &mut Context<Self>) {
-        self.theme_follows_system = true;
-        self.theme = theme::theme_from_appearance(cx.window_appearance());
+        self.apply_theme_state("", cx);
         self.settings.theme = String::new();
         let save_result = self.settings.save();
-        theme::set_theme(self.theme);
         match save_result {
             Ok(()) => self.set_status_text(self.tr("主题已恢复为跟随系统")),
             Err(err) => {
@@ -3965,46 +3978,17 @@ impl Root {
             || old.shortcut_next != incoming.shortcut_next;
         let quality_changed =
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
-        let session_changed = incoming.signer_url != old.signer_url
-            || incoming.signer_token != old.signer_token
-            || incoming.cookie != old.cookie
-            || incoming.device_id != old.device_id
-            || incoming.iid != old.iid
-            || incoming.fp != old.fp
-            || quality_changed
-            || incoming.login_device_id != old.login_device_id
-            || incoming.login_install_id != old.login_install_id;
+        let session_changed = incoming.session_inputs_differ(&old);
         let cookie_changed = incoming.cookie != old.cookie;
         self.settings = incoming.clone();
 
-        // 主题：认得就手动应用，认不得（空/未识别）回到跟随系统。
+        // 主题：与 `set_ui_theme*` 同一套应用逻辑（认不得的值回到跟随系统），不落盘。
         if old.theme != incoming.theme {
-            match ThemeKind::from_key(&incoming.theme) {
-                Some(theme) => {
-                    self.theme = theme;
-                    self.theme_follows_system = false;
-                }
-                None => {
-                    self.theme_follows_system = true;
-                    self.theme = theme::theme_from_appearance(cx.window_appearance());
-                }
-            }
-            theme::set_theme(self.theme);
+            self.apply_theme_state(&incoming.theme, cx);
         }
         // 语言：与 `set_language` 同一套应用逻辑，但不落盘。
         if old.language != incoming.language {
-            match Language::from_key(&incoming.language) {
-                Some(Language::System) | None => {
-                    self.language = Language::system_locale();
-                    self.language_follows_system = true;
-                }
-                Some(language) => {
-                    self.language = language;
-                    self.language_follows_system = false;
-                }
-            }
-            #[cfg(target_os = "macos")]
-            crate::menus::refresh(cx, self.language);
+            self.apply_language_state(&incoming.language, cx);
         }
         // 详细日志即时生效。
         if old.detailed_logs != incoming.detailed_logs {

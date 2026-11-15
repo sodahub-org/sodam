@@ -11,7 +11,6 @@ use gpui::{
     Window,
 };
 use sodam_core::{
-    config::LoadOutcome,
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -593,40 +592,10 @@ impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config_path = Settings::config_path();
-        // 安全加载：区分「不存在 / 正常 / 坏了」。坏文件绝不覆盖：先试备份，
-        // 备份可用就用备份继续、坏文件改名保留并告诉用户在哪；否则默认值启动
-        // 并提示出错的大致位置（#185）。
-        enum StartupNotice {
-            Recovered(PathBuf),
-            Corrupt(String),
-        }
-        let mut startup_notice: Option<StartupNotice> = None;
-        let mut settings = match Settings::try_load_from(&config_path) {
-            LoadOutcome::Corrupt { error } => {
-                match Settings::load_settings_backup(&config_path) {
-                    Some(mut backup) => {
-                        backup.ensure_login_device();
-                        let bad_path = Settings::quarantine_corrupt_file(&config_path);
-                        let _ = backup.save_to(&config_path);
-                        let _ = Settings::write_settings_backup(&config_path, &backup);
-                        startup_notice = Some(StartupNotice::Recovered(
-                            bad_path.unwrap_or_else(|| config_path.clone()),
-                        ));
-                        backup
-                    }
-                    None => {
-                        startup_notice = Some(StartupNotice::Corrupt(error));
-                        // 不生成设备身份、不回写：坏文件在磁盘上原样保留。
-                        let mut defaults = Settings::default();
-                        defaults.normalize_playback();
-                        defaults
-                    }
-                }
-            }
-            // 正常（或首次）路径走 load_from：迁移回存 + 登录设备初始化 + 写备份。
-            _ => Settings::load_from(&config_path),
-        };
-        settings = settings.merged_with_env();
+        // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
+        // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
+        let (settings, recovery) = sodam_core::config::load_for_startup(&config_path);
+        let mut settings = settings.merged_with_env();
         // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
         // 这里补上开关状态（环境变量那一路已在出口初始化时读过，两者取并集）。
         log_outlet::set_global_detailed(settings.detailed_logs);
@@ -646,15 +615,17 @@ impl Root {
             Some(language) => (language, false),
         };
         let session = Session::new(settings.clone());
-        let status = match startup_notice {
-            Some(StartupNotice::Recovered(bad_path)) => language.textf(
-                "配置文件损坏，已从备份恢复；坏文件保留在 {}",
-                &[bad_path.display().to_string()],
-            ),
-            Some(StartupNotice::Corrupt(error)) => language.textf(
-                "配置文件损坏（{}）：已用默认设置启动，原文件未改动",
-                &[error],
-            ),
+        let status = match recovery {
+            Some(sodam_core::config::StartupRecovery::RecoveredFromBackup { bad_path }) => language
+                .textf(
+                    "配置文件损坏，已从备份恢复；坏文件保留在 {}",
+                    &[bad_path.display().to_string()],
+                ),
+            Some(sodam_core::config::StartupRecovery::FellBackToDefaults { error }) => language
+                .textf(
+                    "配置文件损坏（{}）：已用默认设置启动，原文件未改动",
+                    &[error],
+                ),
             None => {
                 if settings.is_ready_for_vip() {
                     if language.is_zh() {
@@ -1605,9 +1576,27 @@ impl Root {
         self.push_message_with_key(kind, message, Some(ui::message::DEFAULT_DURATION), key)
     }
 
+    /// 只应用语言、不保存：设置页与热重载共用这一套应用逻辑（#185）。
+    ///
+    /// 空/未识别的值回退到跟随系统；调用方自己决定要不要回写 `settings.language`。
+    pub(crate) fn apply_language_state(&mut self, key: &str, cx: &mut Context<Self>) {
+        match Language::from_key(key) {
+            Some(Language::System) | None => {
+                self.language = Language::system_locale();
+                self.language_follows_system = true;
+            }
+            Some(language) => {
+                self.language = language;
+                self.language_follows_system = false;
+            }
+        }
+        // macOS 菜单栏的标题也要跟着换语言。
+        #[cfg(target_os = "macos")]
+        crate::menus::refresh(cx, self.language);
+    }
+
     pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
-        self.language = language;
-        self.language_follows_system = false;
+        self.apply_language_state(language.key(), cx);
         self.settings.language = language.key().to_string();
         let save_result = self.settings.save();
         match save_result {
@@ -1624,9 +1613,6 @@ impl Root {
                 self.notify_warning_once("language-save-failed", message);
             }
         }
-        // macOS 菜单栏的标题也要跟着换语言。
-        #[cfg(target_os = "macos")]
-        crate::menus::refresh(cx, language);
         cx.notify();
     }
 }

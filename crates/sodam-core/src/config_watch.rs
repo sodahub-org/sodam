@@ -103,7 +103,7 @@ impl ReloadTracker {
             };
         }
 
-        match crate::config::try_load_from(path) {
+        match Settings::try_load_from(path) {
             LoadOutcome::Corrupt { error } => {
                 let first_seen = self.pending.first_seen.unwrap_or(now);
                 let stable = now.duration_since(first_seen) >= CORRUPT_AFTER;
@@ -113,12 +113,11 @@ impl ReloadTracker {
                 }
                 ReloadEvent::Quiet
             }
-            outcome @ (LoadOutcome::NotFound(_) | LoadOutcome::Loaded { .. }) => {
-                let settings = match outcome {
-                    LoadOutcome::NotFound(settings) => settings,
-                    LoadOutcome::Loaded { settings, .. } => settings,
-                    LoadOutcome::Corrupt { .. } => unreachable!("上一分支已处理"),
-                };
+            LoadOutcome::NotFound(settings) | LoadOutcome::Loaded { settings, .. } => {
+                // 每次外部重载后重新补环境变量，优先级与启动时一致（#185）。
+                // 这里故意不做 ensure_login_device：文件没带设备身份时不能在轮询里
+                // 现生成一份（会悄悄轮换身份），交给应用侧沿用当前身份。
+                let settings = settings.fill_empty_from_env();
                 // 第一次解析成功只记账：等指纹稳定跨过 APPLY_AFTER 再应用，
                 // 编辑器「截断 → 写全」的中间态不会被当成损坏，也不会应用半份。
                 let good_since = *self.pending.good_since.get_or_insert(now);
@@ -257,7 +256,7 @@ mod tests {
 
         std::thread::sleep(CORRUPT_AFTER + Duration::from_millis(100));
         match tracker.poll(&path, &current, Instant::now(), false) {
-            ReloadEvent::Corrupt(error) => assert!(error.contains("行"), "{error}"),
+            ReloadEvent::Corrupt(error) => assert!(error.contains("line"), "{error}"),
             other => panic!("稳定损坏应提示一次，实际 {other:?}"),
         }
         // 同一份坏文件不再重复提示。

@@ -28,7 +28,9 @@ impl PlaybackPreferences {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mut settings = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)?,
+            // 字段级容错：单个字段类型坏不连累整份合并写（#185）。
+            Ok(bytes) => crate::config::parse_settings_bytes(&bytes)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Settings::default(),
             Err(err) => return Err(err.into()),
         };

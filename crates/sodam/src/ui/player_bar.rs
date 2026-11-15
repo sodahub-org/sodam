@@ -131,6 +131,14 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                     cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
                         root.volume_scrubbing = false;
                     }),
+                )
+                // 拖出滑条外松手收不到 on_mouse_up，用元素外的 up 兜底，
+                // 否则标记卡 true，之后的外部音量重载会一直被吞（#185）。
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
+                        root.volume_scrubbing = false;
+                    }),
                 ),
         )
 }

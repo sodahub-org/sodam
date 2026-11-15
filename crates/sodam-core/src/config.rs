@@ -292,20 +292,21 @@ impl TitlebarMode {
 }
 
 /// 解析配置文本：先按整份解析；失败时做字段级容错（类型不对的字段丢掉补默认值，
-/// 其余照常生效），只有语法坏或结构对不上才报错。错误信息带大致行列位置。
+/// 其余照常生效），只有语法坏或结构对不上才报错。错误信息带大致行列位置
+/// （`line X column Y`——领域层不知道界面语言，位置信息用语言无关的技术写法）。
 fn parse_settings_text(text: &str) -> Result<Settings, String> {
     match serde_json::from_str::<Settings>(text) {
         Ok(settings) => Ok(settings),
         Err(first) => {
-            let location = format!("第 {} 行第 {} 列附近", first.line(), first.column());
+            let location = format!("line {} column {}", first.line(), first.column());
             let mut value: serde_json::Value = match serde_json::from_str(text) {
                 Ok(value) => value,
                 // 连 JSON 都不是（或写到一半被截断）：语法损坏，原样报出去。
-                Err(_) => return Err(format!("{location}：{first}")),
+                Err(_) => return Err(format!("{location}: {first}")),
             };
             let dropped = sanitize_config_value(&mut value);
             let settings = serde_json::from_value::<Settings>(value)
-                .map_err(|err| format!("{location}：{err}"))?;
+                .map_err(|err| format!("{location}: {err}"))?;
             if !dropped.is_empty() {
                 log_event(
                     LogLevel::Warn,
@@ -317,6 +318,13 @@ fn parse_settings_text(text: &str) -> Result<Settings, String> {
             Ok(settings)
         }
     }
+}
+
+/// 解析配置字节（音量写线程的读-改-写走这里）：与文本路径共用字段级容错，
+/// 单个字段坏了不连累整份合并写。
+pub(crate) fn parse_settings_bytes(bytes: &[u8]) -> Result<Settings, String> {
+    let text = std::str::from_utf8(bytes).map_err(|err| format!("invalid utf-8: {err}"))?;
+    parse_settings_text(text)
 }
 
 /// 字段级容错：类型不符合的字段直接删掉，让 `serde(default)` 补默认值，
@@ -376,8 +384,15 @@ pub fn settings_backup_path(path: &Path) -> PathBuf {
 }
 
 /// 把一份可用配置原子写入备份文件（与主文件同目录）。每次成功加载后调用一次，
-/// 主文件损坏时靠它恢复。
+/// 主文件损坏时靠它恢复。与保存共用同一把写锁，避免与并发保存互相踩（#185）。
 pub fn write_settings_backup(path: &Path, settings: &Settings) -> std::io::Result<()> {
+    let _guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    write_settings_backup_locked(path, settings)
+}
+
+fn write_settings_backup_locked(path: &Path, settings: &Settings) -> std::io::Result<()> {
     let backup = settings_backup_path(path);
     let parent = backup
         .parent()
@@ -391,14 +406,27 @@ pub fn write_settings_backup(path: &Path, settings: &Settings) -> std::io::Resul
 }
 
 /// 读取主文件的备份（同样做字段级容错）。备份也读不出时返回 `None`。
+/// 与保存共用同一把写锁，读到一半不会被并发的隔离改名/保存打断。
 pub fn load_settings_backup(path: &Path) -> Option<Settings> {
+    let _guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let text = std::fs::read_to_string(settings_backup_path(path)).ok()?;
     parse_settings_text(&text).ok()
 }
 
 /// 把坏掉的主文件改名保留（`config.json` → `config.json.bad-<毫秒时间戳>`），
 /// 返回保留路径；改名失败（目录只读等）返回 `None`。
+/// 与保存共用同一把写锁：并发保存可能正要覆盖这份坏文件，先到先得。
 pub fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
+    let _guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    quarantine_corrupt_file_locked(path)
+}
+
+/// [`Self::save_to_locked`] 持锁期间用的隔离变体（锁不可重入，勿混用）。
+fn quarantine_corrupt_file_locked(path: &Path) -> Option<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
@@ -406,6 +434,46 @@ pub fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
     let bad_path = path.with_extension(format!("json.bad-{stamp}"));
     std::fs::rename(path, &bad_path).ok()?;
     Some(bad_path)
+}
+
+/// 启动期加载的恢复结果：主文件损坏时用了哪条路，界面据此提示（#185）。
+#[derive(Debug, Clone)]
+pub enum StartupRecovery {
+    /// 已从备份恢复；坏文件改名保留在 `bad_path`。
+    RecoveredFromBackup { bad_path: PathBuf },
+    /// 无备份可用：默认值启动，坏文件原样保留；`error` 是损坏详情。
+    FellBackToDefaults { error: String },
+}
+
+/// 启动加载：正常路径走 [`Self::load_from`]（迁移回存 + 设备身份 + 备份）；
+/// 主文件损坏时先试备份——备份可用就用备份继续、坏文件改名保留；无备份则
+/// 默认值启动且绝不碰坏文件。恢复编排收在领域层，UI 只拿结果拼文案。
+pub fn load_for_startup(path: &Path) -> (Settings, Option<StartupRecovery>) {
+    if let LoadOutcome::Corrupt { error } = Settings::try_load_from(path) {
+        return match load_settings_backup(path) {
+            Some(mut backup) => {
+                backup.ensure_login_device();
+                let bad_path = quarantine_corrupt_file(path).unwrap_or_else(|| path.to_path_buf());
+                // 恢复内容写回主文件与备份；写失败不影响用内存里的值继续。
+                let _ = backup.save_to(path);
+                let _ = write_settings_backup(path, &backup);
+                (
+                    backup,
+                    Some(StartupRecovery::RecoveredFromBackup { bad_path }),
+                )
+            }
+            None => {
+                // 不生成设备身份、不回存：坏文件在磁盘上原样保留。
+                let mut defaults = Settings::default();
+                defaults.normalize_playback();
+                (
+                    defaults,
+                    Some(StartupRecovery::FellBackToDefaults { error }),
+                )
+            }
+        };
+    }
+    (Settings::load_from(path), None)
 }
 
 impl Default for Settings {
@@ -504,6 +572,10 @@ impl Settings {
     /// - 旧格式迁移只改内存值；是否回存由 [`Self::load_from`]（启动）决定，
     ///   热重载路径拿到 `migrated` 也不回写，避免外部编辑被立刻覆盖。
     pub fn try_load_from(path: &Path) -> LoadOutcome {
+        // 与保存共用同一把写锁：轮询读文件不会被并发保存的原子替换序列读到中间态。
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -609,7 +681,7 @@ impl Settings {
         // 用户原件在哪），改不动就取消本次保存——用户内容比这次写入重要。
         if let Ok(existing) = std::fs::read_to_string(path) {
             if serde_json::from_str::<serde_json::Value>(&existing).is_err() {
-                match quarantine_corrupt_file(path) {
+                match quarantine_corrupt_file_locked(path) {
                     Some(bad_path) => log_event(
                         LogLevel::Warn,
                         LogTopic::App,
@@ -782,7 +854,19 @@ impl Settings {
     /// `SODAM_QUALITY` 是唯一例外：音质的「自动」现在写成 `auto` 而不是空串，按「补空字段」
     /// 的规则它会永远填不进去。所以它按**意图**与**来源**判断——只有当前未被用户显式
     /// 选择且意图是自动时才让环境变量覆盖（标记为 `Derived`），用户手选的具体档位或明确选的「自动」不会被开发变量悄悄改掉。
-    pub fn merged_with_env(mut self) -> Self {
+    ///
+    /// 补完环境变量后再生成缺失的登录设备身份（见 [`Self::ensure_login_device`]）。
+    /// 热重载路径请用 [`Self::fill_empty_from_env`]——轮询里不能现生成设备身份，
+    /// 否则外部文件没带身份时会在后台悄悄轮换一份。
+    pub fn merged_with_env(self) -> Self {
+        let mut settings = self.fill_empty_from_env();
+        settings.ensure_login_device();
+        settings
+    }
+
+    /// 只补环境变量，不生成设备身份：热重载轮询与启动共用同一套补全逻辑
+    /// （优先级一致），设备身份交给调用方决定要不要生成。
+    pub(crate) fn fill_empty_from_env(mut self) -> Self {
         let pairs = [
             ("SODA_COOKIE", &mut self.cookie),
             ("QISHUI_SIGNER_URL", &mut self.signer_url),
@@ -802,7 +886,6 @@ impl Settings {
                 }
             }
         }
-        self.ensure_login_device();
         if self.quality_source != crate::quality::QualitySource::User
             && self.quality_intent() == crate::quality::QualityIntent::Auto
         {
@@ -814,6 +897,24 @@ impl Settings {
             }
         }
         self
+    }
+
+    /// 会话输入字段是否与另一份设置不同：签名地址/Token、Cookie、签名设备身份
+    /// （device_id/iid/fp）、登录设备身份、音质意图。这些字段变了需要重建会话
+    /// 才生效（`Session::adopt` / `Session::apply`），其余字段即时读取。
+    ///
+    /// 「哪些字段算会话输入」是配置的领域知识，收在这里，UI 层不做字段清单。
+    pub fn session_inputs_differ(&self, other: &Settings) -> bool {
+        self.signer_url != other.signer_url
+            || self.signer_token != other.signer_token
+            || self.cookie != other.cookie
+            || self.device_id != other.device_id
+            || self.iid != other.iid
+            || self.fp != other.fp
+            || self.quality != other.quality
+            || self.quality_source != other.quality_source
+            || self.login_device_id != other.login_device_id
+            || self.login_install_id != other.login_install_id
     }
 }
 
@@ -1239,7 +1340,7 @@ mod tests {
         std::fs::write(&path, "{oops").unwrap();
         match Settings::try_load_from(&path) {
             LoadOutcome::Corrupt { error } => {
-                assert!(error.contains("行"), "损坏提示应带行列位置：{error}");
+                assert!(error.contains("line"), "损坏提示应带行列位置：{error}");
             }
             _ => panic!("非法 JSON 应为 Corrupt"),
         }
