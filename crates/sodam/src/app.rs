@@ -849,7 +849,8 @@ impl Root {
             root.refresh_account(cx);
             root.load_liked_ids(cx);
             root.start_recommendation(false, cx);
-        } else {
+        } else if recovery.is_none() {
+            // 配置恢复提示已在状态行里：不要被登录提示覆盖，用户需要知道坏文件的去向。
             root.set_status_text(root.tr("请先在「设置 → 账户」扫码登录"));
         }
         // 开发/验证便利：`SODAM_QUERY="周杰伦" cargo run -p sodam` 启动即搜索一次

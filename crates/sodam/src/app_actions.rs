@@ -2217,7 +2217,15 @@ impl Root {
         };
         self.settings = settings;
         match save_result {
-            Ok(()) => self.set_status_text(self.tr("已退出登录")),
+            Ok(()) => {
+                // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
+                // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
+                let _ = sodam_core::config::write_settings_backup(
+                    &Settings::config_path(),
+                    &self.settings,
+                );
+                self.set_status_text(self.tr("已退出登录"));
+            }
             Err(err) => {
                 self.notify_error_once(
                     "logout-save-failed",
@@ -2236,6 +2244,9 @@ impl Root {
         self.playing = false;
         self.pending_track = None;
         self.playback_error = None;
+        // 推进播放请求序号：正在下载的旧身份装载回来会被序号检查拒绝，
+        // 否则清空队列后旧下载成功仍会把旧曲目塞回引擎（#185）。
+        self.play_seq = self.play_seq.wrapping_add(1);
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
         self.invalidate_identity_conclusions();
@@ -3023,6 +3034,9 @@ impl Root {
         }
         self.liked_loading = true;
         let settings = self.settings.clone();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃，不让旧账号的
+        // ids 写进新会话（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             // 启动时网络/接口可能未就绪：最多尝试 3 次（2s / 4s 退避），
@@ -3043,6 +3057,13 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.liked_loading = false;
+                if root.auth_epoch != auth_epoch {
+                    // 旧身份的结果不要：新身份还没拉过 ids，接着拉一次。
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_liked_ids(cx);
+                    }
+                    return;
+                }
                 match result {
                     Ok(ids) => {
                         root.liked_ids = Arc::new(ids);
@@ -3150,6 +3171,8 @@ impl Root {
         self.loading_liked = true;
         self.set_status_text(self.tr("正在读取我喜欢的音乐…"));
         cx.notify();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             sodam_core::library::liked_songs(&session)
@@ -3158,6 +3181,9 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.loading_liked = false;
+                if root.auth_epoch != auth_epoch {
+                    return;
+                }
                 match result {
                     Ok(tracks) => {
                         root.liked_loaded = true;
@@ -3999,8 +4025,12 @@ impl Root {
             self.engine.set_volume(incoming.volume);
         }
         // 播放模式：队列按钮在播放栏，settings 换掉后同步给队列。
+        // 切到随机要重建随机轮次：面板的「接下来」直接读 shuffle_round，
+        // 不重建会显示空列表或旧模式残留的顺序。
         if old.play_mode != incoming.play_mode {
             self.queue.mode = incoming.play_mode;
+            self.queue.reset_shuffle_round();
+            self.queue.prepare_shuffle_round();
         }
         // 缓存上限：触一次维护，让超限的旧缓存马上被清。
         if old.audio_cache_limit_mb != incoming.audio_cache_limit_mb {
@@ -4024,6 +4054,14 @@ impl Root {
                 self.clear_identity_state(cx);
             } else {
                 self.invalidate_identity_conclusions();
+                // 旧账号的歌单/收藏缓存是身份私有数据：换号不清，新账号会直接
+                // 看到旧账号的列表（加载守卫会拦住重拉）。保留当前播放。
+                self.playlists.clear();
+                self.liked = Arc::new(Vec::new());
+                self.liked_ids = Arc::new(HashSet::new());
+                self.liked_ids_failed = false;
+                self.liked_loaded = false;
+                self.open_playlist = None;
                 self.refresh_account(cx);
                 self.load_liked_ids(cx);
             }

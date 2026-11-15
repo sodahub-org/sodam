@@ -344,9 +344,17 @@ fn sanitize_config_value(value: &mut serde_json::Value) -> Vec<String> {
         }
     };
     let is_string = |value: &serde_json::Value| value.is_string();
-    let is_number = |value: &serde_json::Value| value.is_number();
     let is_bool = |value: &serde_json::Value| value.is_boolean();
-    let is_array = |value: &serde_json::Value| value.is_array();
+    // 数字字段按目标类型校验：`-1` 是合法 JSON number 但进不了 u64，
+    // 放过去会让整份配置解析失败（#185）。
+    let is_f32 = |value: &serde_json::Value| serde_json::from_value::<f32>(value.clone()).is_ok();
+    let is_u64 = |value: &serde_json::Value| serde_json::from_value::<u64>(value.clone()).is_ok();
+    // 字符串数组：元素类型也要对得上。
+    let is_string_array = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+    };
     for key in [
         "signer_url",
         "signer_token",
@@ -368,13 +376,14 @@ fn sanitize_config_value(value: &mut serde_json::Value) -> Vec<String> {
     ] {
         drop_unless(key, &is_string);
     }
-    for key in ["volume", "volume_before_mute", "audio_cache_limit_mb"] {
-        drop_unless(key, &is_number);
+    for key in ["volume", "volume_before_mute"] {
+        drop_unless(key, &is_f32);
     }
+    drop_unless("audio_cache_limit_mb", &is_u64);
     for key in ["search_history_enabled", "detailed_logs"] {
         drop_unless(key, &is_bool);
     }
-    drop_unless("search_history", &is_array);
+    drop_unless("search_history", &is_string_array);
     dropped
 }
 
@@ -677,21 +686,30 @@ impl Settings {
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
-        // 目标文件存在但已是坏 JSON：不直接覆盖。先把坏文件改名保留（上层据此告诉
+        // 目标文件存在但已是坏配置：不直接覆盖。先把坏文件改名保留（上层据此告诉
         // 用户原件在哪），改不动就取消本次保存——用户内容比这次写入重要。
-        if let Ok(existing) = std::fs::read_to_string(path) {
-            if serde_json::from_str::<serde_json::Value>(&existing).is_err() {
-                match quarantine_corrupt_file_locked(path) {
-                    Some(bad_path) => log_event(
-                        LogLevel::Warn,
-                        LogTopic::App,
-                        "config_corrupt_quarantined_on_save",
-                        &[("bad_path", bad_path.display().to_string().as_str())],
-                    ),
-                    None => {
-                        anyhow::bail!("配置文件损坏且无法保留原件，已取消本次保存");
+        // 判定与加载共用同一套容错解析：非 UTF-8、`null`、语法坏都算坏原件。
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                if parse_settings_bytes(&bytes).is_err() {
+                    match quarantine_corrupt_file_locked(path) {
+                        Some(bad_path) => log_event(
+                            LogLevel::Warn,
+                            LogTopic::App,
+                            "config_corrupt_quarantined_on_save",
+                            &[("bad_path", bad_path.display().to_string().as_str())],
+                        ),
+                        None => {
+                            anyhow::bail!("配置文件损坏且无法保留原件，已取消本次保存");
+                        }
                     }
                 }
+            }
+            // 文件不存在是首次保存的正常情况。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // 读不出原件就无法确认它是好是坏：宁可取消本次保存，也不盲写。
+            Err(err) => {
+                anyhow::bail!("配置文件无法读取（{err}），已取消本次保存");
             }
         }
         // 同目录原子替换，避免退出/并发保存留下半份 JSON（Windows 也支持替换旧文件）。
@@ -1381,6 +1399,21 @@ mod tests {
             settings.audio_cache_limit_mb,
             crate::cache::DEFAULT_AUDIO_LIMIT_MB
         );
+
+        // 目标类型校验：负数/小数进不了 u64，混型数组进不了 Vec<String>；
+        // 两者都不该把整份配置打成损坏，丢掉该字段继续加载。
+        let text = r#"{"cookie":"sessionid_ss=x","device_id":"dev","audio_cache_limit_mb":-1}"#;
+        let settings = parse_settings_text(text).expect("负数缓存上限应被丢弃而不是整份失败");
+        assert_eq!(settings.cookie, "sessionid_ss=x");
+        assert_eq!(settings.device_id, "dev");
+        assert_eq!(
+            settings.audio_cache_limit_mb,
+            crate::cache::DEFAULT_AUDIO_LIMIT_MB
+        );
+        let text = r#"{"cookie":"sessionid_ss=x","search_history":["有效记录",42]}"#;
+        let settings = parse_settings_text(text).expect("混型搜索历史应被丢弃而不是整份失败");
+        assert_eq!(settings.cookie, "sessionid_ss=x");
+        assert!(settings.search_history.is_empty());
     }
 
     /// 无法识别的播放模式回退列表循环，不连累整份配置解析。
@@ -1435,29 +1468,47 @@ mod tests {
         );
     }
 
-    /// 保存时目标文件已是坏 JSON：先改名保留原件，再写新内容，用户能找回原文件。
+    /// 保存时目标文件已是坏配置：先改名保留原件，再写新内容，用户能找回原文件。
+    /// 非 UTF-8 字节与 `null` 这类「读得出但解析不了」的原件同样要被隔离。
     #[test]
     fn save_quarantines_corrupt_target_before_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        std::fs::write(&path, "half json").unwrap();
-
         let settings = Settings {
             cookie: "sessionid_ss=x".into(),
             ..Default::default()
         };
-        settings.save_to(&path).expect("保存应成功");
 
+        // 非法字节序列：read_to_string 会失败，但保存前仍要保留原件。
+        let bad_bytes = [0xFF, 0xFE, b'{'];
+        std::fs::write(&path, bad_bytes).unwrap();
+        settings.save_to(&path).expect("保存应成功");
         assert_eq!(Settings::load_from(&path).cookie, "sessionid_ss=x");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().contains(".json.bad-"))
             .collect();
-        assert_eq!(quarantined.len(), 1, "坏原件应被保留一份");
+        assert_eq!(quarantined.len(), 1, "非 UTF-8 原件应被保留一份");
+        assert_eq!(
+            std::fs::read(quarantined[0].path()).unwrap(),
+            bad_bytes,
+            "坏原件内容应原样保留"
+        );
+        std::fs::remove_file(quarantined[0].path()).unwrap();
+
+        // `null`：语法合法但解析不了配置，同样不许盲覆盖。
+        std::fs::write(&path, "null").unwrap();
+        settings.save_to(&path).expect("保存应成功");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".json.bad-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "null 原件应被保留一份");
         assert_eq!(
             std::fs::read_to_string(quarantined[0].path()).unwrap(),
-            "half json"
+            "null"
         );
     }
 }

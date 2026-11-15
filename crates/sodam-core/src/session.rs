@@ -865,6 +865,17 @@ impl Session {
         // 冗余兜底，确保在其他触发偏好落盘的分支上会话副本也与外部一致。
         self.settings.quality = settings.quality.clone();
         self.settings.quality_source = settings.quality_source;
+        // 界面类字段同步：热重载改了主题/语言/快捷键/搜索历史时不会重建会话，
+        // 而登录的 `apply_login_cookie` 会把会话副本整体落盘——不同步就会把
+        // 用户（或外部编辑）刚改的值写回旧值（#185）。
+        self.settings.theme = settings.theme.clone();
+        self.settings.language = settings.language.clone();
+        self.settings.titlebar = settings.titlebar.clone();
+        self.settings.shortcut_toggle = settings.shortcut_toggle.clone();
+        self.settings.shortcut_previous = settings.shortcut_previous.clone();
+        self.settings.shortcut_next = settings.shortcut_next.clone();
+        self.settings.search_history_enabled = settings.search_history_enabled;
+        self.settings.search_history = settings.search_history.clone();
     }
 
     pub fn settings(&self) -> &Settings {

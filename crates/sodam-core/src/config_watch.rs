@@ -105,6 +105,17 @@ impl ReloadTracker {
 
         match Settings::try_load_from(path) {
             LoadOutcome::Corrupt { error } => {
+                // 读取内容前后文件可能又被写（编辑器第二次落盘）：对不上就重开防抖，
+                // 不拿旧的稳定时间给新内容背书。
+                if fingerprint(path) != Some(fingerprint) {
+                    self.pending = PendingChange {
+                        fingerprint: Some(fingerprint),
+                        first_seen: Some(now),
+                        good_since: None,
+                        corrupt_reported: false,
+                    };
+                    return ReloadEvent::Quiet;
+                }
                 let first_seen = self.pending.first_seen.unwrap_or(now);
                 let stable = now.duration_since(first_seen) >= CORRUPT_AFTER;
                 if stable && !self.pending.corrupt_reported {
@@ -113,7 +124,23 @@ impl ReloadTracker {
                 }
                 ReloadEvent::Quiet
             }
-            LoadOutcome::NotFound(settings) | LoadOutcome::Loaded { settings, .. } => {
+            LoadOutcome::NotFound(_) => {
+                // metadata 时还在、读取时已被删：不能把默认值当外部配置应用，
+                // 否则一次删除竞争就会把音量/主题/凭据全部重置。
+                self.pending = PendingChange::default();
+                ReloadEvent::Quiet
+            }
+            LoadOutcome::Loaded { settings, .. } => {
+                // 读取内容前后文件可能又被写：对不上就重开防抖，新内容要重新等稳定。
+                if fingerprint(path) != Some(fingerprint) {
+                    self.pending = PendingChange {
+                        fingerprint: Some(fingerprint),
+                        first_seen: Some(now),
+                        good_since: None,
+                        corrupt_reported: false,
+                    };
+                    return ReloadEvent::Quiet;
+                }
                 // 每次外部重载后重新补环境变量，优先级与启动时一致（#185）。
                 // 这里故意不做 ensure_login_device：文件没带设备身份时不能在轮询里
                 // 现生成一份（会悄悄轮换身份），交给应用侧沿用当前身份。
