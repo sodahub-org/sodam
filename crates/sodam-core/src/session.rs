@@ -878,6 +878,12 @@ impl Session {
         Ok(())
     }
 
+    /// 换设置但**不落盘**：热重载专用。外部改动刚落进来就被回写一遍，
+    /// 会把用户编辑器里还没保存的内容覆盖掉，所以这里只重建会话（#185）。
+    pub fn adopt(&mut self, settings: Settings) {
+        *self = Self::new(settings);
+    }
+
     /// 获取歌词，并保留原始增强 LRC 中的逐字时间轴。
     pub fn lyrics(
         &self,

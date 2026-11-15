@@ -11,6 +11,7 @@ use gpui::{
     Window,
 };
 use sodam_core::{
+    config::LoadOutcome,
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -563,12 +564,69 @@ pub struct Root {
     pub engine: PlaybackEngine,
     /// 播放进度 / 时长上报（喂引擎快照，内部异步发请求）。
     pub play_reporter: PlayReporter,
+    /// 配置热重载状态机：读盘解析在后台线程，事件回 UI 线程应用（见 main.rs 心跳）。
+    pub(crate) config_reload: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
+    /// 一次配置轮询在途标记：心跳周期短于轮询耗时，防止重叠发起。
+    pub(crate) config_poll_busy: bool,
+    /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
+    pub(crate) volume_scrubbing: bool,
+}
+
+/// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
+pub(crate) struct ConfigPollRequest {
+    tracker: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
+    path: PathBuf,
+    current: Settings,
+}
+
+impl ConfigPollRequest {
+    /// 读盘 + 解析（阻塞调用，必须放到后台线程跑，见 #185 约定）。
+    pub(crate) fn poll(self) -> sodam_core::config_watch::ReloadEvent {
+        let now = std::time::Instant::now();
+        let self_write_recent = sodam_core::config::recent_self_write();
+        let mut tracker = self.tracker.lock().unwrap_or_else(|err| err.into_inner());
+        tracker.poll(&self.path, &self.current, now, self_write_recent)
+    }
 }
 
 impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut settings = Settings::load().merged_with_env();
+        let config_path = Settings::config_path();
+        // 安全加载：区分「不存在 / 正常 / 坏了」。坏文件绝不覆盖：先试备份，
+        // 备份可用就用备份继续、坏文件改名保留并告诉用户在哪；否则默认值启动
+        // 并提示出错的大致位置（#185）。
+        enum StartupNotice {
+            Recovered(PathBuf),
+            Corrupt(String),
+        }
+        let mut startup_notice: Option<StartupNotice> = None;
+        let mut settings = match Settings::try_load_from(&config_path) {
+            LoadOutcome::Corrupt { error } => {
+                match Settings::load_settings_backup(&config_path) {
+                    Some(mut backup) => {
+                        backup.ensure_login_device();
+                        let bad_path = Settings::quarantine_corrupt_file(&config_path);
+                        let _ = backup.save_to(&config_path);
+                        let _ = Settings::write_settings_backup(&config_path, &backup);
+                        startup_notice = Some(StartupNotice::Recovered(
+                            bad_path.unwrap_or_else(|| config_path.clone()),
+                        ));
+                        backup
+                    }
+                    None => {
+                        startup_notice = Some(StartupNotice::Corrupt(error));
+                        // 不生成设备身份、不回写：坏文件在磁盘上原样保留。
+                        let mut defaults = Settings::default();
+                        defaults.normalize_playback();
+                        defaults
+                    }
+                }
+            }
+            // 正常（或首次）路径走 load_from：迁移回存 + 登录设备初始化 + 写备份。
+            _ => Settings::load_from(&config_path),
+        };
+        settings = settings.merged_with_env();
         // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
         // 这里补上开关状态（环境变量那一路已在出口初始化时读过，两者取并集）。
         log_outlet::set_global_detailed(settings.detailed_logs);
@@ -576,7 +634,7 @@ impl Root {
         settings.volume = engine.snapshot().volume;
         // 首次运行就把配置落盘：用户可以直接编辑 ~/.config/sodam/config.json
         // 换签名服务 / 钉死设备指纹（默认值已内置，见 sodam_core::config）
-        if !Settings::config_path().exists() {
+        if !config_path.exists() {
             let _ = settings.save();
         }
         let theme_follows_system = ThemeKind::from_key(&settings.theme).is_none();
@@ -588,19 +646,29 @@ impl Root {
             Some(language) => (language, false),
         };
         let session = Session::new(settings.clone());
-        let status = if settings.is_ready_for_vip() {
-            if language.is_zh() {
-                language
-                    .text("已配置登录与签名服务，可以去「搜索」或「推荐」了")
-                    .to_string()
-            } else {
-                "Signed in and signer ready. Try Discover or Search.".to_string()
-            }
-        } else {
-            if language.is_zh() {
-                language.text("还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）").to_string()
-            } else {
-                "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
+        let status = match startup_notice {
+            Some(StartupNotice::Recovered(bad_path)) => language.textf(
+                "配置文件损坏，已从备份恢复；坏文件保留在 {}",
+                &[bad_path.display().to_string()],
+            ),
+            Some(StartupNotice::Corrupt(error)) => language.textf(
+                "配置文件损坏（{}）：已用默认设置启动，原文件未改动",
+                &[error],
+            ),
+            None => {
+                if settings.is_ready_for_vip() {
+                    if language.is_zh() {
+                        language
+                            .text("已配置登录与签名服务，可以去「搜索」或「推荐」了")
+                            .to_string()
+                    } else {
+                        "Signed in and signer ready. Try Discover or Search.".to_string()
+                    }
+                } else if language.is_zh() {
+                    language.text("还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）").to_string()
+                } else {
+                    "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
+                }
             }
         };
         // 启动文案是写死的常量，不含接口地址，不需要脱敏；构造期也还没有 `Root`，
@@ -796,6 +864,9 @@ impl Root {
             account: None,
             engine,
             play_reporter,
+            config_reload: Arc::new(Mutex::new(sodam_core::config_watch::ReloadTracker::new())),
+            config_poll_busy: false,
+            volume_scrubbing: false,
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();

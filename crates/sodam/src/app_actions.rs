@@ -2195,6 +2195,30 @@ impl Root {
         let mut settings = self.settings.clone();
         settings.cookie.clear();
 
+        self.clear_identity_state(cx);
+
+        let save_result = if let Some(session) = self.session.as_mut() {
+            session.apply(settings.clone())
+        } else {
+            settings.save()
+        };
+        self.settings = settings;
+        match save_result {
+            Ok(()) => self.set_status_text(self.tr("已退出登录")),
+            Err(err) => {
+                self.notify_error_once(
+                    "logout-save-failed",
+                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。
+    ///
+    /// 退出登录与「外部把 Cookie 清空了」（热重载）共用这一份，不做保存。
+    fn clear_identity_state(&mut self, cx: &mut Context<Self>) {
         self.engine.stop();
         self.playing = false;
         self.pending_track = None;
@@ -2220,23 +2244,6 @@ impl Root {
         self.track_menu = None;
         self.queue_menu = None;
         self.set_nav(Nav::Settings, cx);
-
-        let save_result = if let Some(session) = self.session.as_mut() {
-            session.apply(settings.clone())
-        } else {
-            settings.save()
-        };
-        self.settings = settings;
-        match save_result {
-            Ok(()) => self.set_status_text(self.tr("已退出登录")),
-            Err(err) => {
-                self.notify_error_once(
-                    "logout-save-failed",
-                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
-                );
-            }
-        }
-        cx.notify();
     }
 
     /// 详情列表内的加载更多分发。
@@ -3890,6 +3897,162 @@ impl Root {
             }
         }
         self.play_reporter.apply_settings(reporter_settings);
+    }
+
+    /// 发起一次配置热重载轮询（main.rs 心跳每 ~500ms 调用一次）。
+    ///
+    /// 返回 `None` 表示上一次轮询还在后台跑，这次跳过。
+    pub(crate) fn begin_config_poll(&mut self) -> Option<super::ConfigPollRequest> {
+        if self.config_poll_busy {
+            return None;
+        }
+        self.config_poll_busy = true;
+        Some(super::ConfigPollRequest {
+            tracker: self.config_reload.clone(),
+            path: Settings::config_path(),
+            current: self.settings.clone(),
+        })
+    }
+
+    /// 收轮询结果并应用（UI 线程）。
+    pub(crate) fn finish_config_poll(
+        &mut self,
+        event: sodam_core::config_watch::ReloadEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.config_poll_busy = false;
+        match event {
+            sodam_core::config_watch::ReloadEvent::Quiet
+            | sodam_core::config_watch::ReloadEvent::Unchanged => {}
+            sodam_core::config_watch::ReloadEvent::Apply(settings) => {
+                self.apply_external_settings(*settings, cx)
+            }
+            sodam_core::config_watch::ReloadEvent::Corrupt(error) => {
+                self.log_failure("配置文件热重载解析失败", &error);
+                let message = self.localized(
+                    "配置文件解析失败（{}）：已保留当前设置，未改动文件",
+                    &[error],
+                );
+                self.notify_warning_once("config-reload-corrupt", message);
+                cx.notify();
+            }
+        }
+    }
+
+    /// 外部改动的配置热生效：只应用、不保存（#185）。
+    ///
+    /// 字段分三类：
+    /// * 已有即时生效路径的（主题/语言/音量/播放模式/缓存上限/详细日志/快捷键）——
+    ///   沿用同样的应用逻辑，只是不回写文件；
+    /// * 会话类（签名地址/Token/Cookie/设备身份/音质意图）——重建会话，当前曲目
+    ///   不断，下一次取流/搜索/上报用新值；Cookie 变更视为换身份；
+    /// * 其余（搜索历史、titlebar 等）——随 `settings` 整体替换自然生效。
+    fn apply_external_settings(&mut self, mut incoming: Settings, cx: &mut Context<Self>) {
+        let old = self.settings.clone();
+
+        // 防回跳：用户正拖着音量滑条时，外部重载不动音量。
+        if self.volume_scrubbing {
+            incoming.volume = old.volume;
+            incoming.volume_before_mute = old.volume_before_mute;
+        }
+        // 设备身份不轮换：外部文件没带（或带坏了）身份时，沿用当前已生成的这份。
+        if !incoming.login_device().is_valid() && old.login_device().is_valid() {
+            incoming.login_device_id = old.login_device_id.clone();
+            incoming.login_install_id = old.login_install_id.clone();
+        }
+        let shortcuts_changed = old.shortcut_toggle != incoming.shortcut_toggle
+            || old.shortcut_previous != incoming.shortcut_previous
+            || old.shortcut_next != incoming.shortcut_next;
+        let quality_changed =
+            old.quality != incoming.quality || old.quality_source != incoming.quality_source;
+        let session_changed = incoming.signer_url != old.signer_url
+            || incoming.signer_token != old.signer_token
+            || incoming.cookie != old.cookie
+            || incoming.device_id != old.device_id
+            || incoming.iid != old.iid
+            || incoming.fp != old.fp
+            || quality_changed
+            || incoming.login_device_id != old.login_device_id
+            || incoming.login_install_id != old.login_install_id;
+        let cookie_changed = incoming.cookie != old.cookie;
+        self.settings = incoming.clone();
+
+        // 主题：认得就手动应用，认不得（空/未识别）回到跟随系统。
+        if old.theme != incoming.theme {
+            match ThemeKind::from_key(&incoming.theme) {
+                Some(theme) => {
+                    self.theme = theme;
+                    self.theme_follows_system = false;
+                }
+                None => {
+                    self.theme_follows_system = true;
+                    self.theme = theme::theme_from_appearance(cx.window_appearance());
+                }
+            }
+            theme::set_theme(self.theme);
+        }
+        // 语言：与 `set_language` 同一套应用逻辑，但不落盘。
+        if old.language != incoming.language {
+            match Language::from_key(&incoming.language) {
+                Some(Language::System) | None => {
+                    self.language = Language::system_locale();
+                    self.language_follows_system = true;
+                }
+                Some(language) => {
+                    self.language = language;
+                    self.language_follows_system = false;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            crate::menus::refresh(cx, self.language);
+        }
+        // 详细日志即时生效。
+        if old.detailed_logs != incoming.detailed_logs {
+            log_outlet::set_global_detailed(incoming.detailed_logs);
+        }
+        // 音量与静音前音量：直接喂引擎（set_volume 内部已钳制）。
+        if old.volume != incoming.volume || old.volume_before_mute != incoming.volume_before_mute {
+            self.engine.set_volume(incoming.volume);
+        }
+        // 播放模式：队列按钮在播放栏，settings 换掉后同步给队列。
+        if old.play_mode != incoming.play_mode {
+            self.queue.mode = incoming.play_mode;
+        }
+        // 缓存上限：触一次维护，让超限的旧缓存马上被清。
+        if old.audio_cache_limit_mb != incoming.audio_cache_limit_mb {
+            self.maintain_cache(cx);
+        }
+        // 快捷键：置脏位，main.rs 心跳里统一重绑（清空 + 重建 keymap）。
+        if shortcuts_changed {
+            self.shortcuts_dirty = true;
+        }
+        // 会话类改动：重建会话（不落盘）。当前曲目不断；下一次取流/搜索/上报用新值。
+        if session_changed {
+            match self.session.as_mut() {
+                Some(session) => session.adopt(incoming.clone()),
+                None => self.session = Some(Session::new(incoming.clone())),
+            }
+        }
+        self.play_reporter.apply_settings(incoming.clone());
+        // Cookie 变了就是换了身份：旧身份的结论全部作废，账号与「我喜欢的」按新身份刷新。
+        if cookie_changed {
+            if incoming.cookie.trim().is_empty() {
+                self.clear_identity_state(cx);
+            } else {
+                self.invalidate_identity_conclusions();
+                self.refresh_account(cx);
+                self.load_liked_ids(cx);
+            }
+        }
+        // 音质意图变了：按新意图重新预取下一首（正在播的这首不受影响）。
+        if quality_changed {
+            self.spawn_prefetch(cx);
+        }
+
+        // 同一来源的重复提示只保留一条。
+        let message = self.tr("配置文件已更新，改动已生效").to_string();
+        self.notify_success_once("config-hot-reload", message);
+        cx.notify();
     }
 }
 
