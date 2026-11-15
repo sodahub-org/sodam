@@ -1580,6 +1580,9 @@ impl Root {
     ///
     /// 空/未识别的值回退到跟随系统；调用方自己决定要不要回写 `settings.language`。
     pub(crate) fn apply_language_state(&mut self, key: &str, cx: &mut Context<Self>) {
+        // 只有 macOS 要刷菜单栏；其它平台该参数用不上。
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
         match Language::from_key(key) {
             Some(Language::System) | None => {
                 self.language = Language::system_locale();

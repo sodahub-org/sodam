@@ -207,6 +207,12 @@ mod tests {
             tracker.poll(&path, &current, Instant::now(), true),
             ReloadEvent::Quiet
         ));
+        // 自写窗口过后：先进入防抖（第一次解析成功只记账），再按 Unchanged 收尾。
+        std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
+        assert!(matches!(
+            tracker.poll(&path, &current, Instant::now(), false),
+            ReloadEvent::Quiet
+        ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         assert!(matches!(
             tracker.poll(&path, &current, Instant::now(), false),
