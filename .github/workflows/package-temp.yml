@@ -1,0 +1,112 @@
+name: Package (temp PR test)
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-temp-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  linux-package:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git \
+            libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+      - name: Create pacman package
+        run: |
+          package=$(packaging/make-linux-package.sh '${{ matrix.arch }}')
+          test -s "$package"
+          test -s "$package.sha256"
+          mkdir -p release
+          mv "$package" "$package.sha256" release/
+      - name: Create Debian package
+        run: |
+          package=$(packaging/deb/make-deb.sh '${{ matrix.arch }}')
+          test -s "$package"
+          test -s "$package.sha256"
+          mkdir -p release
+          mv "$package" "$package.sha256" release/
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-linux-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-package:
+    name: macOS arm64 app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+      - name: Create app bundle
+        run: |
+          package=$(packaging/macos/make-macos-app.sh)
+          test -s "$package"
+          mkdir -p release
+          mv "$package" release/
+          cd release && shasum -a 256 "$(basename "$package")" > "$(basename "$package").sha256"
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-macos-aarch64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-package:
+    name: Windows x64 installer
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked --workspace
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+        shell: pwsh
+      - name: Create installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" packaging/windows/sodam.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "release/sodam-$version-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "installer not found: $setup" }
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "$setup.sha256" -Encoding ascii
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-windows-x64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
