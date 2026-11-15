@@ -615,6 +615,8 @@ impl Root {
             Some(language) => (language, false),
         };
         let session = Session::new(settings.clone());
+        // 后面还要用 recovery 判断要不要展示登录提示，先存一份（match 会移动它）。
+        let had_startup_recovery = recovery.is_some();
         let status = match recovery {
             Some(sodam_core::config::StartupRecovery::RecoveredFromBackup { bad_path }) => language
                 .textf(
@@ -849,7 +851,7 @@ impl Root {
             root.refresh_account(cx);
             root.load_liked_ids(cx);
             root.start_recommendation(false, cx);
-        } else if recovery.is_none() {
+        } else if !had_startup_recovery {
             // 配置恢复提示已在状态行里：不要被登录提示覆盖，用户需要知道坏文件的去向。
             root.set_status_text(root.tr("请先在「设置 → 账户」扫码登录"));
         }
