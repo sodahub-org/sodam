@@ -122,8 +122,9 @@ begin
     '  if (Test-Path $target) {' + #13#10 +
     '    try { $fs = [System.IO.File]::Open($target, ''Open'', ''ReadWrite'', ''None''); $fs.Close() } catch {' + #13#10 +
     '      $inner = $_.Exception.InnerException' + #13#10 +
-    '      if ($inner -and ($inner -isnot [System.UnauthorizedAccessException]) ' +
-    '-and ($inner -isnot [System.IO.FileNotFoundException])) { $locked = $true }' + #13#10 +
+    '      if ($inner -is [System.UnauthorizedAccessException]) { $locked = $false }' + #13#10 +
+    '      elseif ($inner -is [System.IO.FileNotFoundException]) { $locked = $false }' + #13#10 +
+    '      else { $locked = $true }' + #13#10 +
     '    }' + #13#10 +
     '  }' + #13#10 +
     '  if (-not $alive -and -not $locked) { exit 0 }' + #13#10 +
