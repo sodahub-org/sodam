@@ -97,14 +97,18 @@ end;
 
 { Force-close the sodam.exe under the install directory and wait (up to 5s)
   for it to go away. Matched by full ExecutablePath, not just the process
-  name, so a SodaM installed elsewhere is never touched. The script exits 0
-  when no matching process remains, 1 if it survived the wait. }
-procedure StopSodamProcess;
+  name, so a SodaM installed elsewhere is never touched. The helper script
+  polls until no matching process remains AND the exe file can be opened
+  again (lock released). Returns True only when the script confirms that;
+  False covers both "still running" and "the helper itself failed" (the
+  caller falls back to a final CreateFileW probe to tell those apart). }
+function StopSodamProcess: Boolean;
 var
   ScriptPath: String;
   Script: String;
   ResultCode: Integer;
 begin
+  Result := False;
   ScriptPath := ExpandConstant('{tmp}\sodam-close.ps1');
   Script :=
     '$target = $args[0]' + #13#10 +
@@ -114,15 +118,26 @@ begin
     'for ($i = 0; $i -lt 25; $i++) {' + #13#10 +
     '  $alive = Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" | ' +
     'Where-Object { $_.ExecutablePath -eq $target }' + #13#10 +
-    '  if (-not $alive) { exit 0 }' + #13#10 +
+    '  $locked = $false' + #13#10 +
+    '  if (Test-Path $target) {' + #13#10 +
+    '    try { $fs = [System.IO.File]::Open($target, ''Open'', ''ReadWrite'', ''None''); $fs.Close() } catch {' + #13#10 +
+    '      $inner = $_.Exception.InnerException' + #13#10 +
+    '      if ($inner -and ($inner -isnot [System.UnauthorizedAccessException]) ' +
+    '-and ($inner -isnot [System.IO.FileNotFoundException])) { $locked = $true }' + #13#10 +
+    '    }' + #13#10 +
+    '  }' + #13#10 +
+    '  if (-not $alive -and -not $locked) { exit 0 }' + #13#10 +
     '  Start-Sleep -Milliseconds 200' + #13#10 +
     '}' + #13#10 +
     'exit 1';
-  if SaveStringToFile(ScriptPath, Script, False) then
-    Exec('powershell.exe',
+  if not SaveStringToFile(ScriptPath, Script, False) then
+    Exit;
+  if not Exec('powershell.exe',
       '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" "' +
       ExpandConstant('{app}\sodam.exe') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  Result := (ResultCode = 0);
 end;
 
 { Runs right before files are copied, in both wizard and silent mode.
@@ -134,8 +149,7 @@ begin
   Result := '';
   if FileExists(ExpandConstant('{app}\sodam.exe')) then
   begin
-    StopSodamProcess;
-    if SodamExeRunning then
+    if (not StopSodamProcess) and SodamExeRunning then
       Result := CustomMessage('SodamStillRunning');
   end;
 end;
