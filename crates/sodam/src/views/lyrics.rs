@@ -450,12 +450,17 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 .track_scroll(&root.lyrics_scroll)
                 // 用户滚动时暂停自动跟随 5 秒（官方行为），否则往回翻会被拽回当前句。
                 .on_scroll_wheel(cx.listener(|root, _event, _window, cx| {
-                    root.lyrics_user_scroll_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                    // 用户已经自己滚了，过渡动画必须让位，否则会和手动滚动打架。
-                    root.cancel_lyrics_scroll_tween();
+                    root.pause_lyrics_follow();
                     cx.notify();
                 }))
+                // 中键按下时上报自己是这次拖动的目标；之后移动、松开由根元素统一收。
+                // 走和滚轮同一个入口，所以拖动期间也不会被跟唱或过渡动画拽回去。
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+                        root.begin_middle_drag_lyrics(f32::from(event.position.y));
+                    }),
+                )
                 .children(lines.iter().enumerate().map(|(index, line)| {
                     let next_start = lines.get(index + 1).map(|next| next.start_seconds);
                     // 本行此刻是否"正在唱"：区间是 `[start, 下一句开始)`。
