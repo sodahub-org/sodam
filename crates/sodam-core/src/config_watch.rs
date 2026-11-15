@@ -79,11 +79,11 @@ impl ReloadTracker {
         now: Instant,
         self_write_recent: bool,
     ) -> ReloadEvent {
-        let fingerprint = fingerprint(path);
-        if fingerprint == self.seen {
+        let observed = fingerprint(path);
+        if observed == self.seen {
             return ReloadEvent::Quiet;
         }
-        let Some(fingerprint) = fingerprint else {
+        let Some(observed) = observed else {
             // 文件被外部删掉：不动内存设置，等它回来再重载。
             self.acknowledge(None);
             return ReloadEvent::Quiet;
@@ -94,9 +94,9 @@ impl ReloadTracker {
             return ReloadEvent::Quiet;
         }
         // 指纹变了：进入（或延续）这次变化的防抖。
-        if self.pending.fingerprint != Some(fingerprint) {
+        if self.pending.fingerprint != Some(observed) {
             self.pending = PendingChange {
-                fingerprint: Some(fingerprint),
+                fingerprint: Some(observed),
                 first_seen: Some(now),
                 good_since: None,
                 corrupt_reported: false,
@@ -107,9 +107,9 @@ impl ReloadTracker {
             LoadOutcome::Corrupt { error } => {
                 // 读取内容前后文件可能又被写（编辑器第二次落盘）：对不上就重开防抖，
                 // 不拿旧的稳定时间给新内容背书。
-                if fingerprint(path) != Some(fingerprint) {
+                if fingerprint(path) != Some(observed) {
                     self.pending = PendingChange {
-                        fingerprint: Some(fingerprint),
+                        fingerprint: Some(observed),
                         first_seen: Some(now),
                         good_since: None,
                         corrupt_reported: false,
@@ -132,9 +132,9 @@ impl ReloadTracker {
             }
             LoadOutcome::Loaded { settings, .. } => {
                 // 读取内容前后文件可能又被写：对不上就重开防抖，新内容要重新等稳定。
-                if fingerprint(path) != Some(fingerprint) {
+                if fingerprint(path) != Some(observed) {
                     self.pending = PendingChange {
-                        fingerprint: Some(fingerprint),
+                        fingerprint: Some(observed),
                         first_seen: Some(now),
                         good_since: None,
                         corrupt_reported: false,
@@ -151,7 +151,7 @@ impl ReloadTracker {
                 if now.duration_since(good_since) < APPLY_AFTER {
                     return ReloadEvent::Quiet;
                 }
-                self.acknowledge(Some(fingerprint));
+                self.acknowledge(Some(observed));
                 if settings == *current {
                     ReloadEvent::Unchanged
                 } else {
