@@ -205,7 +205,9 @@ mod tests {
             ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "dark"),
             other => panic!("稳定后应应用新内容，实际 {other:?}"),
         }
-        // 已确认：再轮询安静。
+        // Apply 不在 watcher 里确认指纹（UI 应用后才确认）：模拟 UI 侧确认，
+        // 未确认前轮询会重复报 Apply，避免被丢弃的外部改动从此无人处理。
+        tracker.acknowledge(fingerprint(&path));
         assert!(matches!(
             tracker.poll(&path, &current, Instant::now(), false),
             ReloadEvent::Quiet
