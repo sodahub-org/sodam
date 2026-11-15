@@ -2425,10 +2425,11 @@ impl Root {
         if is_lyrics && just_started {
             self.pause_lyrics_follow();
         }
-        // 起步后帧循环每帧都在跑（`Root::render` 里 `request_animation_frame`），
-        // 指针位置下一帧就会被读到，逐次标脏只是重复排队（#189）。
-        // 起步那次必须标脏；`last_frame` 为空说明起步后一帧都还没跑过
-        // （起步事件可能落在绘制中途被吞掉），补一次把循环拉起来。
+        // 起步后帧循环每帧都会经由 `request_animation_frame` 标脏，指针位置下一帧
+        // 就会被读到；鼠标移动再标脏是重复动作（#189）。没起步（含死区内的每次移动）
+        // 和起步那次仍然标脏；`last_frame` 为空说明起步后一帧还没跑过（起步事件可能
+        // 落在绘制中途被吞），这里补一次。已知边界：帧循环完全停摆时（窗口最小化等）
+        // 这里不会自愈，靠系统重绘恢复。
         if !already_scrolling || self.middle_drag_last_frame.is_none() {
             cx.notify();
         }
