@@ -580,11 +580,15 @@ pub(crate) struct ConfigPollRequest {
 
 impl ConfigPollRequest {
     /// 读盘 + 解析（阻塞调用，必须放到后台线程跑，见 #185 约定）。
-    pub(crate) fn poll(self) -> sodam_core::config_watch::ReloadEvent {
+    ///
+    /// 连同发起时的设置快照一起返回：UI 侧要判断轮询往返期间本地是否又有改动，
+    /// 避免拿旧快照整份覆盖用户刚保存的新值（#185 审计）。
+    pub(crate) fn poll(self) -> (sodam_core::config_watch::ReloadEvent, Settings) {
         let now = std::time::Instant::now();
         let self_write_recent = sodam_core::config::recent_self_write();
         let mut tracker = self.tracker.lock().unwrap_or_else(|err| err.into_inner());
-        tracker.poll(&self.path, &self.current, now, self_write_recent)
+        let event = tracker.poll(&self.path, &self.current, now, self_write_recent);
+        (event, self.current)
     }
 }
 

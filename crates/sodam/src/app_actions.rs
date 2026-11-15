@@ -3954,17 +3954,34 @@ impl Root {
     }
 
     /// 收轮询结果并应用（UI 线程）。
+    ///
+    /// `snapshot` 是发起轮询时的设置快照：若本地在这段往返时间里又改过，
+    /// 就不拿旧快照之后的外部结果整份覆盖新值（#185 审计）——丢弃本次应用且
+    /// 不确认指纹，下一轮轮询会拿新快照重新比较，外部改动不会被吞掉。
     pub(crate) fn finish_config_poll(
         &mut self,
         event: sodam_core::config_watch::ReloadEvent,
+        snapshot: Settings,
         cx: &mut Context<Self>,
     ) {
         self.config_poll_busy = false;
         match event {
             sodam_core::config_watch::ReloadEvent::Quiet
             | sodam_core::config_watch::ReloadEvent::Unchanged => {}
-            sodam_core::config_watch::ReloadEvent::Apply(settings) => {
-                self.apply_external_settings(*settings, cx)
+            sodam_core::config_watch::ReloadEvent::Apply {
+                settings,
+                fingerprint,
+            } => {
+                // 本地没动过才应用；应用了才确认这份指纹——被丢弃时留给下一轮
+                // 重新处理（下一轮拿新快照比较，文件没变就 Unchanged 收尾）。
+                if self.settings == snapshot {
+                    self.apply_external_settings(*settings, cx);
+                    let mut tracker = self
+                        .config_reload
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    tracker.acknowledge(Some(fingerprint));
+                }
             }
             sodam_core::config_watch::ReloadEvent::Corrupt(error) => {
                 self.log_failure("配置文件热重载解析失败", &error);

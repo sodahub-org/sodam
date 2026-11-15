@@ -24,7 +24,14 @@ pub enum ReloadEvent {
     /// 无事发生（没变化 / 自己写的 / 防抖中 / 已提示过）。
     Quiet,
     /// 文件变了、解析成功且与内存不同：应用这份新设置（已迁移、已钳制）。
-    Apply(Box<Settings>),
+    ///
+    /// `fingerprint` 随事件带回去，由 UI 在**真正应用之后**确认（见
+    /// [`Self::acknowledge`]）：应用被本地并发改动顶掉时，不确认指纹，
+    /// 下一轮会用新快照重新比较，外部改动不会被吞掉。
+    Apply {
+        settings: Box<Settings>,
+        fingerprint: Fingerprint,
+    },
     /// 文件变了、解析成功但内容与应用内一致：不提示、不回写。
     Unchanged,
     /// 文件稳定损坏：提示一次（内存设置不动，文件不覆盖）。
@@ -151,11 +158,16 @@ impl ReloadTracker {
                 if now.duration_since(good_since) < APPLY_AFTER {
                     return ReloadEvent::Quiet;
                 }
-                self.acknowledge(Some(observed));
                 if settings == *current {
+                    self.acknowledge(Some(observed));
                     ReloadEvent::Unchanged
                 } else {
-                    ReloadEvent::Apply(Box::new(settings))
+                    // 应用与否由 UI 决定（轮询往返期间本地可能又有改动）；
+                    // 指纹不在这里确认，避免被丢弃的外部改动从此无人处理。
+                    ReloadEvent::Apply {
+                        settings: Box::new(settings),
+                        fingerprint: observed,
+                    }
                 }
             }
         }
@@ -190,7 +202,7 @@ mod tests {
 
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         match tracker.poll(&path, &current, Instant::now(), false) {
-            ReloadEvent::Apply(settings) => assert_eq!(settings.theme, "dark"),
+            ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "dark"),
             other => panic!("稳定后应应用新内容，实际 {other:?}"),
         }
         // 已确认：再轮询安静。
@@ -268,7 +280,7 @@ mod tests {
 
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         match tracker.poll(&path, &current, Instant::now(), false) {
-            ReloadEvent::Apply(settings) => assert_eq!(settings.theme, "dark"),
+            ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "dark"),
             other => panic!("写全后应应用新内容，实际 {other:?}"),
         }
     }
@@ -305,7 +317,7 @@ mod tests {
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         match tracker.poll(&path, &current, Instant::now(), false) {
-            ReloadEvent::Apply(settings) => assert_eq!(settings.theme, "light"),
+            ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "light"),
             other => panic!("修好后应应用新内容，实际 {other:?}"),
         }
     }
@@ -336,7 +348,7 @@ mod tests {
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         match tracker.poll(&path, &current, Instant::now(), false) {
-            ReloadEvent::Apply(settings) => assert_eq!(settings.theme, "light"),
+            ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "light"),
             other => panic!("文件回来后应应用新内容，实际 {other:?}"),
         }
     }

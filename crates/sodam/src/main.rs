@@ -139,11 +139,11 @@ fn start_tray_service(
                 if let Some(request) = request {
                     let app = app.clone();
                     cx.spawn(async move |cx| {
-                        let event = cx
+                        let (event, snapshot) = cx
                             .background_executor()
                             .spawn(async move { request.poll() })
                             .await;
-                        app.update(cx, |root, cx| root.finish_config_poll(event, cx));
+                        app.update(cx, |root, cx| root.finish_config_poll(event, snapshot, cx));
                     })
                     .detach();
                 }
