@@ -2220,10 +2220,14 @@ impl Root {
             Ok(()) => {
                 // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
                 // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
-                let _ = sodam_core::config::write_settings_backup(
-                    &Settings::config_path(),
-                    &self.settings,
-                );
+                // 文件 IO 放后台，不占 UI 线程。
+                let backup_settings = self.settings.clone();
+                let backup_path = Settings::config_path();
+                cx.background_spawn(async move {
+                    let _ =
+                        sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
+                })
+                .detach();
                 self.set_status_text(self.tr("已退出登录"));
             }
             Err(err) => {
@@ -2247,6 +2251,13 @@ impl Root {
         // 推进播放请求序号：正在下载的旧身份装载回来会被序号检查拒绝，
         // 否则清空队列后旧下载成功仍会把旧曲目塞回引擎（#185）。
         self.play_seq = self.play_seq.wrapping_add(1);
+        // 在途的队列请求（推荐/听歌模式/加载更多）一并作废：旧回调过了序号
+        // 检查仍会重建队列并开始装载，退出/换号后还能把旧队列播起来。
+        self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+        self.loading_recommendation = false;
+        self.recommendation_error = None;
+        self.switching_queue = None;
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
         self.invalidate_identity_conclusions();
@@ -2997,6 +3008,9 @@ impl Root {
         self.loading_library = true;
         self.set_status_text(self.tr("正在读取歌单…"));
         cx.notify();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃，不让旧账号的
+        // 歌单写回缓存，也把新身份的重拉接上（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             sodam_core::library::user_playlists(&session)
@@ -3005,6 +3019,12 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.loading_library = false;
+                if root.auth_epoch != auth_epoch {
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_playlists(cx);
+                    }
+                    return;
+                }
                 match result {
                     Ok(playlists) => {
                         root.set_status("共 {} 个歌单", &[playlists.len().to_string()]);
@@ -3182,6 +3202,10 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.loading_liked = false;
                 if root.auth_epoch != auth_epoch {
+                    // 旧身份的结果不要；新身份还没拉过完整收藏，接着拉一次。
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_liked(cx);
+                    }
                     return;
                 }
                 match result {
