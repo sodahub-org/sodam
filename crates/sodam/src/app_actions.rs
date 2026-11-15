@@ -2409,12 +2409,14 @@ impl Root {
         let Some(target) = self.middle_drag.target() else {
             return;
         };
+        let already_scrolling = self.middle_drag.is_scrolling();
         let is_lyrics = target == DragTarget::Lyrics;
         let nav = self.nav;
         let window_active = window.is_window_active();
         // 歌词页按下后，自动跟唱补间仍可能推进列表；起步前每次移动都按此刻的真实偏移
         // 重定积分起点，真正越过死区时从最新位置开始，首帧不跳（#169）。
-        if is_lyrics {
+        // 起步后积分起点不能再改，重定只会空转，直接跳过（#189）。
+        if is_lyrics && !already_scrolling {
             let top = self.drag_top(target);
             self.middle_drag
                 .rebase_unstarted_top(top, nav, window_active);
@@ -2423,7 +2425,14 @@ impl Root {
         if is_lyrics && just_started {
             self.pause_lyrics_follow();
         }
-        cx.notify();
+        // 起步后帧循环每帧都会经由 `request_animation_frame` 标脏，指针位置下一帧
+        // 就会被读到；鼠标移动再标脏是重复动作（#189）。没起步（含死区内的每次移动）
+        // 和起步那次仍然标脏；`last_frame` 为空说明起步后一帧还没跑过（起步事件可能
+        // 落在绘制中途被吞），这里补一次。已知边界：帧循环完全停摆时（窗口最小化等）
+        // 这里不会自愈，靠系统重绘恢复。
+        if !already_scrolling || self.middle_drag_last_frame.is_none() {
+            cx.notify();
+        }
     }
 
     /// 距离驱动的自动滚动 dt 上限（毫秒）：渲染卡了一拍也只按这个时长推进，
