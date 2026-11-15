@@ -221,6 +221,20 @@ pub(crate) struct BatchUpgradeProgress {
     pub(crate) total: usize,
 }
 
+/// 变高列表拖动「补欠账」的临时状态。
+///
+/// 列表的上限只按已测量高度算；一次大幅拖动被截短后，剩下的距离要靠
+/// 下一帧（内容量多了）继续补，见 `Root::settle_list_drag`（#168）。
+#[derive(Clone, Copy)]
+pub(crate) struct MiddleDragSettle {
+    pub(crate) target: ui::middle_drag::DragTarget,
+    pub(crate) y: f32,
+    /// 已经补了多少帧，用来兜底防死循环。
+    pub(crate) frames: u16,
+    /// 连续多少帧没滚动了；连着两帧没动就判到底或不再长高。
+    pub(crate) stalled: u8,
+}
+
 /// 根视图状态。
 pub struct Root {
     pub nav: Nav,
@@ -240,6 +254,8 @@ pub struct Root {
     pub playlist_grid_scroll: gpui::ScrollHandle,
     /// 中键拖动的状态，只算数不碰窗口（见 ui::middle_drag）。
     pub(crate) middle_drag: ui::middle_drag::MiddleDrag,
+    /// 变高列表拖动被测量上限截短后，剩下那段距离在下一帧继续补（#168）。
+    pub(crate) middle_drag_settle: Option<MiddleDragSettle>,
     /// 自绘标题栏拖拽区的按下锚点：按下只记录，移动超过阈值才交给合成器，
     /// 否则合成器会抢走指针，双击最大化收不到第二次按下（见 ui::titlebar）。
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
@@ -648,6 +664,7 @@ impl Root {
             search_playlists_scroll: gpui::ScrollHandle::new(),
             playlist_grid_scroll: gpui::ScrollHandle::new(),
             middle_drag: ui::middle_drag::MiddleDrag::default(),
+            middle_drag_settle: None,
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
@@ -1719,11 +1736,7 @@ impl Render for Root {
                         root.middle_drag.finish();
                         return;
                     }
-                    root.middle_drag_move(
-                        f32::from(event.position.y),
-                        window.is_window_active(),
-                        cx,
-                    );
+                    root.middle_drag_move(f32::from(event.position.y), window, cx);
                 }),
             )
             .on_mouse_up(

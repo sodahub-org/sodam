@@ -27,6 +27,36 @@ pub enum DragTarget {
     PlaylistGrid,
     /// 歌词页（用 `lyrics_scroll`）。
     Lyrics,
+    /// 听歌模式页（用 `scenes_list`，变高虚拟列表）。
+    Scenes,
+    /// 我喜欢的音乐详情（用 `liked_detail_list`，变高虚拟列表）。
+    LikedDetail,
+    /// 我的歌单详情（用 `library_detail_list`，变高虚拟列表）。
+    LibraryDetail,
+    /// 搜索歌单详情（用 `search_playlist_detail_list`，变高虚拟列表）。
+    SearchPlaylistDetail,
+    /// 音乐人详情（用 `artist_detail_list`，变高虚拟列表）。
+    ArtistDetail,
+    /// 专辑详情（用 `album_detail_list`，变高虚拟列表）。
+    AlbumDetail,
+}
+
+impl DragTarget {
+    /// 这次拖动的目标是不是变高虚拟列表（`ListState`）。
+    ///
+    /// 列表只认增量、而且「最多能滚多远」会随测量变大，所以写回和到边
+    /// 处理都跟普通滚动句柄分开走。
+    pub fn is_list(self) -> bool {
+        matches!(
+            self,
+            DragTarget::Scenes
+                | DragTarget::LikedDetail
+                | DragTarget::LibraryDetail
+                | DragTarget::SearchPlaylistDetail
+                | DragTarget::ArtistDetail
+                | DragTarget::AlbumDetail
+        )
+    }
 }
 
 /// 起步死区：鼠标没挪够 2px 就不滚，免得中键轻点让页面抖一下。
@@ -42,6 +72,9 @@ struct Anchor {
     target: DragTarget,
     /// 已经挪够 2px、开始滚了。起步之后不再判死区，否则拖回起点会卡住。
     started: bool,
+    /// 上一次算出的「想去哪」，没有按当前测量上限夹过。
+    /// 变高虚拟列表的已测量高度会越滚越大，夹掉的这段距离靠它补回来。
+    wanted: f32,
 }
 
 /// 一次中键拖动。`None` 表示现在没在拖。
@@ -58,6 +91,7 @@ impl MiddleDrag {
                 page,
                 target,
                 started: false,
+                wanted: top,
             });
         }
     }
@@ -73,6 +107,7 @@ impl MiddleDrag {
         if let Some(mut anchor) = self.0 {
             if !anchor.started {
                 anchor.top = top;
+                anchor.wanted = top;
                 self.0 = Some(anchor);
             }
         }
@@ -114,7 +149,30 @@ impl MiddleDrag {
             self.0 = Some(anchor);
         }
         // 往下拖，内容跟着往下走，离顶部就近了；往上拖反过来。
-        Some((anchor.top - moved).clamp(0.0, max_top))
+        let wanted = (anchor.top - moved).max(0.0);
+        anchor.wanted = wanted;
+        self.0 = Some(anchor);
+        Some(wanted.min(max_top))
+    }
+
+    /// 上一次想去的目标位置，没有按当前测量上限夹过。
+    /// 变高虚拟列表补欠账时用它算还差多少；没在拖就是 `None`。
+    pub fn wanted_top(&self) -> Option<f32> {
+        self.0.map(|anchor| anchor.wanted)
+    }
+
+    /// 变高虚拟列表用：把「想去哪」换成「这一帧该滚多少」。
+    /// 返回 `None` 的条件和 [`Self::move_to`] 一样。
+    pub fn move_by(
+        &mut self,
+        y: f32,
+        current_top: f32,
+        max_top: f32,
+        page: Nav,
+        window_active: bool,
+    ) -> Option<f32> {
+        let target_top = self.move_to(y, max_top, page, window_active)?;
+        Some(target_top - current_top)
     }
 }
 
@@ -303,6 +361,75 @@ mod tests {
             drag.begin(180.0, 10.0, page, DragTarget::PlaylistGrid);
             assert_eq!(drag.target(), Some(target));
             assert_eq!(drag.move_to(130.0, 500.0, page, true), Some(20.0));
+        }
+    }
+
+    /// 变高列表按增量写回：目标减当前位置，就是这一帧该滚的距离。
+    #[test]
+    fn move_by_returns_the_step_from_the_current_offset() {
+        let mut drag = dragging(100.0, 50.0);
+        assert_eq!(
+            drag.move_by(130.0, 50.0, 500.0, SETTINGS, true),
+            Some(-30.0)
+        );
+        // 列表已经走到 20；再往下拖 10px，只该滚 10。
+        assert_eq!(
+            drag.move_by(140.0, 20.0, 500.0, SETTINGS, true),
+            Some(-10.0)
+        );
+    }
+
+    /// 被测量上限夹掉时，`wanted_top` 仍记着真正想去的位置；
+    /// 后面内容量出来了，下一帧还能把欠的这段补上。
+    #[test]
+    fn clamped_drag_remembers_where_it_wanted_to_go() {
+        let mut drag = dragging(100.0, 10.0);
+        // 往上拖 200px：想去 210，但眼下只量到 100。
+        assert_eq!(drag.move_to(-100.0, 100.0, SETTINGS, true), Some(100.0));
+        assert_eq!(drag.wanted_top(), Some(210.0));
+        // 下一帧量出更多内容，上限变 300：这一帧该滚 110，正好补完。
+        assert_eq!(
+            drag.move_by(-100.0, 100.0, 300.0, SETTINGS, true),
+            Some(110.0)
+        );
+        assert_eq!(drag.wanted_top(), Some(210.0));
+    }
+
+    /// 一次大幅拖动被截短后，上限变大时几帧之内能补到想去的位置。
+    #[test]
+    fn clamped_drag_catches_up_across_frames() {
+        let mut drag = dragging(100.0, 10.0);
+        // 第一帧：想去 110，但只量到 100，先滚 90，差 10 记着。
+        assert_eq!(drag.move_by(0.0, 10.0, 100.0, SETTINGS, true), Some(90.0));
+        // 第二帧：内容量多了，上限 120；把差的 10 补上。
+        assert_eq!(drag.move_by(0.0, 100.0, 120.0, SETTINGS, true), Some(10.0));
+        // 第三帧：已经到想去的位置，不再动。
+        assert_eq!(drag.move_by(0.0, 110.0, 120.0, SETTINGS, true), Some(0.0));
+        assert_eq!(drag.wanted_top(), Some(110.0));
+    }
+
+    /// 六个变高列表能被认出来；普通滚动句柄不算。
+    #[test]
+    fn list_targets_are_marked() {
+        let lists = [
+            DragTarget::Scenes,
+            DragTarget::LikedDetail,
+            DragTarget::LibraryDetail,
+            DragTarget::SearchPlaylistDetail,
+            DragTarget::ArtistDetail,
+            DragTarget::AlbumDetail,
+        ];
+        for target in lists {
+            assert!(target.is_list(), "{target:?}");
+        }
+        for target in [
+            DragTarget::Settings,
+            DragTarget::Queue,
+            DragTarget::Lyrics,
+            DragTarget::SearchTracks,
+            DragTarget::PlaylistGrid,
+        ] {
+            assert!(!target.is_list(), "{target:?}");
         }
     }
 }

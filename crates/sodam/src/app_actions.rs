@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    status_label, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root, REMOTE_TEXT,
-    RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
+    status_label, BatchUpgradeProgress, LoginState, MiddleDragSettle, Nav, QueueOrigin, Root,
+    REMOTE_TEXT, RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -1231,12 +1231,14 @@ impl Root {
         let count = common_rows + card_rows + 3;
         let columns_changed = old_columns != (columns, columns);
         if columns_changed {
+            self.finish_middle_drag_for(DragTarget::Scenes);
             self.scenes_list.reset(count);
         } else if count > self.scenes_list_items {
             let old_count = self.scenes_list_items;
             self.scenes_list
                 .splice(old_count..old_count, count - old_count);
         } else if count < self.scenes_list_items {
+            self.finish_middle_drag_for(DragTarget::Scenes);
             self.scenes_list.reset(count);
         }
         self.scenes_list_items = count;
@@ -2179,10 +2181,10 @@ impl Root {
         offset
     }
 
-    /// 这次拖动该写回哪个滚动句柄。统一成普通 `ScrollHandle`，
-    /// 读最大偏移和写偏移只走这一份，不按目标各写一套。
-    fn drag_scroll_handle(&self, target: DragTarget) -> gpui::ScrollHandle {
-        match target {
+    /// 普通滚动句柄目标（设置页、队列、搜索页、歌词页）。
+    /// 六个变高虚拟列表不走这里，它们只吃增量。
+    fn drag_scroll_handle(&self, target: DragTarget) -> Option<gpui::ScrollHandle> {
+        Some(match target {
             DragTarget::Settings => self.settings_scroll.clone(),
             DragTarget::Queue => self.queue_base_handle(),
             DragTarget::SearchGroups => self.search_groups_scroll.clone(),
@@ -2192,13 +2194,70 @@ impl Root {
             DragTarget::SearchPlaylists => self.search_playlists_scroll.clone(),
             DragTarget::PlaylistGrid => self.playlist_grid_scroll.clone(),
             DragTarget::Lyrics => self.lyrics_scroll.clone(),
+            _ => return None,
+        })
+    }
+
+    /// 六个变高虚拟列表各自的滚动状态。
+    fn drag_list_state(&self, target: DragTarget) -> Option<&gpui::ListState> {
+        Some(match target {
+            DragTarget::Scenes => &self.scenes_list,
+            DragTarget::LikedDetail => &self.liked_detail_list,
+            DragTarget::LibraryDetail => &self.library_detail_list,
+            DragTarget::SearchPlaylistDetail => &self.search_playlist_detail_list,
+            DragTarget::ArtistDetail => &self.artist_detail_list,
+            DragTarget::AlbumDetail => &self.album_detail_list,
+            _ => return None,
+        })
+    }
+
+    /// 这个目标眼下离顶部多远。
+    fn drag_top(&self, target: DragTarget) -> f32 {
+        if let Some(handle) = self.drag_scroll_handle(target) {
+            return Self::top_from_offset(&handle);
+        }
+        if let Some(list) = self.drag_list_state(target) {
+            return -f32::from(list.scroll_px_offset_for_scrollbar().y);
+        }
+        0.0
+    }
+
+    /// 这个目标最多能滚多远。
+    /// 变高列表用的是「已测量高度」，会随滚动变大；差的那段靠下一帧补（#168）。
+    fn drag_max_top(&self, target: DragTarget) -> f32 {
+        if let Some(handle) = self.drag_scroll_handle(target) {
+            return f32::from(handle.max_offset().y);
+        }
+        if let Some(list) = self.drag_list_state(target) {
+            return f32::from(list.max_offset_for_scrollbar().y);
+        }
+        0.0
+    }
+
+    /// 把「离顶部距离」写回目标：普通句柄写绝对偏移，列表按增量滚。
+    fn apply_drag_top(&self, target: DragTarget, top: f32) {
+        if let Some(handle) = self.drag_scroll_handle(target) {
+            handle.set_offset(Self::offset_with_top(handle.offset(), top));
+            return;
+        }
+        if let Some(list) = self.drag_list_state(target) {
+            let delta = top - self.drag_top(target);
+            list.scroll_by(gpui::px(delta));
+        }
+    }
+
+    /// 只结束「正好是这个目标」的拖动。
+    /// 异步回调迟到时，用户可能已经在别的列表上开拖了，不能一把全停。
+    pub(crate) fn finish_middle_drag_for(&mut self, target: DragTarget) {
+        if self.middle_drag.target() == Some(target) {
+            self.middle_drag.finish();
+            self.middle_drag_settle = None;
         }
     }
 
     /// 上报「中键按下」：记下起点和这个区域当时的滚动位置。
     fn begin_middle_drag_on(&mut self, target: DragTarget, y: f32) {
-        let handle = self.drag_scroll_handle(target);
-        let top = Self::top_from_offset(&handle);
+        let top = self.drag_top(target);
         let nav = self.nav;
         self.middle_drag.begin(y, top, nav, target);
     }
@@ -2238,36 +2297,145 @@ impl Root {
     }
 
     /// 中键按着移动时推进一次：算出新偏移，按当前拖动绑定的滚动区写回。
-    pub(crate) fn middle_drag_move(&mut self, y: f32, window_active: bool, cx: &mut Context<Self>) {
+    pub(crate) fn middle_drag_move(
+        &mut self,
+        y: f32,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         let nav = self.nav;
+        let window_active = window.is_window_active();
         let Some(target) = self.middle_drag.target() else {
             return;
         };
         let is_lyrics = target == DragTarget::Lyrics;
-        let handle = self.drag_scroll_handle(target);
         // 歌词页按下后，自动跟唱补间仍可能推进列表；起步前每次移动都按此刻的真实偏移
         // 刷新锚点，真正越过死区时用的就是最新值，首帧只跟指针走（#169）。
         if is_lyrics {
-            self.middle_drag.rebase_unstarted_top(
-                Self::top_from_offset(&handle),
-                nav,
-                window_active,
-            );
+            let top = self.drag_top(target);
+            self.middle_drag
+                .rebase_unstarted_top(top, nav, window_active);
         }
         // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
-        let max_top = f32::from(handle.max_offset().y);
-        let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
+        let max_top = self.drag_max_top(target);
+        if target.is_list() {
+            // 变高列表只吃增量：算出这一帧该滚多少，写回后再补被测量上限夹掉的那段。
+            let current_top = self.drag_top(target);
+            let Some(delta) = self
+                .middle_drag
+                .move_by(y, current_top, max_top, nav, window_active)
+            else {
+                return;
+            };
+            self.apply_drag_top(target, current_top + delta);
+            self.schedule_list_settle(target, y, window, cx);
+        } else {
+            let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
+                return;
+            };
+            // 歌词页真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
+            // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
+            // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
+            if is_lyrics {
+                self.pause_lyrics_follow();
+            }
+            // 再写回同一个句柄：1:1 跟手、不跳项、不回弹、不越界。
+            self.apply_drag_top(target, top);
+        }
+        cx.notify();
+    }
+
+    /// 列表这一帧被测量上限截短了：记下来，下一帧内容量多了接着滚（#168）。
+    fn schedule_list_settle(
+        &mut self,
+        target: DragTarget,
+        y: f32,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let short = self
+            .middle_drag
+            .wanted_top()
+            .map_or(0.0, |wanted| (wanted - self.drag_top(target)).max(0.0));
+        if short <= 0.5 {
+            self.middle_drag_settle = None;
+            return;
+        }
+        // 已经排过下一帧：只把指针位置刷新到最新，别重复排队。
+        if let Some(settle) = self
+            .middle_drag_settle
+            .as_mut()
+            .filter(|settle| settle.target == target)
+        {
+            settle.y = y;
+            return;
+        }
+        self.middle_drag_settle = Some(MiddleDragSettle {
+            target,
+            y,
+            frames: 0,
+            stalled: 0,
+        });
+        cx.on_next_frame(window, move |root, window, cx| {
+            root.settle_list_drag(target, window, cx);
+        });
+    }
+
+    /// 补欠账：内容量多了就接着滚，直到走到想去的位置、真到底，或者不再长高。
+    fn settle_list_drag(
+        &mut self,
+        target: DragTarget,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let window_active = window.is_window_active();
+        let Some(settle) = self.middle_drag_settle else {
             return;
         };
-        // 歌词页真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
-        // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
-        // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
-        if is_lyrics {
-            self.pause_lyrics_follow();
+        let y = settle.y;
+        if settle.target != target {
+            return;
         }
-        // 再写回同一个句柄：1:1 跟手、不跳项、不回弹、不越界。
-        handle.set_offset(Self::offset_with_top(handle.offset(), top));
+        // 松手、切页、失焦、换目标：欠账作废，别再滚。
+        if self.middle_drag.target() != Some(target) {
+            self.middle_drag_settle = None;
+            return;
+        }
+        let max_top = self.drag_max_top(target);
+        let nav = self.nav;
+        let Some(target_top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
+            self.middle_drag_settle = None;
+            return;
+        };
+        let before = self.drag_top(target);
+        self.apply_drag_top(target, target_top);
+        let after = self.drag_top(target);
         cx.notify();
+        let wanted = self.middle_drag.wanted_top().unwrap_or(after);
+        // 高度全量完并且已经在底部：真到底，停止补。
+        let at_end = self
+            .drag_list_state(target)
+            .is_some_and(|list| list.is_scrolled_to_end() == Some(true));
+        let stalled = if (after - before).abs() < 0.5 {
+            settle.stalled + 1
+        } else {
+            0
+        };
+        let frames = settle.frames + 1;
+        // 一帧没动可能只是布局还没跑；连着两帧没动就不再等。
+        if wanted - after <= 0.5 || at_end || stalled >= 2 || frames >= 180 {
+            self.middle_drag_settle = None;
+            return;
+        }
+        self.middle_drag_settle = Some(MiddleDragSettle {
+            target,
+            y,
+            frames,
+            stalled,
+        });
+        cx.on_next_frame(window, move |root, window, cx| {
+            root.settle_list_drag(target, window, cx);
+        });
     }
 
     /// 统一页面切换：保留返回栈，详情页使用通用返回组件。
@@ -2538,6 +2706,10 @@ impl Root {
 
     /// 通用返回：同页详情优先关闭，再按真实访问历史回退。
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
+        // 关掉同页详情时页签没变，渲染里的 sync_context 认不出来；中键还按着
+        // 就会继续滚已经不显示的列表。这里先手动停手，切页时这句是幂等的。
+        self.middle_drag.finish();
+        self.middle_drag_settle = None;
         if self.nav == Nav::Search && self.search_playlist.is_some() {
             self.search_playlist = None;
             self.loading_search_playlist = false;
@@ -2586,6 +2758,7 @@ impl Root {
                 Nav::Library => self.load_playlists(cx),
                 Nav::Liked => {
                     // 收藏页使用独立列表状态；已加载数据也要重建到页首。
+                    self.finish_middle_drag_for(DragTarget::LikedDetail);
                     self.liked_detail_list.reset(self.liked.len() + 1);
                     self.load_liked(cx);
                 }
@@ -2839,6 +3012,7 @@ impl Root {
 
     /// 拉「我喜欢的音乐」。
     pub fn load_liked(&mut self, cx: &mut Context<Self>) {
+        self.finish_middle_drag_for(DragTarget::LikedDetail);
         self.liked_detail_list.reset(self.liked.len() + 1);
         // `liked` 可能被点爱心提前预填；是否完整加载必须单独标记。
         if self.loading_liked || self.liked_loaded {
@@ -2869,6 +3043,7 @@ impl Root {
                         root.liked_ids =
                             Arc::new(tracks.iter().map(|track| track.id.clone()).collect());
                         root.liked_ids_failed = false;
+                        root.finish_middle_drag_for(DragTarget::LikedDetail);
                         root.liked_detail_list.reset(tracks.len() + 1);
                         root.set_status("我喜欢的音乐：{} 首", &[tracks.len().to_string()]);
                         // 只取头部封面（列表封面由「可见行」按需排队）
@@ -2993,6 +3168,9 @@ impl Root {
         if self.loading_search_playlist {
             return;
         }
+        // 从搜索结果点进歌单详情，可拖的列表换了，旧起点作废。
+        self.middle_drag.finish();
+        self.middle_drag_settle = None;
         let playlist_id = playlist.id.clone();
         self.search_playlist = Some((
             playlist_id.clone(),
@@ -3015,6 +3193,7 @@ impl Root {
                 match result {
                     Ok(tracks) => {
                         let count = tracks.len();
+                        root.finish_middle_drag_for(DragTarget::SearchPlaylistDetail);
                         root.search_playlist_detail_list.reset(count + 1);
                         let head: Vec<String> = tracks
                             .first()
@@ -3064,6 +3243,9 @@ impl Root {
         if self.loading_playlist {
             return;
         }
+        // 从歌单网格点进详情，可拖的列表换了，旧起点作废。
+        self.middle_drag.finish();
+        self.middle_drag_settle = None;
         let playlist_title = known_title.unwrap_or_else(|| {
             self.playlists
                 .iter()
@@ -3079,6 +3261,7 @@ impl Root {
             playlist_title.clone(),
             Arc::new(Vec::new()),
         ));
+        self.finish_middle_drag_for(DragTarget::LibraryDetail);
         self.library_detail_list.reset(1);
         self.loading_playlist = true;
         self.set_status_text(self.tr("正在读取歌单曲目…"));
@@ -3117,6 +3300,7 @@ impl Root {
                         }
                         let final_count = tracks.len();
                         root.open_playlist = Some((playlist_id, playlist_title, Arc::new(tracks)));
+                        root.finish_middle_drag_for(DragTarget::LibraryDetail);
                         root.library_detail_list.reset(final_count + 1);
                     }
                     Err(err) => {
