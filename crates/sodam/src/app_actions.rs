@@ -2409,6 +2409,7 @@ impl Root {
         let Some(target) = self.middle_drag.target() else {
             return;
         };
+        let already_scrolling = self.middle_drag.is_scrolling();
         let is_lyrics = target == DragTarget::Lyrics;
         let nav = self.nav;
         let window_active = window.is_window_active();
@@ -2423,7 +2424,12 @@ impl Root {
         if is_lyrics && just_started {
             self.pause_lyrics_follow();
         }
-        cx.notify();
+        // 起步后帧循环每帧都在跑（`Root::render` 里 `request_animation_frame`），
+        // 指针位置下一帧就会被读到；1000Hz 鼠标每秒上千次移动再逐个标脏是重复排队（#189）。
+        // 起步那次和「起步后帧循环还没跑过第一帧」的移动仍然标脏，保证滚动当场开始。
+        if !already_scrolling || self.middle_drag_last_frame.is_none() {
+            cx.notify();
+        }
     }
 
     /// 距离驱动的自动滚动 dt 上限（毫秒）：渲染卡了一拍也只按这个时长推进，
