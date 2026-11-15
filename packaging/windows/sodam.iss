@@ -115,11 +115,13 @@ begin
     'Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" | ' +
     'Where-Object { $_.ExecutablePath -eq $target } | ' +
     'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }' + #13#10 +
-    'for ($i = 0; $i -lt 25; $i++) {' + #13#10 +
-    '  $alive = Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" | ' +
+    '$sw = [System.Diagnostics.Stopwatch]::StartNew()' + #13#10 +
+    'while ($sw.ElapsedMilliseconds -lt 5000) {' + #13#10 +
+    '  $alive = Get-CimInstance Win32_Process -Filter "Name=''sodam.exe''" ' +
+    '-OperationTimeoutSec 3 | ' +
     'Where-Object { $_.ExecutablePath -eq $target }' + #13#10 +
     '  $locked = $false' + #13#10 +
-    '  if (Test-Path $target) {' + #13#10 +
+    '  if (Test-Path -LiteralPath $target) {' + #13#10 +
     '    try { $fs = [System.IO.File]::Open($target, ''Open'', ''ReadWrite'', ''None''); $fs.Close() } catch {' + #13#10 +
     '      $inner = $_.Exception.InnerException' + #13#10 +
     '      if ($inner -is [System.UnauthorizedAccessException]) { $locked = $false }' + #13#10 +

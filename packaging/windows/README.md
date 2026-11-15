@@ -18,8 +18,8 @@ ISCC.exe /DMyAppVersion=<版本> packaging/windows/sodam.iss
   安装后可在 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{A1AAB6BA-...}_is1`
   的 `InstallLocation` 与 `DisplayVersion` 确认目标目录和实际版本。
 - **安装时会自动结束安装目录下的 `sodam.exe`**（issue #184）：在开始拷文件前按完整路径精确
-  匹配并强制结束，等待最多 5 秒确认进程退出、文件解锁；不弹「准备安装」页，也没有重启管理
-  器的 30 秒等待。
+  匹配并强制结束，按墙钟等待约 5 秒确认进程退出、文件解锁；不弹「准备安装」页，也没有重启
+  管理器的 30 秒等待。
   交互和静默安装行为一致，中途取消安装不会杀进程。
 - **只杀安装目录下的那个实例**：按 `ExecutablePath` 全路径比对，装在别处的 SodaM 不受影响。
   杀不掉时才会中止安装（比如另一个登录会话里还开着 SodaM），此时不改动任何文件，报错提示
