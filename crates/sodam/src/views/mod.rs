@@ -9,6 +9,7 @@ use gpui::{
 use crate::app::{LoginState, Nav, Root};
 use crate::ui::artwork::{cover, scene_image};
 use crate::ui::icons;
+use crate::ui::middle_drag::DragTarget;
 use crate::ui::spinner::loading_state;
 use crate::ui::theme;
 use crate::ui::theme::ThemeKind;
@@ -396,13 +397,12 @@ fn track_row(
         .into_any_element()
 }
 
-/// 曲目列表（虚拟滚动）。
+/// 曲目列表（虚拟滚动，搜索页「歌曲」列表）。
 #[allow(clippy::too_many_arguments)]
 fn track_list(
     root: &Root,
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     nav: Nav,
-    scroll: Option<&gpui::UniformListScrollHandle>,
     liked_ids: std::sync::Arc<std::collections::HashSet<String>>,
     covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
     cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -446,7 +446,7 @@ fn track_list(
     .min_h(px(0.0))
     .flex_1()
     .min_h(px(0.0))
-    .when_some(scroll.cloned(), |this, handle| this.track_scroll(&handle));
+    .track_scroll(&root.search_tracks_scroll);
 
     div()
         .relative()
@@ -457,6 +457,13 @@ fn track_list(
         .w_full()
         .gap(px(theme::space::XS))
         .child(track_header(cols, root.language))
+        // 按下时上报自己是这次拖动的目标；移动、松开由根元素统一收。
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+                root.begin_middle_drag_for(DragTarget::SearchTracks, f32::from(event.position.y));
+            }),
+        )
         .child(
             canvas(
                 move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
@@ -1194,6 +1201,17 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
                 .min_h(px(0.0))
                 .gap(px(theme::space::SM))
                 .overflow_y_scroll()
+                .track_scroll(&root.playlist_grid_scroll)
+                // 按下时上报自己是这次拖动的目标；移动、松开由根元素统一收。
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+                        root.begin_middle_drag_for(
+                            DragTarget::PlaylistGrid,
+                            f32::from(event.position.y),
+                        );
+                    }),
+                )
                 .child(playlist_grid(root, cx))
                 .into_any_element(),
         },

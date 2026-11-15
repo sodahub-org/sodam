@@ -2159,21 +2159,48 @@ impl Root {
         self.queue_scroll.0.borrow().base_handle.clone()
     }
 
-    /// 设置页上报「中键按下」：记下起点和当时的滚动位置。
-    pub(crate) fn begin_middle_drag(&mut self, y: f32) {
-        // GPUI 的偏移是负的：0 在最顶上，越往下滚越负。
-        let top = -f32::from(self.settings_scroll.offset().y);
-        let nav = self.nav;
-        self.middle_drag.begin(y, top, nav, DragTarget::Settings);
+    /// 搜索页「歌曲」列表也是虚拟列表，同样借 `base_handle` 做像素滚动。
+    fn search_tracks_base_handle(&self) -> gpui::ScrollHandle {
+        self.search_tracks_scroll.0.borrow().base_handle.clone()
     }
 
-    /// 队列抽屉上报「中键按下」：记下起点和抽屉当时的滚动位置。
-    pub(crate) fn begin_middle_drag_queue(&mut self, y: f32) {
-        // 队列用 `UniformListScrollHandle`，内部滚动由 `base_handle` 驱动，
-        // 偏移同样是负的：0 在最顶上，越往下滚越负。
-        let top = -f32::from(self.queue_base_handle().offset().y);
+    /// 这次拖动该写回哪个滚动句柄。统一成普通 `ScrollHandle`，
+    /// 读最大偏移和写偏移只走这一份，不按目标各写一套。
+    fn drag_scroll_handle(&self, target: DragTarget) -> gpui::ScrollHandle {
+        match target {
+            DragTarget::Settings => self.settings_scroll.clone(),
+            DragTarget::Queue => self.queue_base_handle(),
+            DragTarget::SearchGroups => self.search_groups_scroll.clone(),
+            DragTarget::SearchTracks => self.search_tracks_base_handle(),
+            DragTarget::SearchArtists => self.search_artists_scroll.clone(),
+            DragTarget::SearchAlbums => self.search_albums_scroll.clone(),
+            DragTarget::SearchPlaylists => self.search_playlists_scroll.clone(),
+            DragTarget::PlaylistGrid => self.playlist_grid_scroll.clone(),
+            DragTarget::Lyrics => self.lyrics_scroll.clone(),
+        }
+    }
+
+    /// 上报「中键按下」：记下起点和这个区域当时的滚动位置。
+    fn begin_middle_drag_on(&mut self, target: DragTarget, y: f32) {
+        // GPUI 的偏移是负的：0 在最顶上，越往下滚越负。
+        let top = -f32::from(self.drag_scroll_handle(target).offset().y);
         let nav = self.nav;
-        self.middle_drag.begin(y, top, nav, DragTarget::Queue);
+        self.middle_drag.begin(y, top, nav, target);
+    }
+
+    /// 设置页上报「中键按下」。
+    pub(crate) fn begin_middle_drag(&mut self, y: f32) {
+        self.begin_middle_drag_on(DragTarget::Settings, y);
+    }
+
+    /// 队列抽屉上报「中键按下」。
+    pub(crate) fn begin_middle_drag_queue(&mut self, y: f32) {
+        self.begin_middle_drag_on(DragTarget::Queue, y);
+    }
+
+    /// 搜索页各个列表和歌单网格上报「中键按下」，按 `target` 分清是谁。
+    pub(crate) fn begin_middle_drag_for(&mut self, target: DragTarget, y: f32) {
+        self.begin_middle_drag_on(target, y);
     }
 
     /// 歌词页上报「中键按下」：只记下起点和歌词当时的滚动位置。
@@ -2181,10 +2208,7 @@ impl Root {
     /// 这里**不动**自动跟唱：按下没拖（或者抖动不到 2px）就什么都不该发生，
     /// 让位留到真正滚起来那一刻（见 [`Self::middle_drag_move`]）。
     pub(crate) fn begin_middle_drag_lyrics(&mut self, y: f32) {
-        // 偏移同样是负的：0 在最顶上，越往下滚越负。
-        let top = -f32::from(self.lyrics_scroll.offset().y);
-        let nav = self.nav;
-        self.middle_drag.begin(y, top, nav, DragTarget::Lyrics);
+        self.begin_middle_drag_on(DragTarget::Lyrics, y);
     }
 
     /// 用户自己动手了（滚轮或中键拖动）：先停 5 秒自动跟唱，再停掉滚动动画。
@@ -2203,37 +2227,22 @@ impl Root {
         let Some(target) = self.middle_drag.target() else {
             return;
         };
+        let handle = self.drag_scroll_handle(target);
         // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
-        let max_top = match target {
-            DragTarget::Settings => f32::from(self.settings_scroll.max_offset().y),
-            DragTarget::Queue => f32::from(self.queue_base_handle().max_offset().y),
-            DragTarget::Lyrics => f32::from(self.lyrics_scroll.max_offset().y),
-        };
+        let max_top = f32::from(handle.max_offset().y);
         let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
             return;
         };
-        // 再按同一目标写回对应句柄：1:1 跟手、不跳项、不回弹、不越界。
-        match target {
-            DragTarget::Settings => {
-                let mut offset = self.settings_scroll.offset();
-                offset.y = gpui::px(-top);
-                self.settings_scroll.set_offset(offset);
-            }
-            DragTarget::Queue => {
-                let mut offset = self.queue_base_handle().offset();
-                offset.y = gpui::px(-top);
-                self.queue_base_handle().set_offset(offset);
-            }
-            DragTarget::Lyrics => {
-                // 真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
-                // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
-                // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
-                self.pause_lyrics_follow();
-                let mut offset = self.lyrics_scroll.offset();
-                offset.y = gpui::px(-top);
-                self.lyrics_scroll.set_offset(offset);
-            }
+        // 歌词页真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
+        // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
+        // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
+        if target == DragTarget::Lyrics {
+            self.pause_lyrics_follow();
         }
+        // 再写回同一个句柄：1:1 跟手、不跳项、不回弹、不越界。
+        let mut offset = handle.offset();
+        offset.y = gpui::px(-top);
+        handle.set_offset(offset);
         cx.notify();
     }
 
