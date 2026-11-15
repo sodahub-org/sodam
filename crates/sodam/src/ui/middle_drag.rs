@@ -71,7 +71,7 @@ fn scroll_speed(distance: f32) -> f32 {
 }
 
 /// 按下时记下的起点。`y` 是速度的参照点：指针离它越远滚得越快，
-/// 参照点本身不动。`top` 是起步那一刻的内容位置，起步前可能被重定。
+/// 参照点本身不动；`wanted` 从按下时的内容位置起步，起步前可能被重定。
 #[derive(Clone, Copy)]
 struct Anchor {
     y: f32,
