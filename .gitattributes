@@ -1,0 +1,34 @@
+# 行尾与二进制规则（text=auto 搭配 eol 需要 Git >= 2.10）。
+# 仓库只存 LF；规则生效后新检出的文件一律 LF，不受各人 core.autocrlf 影响。
+# 已有工作区不会自动改写，Windows 上重新克隆一次最省事。
+* text=auto eol=lf
+
+# Windows 专属文件保持 CRLF：cmd 的 goto/label 对纯 LF 不可靠，
+# Inno Setup（sodam.iss / .isl）是发版时才在 Windows 上编译的，按 Windows 习惯给 CRLF。
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.iss   text eol=crlf
+*.isl   text eol=crlf
+
+# 二进制：显式声明，避免被当成文本来回转换。
+# 注意 gitattributes 不支持 {a,b} 大括号写法，必须一行一个。
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.exe   binary
+*.dll   binary
+*.node  binary
+*.pdb   binary
+*.msi   binary
+*.so    binary
+*.dylib binary
+*.bin   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.7z    binary
