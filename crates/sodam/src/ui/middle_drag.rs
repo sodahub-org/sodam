@@ -46,24 +46,6 @@ pub enum DragTarget {
     AlbumDetail,
 }
 
-impl DragTarget {
-    /// 这次拖动的目标是不是变高虚拟列表（`ListState`）。
-    ///
-    /// 列表只认增量、而且「最多能滚多远」会随测量变大，所以写回和到边
-    /// 处理都跟普通滚动句柄分开走。
-    pub fn is_list(self) -> bool {
-        matches!(
-            self,
-            DragTarget::Scenes
-                | DragTarget::LikedDetail
-                | DragTarget::LibraryDetail
-                | DragTarget::SearchPlaylistDetail
-                | DragTarget::ArtistDetail
-                | DragTarget::AlbumDetail
-        )
-    }
-}
-
 /// 起步死区：鼠标没挪够 2px 就不滚，免得中键轻点让页面抖一下。
 const DEAD_ZONE: f32 = 2.0;
 
@@ -538,31 +520,6 @@ mod tests {
             assert_eq!(drag.target(), Some(target));
             drag.update_pointer(200.0, page, true);
             assert!(drag.advance(16.0, 500.0, page, true).is_some());
-        }
-    }
-
-    /// 六个变高列表能被认出来；普通滚动句柄不算。
-    #[test]
-    fn list_targets_are_marked() {
-        let lists = [
-            DragTarget::Scenes,
-            DragTarget::LikedDetail,
-            DragTarget::LibraryDetail,
-            DragTarget::SearchPlaylistDetail,
-            DragTarget::ArtistDetail,
-            DragTarget::AlbumDetail,
-        ];
-        for target in lists {
-            assert!(target.is_list(), "{target:?}");
-        }
-        for target in [
-            DragTarget::Settings,
-            DragTarget::Queue,
-            DragTarget::Lyrics,
-            DragTarget::SearchTracks,
-            DragTarget::PlaylistGrid,
-        ] {
-            assert!(!target.is_list(), "{target:?}");
         }
     }
 }
