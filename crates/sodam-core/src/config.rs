@@ -1,5 +1,6 @@
 //! 应用配置（`~/.config/sodam/config.json`）。
 
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,12 @@ pub struct Settings {
     pub device_id: String,
     pub iid: String,
     pub fp: String,
+    /// 扫码登录用的设备身份（passport），与上面的签名设备 `device_id/iid/fp` 是两套东西。
+    ///
+    /// 汽水服务端按 `device_id` 做风控；同一个身份持续使用后才补发 `odin_tt`。
+    /// 首次生成后写入 config.json，退出登录不清除，只有显式重置登录设备才轮换。
+    pub login_device_id: String,
+    pub login_install_id: String,
     /// 音质偏好：只存**意图**——`auto` 或一个具体档位
     ///（`hires` / `lossless` / `dolby` / `highest` / `medium` / `low`）。
     ///
@@ -255,6 +262,8 @@ impl Default for Settings {
             device_id: String::new(),
             iid: String::new(),
             fp: String::new(),
+            login_device_id: String::new(),
+            login_install_id: String::new(),
             // 只存意图，不存实际档位：新写入一律 auto，空串只作历史写法来读
             //（见 crate::quality）。不再按会员等级推导一个具体档位写回。
             quality: crate::quality::AUTO.to_string(),
@@ -293,21 +302,56 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Self {
-        let Some(settings) = std::fs::read_to_string(path)
+        let settings = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Self>(&text).ok())
-        else {
-            return Self::default();
-        };
+            .unwrap_or_default();
         let (mut settings, migrated) = settings.migrated();
+        let mut changed = migrated;
+        // 老版本把登录设备身份存在 libresoda 自己的文件里；首次升级时搬进 config.json，
+        // 保住已经积累的服务端设备信誉。之后二维码只使用配置里的这份身份。
+        if settings.ensure_login_device() {
+            changed = true;
+            // 只记「初始化过」这件事，不记 device_id/install_id 本身。
+            log_event(
+                LogLevel::Info,
+                LogTopic::App,
+                "login_device_initialized",
+                &[],
+            );
+        }
         settings.normalize_playback();
         settings.normalize_search_history();
         // 迁移后立刻落盘：用户下次打开配置文件看到的、以及设置页显示的，都是真正生效的那份。
         // 写失败不影响启动，内存里的值已经是迁移后的。
-        if migrated {
+        if changed {
             let _ = settings.save_to(path);
         }
         settings
+    }
+
+    /// 确保配置里有合法的扫码登录设备身份；返回是否发生了生成/迁移。
+    ///
+    /// 优先迁移 libresoda 旧文件里的身份，其次生成一份新的。生成结果由调用方
+    /// 随配置落盘（`load_from` 会自动保存）。
+    pub fn ensure_login_device(&mut self) -> bool {
+        let current = self.login_device();
+        if current.is_valid() {
+            return false;
+        }
+        let device = libresoda::soda::qr_login::load_persisted_device()
+            .unwrap_or_else(libresoda::soda::qr_login::QrDevice::generate);
+        self.login_device_id = device.device_id;
+        self.login_install_id = device.install_id;
+        true
+    }
+
+    /// 当前扫码登录设备身份（可能无效，调用前先 [`Self::ensure_login_device`]）。
+    pub fn login_device(&self) -> libresoda::soda::qr_login::QrDevice {
+        libresoda::soda::qr_login::QrDevice {
+            device_id: self.login_device_id.clone(),
+            install_id: self.login_install_id.clone(),
+        }
     }
 
     /// 把老配置里已经失效的写法改到当前形式：内置签名端点、快捷键的显示形式。
@@ -531,6 +575,8 @@ impl Settings {
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
+            ("SODA_LOGIN_DEVICE_ID", &mut self.login_device_id),
+            ("SODA_LOGIN_INSTALL_ID", &mut self.login_install_id),
         ];
         for (key, slot) in pairs {
             if slot.trim().is_empty() {
@@ -541,6 +587,7 @@ impl Settings {
                 }
             }
         }
+        self.ensure_login_device();
         if self.quality_source != crate::quality::QualitySource::User
             && self.quality_intent() == crate::quality::QualityIntent::Auto
         {
@@ -615,6 +662,22 @@ mod tests {
         assert!(settings.set_search_history_enabled(true));
         assert!(settings.record_search("third"));
         assert_eq!(settings.search_history, vec!["third"]);
+    }
+
+    #[test]
+    fn login_device_identity_is_generated_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut settings = Settings::default();
+        assert!(settings.ensure_login_device(), "空配置应生成登录设备身份");
+        let device = settings.login_device();
+        assert!(device.is_valid(), "生成的设备身份形态必须合法");
+        assert!(!settings.ensure_login_device(), "已有合法身份时不应再轮换");
+
+        settings.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.login_device(), device, "重载后设备身份必须保持稳定");
     }
 
     #[test]
@@ -864,14 +927,18 @@ mod tests {
         assert_eq!(loaded_derived.quality_source(), QualitySource::Derived);
 
         // 旧配置里的空串：读成自动，来源为未知，且文件不被无故改写
-        std::fs::write(&path, r#"{"quality":""}"#).expect("写入旧配置");
+        std::fs::write(
+            &path,
+            r#"{"quality":"","login_device_id":"1234567890123456","login_install_id":"123456789012345"}"#,
+        )
+        .expect("写入旧配置");
         let legacy = Settings::load_from(&path);
         assert_eq!(legacy.quality, "");
         assert_eq!(legacy.quality_intent(), QualityIntent::Auto);
         assert_eq!(legacy.quality_source(), QualitySource::Unknown);
         assert_eq!(
             std::fs::read_to_string(&path).expect("读回"),
-            r#"{"quality":""}"#,
+            r#"{"quality":"","login_device_id":"1234567890123456","login_install_id":"123456789012345"}"#,
             "没有别的迁移时不应改写文件"
         );
 

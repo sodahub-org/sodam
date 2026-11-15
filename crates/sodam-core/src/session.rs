@@ -399,6 +399,11 @@ impl Session {
             fp: settings.fp.clone(),
             ..Default::default()
         });
+        // 登录设备身份由 sodam 配置持有；libresoda 只接收，不替应用决定存哪里。
+        // 配置异常时兜底生成一份，避免整次登录直接失败（下一次配置保存会修正）。
+        if pumpkin.set_qr_device(settings.login_device()).is_err() {
+            let _ = pumpkin.set_qr_device(libresoda::soda::qr_login::QrDevice::generate());
+        }
 
         let url = settings.signer_url.trim();
         if !url.is_empty() {
@@ -410,11 +415,10 @@ impl Session {
         if let crate::quality::QualityIntent::Tier(tier) = settings.quality_intent() {
             pumpkin.set_quality_preference(tier);
         }
-        // 登录必须走签名页（等价上游 Meting-API 的 signQishuiRequest）：本地直连护照接口
-        // 会一路 error_code=7，且确认后的登录态只能由签名页的浏览器会话承接。
-        // sodam 固定使用 libresoda 内置 Rust CDP 签名页：直控 Chromium，无 Node 依赖；
-        // 浏览器路径可用 QISHUI_CHROMIUM_PATH 指定。
-        pumpkin.enable_cdp_signer();
+        // 登录走 libresoda 的纯 HTTP 实现：passport 请求由本进程直接发出，Cookie 由本进程
+        // 持有；遇到二次验证（2046）时用系统默认浏览器打开本机验证页，验证页的请求经
+        // libresoda 的本地桥接代发。不依赖 Chromium / CDP。
+        pumpkin.enable_http_login();
 
         Self { pumpkin, settings }
     }

@@ -162,7 +162,7 @@ UI 规范见 [`docs/UI-SPEC.md`](docs/UI-SPEC.md)。
 - macOS：Apple Silicon（M 系列），macOS 12+；构建需完整版 Xcode（Metal shader 编译，
   仅装 Command Line Tools 会报 `xcrun: unable to find utility "metal"`）
 - Windows：Windows 10+ x64；源码构建需 VS 2022 Build Tools（C++ 工作负载）
-- Chromium / Chrome / Edge 等浏览器用于扫码登录签名页
+- 系统默认浏览器用于扫码登录的二次验证页（无需安装 Chromium/Chrome）
 - `libresoda` 与 `sodam` 同级 clone（可选）：本地联调时可用
   `[patch."https://github.com/sodahub-org/libresoda"]` 指向 `../libresoda`，
   改动 libresoda 即时生效，无需等新版本。

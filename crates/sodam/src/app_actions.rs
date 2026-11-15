@@ -11,6 +11,7 @@ use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
+use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
@@ -762,19 +763,31 @@ impl Root {
                 }
             };
             let token = created.token.clone();
+            let expires_at = created.expire_time;
             let _ = this.update(cx, |root, cx| {
                 root.login = LoginState::Waiting {
                     matrix,
                     token: token.clone(),
                     status: language.text("等待扫码…").to_string(),
+                    expires_at,
+                    need_second_verify: false,
+                    verify_window_opened: false,
                 };
                 root.set_status_text(language.text("请用汽水音乐 App 扫码并确认").to_string());
                 cx.notify();
             });
+            let expires_at_text = expires_at.to_string();
+            log_event(
+                LogLevel::Info,
+                LogTopic::App,
+                "login_qr_created",
+                &[("expires_at", expires_at_text.as_str())],
+            );
 
             // 轮询：libresoda 内部有 2.5s 最小间隔 + 5s 限流冷却，这里 3s 一次足够温和
             // 二次验证窗口只自动拉起一次（误关可重试登录流程）；完成后轮询自动领取结果
             let mut verify_window_opened = false;
+            let mut last_login_phase = String::new();
             for _ in 0..80 {
                 // 6 秒一次：3 秒会触发服务端限流（error_code=7），确认握手会被丢掉
                 cx.background_executor()
@@ -808,7 +821,52 @@ impl Root {
                 };
                 let cookie = result.cookie.trim().to_string();
                 let finished = result.is_finished();
+                let status_key = match result.status {
+                    LoginStatus::Waiting => "waiting",
+                    LoginStatus::Scanned => "scanned",
+                    LoginStatus::Success => "success",
+                    LoginStatus::Expired => "expired",
+                    LoginStatus::Failed => "failed",
+                };
+                let phase = if result.need_second_verify {
+                    "second_verify"
+                } else if result.rate_limited {
+                    "rate_limited"
+                } else if verify_window_opened && !finished {
+                    "second_verify_submitted"
+                } else {
+                    status_key
+                };
+                if last_login_phase != phase {
+                    log_event(
+                        LogLevel::Info,
+                        LogTopic::App,
+                        "login_poll",
+                        &[
+                            ("phase", phase),
+                            ("status", status_key),
+                            (
+                                "rate_limited",
+                                if result.rate_limited { "true" } else { "false" },
+                            ),
+                        ],
+                    );
+                    last_login_phase = phase.to_string();
+                }
                 if finished {
+                    log_event(
+                        LogLevel::Info,
+                        LogTopic::App,
+                        "login_success",
+                        &[(
+                            "second_verify",
+                            if verify_window_opened {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                        )],
+                    );
                     let _ = this.update(cx, |root, cx| {
                         match root.session.as_mut() {
                             Some(session) => {
@@ -875,9 +933,17 @@ impl Root {
                         Session::new(open_settings).open_second_verify(&open_token)
                     });
                     let message = match open.await {
-                        Ok(_) => language
-                            .text("已打开二次验证窗口，请在其中完成验证")
-                            .to_string(),
+                        Ok(_) => {
+                            log_event(
+                                LogLevel::Info,
+                                LogTopic::App,
+                                "login_second_verify_opened",
+                                &[],
+                            );
+                            language
+                                .text("已打开二次验证窗口，请在其中完成验证")
+                                .to_string()
+                        }
                         Err(err) => {
                             // 这里没有 `root` 可借；脱敏由日志出口在写盘前统一做，
                             // 不依赖调用方是否拿得到 `root`。
@@ -894,18 +960,43 @@ impl Root {
                         }
                     };
                     let _ = this.update(cx, |root, cx| {
-                        root.set_status_text(message);
+                        root.set_status_text(message.clone());
+                        if let LoginState::Waiting {
+                            status: slot,
+                            need_second_verify: flag,
+                            verify_window_opened: opened,
+                            ..
+                        } = &mut root.login
+                        {
+                            *flag = true;
+                            *opened = true;
+                            *slot = message;
+                        }
                         cx.notify();
                     });
                 }
                 let _ = this.update(cx, |root, cx| {
-                    if let LoginState::Waiting { status: slot, .. } = &mut root.login {
-                        *slot = status;
+                    if let LoginState::Waiting {
+                        status: slot,
+                        need_second_verify: flag,
+                        verify_window_opened: opened,
+                        ..
+                    } = &mut root.login
+                    {
+                        *flag = result.need_second_verify;
+                        if result.need_second_verify && *opened {
+                            *slot = language
+                                .text("验证窗口已打开；完成后这里会自动更新")
+                                .to_string();
+                        } else {
+                            *slot = status;
+                        }
                     }
                     cx.notify();
                 });
                 if expired {
                     // 过期就自动换一张新码（会话只有 3 分钟，用户常常来不及扫/确认）
+                    log_event(LogLevel::Warn, LogTopic::App, "login_qr_expired", &[]);
                     let _ = this.update(cx, |root, cx| {
                         root.set_status_text(
                             language.text("二维码已过期，正在自动换新码…").to_string(),

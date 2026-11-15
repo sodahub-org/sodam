@@ -27,6 +27,9 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
             matrix,
             status,
             token,
+            expires_at,
+            need_second_verify,
+            verify_window_opened,
         } => div()
             .w(px(360.0))
             .flex()
@@ -79,7 +82,29 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
                                 root.tr("会话 {}…"),
                                 &[token.chars().take(10).collect::<String>()],
                             )),
-                    ),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::Text::Tiny.size())
+                            .text_color(if *verify_window_opened {
+                                theme::text_muted()
+                            } else {
+                                theme::text_faint()
+                            })
+                            .child(qr_expiry_text(root, *expires_at)),
+                    )
+                    .when(*need_second_verify, |this| {
+                        this.child(
+                            div()
+                                .text_size(theme::Text::Tiny.size())
+                                .text_color(theme::warning())
+                                .child(if *verify_window_opened {
+                                    root.tr("验证窗口已打开；完成后这里会自动更新")
+                                } else {
+                                    root.tr("需要二次验证，正在打开验证窗口…")
+                                }),
+                        )
+                    }),
             )
             .child(close_button(root.language, cx))
             .into_any_element(),
@@ -139,6 +164,29 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
     )
     .with_priority(10)
     .into_any_element()
+}
+
+/// 二维码剩余时间文案（按秒；由轮询每 6 秒触发的重绘更新）。
+fn qr_expiry_text(root: &Root, expires_at: i64) -> String {
+    if expires_at <= 0 {
+        return root.tr("二维码有效期未知").to_string();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let remaining = (expires_at - now).max(0);
+    if remaining == 0 {
+        return root.tr("二维码已过期，正在自动换新码…").to_string();
+    }
+    if remaining >= 60 {
+        root.localized(
+            "二维码剩余 {} 分 {} 秒",
+            &[(remaining / 60).to_string(), (remaining % 60).to_string()],
+        )
+    } else {
+        root.localized("二维码剩余 {} 秒", &[remaining.to_string()])
+    }
 }
 
 fn close_button(language: crate::ui::i18n::Language, cx: &mut Context<Root>) -> impl IntoElement {
