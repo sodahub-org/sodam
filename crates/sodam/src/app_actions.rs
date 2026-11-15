@@ -4095,6 +4095,9 @@ impl Root {
                 self.clear_identity_state(cx);
             } else {
                 self.invalidate_identity_conclusions();
+                // A 的账号信息（昵称/VIP）不再代表当前身份：先清空，刷新成功写入
+                // B 的信息；刷新失败时 VIP 状态按未知处理，不按 A 的算（#185 审计）。
+                self.account = None;
                 // 旧账号的歌单/收藏缓存是身份私有数据：换号不清，新账号会直接
                 // 看到旧账号的列表（加载守卫会拦住重拉）。保留当前播放。
                 self.playlists.clear();
@@ -4111,6 +4114,15 @@ impl Root {
         if quality_changed {
             self.spawn_prefetch(cx);
         }
+
+        // 接受了外部改动，备份也跟上：热重载不写盘，备份不同步的话，
+        // 之后主文件损坏走恢复会退回加载时的旧值（#185 审计）。IO 放后台。
+        let backup_path = Settings::config_path();
+        let backup_settings = self.settings.clone();
+        cx.background_spawn(async move {
+            let _ = sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
+        })
+        .detach();
 
         // 同一来源的重复提示只保留一条。
         let message = self.tr("配置文件已更新，改动已生效").to_string();

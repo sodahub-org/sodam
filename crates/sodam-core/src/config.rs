@@ -459,7 +459,13 @@ pub enum StartupRecovery {
 /// 默认值启动且绝不碰坏文件。恢复编排收在领域层，UI 只拿结果拼文案。
 pub fn load_for_startup(path: &Path) -> (Settings, Option<StartupRecovery>) {
     if let LoadOutcome::Corrupt { error } = Settings::try_load_from(path) {
-        return match load_settings_backup(path) {
+        // 备份走与主文件完全相同的加载管线（try_load_from：字段容错 + 迁移 +
+        // 数值钳制 + 搜索历史清理），备份里存了什么形态都不能绕过归一化。
+        let backup = match Settings::try_load_from(&settings_backup_path(path)) {
+            LoadOutcome::Loaded { settings, .. } => Some(settings),
+            _ => None,
+        };
+        return match backup {
             Some(mut backup) => {
                 backup.ensure_login_device();
                 let bad_path = quarantine_corrupt_file(path).unwrap_or_else(|| path.to_path_buf());
@@ -716,6 +722,10 @@ impl Settings {
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(&serde_json::to_vec_pretty(self)?)?;
         file.persist(path).map_err(|err| err.error)?;
+        // 备份同步刷新到最新一份可用配置：备份只在加载时写的话，运行期间的
+        // 保存（换 Cookie、改设置）之后主文件损坏，恢复会退回加载时的旧值（#185）。
+        // 已在写锁内，走 locked 变体，不重复加锁。
+        let _ = write_settings_backup_locked(path, self);
         // 热重载轮询要靠这个区分「自己写的」和「外部改的」。
         note_self_write();
         Ok(())
@@ -1465,6 +1475,33 @@ mod tests {
             std::fs::read_to_string(&bad).unwrap(),
             "not json at all",
             "坏文件内容应原样保留"
+        );
+    }
+
+    /// 备份恢复走同一套加载管线：备份里的越界数值同样钳制，
+    /// 关闭搜索历史后残留的记录同样清理，不会被原样启用（#185 审计）。
+    #[test]
+    fn load_for_startup_normalizes_backup_before_recovering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            settings_backup_path(&path),
+            r#"{"cookie":"sessionid_ss=x","volume":5.0,"audio_cache_limit_mb":1,"search_history_enabled":false,"search_history":["stale"]}"#,
+        )
+        .unwrap();
+        std::fs::write(&path, "corrupt!").unwrap();
+
+        let (settings, recovery) = load_for_startup(&path);
+        assert!(
+            matches!(recovery, Some(StartupRecovery::RecoveredFromBackup { .. })),
+            "备份可用应走恢复分支"
+        );
+        assert_eq!(settings.cookie, "sessionid_ss=x");
+        assert_eq!(settings.volume, 1.0, "备份里的越界音量要钳制");
+        assert_eq!(settings.audio_cache_limit_mb, 1024);
+        assert!(
+            settings.search_history.is_empty(),
+            "关闭搜索历史后不得残留旧记录"
         );
     }
 
