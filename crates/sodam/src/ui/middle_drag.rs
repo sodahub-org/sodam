@@ -2,6 +2,10 @@
 //!
 //! 这里不碰窗口，也不持有滚动句柄，全是普通数字，所以能直接单测。
 //! 界面层把事件喂进来，再把算出的偏移写回滚动句柄。
+//!
+//! 位移不是 1:1 直通：锚点 ±80px 内严格跟手，拖远了按
+//! [`scaled_offset`] 的曲线放大（上限 2.5 倍），长页面省力；曲线是
+//! 奇函数，拖回按下点内容精确回到起点。
 
 use crate::app::Nav;
 
@@ -61,6 +65,36 @@ impl DragTarget {
 
 /// 起步死区：鼠标没挪够 2px 就不滚，免得中键轻点让页面抖一下。
 const DEAD_ZONE: f32 = 2.0;
+
+/// 严格 1:1 的范围：锚点 ±80px 内不加速，微调精度和加速上线之前完全一样
+/// （票面给定的值）。
+const ONE_TO_ONE_RANGE: f32 = 80.0;
+
+/// 加速上限：大幅拖动时内容最多走 2.5 倍速。票面要求 2~3 倍，取中点起步——
+/// 长页面从顶拖到底明显省力，又不至于一步窜过头；要调手感先改这里。
+const MAX_SPEEDUP: f32 = 2.5;
+
+/// 倍率从 1 爬到上限要再挪的距离：超出 1:1 区再拖 400px（|x| 达 480px）到满速。
+/// 大约一屏的距离就到顶，之后不再变快，避免「越拖越猛」的失控感。
+const RAMP_DISTANCE: f32 = 400.0;
+
+/// 指针位移到滚动位移的换算曲线 `g(x) = f(x) · x`。
+///
+/// 倍率 `f` 是偶函数，随 |x| 从 1 平滑爬到 [`MAX_SPEEDUP`]：|x| 不超过
+/// [`ONE_TO_ONE_RANGE`] 时严格 1:1，之后用 smoothstep 爬升，两端导数为 0，
+/// 在 1:1 边界上一阶连续，起步不顿挫。`f ≥ 1` 且爬升段 `f' ≥ 0`，
+/// 所以 `g` 连续、严格单调、是奇函数——指针往前走内容不会往回折，
+/// 拖回按下点位移正好抵消。
+fn scaled_offset(x: f32) -> f32 {
+    let beyond = x.abs() - ONE_TO_ONE_RANGE;
+    if beyond <= 0.0 {
+        return x;
+    }
+    let t = (beyond / RAMP_DISTANCE).min(1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    let factor = 1.0 + (MAX_SPEEDUP - 1.0) * smooth;
+    x * factor
+}
 
 /// 按下时记下的起点。`top` 是内容离顶部的距离，0 表示已经在最顶上。
 #[derive(Clone, Copy)]
@@ -149,7 +183,7 @@ impl MiddleDrag {
             self.0 = Some(anchor);
         }
         // 往下拖，内容跟着往下走，离顶部就近了；往上拖反过来。
-        let wanted = (anchor.top - moved).max(0.0);
+        let wanted = (anchor.top - scaled_offset(moved)).max(0.0);
         anchor.wanted = wanted;
         self.0 = Some(anchor);
         Some(wanted.min(max_top))
@@ -178,7 +212,7 @@ impl MiddleDrag {
 
 #[cfg(test)]
 mod tests {
-    use super::{DragTarget, MiddleDrag};
+    use super::{scaled_offset, DragTarget, MiddleDrag};
     use crate::app::Nav;
 
     const SETTINGS: Nav = Nav::Settings;
@@ -226,6 +260,78 @@ mod tests {
         let mut drag = dragging(100.0, 80.0);
         assert_eq!(drag.move_to(130.0, 500.0, SETTINGS, true), Some(50.0));
         assert_eq!(drag.move_to(70.0, 500.0, SETTINGS, true), Some(110.0));
+    }
+
+    /// 大幅拖动提速：超出 1:1 区后内容走得比指针快。280px 位移被放大到 490px
+    /// （倍率爬到 1.75），上下两个方向对称。
+    #[test]
+    fn large_drags_move_faster_than_the_pointer() {
+        let mut drag = dragging(100.0, 600.0);
+        // 往下拖 280px：想去 600 - 490 = 110。
+        assert_eq!(drag.move_to(380.0, 5000.0, SETTINGS, true), Some(110.0));
+        // 往上拖 280px：想去 600 + 490 = 1090。
+        let mut drag = dragging(100.0, 600.0);
+        assert_eq!(drag.move_to(-180.0, 5000.0, SETTINGS, true), Some(1090.0));
+    }
+
+    /// 大幅拖出去再拖回按下点，内容精确回到起点：曲线是奇函数，去程和回程正好抵消。
+    #[test]
+    fn dragging_back_to_the_press_point_restores_the_start() {
+        let mut drag = dragging(100.0, 600.0);
+        assert_eq!(drag.move_to(380.0, 5000.0, SETTINGS, true), Some(110.0));
+        assert_eq!(drag.move_to(-180.0, 5000.0, SETTINGS, true), Some(1090.0));
+        // 回到按下点：位移 0，无论曲线多陡都精确回原位。
+        assert_eq!(drag.move_to(100.0, 5000.0, SETTINGS, true), Some(600.0));
+    }
+
+    /// 曲线在 ±80px 内严格 1:1；一出去就开始爬，88px 处已经略快于指针。
+    #[test]
+    fn curve_is_one_to_one_inside_the_range_then_climbs() {
+        for x in [0.0, 2.0, 40.0, 79.0, 80.0, -2.0, -80.0] {
+            assert_eq!(scaled_offset(x), x, "x = {x}");
+        }
+        assert!(scaled_offset(88.0) > 88.0);
+        assert!(scaled_offset(-88.0) < -88.0);
+    }
+
+    /// 曲线是奇函数：上下方向对称，拖回按下点位移才能精确抵消。
+    #[test]
+    fn curve_is_odd() {
+        assert!(scaled_offset(0.0).abs() < 1e-6);
+        for x in [1.0, 80.0, 88.0, 280.0, 479.0, 1000.0, 5000.0] {
+            let forward = scaled_offset(x);
+            let backward = scaled_offset(-x);
+            assert!(
+                (forward + backward).abs() < 1e-4,
+                "x = {x}, g = {forward}, g(-x) = {backward}"
+            );
+        }
+    }
+
+    /// 曲线严格单调：指针往前走，内容永远不往回折。
+    #[test]
+    fn curve_is_strictly_monotonic() {
+        let mut prev = scaled_offset(-5000.0);
+        for step in 1..=500 {
+            let x = -5000.0 + step as f32 * 20.0;
+            let next = scaled_offset(x);
+            assert!(next > prev, "x = {x}, g = {next}, prev = {prev}");
+            prev = next;
+        }
+    }
+
+    /// 倍率平滑爬到上限后不再变：中间点 280px 处 1.75 倍，
+    /// 拖得很远时稳定在 2.5 倍，落在票面要求的 2~3 之间。
+    #[test]
+    fn curve_saturates_between_two_and_three() {
+        let middle = scaled_offset(280.0) / 280.0;
+        assert!((middle - 1.75).abs() < 1e-4, "f(280) = {middle}");
+        let cap = scaled_offset(2000.0) / 2000.0;
+        assert!((cap - 2.5).abs() < 1e-4, "cap = {cap}");
+        for x in [480.0_f32, 1000.0, 5000.0] {
+            let factor = scaled_offset(x) / x;
+            assert!((2.0..=3.0).contains(&factor), "x = {x}, f = {factor}");
+        }
     }
 
     /// 到顶就停住，不会滚出负的偏移。
@@ -384,28 +490,42 @@ mod tests {
     #[test]
     fn clamped_drag_remembers_where_it_wanted_to_go() {
         let mut drag = dragging(100.0, 10.0);
-        // 往上拖 200px：想去 210，但眼下只量到 100。
-        assert_eq!(drag.move_to(-100.0, 100.0, SETTINGS, true), Some(100.0));
-        assert_eq!(drag.wanted_top(), Some(210.0));
-        // 下一帧量出更多内容，上限变 300：这一帧该滚 110，正好补完。
+        // 往上拖 280px：加速后想去 500（10 + 490），但眼下只量到 100。
+        assert_eq!(drag.move_to(-180.0, 100.0, SETTINGS, true), Some(100.0));
+        assert_eq!(drag.wanted_top(), Some(500.0));
+        // 下一帧量出更多内容，上限变 600：这一帧该滚 400，正好补完。
         assert_eq!(
-            drag.move_by(-100.0, 100.0, 300.0, SETTINGS, true),
-            Some(110.0)
+            drag.move_by(-180.0, 100.0, 600.0, SETTINGS, true),
+            Some(400.0)
         );
-        assert_eq!(drag.wanted_top(), Some(210.0));
+        assert_eq!(drag.wanted_top(), Some(500.0));
     }
 
-    /// 一次大幅拖动被截短后，上限变大时几帧之内能补到想去的位置。
+    /// 加速后的一次大幅拖动被截短，上限逐步变大时几帧之内能补到想去的位置。
     #[test]
     fn clamped_drag_catches_up_across_frames() {
         let mut drag = dragging(100.0, 10.0);
-        // 第一帧：想去 110，但只量到 100，先滚 90，差 10 记着。
-        assert_eq!(drag.move_by(0.0, 10.0, 100.0, SETTINGS, true), Some(90.0));
-        // 第二帧：内容量多了，上限 120；把差的 10 补上。
-        assert_eq!(drag.move_by(0.0, 100.0, 120.0, SETTINGS, true), Some(10.0));
-        // 第三帧：已经到想去的位置，不再动。
-        assert_eq!(drag.move_by(0.0, 110.0, 120.0, SETTINGS, true), Some(0.0));
-        assert_eq!(drag.wanted_top(), Some(110.0));
+        // 第一帧：往上拖 280px（加速后想去 500），但只量到 100，先滚 90，差 400 记着。
+        assert_eq!(
+            drag.move_by(-180.0, 10.0, 100.0, SETTINGS, true),
+            Some(90.0)
+        );
+        // 第二帧：内容量到 300，补 200。
+        assert_eq!(
+            drag.move_by(-180.0, 100.0, 300.0, SETTINGS, true),
+            Some(200.0)
+        );
+        // 第三帧：上限到 500，把最后的 200 补完。
+        assert_eq!(
+            drag.move_by(-180.0, 300.0, 500.0, SETTINGS, true),
+            Some(200.0)
+        );
+        // 第四帧：已经到想去的位置，不再动。
+        assert_eq!(
+            drag.move_by(-180.0, 500.0, 500.0, SETTINGS, true),
+            Some(0.0)
+        );
+        assert_eq!(drag.wanted_top(), Some(500.0));
     }
 
     /// 六个变高列表能被认出来；普通滚动句柄不算。
