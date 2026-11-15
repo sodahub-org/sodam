@@ -2164,6 +2164,21 @@ impl Root {
         self.search_tracks_scroll.0.borrow().base_handle.clone()
     }
 
+    /// 把 GPUI 的滚动偏移换成「离顶部距离」。
+    /// 偏移是负的：0 在最顶上，越往下滚越负。
+    fn top_from_offset(handle: &gpui::ScrollHandle) -> f32 {
+        -f32::from(handle.offset().y)
+    }
+
+    /// 把「离顶部距离」写回 GPUI 的滚动偏移；横轴保持不变。
+    fn offset_with_top(
+        mut offset: gpui::Point<gpui::Pixels>,
+        top: f32,
+    ) -> gpui::Point<gpui::Pixels> {
+        offset.y = gpui::px(-top);
+        offset
+    }
+
     /// 这次拖动该写回哪个滚动句柄。统一成普通 `ScrollHandle`，
     /// 读最大偏移和写偏移只走这一份，不按目标各写一套。
     fn drag_scroll_handle(&self, target: DragTarget) -> gpui::ScrollHandle {
@@ -2182,8 +2197,8 @@ impl Root {
 
     /// 上报「中键按下」：记下起点和这个区域当时的滚动位置。
     fn begin_middle_drag_on(&mut self, target: DragTarget, y: f32) {
-        // GPUI 的偏移是负的：0 在最顶上，越往下滚越负。
-        let top = -f32::from(self.drag_scroll_handle(target).offset().y);
+        let handle = self.drag_scroll_handle(target);
+        let top = Self::top_from_offset(&handle);
         let nav = self.nav;
         self.middle_drag.begin(y, top, nav, target);
     }
@@ -2207,6 +2222,7 @@ impl Root {
     ///
     /// 这里**不动**自动跟唱：按下没拖（或者抖动不到 2px）就什么都不该发生，
     /// 让位留到真正滚起来那一刻（见 [`Self::middle_drag_move`]）。
+    /// 按下到首次移动之间补间还会推进列表；起步前的每次移动都会按此刻偏移重定锚点（#169）。
     pub(crate) fn begin_middle_drag_lyrics(&mut self, y: f32) {
         self.begin_middle_drag_on(DragTarget::Lyrics, y);
     }
@@ -2227,7 +2243,17 @@ impl Root {
         let Some(target) = self.middle_drag.target() else {
             return;
         };
+        let is_lyrics = target == DragTarget::Lyrics;
         let handle = self.drag_scroll_handle(target);
+        // 歌词页按下后，自动跟唱补间仍可能推进列表；起步前每次移动都按此刻的真实偏移
+        // 刷新锚点，真正越过死区时用的就是最新值，首帧只跟指针走（#169）。
+        if is_lyrics {
+            self.middle_drag.rebase_unstarted_top(
+                Self::top_from_offset(&handle),
+                nav,
+                window_active,
+            );
+        }
         // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
         let max_top = f32::from(handle.max_offset().y);
         let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
@@ -2236,13 +2262,11 @@ impl Root {
         // 歌词页真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
         // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
         // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
-        if target == DragTarget::Lyrics {
+        if is_lyrics {
             self.pause_lyrics_follow();
         }
         // 再写回同一个句柄：1:1 跟手、不跳项、不回弹、不越界。
-        let mut offset = handle.offset();
-        offset.y = gpui::px(-top);
-        handle.set_offset(offset);
+        handle.set_offset(Self::offset_with_top(handle.offset(), top));
         cx.notify();
     }
 

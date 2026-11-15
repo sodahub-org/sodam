@@ -62,6 +62,22 @@ impl MiddleDrag {
         }
     }
 
+    /// 起步前把锚点里「离顶部距离」换成此刻的真实值。
+    ///
+    /// 按下之后、真正挪过死区之前，列表可能自己动了（歌词页的跟唱补间就是这样）。
+    /// 起步前的移动都会重定一次，拖动就从眼前的画面开始，不会把这段时间的位移一并抹掉。
+    /// 已经起步就不动锚点：中途再改会让拖动一路漂移；页面换了或窗口失焦也直接清掉，
+    /// 不往失效的锚点里写值。
+    pub fn rebase_unstarted_top(&mut self, top: f32, page: Nav, window_active: bool) {
+        self.sync_context(page, window_active);
+        if let Some(mut anchor) = self.0 {
+            if !anchor.started {
+                anchor.top = top;
+                self.0 = Some(anchor);
+            }
+        }
+    }
+
     /// 当前拖动绑在哪个滚动区；没在拖就是 `None`。
     /// `move_to` 只负责算偏移，真正写回交给上层按这个目标分流。
     pub fn target(&self) -> Option<DragTarget> {
@@ -114,6 +130,12 @@ mod tests {
     fn dragging(at: f32, top: f32) -> MiddleDrag {
         let mut drag = MiddleDrag::default();
         drag.begin(at, top, SETTINGS, DragTarget::Settings);
+        drag
+    }
+
+    fn lyrics_dragging(at: f32, top: f32) -> MiddleDrag {
+        let mut drag = MiddleDrag::default();
+        drag.begin(at, top, LYRICS, DragTarget::Lyrics);
         drag
     }
 
@@ -210,12 +232,51 @@ mod tests {
         assert_eq!(drag.move_to(130.0, 500.0, SETTINGS, true), Some(20.0));
     }
 
+    /// 按下后列表自己动了（歌词页跟唱补间）：起步前重定锚点，
+    /// 首帧从眼前的位置算，不会把这段位移当成拖动。
+    #[test]
+    fn rebase_before_start_uses_latest_top() {
+        let mut drag = lyrics_dragging(100.0, 50.0);
+        drag.rebase_unstarted_top(118.0, LYRICS, true);
+        assert_eq!(drag.move_to(108.0, 500.0, LYRICS, true), Some(110.0));
+    }
+
+    /// 死区里的小移动不滚；锚点在每次移动前被刷新到最新位置，
+    /// 真正越过死区时用最后那个值。
+    #[test]
+    fn rebase_after_dead_zone_move_uses_latest_top() {
+        let mut drag = lyrics_dragging(100.0, 50.0);
+        assert_eq!(drag.move_to(101.0, 500.0, LYRICS, true), None);
+        drag.rebase_unstarted_top(62.0, LYRICS, true);
+        assert_eq!(drag.move_to(103.0, 500.0, LYRICS, true), Some(59.0));
+    }
+
+    /// 已经起步后重定无效：拖动中途再改锚点，位移仍按起步那一刻算。
+    #[test]
+    fn rebase_after_start_is_ignored() {
+        let mut drag = lyrics_dragging(100.0, 50.0);
+        assert_eq!(drag.move_to(108.0, 500.0, LYRICS, true), Some(42.0));
+        drag.rebase_unstarted_top(200.0, LYRICS, true);
+        assert_eq!(drag.move_to(116.0, 500.0, LYRICS, true), Some(34.0));
+    }
+
+    /// 页面换了或窗口失焦：重定会先把失效的拖动清掉，不往旧锚点里写值。
+    #[test]
+    fn rebase_after_context_change_is_ignored() {
+        let mut drag = lyrics_dragging(100.0, 50.0);
+        drag.rebase_unstarted_top(118.0, HOME, true);
+        assert_eq!(drag.move_to(108.0, 500.0, HOME, true), None);
+
+        let mut drag = lyrics_dragging(100.0, 50.0);
+        drag.rebase_unstarted_top(118.0, LYRICS, false);
+        assert_eq!(drag.move_to(108.0, 500.0, LYRICS, true), None);
+    }
+
     /// 歌词页按下时上报的是歌词区，上层靠它把偏移写回 `lyrics_scroll`；
     /// 松手之后目标也要跟着清掉。
     #[test]
     fn lyrics_drag_reports_its_target() {
-        let mut drag = MiddleDrag::default();
-        drag.begin(100.0, 40.0, LYRICS, DragTarget::Lyrics);
+        let mut drag = lyrics_dragging(100.0, 40.0);
         assert_eq!(drag.target(), Some(DragTarget::Lyrics));
         assert_eq!(drag.move_to(130.0, 500.0, LYRICS, true), Some(10.0));
         drag.finish();
