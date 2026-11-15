@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    status_label, BatchUpgradeProgress, LoginState, MiddleDragSettle, Nav, QueueOrigin, Root,
-    REMOTE_TEXT, RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
+    status_label, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root, REMOTE_TEXT,
+    RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -2337,10 +2337,10 @@ impl Root {
         }
     }
 
-    /// 结束当前拖动（不管是哪个目标），连补欠账一起清掉。
+    /// 结束当前拖动（不管是哪个目标），帧循环的计时也一并清掉。
     pub(crate) fn finish_middle_drag(&mut self) {
         self.middle_drag.finish();
-        self.middle_drag_settle = None;
+        self.middle_drag_last_frame = None;
     }
 
     /// 只结束「正好是这个目标」的拖动。
@@ -2353,8 +2353,8 @@ impl Root {
 
     /// 上报「中键按下」：记下起点和这个区域当时的滚动位置。
     fn begin_middle_drag_on(&mut self, target: DragTarget, y: f32) {
-        // 上一次手势的补欠账可能还在排队；新按下就作废，别让它用旧起点推进新拖动。
-        self.middle_drag_settle = None;
+        // 上一次手势的帧计时可能还留着；新按下就清掉，首帧从 dt = 0 起步。
+        self.middle_drag_last_frame = None;
         let top = self.drag_top(target);
         let nav = self.nav;
         self.middle_drag.begin(y, top, nav, target);
@@ -2394,152 +2394,72 @@ impl Root {
         self.cancel_lyrics_scroll_tween();
     }
 
-    /// 中键按着移动时推进一次：算出新偏移，按当前拖动绑定的滚动区写回。
+    /// 中键按着移动时更新指针位置（#182）。
+    ///
+    /// 距离驱动语义下指针只决定速度，不直接决定位置；位置的推进由帧循环
+    /// （`Root::render` 每帧的 [`Self::advance_middle_drag_scroll`]）负责，
+    /// 指针停住不动也继续滚。刚越过死区那一刻歌词页先让位一次，
+    /// 之后的持续让位由帧循环每帧续。
     pub(crate) fn middle_drag_move(
         &mut self,
         y: f32,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let nav = self.nav;
-        let window_active = window.is_window_active();
         let Some(target) = self.middle_drag.target() else {
             return;
         };
         let is_lyrics = target == DragTarget::Lyrics;
+        let nav = self.nav;
+        let window_active = window.is_window_active();
         // 歌词页按下后，自动跟唱补间仍可能推进列表；起步前每次移动都按此刻的真实偏移
-        // 刷新锚点，真正越过死区时用的就是最新值，首帧只跟指针走（#169）。
+        // 重定积分起点，真正越过死区时从最新位置开始，首帧不跳（#169）。
         if is_lyrics {
             let top = self.drag_top(target);
             self.middle_drag
                 .rebase_unstarted_top(top, nav, window_active);
         }
-        // 先按目标读最大可滚距离，算出新的离顶距离（move_to 只算数，不碰句柄）。
-        let max_top = self.drag_max_top(target);
-        if target.is_list() {
-            // 变高列表只吃增量：算出这一帧该滚多少，写回后再补被测量上限夹掉的那段。
-            let current_top = self.drag_top(target);
-            let Some(delta) = self
-                .middle_drag
-                .move_by(y, current_top, max_top, nav, window_active)
-            else {
-                return;
-            };
-            self.apply_drag_top(target, current_top + delta);
-            self.schedule_list_settle(target, y, window, cx);
-        } else {
-            let Some(top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
-                return;
-            };
-            // 歌词页真的滚起来了才让位：跟唱停 5 秒，正在跑的过渡动画当场取消。
-            // 放在写回偏移之前，同一次事件里就把动画停掉，下一帧不会再来抢偏移；
-            // 拖动期间每次移动都续一次，拖多久都不会被拽回当前句。
-            if is_lyrics {
-                self.pause_lyrics_follow();
-            }
-            // 再写回同一个句柄：1:1 跟手、不跳项、不回弹、不越界。
-            self.apply_drag_top(target, top);
+        let just_started = self.middle_drag.update_pointer(y, nav, window_active);
+        if is_lyrics && just_started {
+            self.pause_lyrics_follow();
         }
         cx.notify();
     }
 
-    /// 列表这一帧被测量上限截短了：记下来，下一帧内容量多了接着滚（#168）。
-    fn schedule_list_settle(
-        &mut self,
-        target: DragTarget,
-        y: f32,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let short = self
-            .middle_drag
-            .wanted_top()
-            .map_or(0.0, |wanted| (wanted - self.drag_top(target)).max(0.0));
-        if short <= 0.5 {
-            self.middle_drag_settle = None;
-            return;
-        }
-        // 已经排过下一帧：只把指针位置刷新到最新，别重复排队。
-        if let Some(settle) = self
-            .middle_drag_settle
-            .as_mut()
-            .filter(|settle| settle.target == target)
-        {
-            settle.y = y;
-            return;
-        }
-        self.middle_drag_settle_seq += 1;
-        let id = self.middle_drag_settle_seq;
-        self.middle_drag_settle = Some(MiddleDragSettle {
-            target,
-            y,
-            id,
-            frames: 0,
-            stalled: 0,
-        });
-        cx.on_next_frame(window, move |root, window, cx| {
-            root.settle_list_drag(target, id, window, cx);
-        });
-    }
+    /// 距离驱动的自动滚动 dt 上限（毫秒）：渲染卡了一拍也只按这个时长推进，
+    /// 不会把卡住的时间一口气滚完。
+    const MAX_DRAG_FRAME_DT_MS: f32 = 50.0;
 
-    /// 补欠账：内容量多了就接着滚，直到走到想去的位置、真到底，或者不再长高。
-    fn settle_list_drag(
-        &mut self,
-        target: DragTarget,
-        id: u64,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let window_active = window.is_window_active();
-        let Some(settle) = self.middle_drag_settle else {
+    /// 帧循环推进一次中键自动滚动（#182）。
+    ///
+    /// 由 `Root::render` 在 `is_scrolling()` 时每帧调用：按当前指针离参照点的
+    /// 距离算速度，乘上距上一帧的 dt，积分出这一帧的目标位置并写回。
+    /// 指针停住不动时没有鼠标事件，滚动全靠这里。松手、切页、失焦后
+    /// `middle_drag` 已被清掉，直接收摊，下一帧循环自然停。
+    pub(crate) fn advance_middle_drag_scroll(&mut self, window: &mut gpui::Window) {
+        let Some(target) = self.middle_drag.target() else {
+            self.middle_drag_last_frame = None;
             return;
         };
-        let y = settle.y;
-        // 这是上一轮排的旧回调：这一轮已经换过编号，直接作废。
-        if settle.target != target || settle.id != id {
-            return;
-        }
-        // 松手、切页、失焦、换目标：欠账作废，别再滚。
-        if self.middle_drag.target() != Some(target) {
-            self.middle_drag_settle = None;
-            return;
-        }
-        let max_top = self.drag_max_top(target);
         let nav = self.nav;
-        let Some(target_top) = self.middle_drag.move_to(y, max_top, nav, window_active) else {
-            self.middle_drag_settle = None;
+        let window_active = window.is_window_active();
+        let max_top = self.drag_max_top(target);
+        let now = std::time::Instant::now();
+        let dt_ms = self
+            .middle_drag_last_frame
+            .map_or(0.0, |last| (now - last).as_secs_f32() * 1000.0)
+            .min(Self::MAX_DRAG_FRAME_DT_MS);
+        self.middle_drag_last_frame = Some(now);
+        let Some(top) = self.middle_drag.advance(dt_ms, max_top, nav, window_active) else {
+            self.middle_drag_last_frame = None;
             return;
         };
-        let before = self.drag_top(target);
-        self.apply_drag_top(target, target_top);
-        let after = self.drag_top(target);
-        cx.notify();
-        let wanted = self.middle_drag.wanted_top().unwrap_or(after);
-        // 高度全量完并且已经在底部：真到底，停止补。
-        let at_end = self
-            .drag_list_state(target)
-            .is_some_and(|list| list.is_scrolled_to_end() == Some(true));
-        let stalled = if (after - before).abs() < 0.5 {
-            settle.stalled + 1
-        } else {
-            0
-        };
-        let frames = settle.frames + 1;
-        // 一帧没动可能只是布局还没跑；连着两帧没动就不再等。
-        if wanted - after <= 0.5 || at_end || stalled >= 2 || frames >= 180 {
-            self.middle_drag_settle = None;
-            return;
+        // 歌词页：拖动期间每帧续一次让位。指针停住不动时没有鼠标事件来续，
+        // 不在这里续的话跟唱 5 秒一到就会把视图拽回当前句。
+        if target == DragTarget::Lyrics {
+            self.pause_lyrics_follow();
         }
-        self.middle_drag_settle = Some(MiddleDragSettle {
-            target,
-            y,
-            id,
-            frames,
-            stalled,
-        });
-        cx.on_next_frame(window, move |root, window, cx| {
-            root.settle_list_drag(target, id, window, cx);
-        });
+        self.apply_drag_top(target, top);
     }
 
     /// 统一页面切换：保留返回栈，详情页使用通用返回组件。

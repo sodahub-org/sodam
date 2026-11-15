@@ -227,23 +227,6 @@ pub(crate) struct BatchUpgradeProgress {
     pub(crate) total: usize,
 }
 
-/// 变高列表拖动「补欠账」的临时状态。
-///
-/// 列表的上限只按已测量高度算；一次大幅拖动被截短后，剩下的距离要靠
-/// 下一帧（内容量多了）继续补，见 `Root::settle_list_drag`（#168）。
-#[derive(Clone, Copy)]
-pub(crate) struct MiddleDragSettle {
-    pub(crate) target: ui::middle_drag::DragTarget,
-    pub(crate) y: f32,
-    /// 这一轮补欠账的编号。清空后旧回调迟到，编号对不上就直接作废，
-    /// 免得它推进下一轮记录、把 `stalled` 多记一次。
-    pub(crate) id: u64,
-    /// 已经补了多少帧，用来兜底防死循环。
-    pub(crate) frames: u16,
-    /// 连续多少帧没滚动了；连着两帧没动就判到底或不再长高。
-    pub(crate) stalled: u8,
-}
-
 /// 根视图状态。
 pub struct Root {
     pub nav: Nav,
@@ -263,10 +246,8 @@ pub struct Root {
     pub playlist_grid_scroll: gpui::ScrollHandle,
     /// 中键拖动的状态，只算数不碰窗口（见 ui::middle_drag）。
     pub(crate) middle_drag: ui::middle_drag::MiddleDrag,
-    /// 变高列表拖动被测量上限截短后，剩下那段距离在下一帧继续补（#168）。
-    pub(crate) middle_drag_settle: Option<MiddleDragSettle>,
-    /// 补欠账的轮次编号，用来让过期的下一帧回调直接作废。
-    pub(crate) middle_drag_settle_seq: u64,
+    /// 中键自动滚动帧循环的上一帧时刻：每帧按它算 dt。没在拖就是 `None`。
+    pub(crate) middle_drag_last_frame: Option<std::time::Instant>,
     /// 自绘标题栏拖拽区的按下锚点：按下只记录，移动超过阈值才交给合成器，
     /// 否则合成器会抢走指针，双击最大化收不到第二次按下（见 ui::titlebar）。
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
@@ -675,8 +656,7 @@ impl Root {
             search_playlists_scroll: gpui::ScrollHandle::new(),
             playlist_grid_scroll: gpui::ScrollHandle::new(),
             middle_drag: ui::middle_drag::MiddleDrag::default(),
-            middle_drag_settle: None,
-            middle_drag_settle_seq: 0,
+            middle_drag_last_frame: None,
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_user_scroll_until: None,
             pending_lyrics_scroll: None,
@@ -1635,6 +1615,14 @@ impl Render for Root {
         theme::set_ambient_rgb(ambient_color);
         // 上一帧布局未就绪时记下的歌词对齐，在这里补做一次。
         self.flush_pending_lyrics_scroll();
+        // 中键距离驱动自动滚动（#182）：指针只决定速度，位置由这里的帧循环
+        // 每帧按 `速度 × dt` 积分。指针停住不动时没有鼠标事件，滚动全靠帧回调；
+        // 松手、切页、失焦后 `middle_drag` 被清掉，`is_scrolling` 变 false，
+        // 循环自然停住，不白烧 CPU。
+        if self.middle_drag.is_scrolling() {
+            self.advance_middle_drag_scroll(window);
+            window.request_animation_frame();
+        }
         // 歌词滚动过渡进行中：用**帧回调**驱动下一帧，而不是等背景 timer。
         //
         // `background_executor().timer(16ms)` 不是帧同步的：Windows 默认计时器精度
