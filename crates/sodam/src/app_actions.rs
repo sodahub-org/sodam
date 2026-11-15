@@ -2415,7 +2415,8 @@ impl Root {
         let window_active = window.is_window_active();
         // 歌词页按下后，自动跟唱补间仍可能推进列表；起步前每次移动都按此刻的真实偏移
         // 重定积分起点，真正越过死区时从最新位置开始，首帧不跳（#169）。
-        if is_lyrics {
+        // 起步后积分起点不能再改，重定只会空转，直接跳过（#189）。
+        if is_lyrics && !already_scrolling {
             let top = self.drag_top(target);
             self.middle_drag
                 .rebase_unstarted_top(top, nav, window_active);
@@ -2425,8 +2426,9 @@ impl Root {
             self.pause_lyrics_follow();
         }
         // 起步后帧循环每帧都在跑（`Root::render` 里 `request_animation_frame`），
-        // 指针位置下一帧就会被读到；1000Hz 鼠标每秒上千次移动再逐个标脏是重复排队（#189）。
-        // 起步那次和「起步后帧循环还没跑过第一帧」的移动仍然标脏，保证滚动当场开始。
+        // 指针位置下一帧就会被读到，逐次标脏只是重复排队（#189）。
+        // 起步那次必须标脏；`last_frame` 为空说明起步后一帧都还没跑过
+        // （起步事件可能落在绘制中途被吞掉），补一次把循环拉起来。
         if !already_scrolling || self.middle_drag_last_frame.is_none() {
             cx.notify();
         }
