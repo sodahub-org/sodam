@@ -1739,7 +1739,7 @@ impl Render for Root {
             .on_mouse_move(
                 cx.listener(|root, event: &gpui::MouseMoveEvent, window, cx| {
                     if event.pressed_button != Some(gpui::MouseButton::Middle) {
-                        root.middle_drag.finish();
+                        root.finish_middle_drag();
                         return;
                     }
                     root.middle_drag_move(f32::from(event.position.y), window, cx);
@@ -1748,13 +1748,13 @@ impl Render for Root {
             .on_mouse_up(
                 gpui::MouseButton::Middle,
                 cx.listener(|root, _event: &gpui::MouseUpEvent, _window, _cx| {
-                    root.middle_drag.finish();
+                    root.finish_middle_drag();
                 }),
             )
             .on_mouse_up_out(
                 gpui::MouseButton::Middle,
                 cx.listener(|root, _event: &gpui::MouseUpEvent, _window, _cx| {
-                    root.middle_drag.finish();
+                    root.finish_middle_drag();
                 }),
             )
             // 焦点在窗口内的任何地方都能命中：根元素是全部聚焦节点的共同祖先。

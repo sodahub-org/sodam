@@ -2246,17 +2246,24 @@ impl Root {
         }
     }
 
+    /// 结束当前拖动（不管是哪个目标），连补欠账一起清掉。
+    pub(crate) fn finish_middle_drag(&mut self) {
+        self.middle_drag.finish();
+        self.middle_drag_settle = None;
+    }
+
     /// 只结束「正好是这个目标」的拖动。
     /// 异步回调迟到时，用户可能已经在别的列表上开拖了，不能一把全停。
     pub(crate) fn finish_middle_drag_for(&mut self, target: DragTarget) {
         if self.middle_drag.target() == Some(target) {
-            self.middle_drag.finish();
-            self.middle_drag_settle = None;
+            self.finish_middle_drag();
         }
     }
 
     /// 上报「中键按下」：记下起点和这个区域当时的滚动位置。
     fn begin_middle_drag_on(&mut self, target: DragTarget, y: f32) {
+        // 上一次手势的补欠账可能还在排队；新按下就作废，别让它用旧起点推进新拖动。
+        self.middle_drag_settle = None;
         let top = self.drag_top(target);
         let nav = self.nav;
         self.middle_drag.begin(y, top, nav, target);
@@ -2714,8 +2721,7 @@ impl Root {
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
         // 关掉同页详情时页签没变，渲染里的 sync_context 认不出来；中键还按着
         // 就会继续滚已经不显示的列表。这里先手动停手，切页时这句是幂等的。
-        self.middle_drag.finish();
-        self.middle_drag_settle = None;
+        self.finish_middle_drag();
         if self.nav == Nav::Search && self.search_playlist.is_some() {
             self.search_playlist = None;
             self.loading_search_playlist = false;
@@ -3175,8 +3181,7 @@ impl Root {
             return;
         }
         // 从搜索结果点进歌单详情，可拖的列表换了，旧起点作废。
-        self.middle_drag.finish();
-        self.middle_drag_settle = None;
+        self.finish_middle_drag();
         let playlist_id = playlist.id.clone();
         self.search_playlist = Some((
             playlist_id.clone(),
@@ -3250,8 +3255,7 @@ impl Root {
             return;
         }
         // 从歌单网格点进详情，可拖的列表换了，旧起点作废。
-        self.middle_drag.finish();
-        self.middle_drag_settle = None;
+        self.finish_middle_drag();
         let playlist_title = known_title.unwrap_or_else(|| {
             self.playlists
                 .iter()
