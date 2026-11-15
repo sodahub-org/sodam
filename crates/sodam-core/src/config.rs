@@ -1442,8 +1442,10 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, "half json").unwrap();
 
-        let mut settings = Settings::default();
-        settings.cookie = "sessionid_ss=x".into();
+        let settings = Settings {
+            cookie: "sessionid_ss=x".into(),
+            ..Default::default()
+        };
         settings.save_to(&path).expect("保存应成功");
 
         assert_eq!(Settings::load_from(&path).cookie, "sessionid_ss=x");

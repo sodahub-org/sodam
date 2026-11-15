@@ -143,7 +143,7 @@ fn start_tray_service(
                             .background_executor()
                             .spawn(async move { request.poll() })
                             .await;
-                        let _ = app.update(cx, |root, cx| root.finish_config_poll(event, cx));
+                        app.update(cx, |root, cx| root.finish_config_poll(event, cx));
                     })
                     .detach();
                 }
