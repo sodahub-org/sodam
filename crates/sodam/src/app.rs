@@ -174,6 +174,12 @@ pub enum LoginState {
         matrix: QrMatrix,
         token: String,
         status: String,
+        /// 服务端给的二维码过期时间（Unix 秒；0 = 未知）。
+        expires_at: i64,
+        /// 服务端要求二次验证（2046）。
+        need_second_verify: bool,
+        /// 验证窗口是否已经尝试拉起。
+        verify_window_opened: bool,
     },
     /// 已登录
     LoggedIn(#[allow(dead_code)] AccountInfo),

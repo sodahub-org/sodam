@@ -1,5 +1,6 @@
 //! 应用配置（`~/.config/sodam/config.json`）。
 
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -311,6 +312,13 @@ impl Settings {
         // 保住已经积累的服务端设备信誉。之后二维码只使用配置里的这份身份。
         if settings.ensure_login_device() {
             changed = true;
+            // 只记「初始化过」这件事，不记 device_id/install_id 本身。
+            log_event(
+                LogLevel::Info,
+                LogTopic::App,
+                "login_device_initialized",
+                &[],
+            );
         }
         settings.normalize_playback();
         settings.normalize_search_history();

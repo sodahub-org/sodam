@@ -564,6 +564,15 @@ impl Language {
             "登录成功，正在读取账号信息…" => "Signed in. Loading account…",
             "登录成功（会话未初始化）" => "Signed in (session not initialized)",
             "二维码已过期，正在自动换新码…" => "QR code expired. Refreshing…",
+            "二维码有效期未知" => "QR expiry unavailable",
+            "二维码剩余 {} 分 {} 秒" => "QR code expires in {}m {}s",
+            "二维码剩余 {} 秒" => "QR code expires in {}s",
+            "验证窗口已打开；完成后这里会自动更新" => {
+                "Verification window opened; this view updates when it completes."
+            }
+            "需要二次验证，正在打开验证窗口…" => {
+                "Second verification required. Opening the verification window…"
+            }
             "还没有正在播放的歌曲" => "No song is playing",
             "正在读取听歌模式…" => "Loading listening modes…",
             "正在加载更多探索歌单…" => "Loading more discovery playlists…",
