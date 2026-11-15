@@ -1,6 +1,7 @@
 //! 听歌模式页。
 
 use super::*;
+use crate::ui::middle_drag::DragTarget;
 /// 听歌模式页：常用模式 + 探索歌单，使用变高虚拟列表只渲染可视行。
 pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let scenes = root.scenes.clone();
@@ -294,6 +295,13 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .flex_col()
         .flex_1()
         .min_h(px(0.0))
+        // 按下时上报自己是这次拖动的目标；移动、松开由根元素统一收。
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(|root, event: &MouseDownEvent, _window, _cx| {
+                root.begin_middle_drag_for(DragTarget::Scenes, f32::from(event.position.y));
+            }),
+        )
         .child(
             canvas(
                 move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {

@@ -493,6 +493,7 @@ pub(crate) fn scrolling_detail_page(
     show_load_more: bool,
     on_load_more: Option<gpui::Entity<Root>>,
     list_state: &gpui::ListState,
+    drag_target: DragTarget,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     let language = root.language;
@@ -757,6 +758,13 @@ pub(crate) fn scrolling_detail_page(
         .flex_1()
         .min_h(px(0.0))
         .w_full()
+        // 按下时上报自己是这次拖动的目标；移动、松开由根元素统一收。
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |root, event: &MouseDownEvent, _window, _cx| {
+                root.begin_middle_drag_for(drag_target, f32::from(event.position.y));
+            }),
+        )
         .child(
             canvas(
                 move |bounds: gpui::Bounds<gpui::Pixels>, _window, _cx| {
@@ -1146,6 +1154,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
                         false,
                         None,
                         &root.liked_detail_list,
+                        DragTarget::LikedDetail,
                         cx,
                     ))
                     .into_any_element()
@@ -1185,6 +1194,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
                         false,
                         None,
                         &root.library_detail_list,
+                        DragTarget::LibraryDetail,
                         cx,
                     ))
                     .into_any_element()

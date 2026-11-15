@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{Nav, Root};
+use crate::ui::middle_drag::DragTarget;
 
 impl Root {
     pub fn run_history_search(&mut self, query: String, cx: &mut Context<Self>) {
@@ -166,6 +167,7 @@ impl Root {
             artist,
             ..Default::default()
         });
+        self.finish_middle_drag_for(DragTarget::ArtistDetail);
         self.artist_detail_list.reset(1);
         self.loading_artist = true;
         self.set_nav(Nav::Artist, cx);
@@ -185,6 +187,7 @@ impl Root {
                 root.loading_artist = false;
                 match result {
                     Ok(detail) => {
+                        root.finish_middle_drag_for(DragTarget::ArtistDetail);
                         root.artist_detail_list.reset(
                             detail.tracks.len()
                                 + 1
@@ -272,6 +275,7 @@ impl Root {
                                     }
                             })
                             .unwrap_or(1);
+                        root.finish_middle_drag_for(DragTarget::ArtistDetail);
                         root.artist_detail_list.reset(count);
                         let covers: Vec<String> = root
                             .open_artist
@@ -347,6 +351,7 @@ impl Root {
             album,
             tracks: Vec::new(),
         });
+        self.finish_middle_drag_for(DragTarget::AlbumDetail);
         self.album_detail_list.reset(1);
         self.loading_album = true;
         self.set_nav(Nav::Album, cx);
@@ -372,6 +377,7 @@ impl Root {
                             .collect();
                         root.ensure_covers(&covers, cx);
                         root.open_album = Some(detail);
+                        root.finish_middle_drag_for(DragTarget::AlbumDetail);
                         root.album_detail_list.reset(track_count + 1);
                         let message = root.localized("专辑共 {} 首", &[track_count.to_string()]);
                         root.set_status_text(message);
