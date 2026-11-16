@@ -456,11 +456,8 @@ fn quarantine_target(path: &Path) -> Option<PathBuf> {
     Some(path.with_extension(format!("json.bad-{stamp}")))
 }
 
-/// 把坏文件改名到预先算好的目标（与保存共用同一把写锁）。
-fn quarantine_corrupt_file_to(path: &Path, bad_path: &Path) -> std::io::Result<()> {
-    let _guard = SETTINGS_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+/// 把坏文件改名到预先算好的目标。调用方必须持有 `SETTINGS_WRITE_LOCK`（锁不可重入）。
+fn quarantine_corrupt_file_to_locked(path: &Path, bad_path: &Path) -> std::io::Result<()> {
     std::fs::rename(path, bad_path)
 }
 
@@ -479,6 +476,8 @@ pub struct StartupLoad {
     pub recovery: Option<StartupRecovery>,
     /// 启动前主文件不存在（首启）：旧行为会在启动时创建配置文件。
     pub first_run: bool,
+    /// 读盘前记下的文件指纹：热重载基线与后台回写的并发保护都用这一份。
+    pub baseline: Option<crate::config_watch::Fingerprint>,
     /// 落盘修正（备份刷新 / 迁移回存 / 损坏隔离与恢复写回）。默认值启动时为 `None`。
     pub write_back: Option<StartupWriteBack>,
 }
@@ -491,8 +490,10 @@ pub struct StartupWriteBack {
     settings: Settings,
     /// 损坏路径：坏文件改名到这个目标，再做恢复写回。
     quarantine_to: Option<PathBuf>,
-    /// 迁移 / 补身份后是否需要回存主文件（`save_to` 会顺带刷新备份）。
+    /// 迁移 / 补身份后是否需要回存主文件。
     save_main: bool,
+    /// 读盘前的文件指纹：回写前对不上就说明外部改过，放弃覆盖。
+    expected: Option<crate::config_watch::Fingerprint>,
 }
 
 impl StartupWriteBack {
@@ -502,16 +503,25 @@ impl StartupWriteBack {
     }
 
     /// 执行落盘修正。阻塞调用，必须在后台线程跑；返回第一处失败。
+    ///
+    /// 主文件保存与备份刷新在同一把写锁内完成：要么一起刷新到同一份内容，要么都不动。
+    /// 回写前指纹对不上（外部已改过文件）就整体跳过，交给热重载应用新内容。
     pub fn persist(self) -> Result<(), String> {
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if crate::config_watch::fingerprint(&self.path) != self.expected {
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "startup_config_write_back_skipped",
+                &[],
+            );
+            return Ok(());
+        }
         let mut first_error: Option<String> = None;
         if let Some(bad_path) = self.quarantine_to.as_deref() {
-            // 读盘到真正落盘之间隔了至少一帧：先看磁盘现状，不盲改名。
-            // 外部已经修好这份文件时，不再隔离，也不拿旧备份覆盖新的内容。
-            match Settings::try_load_from(&self.path) {
-                LoadOutcome::Loaded { .. } => return Ok(()),
-                LoadOutcome::Corrupt { .. } | LoadOutcome::NotFound(_) => {}
-            }
-            match quarantine_corrupt_file_to(&self.path, bad_path) {
+            match quarantine_corrupt_file_to_locked(&self.path, bad_path) {
                 Ok(()) => {}
                 // 等待期间坏文件已被删掉：没有要保留的原件，按成功继续恢复写回。
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -521,13 +531,13 @@ impl StartupWriteBack {
             }
         }
         if self.save_main {
-            if let Err(err) = self.settings.save_to(&self.path) {
+            if let Err(err) = self.settings.save_to_locked(&self.path) {
                 first_error.get_or_insert_with(|| format!("回存配置失败：{err}"));
             }
         }
-        // `save_to` 内部会吞掉备份写错误，所以这里总是单独刷新一次并报告失败，
+        // `save_to_locked` 内部会吞掉备份写错误，所以这里总是单独刷新一次并报告失败，
         // 避免主文件保存成功、备份没更新却没人知道。
-        if let Err(err) = write_settings_backup(&self.path, &self.settings) {
+        if let Err(err) = write_settings_backup_locked(&self.path, &self.settings) {
             first_error.get_or_insert_with(|| format!("写配置备份失败：{err}"));
         }
         match first_error {
@@ -544,6 +554,8 @@ impl StartupWriteBack {
 /// 主文件损坏时先试备份——备份可用就用备份继续、坏文件改名保留；无备份则默认值
 /// 启动且绝不碰坏文件。
 pub fn load_for_startup(path: &Path) -> StartupLoad {
+    // 读盘前先记指纹：热重载基线和后台回写的并发保护都用这一份。
+    let baseline = crate::config_watch::fingerprint(path);
     match Settings::try_load_from(path) {
         LoadOutcome::Corrupt { error } => {
             // 备份走与主文件完全相同的加载管线（try_load_from：字段容错 + 迁移 +
@@ -565,10 +577,12 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                             settings: backup.clone(),
                             quarantine_to: Some(bad_path.clone()),
                             save_main: true,
+                            expected: baseline,
                         }),
                         settings: backup,
                         recovery: Some(StartupRecovery::RecoveredFromBackup { bad_path }),
                         first_run: false,
+                        baseline,
                     }
                 }
                 None => {
@@ -579,14 +593,15 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                         settings: defaults,
                         recovery: Some(StartupRecovery::FellBackToDefaults { error }),
                         first_run: false,
+                        baseline,
                         write_back: None,
                     }
                 }
             }
         }
-        LoadOutcome::NotFound(settings) => startup_load_from(path, settings, false, true),
+        LoadOutcome::NotFound(settings) => startup_load_from(path, settings, false, true, baseline),
         LoadOutcome::Loaded { settings, migrated } => {
-            startup_load_from(path, settings, migrated, false)
+            startup_load_from(path, settings, migrated, false, baseline)
         }
     }
 }
@@ -597,6 +612,7 @@ fn startup_load_from(
     settings: Settings,
     migrated: bool,
     first_run: bool,
+    baseline: Option<crate::config_watch::Fingerprint>,
 ) -> StartupLoad {
     let (settings, changed) = Settings::prepare_loaded(settings, migrated);
     StartupLoad {
@@ -606,10 +622,12 @@ fn startup_load_from(
             quarantine_to: None,
             // 首启即使身份全部来自环境变量（ensure 不生成）也要创建配置文件。
             save_main: changed || first_run,
+            expected: baseline,
         }),
         settings,
         recovery: None,
         first_run,
+        baseline,
     }
 }
 
@@ -1836,11 +1854,33 @@ mod tests {
             settings: Settings::default(),
             quarantine_to: None,
             save_main: false,
+            expected: None,
         };
         assert!(
             write_back.persist().is_err(),
             "写不进去应返回错误而不是 panic"
         );
+    }
+
+    /// 读盘后、回写前文件被外部改过：放弃覆盖，磁盘上的新内容保持不动。
+    #[test]
+    fn startup_write_back_skips_when_file_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"cookie":"sessionid_ss=old"}"#).unwrap();
+
+        let load = load_for_startup(&path);
+        let write_back = load.write_back.expect("正常路径应欠备份刷新");
+        // 模拟外部在首帧后改写了配置（长度不同，指纹必然变化）。
+        std::fs::write(&path, r#"{"cookie":"sessionid_ss=definitely-new"}"#).unwrap();
+        write_back.persist().expect("指纹不符应安静跳过");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"cookie":"sessionid_ss=definitely-new"}"#,
+            "外部新内容不能被启动快照覆盖"
+        );
+        assert!(!settings_backup_path(&path).exists(), "跳过时不应刷新备份");
     }
 
     /// 保存时目标文件已是坏配置：先改名保留原件，再写新内容，用户能找回原文件。

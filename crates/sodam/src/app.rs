@@ -644,15 +644,15 @@ impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config_path = Settings::config_path();
-        // 读盘前先取指纹：读盘之后发生的任何外部修改，下一次轮询都会重新比较内容。
-        let config_baseline = sodam_core::config_watch::fingerprint(&config_path);
         // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
         // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
         // 读盘阶段只做内存修正，备份 / 回存 / 隔离改名全部留给首帧后的后台任务（#191）。
+        // `baseline` 是读盘前记的文件指纹：热重载基线和后台回写保护共用这一份。
         let sodam_core::config::StartupLoad {
             settings,
             recovery,
             first_run,
+            baseline,
             mut write_back,
         } = sodam_core::config::load_for_startup(&config_path);
         let mut settings = settings.merged_with_env();
@@ -721,7 +721,7 @@ impl Root {
             let mut tracker = sodam_core::config_watch::ReloadTracker::new();
             // 以读盘前的文件状态作基线：首帧后的隔离 / 回写不算外部改动，
             // 慢盘上也不会把「正在恢复」误报成配置文件损坏（#191）。
-            tracker.acknowledge(config_baseline);
+            tracker.acknowledge(baseline);
             Arc::new(Mutex::new(tracker))
         };
         let mut root = Self {
