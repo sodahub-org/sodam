@@ -885,15 +885,18 @@ impl Settings {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         Self::debug_delay_before_write();
-        match std::fs::read(path) {
-            Ok(bytes) => match parse_settings_bytes(&bytes) {
-                // 盘上已经是别的身份：这份旧快照不许动文件和备份。
-                Ok(current) if current.cookie != expected_cookie => return Ok(false),
-                // 坏原件没有可用身份可比：照常交给 `save_to_locked` 走隔离流程。
-                _ => {}
-            },
-            // 文件不存在 = 首次保存；读不出来 = 让 `save_to_locked` 自己报错。
-            Err(_) => {}
+        // 读不出或解析不了的不比：文件不存在算首次保存，
+        // 坏原件交给 `save_to_locked` 走隔离流程，读错误也由它报。
+        let disk_cookie = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| parse_settings_bytes(&bytes).ok())
+            .map(|current| current.cookie);
+        // 盘上已经是别的身份：这份旧快照不许动文件和备份。
+        if disk_cookie
+            .as_deref()
+            .is_some_and(|cookie| cookie != expected_cookie)
+        {
+            return Ok(false);
         }
         self.save_to_locked(path)?;
         Ok(true)
