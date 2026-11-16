@@ -583,29 +583,32 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                 }
             }
         }
-        outcome => {
-            let first_run = matches!(outcome, LoadOutcome::NotFound(_));
-            let (settings, changed) = match outcome {
-                LoadOutcome::NotFound(settings) => Settings::prepare_loaded(settings, false),
-                LoadOutcome::Loaded { settings, migrated } => {
-                    Settings::prepare_loaded(settings, migrated)
-                }
-                // 损坏分支已在上面单独处理；这里按默认值兜底，保证只读盘一次。
-                LoadOutcome::Corrupt { .. } => (Settings::default(), false),
-            };
-            StartupLoad {
-                write_back: Some(StartupWriteBack {
-                    path: path.to_path_buf(),
-                    settings: settings.clone(),
-                    quarantine_to: None,
-                    // 首启即使身份全部来自环境变量（ensure 不生成）也要创建配置文件。
-                    save_main: changed || first_run,
-                }),
-                settings,
-                recovery: None,
-                first_run,
-            }
+        LoadOutcome::NotFound(settings) => startup_load_from(path, settings, false, true),
+        LoadOutcome::Loaded { settings, migrated } => {
+            startup_load_from(path, settings, migrated, false)
         }
+    }
+}
+
+/// 正常读盘结果 → 内存设置 + 落盘修正（备份必刷；迁移 / 首启要回存主文件）。
+fn startup_load_from(
+    path: &Path,
+    settings: Settings,
+    migrated: bool,
+    first_run: bool,
+) -> StartupLoad {
+    let (settings, changed) = Settings::prepare_loaded(settings, migrated);
+    StartupLoad {
+        write_back: Some(StartupWriteBack {
+            path: path.to_path_buf(),
+            settings: settings.clone(),
+            quarantine_to: None,
+            // 首启即使身份全部来自环境变量（ensure 不生成）也要创建配置文件。
+            save_main: changed || first_run,
+        }),
+        settings,
+        recovery: None,
+        first_run,
     }
 }
 

@@ -910,7 +910,9 @@ impl Root {
             sodam_core::flush_global();
             // 心跳首拍之前就退出：补做还没跑的启动落盘修正（小文件，退出期一次性）。
             if let Some(write_back) = root.startup_write_back.take() {
-                let _ = write_back.persist();
+                if let Err(error) = write_back.persist() {
+                    root.log_failure("启动配置回存失败（退出前补做）", &error);
+                }
             }
             root.preferences_writer.flush()
         })

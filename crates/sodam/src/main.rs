@@ -133,24 +133,27 @@ fn start_tray_service(
 
             tick += 1;
             // 启动期欠下的落盘修正（备份 / 迁移回存 / 损坏隔离）：首帧后才动磁盘（#191）。
-            if let Some(write_back) =
-                cx.update(|cx| app.update(cx, |root, _cx| root.take_startup_write_back()))
-            {
-                let app = app.clone();
-                cx.spawn(async move |cx| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move { write_back.persist() })
-                        .await;
-                    if let Err(error) = result {
-                        let _ = cx.update(|cx| {
-                            app.update(cx, |root, cx| {
-                                root.report_startup_write_back_failure(error, cx)
-                            })
-                        });
-                    }
-                })
-                .detach();
+            // 只有首拍能取到；之后每拍都查一次是白跑。
+            if tick == 1 {
+                if let Some(write_back) =
+                    cx.update(|cx| app.update(cx, |root, _cx| root.take_startup_write_back()))
+                {
+                    let app = app.clone();
+                    cx.spawn(async move |cx| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { write_back.persist() })
+                            .await;
+                        if let Err(error) = result {
+                            let _ = cx.update(|cx| {
+                                app.update(cx, |root, cx| {
+                                    root.report_startup_write_back_failure(error, cx)
+                                })
+                            });
+                        }
+                    })
+                    .detach();
+                }
             }
             // 配置热重载巡检：每 ~500ms 一次，读盘与解析放后台线程，结果回 UI 应用（#185）。
             // 错开托盘同步的那一拍，避免同帧做两批后台活。
