@@ -21,11 +21,13 @@ use sodam_core::{
     },
     prefetch::PrefetchGate,
     queue::Queue,
+    quit_gate::{QuitGate, QuitRequest, QUIT_PERSIST_TIMEOUT},
     session::{AccountInfo, Session},
     PlayReporter, PlaybackEngine, Settings,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
@@ -624,7 +626,7 @@ pub struct Root {
     /// 启动落盘结果：后台任务写、心跳取走提示；退出时兜底写日志（#191）。
     pub(crate) startup_persist_result: Arc<Mutex<Option<Result<(), String>>>>,
     /// 主动退出闸门：托盘 / ⌘Q 先等启动期落盘做完再退（#198）。
-    pub(crate) quit_gate: sodam_core::quit_gate::QuitGate,
+    pub(crate) quit_gate: QuitGate,
 }
 
 /// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
@@ -653,6 +655,44 @@ impl ConfigPollRequest {
             self.cookie_fill,
         );
         (event, self.current)
+    }
+}
+
+/// 启动期欠下的落盘工作：回存、首拍任务、偏好写线程刷尾。
+///
+/// 退出有两条路（`on_app_quit` 的 200ms 兜底、`Root::request_quit` 的主动等待），
+/// 要等的是同一批东西，收在这里，避免两边各写一份（#191 / #198）。
+struct PendingStartupPersist {
+    fallback: Option<gpui::Task<()>>,
+    task: Option<gpui::Task<()>>,
+    preferences: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    result: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+impl PendingStartupPersist {
+    /// 等全部写完；在后台线程跑，别在 UI 线程等磁盘。
+    async fn wait(self) -> Arc<Mutex<Option<Result<(), String>>>> {
+        if let Some(task) = self.fallback {
+            task.await;
+        }
+        if let Some(task) = self.task {
+            task.await;
+        }
+        self.preferences.await;
+        self.result
+    }
+}
+
+/// 首拍任务失败但心跳没来得及提示：把原文写进诊断日志，界面只给退出动作本身。
+fn log_startup_persist_failure(result: &Arc<Mutex<Option<Result<(), String>>>>) {
+    let error = result.lock().unwrap_or_else(|err| err.into_inner()).take();
+    if let Some(Err(error)) = error {
+        log_event(
+            LogLevel::Error,
+            LogTopic::App,
+            "failure",
+            &[("context", "启动配置回存失败"), ("detail", error.as_str())],
+        );
     }
 }
 
@@ -928,53 +968,17 @@ impl Root {
             startup_write_back: write_back,
             startup_persist_task: None,
             startup_persist_result: Arc::new(Mutex::new(None)),
-            quit_gate: sodam_core::quit_gate::QuitGate::default(),
+            quit_gate: QuitGate::new(QUIT_PERSIST_TIMEOUT),
         };
         cx.on_app_quit(|root, cx| {
             sodam_core::flush_global();
             // 心跳首拍之前就退出：补做也放后台，退出 future 里等它写完，不在 UI 线程碰磁盘。
-            let fallback = root.startup_write_back.take().map(|write_back| {
-                cx.background_spawn(async move {
-                    if let Err(error) = write_back.persist() {
-                        log_event(
-                            LogLevel::Error,
-                            LogTopic::App,
-                            "failure",
-                            &[
-                                ("context", "启动配置回存失败（退出前补做）"),
-                                ("detail", error.as_str()),
-                            ],
-                        );
-                    }
-                })
-            });
-            // 首拍已经取走任务时，退出要等它写完；这里等的是后台任务，主线程阻塞也能完成。
-            let persist_task = root.startup_persist_task.take();
-            // 首拍任务失败但心跳还没来得及提示：至少把原文补进日志。
-            let persist_result = root.startup_persist_result.clone();
-            let preferences = root.preferences_writer.flush();
+            let work = root.take_pending_startup_persist(cx);
             async move {
-                if let Some(task) = fallback {
-                    task.await;
-                }
-                if let Some(task) = persist_task {
-                    task.await;
-                }
-                let error = persist_result
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .take();
-                if let Some(Err(error)) = error {
-                    log_event(
-                        LogLevel::Error,
-                        LogTopic::App,
-                        "failure",
-                        &[("context", "启动配置回存失败"), ("detail", error.as_str())],
-                    );
-                }
+                let result = work.wait().await;
+                log_startup_persist_failure(&result);
                 // 上面的日志可能是在第一次 flush 之后写的，退出前再刷一次。
                 sodam_core::flush_global();
-                preferences.await;
             }
         })
         .detach();
@@ -1643,8 +1647,39 @@ impl Root {
         self.startup_write_back.take()
     }
 
+    /// 取走启动期欠下的落盘工作（回存 + 首拍任务 + 偏好刷尾）。
+    ///
+    /// 两条退出路径共用：`on_app_quit` 的兜底与 `request_quit` 的主动等待。
+    fn take_pending_startup_persist(&mut self, cx: &mut Context<Self>) -> PendingStartupPersist {
+        let fallback = self.startup_write_back.take().map(|write_back| {
+            cx.background_spawn(async move {
+                if let Err(error) = write_back.persist() {
+                    log_event(
+                        LogLevel::Error,
+                        LogTopic::App,
+                        "failure",
+                        &[
+                            ("context", "启动配置回存失败（退出前补做）"),
+                            ("detail", error.as_str()),
+                        ],
+                    );
+                }
+            })
+        });
+        PendingStartupPersist {
+            fallback,
+            task: self.startup_persist_task.take(),
+            preferences: Box::pin(self.preferences_writer.flush()),
+            result: self.startup_persist_result.clone(),
+        }
+    }
+
     /// 心跳每拍检查一次启动落盘结果：失败时技术原文进日志，状态行只给人话。
     pub(crate) fn report_startup_persist_result(&mut self, cx: &mut Context<Self>) {
+        // 正在等落盘退出：状态行要一直显示「正在保存…」，结果交给 request_quit 收尾。
+        if self.quit_gate.is_saving() {
+            return;
+        }
         let result = self
             .startup_persist_result
             .lock()
@@ -1665,86 +1700,58 @@ impl Root {
     /// 这里把等待放到自己的任务里，期间界面保持可交互；再点一次退出，或等满
     /// [`sodam_core::quit_gate::QUIT_PERSIST_TIMEOUT`]，就强制退出。
     pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
-        if self.quit_gate.request() == sodam_core::quit_gate::QuitRequest::QuitNow {
+        if self.quit_gate.request(std::time::Instant::now()) == QuitRequest::QuitNow {
             cx.quit();
             return;
         }
         self.set_status_text(self.tr("正在保存…"));
         cx.notify();
 
-        // 与 on_app_quit 补做的是同一批工作，先取走，避免两边同时写。
-        let fallback = self.startup_write_back.take().map(|write_back| {
-            cx.background_spawn(async move {
-                if let Err(error) = write_back.persist() {
-                    log_event(
-                        LogLevel::Error,
-                        LogTopic::App,
-                        "failure",
-                        &[
-                            ("context", "退出前回存启动配置失败"),
-                            ("detail", error.as_str()),
-                        ],
-                    );
-                }
-            })
-        });
-        let persist_task = self.startup_persist_task.take();
-        let preferences = self.preferences_writer.flush();
-        let persist_result = self.startup_persist_result.clone();
-
-        // 等完三件事（回存、首拍任务、偏好刷尾）再回主线程退出；落盘全在后台线程。
+        // 取走这轮要等的落盘工作，后台等完再回主线程退出。
+        let work = self.take_pending_startup_persist(cx);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         cx.background_spawn(async move {
-            if let Some(task) = fallback {
-                task.await;
-            }
-            if let Some(task) = persist_task {
-                task.await;
-            }
-            preferences.await;
+            let result = work.wait().await;
+            log_startup_persist_failure(&result);
             let _ = done_tx.send(());
         })
         .detach();
 
-        let timeout = sodam_core::quit_gate::QUIT_PERSIST_TIMEOUT;
+        // 用通道 + 轮询而不是 select：仓库没有跨平台的 futures 依赖，20ms 一拍足够。
         cx.spawn(async move |this, cx| {
-            let deadline = std::time::Instant::now() + timeout;
             loop {
-                match done_rx.try_recv() {
-                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        if std::time::Instant::now() >= deadline {
-                            // 到点不等了：让用户退得掉，把超时写进日志。
-                            let timeout_ms = timeout.as_millis().to_string();
-                            log_event(
-                                LogLevel::Error,
-                                LogTopic::App,
-                                "quit_persist_timeout",
-                                &[("timeout_ms", timeout_ms.as_str())],
-                            );
-                            break;
-                        }
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(20))
-                            .await;
-                    }
+                if matches!(
+                    done_rx.try_recv(),
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ) {
+                    break;
                 }
+                match this.update(cx, |root, _| {
+                    root.quit_gate.timed_out(std::time::Instant::now())
+                }) {
+                    Ok(false) => {}
+                    // 到点不等了：让用户退得掉，把超时写进日志。
+                    Ok(true) => {
+                        let timeout_ms = QUIT_PERSIST_TIMEOUT.as_millis().to_string();
+                        log_event(
+                            LogLevel::Error,
+                            LogTopic::App,
+                            "quit_persist_timeout",
+                            &[("timeout_ms", timeout_ms.as_str())],
+                        );
+                        break;
+                    }
+                    // 根实体已经销毁：直接走退出。
+                    Err(_) => break,
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(20))
+                    .await;
             }
-            // 首拍任务失败但心跳没来得及提示：退出前至少把原文写进日志。
-            let error = persist_result
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .take();
-            if let Some(Err(error)) = error {
-                log_event(
-                    LogLevel::Error,
-                    LogTopic::App,
-                    "failure",
-                    &[("context", "启动配置回存失败"), ("detail", error.as_str())],
-                );
-            }
+            // 实体不在了说明应用正在销毁，退出已经在路上，不用再补 `cx.quit()`
+            // （`AsyncApp::update` 在 app 已释放时会 panic，不能拿来兜底）。
             let _ = this.update(cx, |root, cx| {
-                root.quit_gate.finish();
+                root.quit_gate.complete();
                 cx.quit();
             });
         })
