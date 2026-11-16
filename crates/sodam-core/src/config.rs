@@ -36,7 +36,7 @@ pub enum EnvCookieFill {
     Skip,
 }
 
-/// 进程环境里是否有非空的 `SODA_COOKIE`：登出提示要用，判空规则只放在这里。
+/// 进程环境里是否有非空的 `SODA_COOKIE`：登出提示用，判空口径与补全一致。
 pub fn env_cookie_present() -> bool {
     std::env::var(ENV_COOKIE_KEY)
         .map(|value| !value.trim().is_empty())

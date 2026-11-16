@@ -2270,7 +2270,11 @@ impl Root {
             Err(err) => {
                 self.notify_error_once(
                     "logout-save-failed",
-                    self.failure_text("退出登录失败", &err, "退出登录失败，账号仍保持登录。"),
+                    self.failure_text(
+                        "退出登录失败",
+                        &err,
+                        "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                    ),
                 );
             }
         }
@@ -3972,9 +3976,9 @@ impl Root {
                 if self.settings == snapshot {
                     // 登出记号只在「外部文件写进非空 Cookie」时解除。记号生效时
                     // 轮询传 `EnvCookieFill::Skip`，补出来的 Cookie 一定是空的；
-                    // 能走到这里说明非空 Cookie 来自文件（手动粘贴/换号）——这个
-                    // 结论依赖上面这条快照守卫，所以判断放在守卫里面（#192）。
-                    if !settings.cookie.trim().is_empty() && settings.cookie != snapshot.cookie {
+                    // 能走到这里，且本地这份快照还是登出后的空 Cookie，说明非空
+                    // Cookie 来自文件（手动粘贴/换号），不是环境变量（#192）。
+                    if !settings.cookie.trim().is_empty() {
                         self.env_cookie_opted_out = false;
                     }
                     self.apply_external_settings(*settings, cx);
