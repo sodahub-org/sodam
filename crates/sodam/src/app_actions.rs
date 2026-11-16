@@ -22,8 +22,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    status_label, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root, REMOTE_TEXT,
-    RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
+    apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
+    Nav, QueueOrigin, Root, VerifyWindowState, VerifyWindowStep, REMOTE_TEXT, RETRY_TEXT,
+    ROW_BATCH, SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -771,7 +772,7 @@ impl Root {
                     status: language.text("等待扫码…").to_string(),
                     expires_at,
                     need_second_verify: false,
-                    verify_window_opened: false,
+                    verify_window: VerifyWindowState::NotRequested,
                 };
                 root.set_status_text(language.text("请用汽水音乐 App 扫码并确认").to_string());
                 cx.notify();
@@ -785,8 +786,12 @@ impl Root {
             );
 
             // 轮询：libresoda 内部有 2.5s 最小间隔 + 5s 限流冷却，这里 3s 一次足够温和
-            // 二次验证窗口只自动拉起一次（误关可重试登录流程）；完成后轮询自动领取结果
-            let mut verify_window_opened = false;
+            // 二次验证窗口只自动拉起一次（失败也不重试，用户可关掉重开登录流程）；
+            // 完成后轮询自动领取结果
+            let mut verify_window = VerifyWindowState::NotRequested;
+            let opened_text = language
+                .text("验证窗口已打开；完成后这里会自动更新")
+                .to_string();
             let mut last_login_phase = String::new();
             for _ in 0..80 {
                 // 6 秒一次：3 秒会触发服务端限流（error_code=7），确认握手会被丢掉
@@ -806,8 +811,16 @@ impl Root {
                             // 先记原文、先取文案：下面要对 root.login 取可变借用。
                             root.log_failure("登录轮询异常", &err);
                             let status_text = root.tr(RETRY_TEXT).to_string();
-                            if let LoginState::Waiting { status, .. } = &mut root.login {
-                                *status = status_text;
+                            if let LoginState::Waiting {
+                                status,
+                                verify_window,
+                                ..
+                            } = &mut root.login
+                            {
+                                // 验证窗口打开失败的原因留着：一次网络抖动不该把它换掉。
+                                if *verify_window != VerifyWindowState::Failed {
+                                    *status = status_text;
+                                }
                             }
                             cx.notify();
                         });
@@ -832,7 +845,7 @@ impl Root {
                     "second_verify"
                 } else if result.rate_limited {
                     "rate_limited"
-                } else if verify_window_opened && !finished {
+                } else if verify_window == VerifyWindowState::Opened && !finished {
                     "second_verify_submitted"
                 } else {
                     status_key
@@ -860,7 +873,7 @@ impl Root {
                         "login_success",
                         &[(
                             "second_verify",
-                            if verify_window_opened {
+                            if verify_window == VerifyWindowState::Opened {
                                 "true"
                             } else {
                                 "false"
@@ -923,8 +936,10 @@ impl Root {
                         .await;
                 }
                 let expired = result.is_terminal_failure();
-                if result.need_second_verify && !verify_window_opened {
-                    verify_window_opened = true;
+                // 二次验证窗口只拉起一次。打开失败后保留错误文案，等用户重开登录流程
+                // （`start_login` 会重新建一份 NotRequested 的状态）。
+                let step = verify_window_step(verify_window, result.need_second_verify);
+                if step == VerifyWindowStep::Open {
                     // 自动拉起验证窗口（libresoda 会经签名页桥接官方验证组件）；
                     // 用户在窗口里完成验证后，下一次轮询会拿到登录成功
                     let open_settings = settings.clone();
@@ -932,7 +947,7 @@ impl Root {
                     let open = cx.background_spawn(async move {
                         Session::new(open_settings).open_second_verify(&open_token)
                     });
-                    let message = match open.await {
+                    let (window_state, message) = match open.await {
                         Ok(_) => {
                             log_event(
                                 LogLevel::Info,
@@ -940,9 +955,12 @@ impl Root {
                                 "login_second_verify_opened",
                                 &[],
                             );
-                            language
-                                .text("已打开二次验证窗口，请在其中完成验证")
-                                .to_string()
+                            (
+                                VerifyWindowState::Opened,
+                                language
+                                    .text("已打开二次验证窗口，请在其中完成验证")
+                                    .to_string(),
+                            )
                         }
                         Err(err) => {
                             // 这里没有 `root` 可借；脱敏由日志出口在写盘前统一做，
@@ -954,22 +972,28 @@ impl Root {
                                 "second_verify_open_failed",
                                 &[("detail", detail.as_str())],
                             );
-                            language
-                                .text("打开验证窗口失败，请改用官方客户端导出 Cookie。")
-                                .to_string()
+                            (
+                                VerifyWindowState::Failed,
+                                language
+                                    .text("打开验证窗口失败，请改用官方客户端导出 Cookie。")
+                                    .to_string(),
+                            )
                         }
                     };
+                    // 成功才置 Opened；失败置 Failed：下一轮不会再开窗，
+                    // 也不会把错误文案换成「已打开」。
+                    verify_window = window_state;
                     let _ = this.update(cx, |root, cx| {
                         root.set_status_text(message.clone());
                         if let LoginState::Waiting {
                             status: slot,
                             need_second_verify: flag,
-                            verify_window_opened: opened,
+                            verify_window: state,
                             ..
                         } = &mut root.login
                         {
                             *flag = true;
-                            *opened = true;
+                            *state = window_state;
                             *slot = message;
                         }
                         cx.notify();
@@ -979,18 +1003,18 @@ impl Root {
                     if let LoginState::Waiting {
                         status: slot,
                         need_second_verify: flag,
-                        verify_window_opened: opened,
+                        verify_window: state,
                         ..
                     } = &mut root.login
                     {
-                        *flag = result.need_second_verify;
-                        if result.need_second_verify && *opened {
-                            *slot = language
-                                .text("验证窗口已打开；完成后这里会自动更新")
-                                .to_string();
-                        } else {
-                            *slot = status;
-                        }
+                        apply_verify_window_result(
+                            *state,
+                            flag,
+                            slot,
+                            status,
+                            result.need_second_verify,
+                            &opened_text,
+                        );
                     }
                     cx.notify();
                 });

@@ -178,13 +178,76 @@ pub enum LoginState {
         expires_at: i64,
         /// 服务端要求二次验证（2046）。
         need_second_verify: bool,
-        /// 验证窗口是否已经尝试拉起。
-        verify_window_opened: bool,
+        /// 验证窗口走到哪一步了（没试 / 已打开 / 打开失败）。
+        verify_window: VerifyWindowState,
     },
     /// 已登录
     LoggedIn(#[allow(dead_code)] AccountInfo),
     /// 出错（可点重试）
     Failed(String),
+}
+
+/// 二次验证窗口的状态。分开「打开失败」是为了不让它被当成「已打开」：
+/// 失败要一直显示错误文案，也不能每轮轮询都重新开窗。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyWindowState {
+    /// 还没尝试打开
+    NotRequested,
+    /// 窗口已经打开，等用户在里面完成验证
+    Opened,
+    /// 打开失败过，保留错误文案，等用户重新发起登录
+    Failed,
+}
+
+/// 这一轮轮询拿到服务端状态后，验证窗口该做什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifyWindowStep {
+    /// 需要验证且还没试过：去打开
+    Open,
+    /// 已经打开过：显示「已打开」，不要重复开
+    ShowOpened,
+    /// 打开失败过：保留错误文案，不被轮询状态覆盖
+    KeepFailed,
+    /// 不需要二次验证：按轮询状态推进
+    PollStatus,
+}
+
+/// 验证窗口的状态流转：纯函数，单测直接钉住（#186）。
+pub(crate) fn verify_window_step(
+    window: VerifyWindowState,
+    need_second_verify: bool,
+) -> VerifyWindowStep {
+    match (need_second_verify, window) {
+        (false, _) => VerifyWindowStep::PollStatus,
+        (true, VerifyWindowState::NotRequested) => VerifyWindowStep::Open,
+        (true, VerifyWindowState::Opened) => VerifyWindowStep::ShowOpened,
+        (true, VerifyWindowState::Failed) => VerifyWindowStep::KeepFailed,
+    }
+}
+
+/// 把一轮轮询结果落进登录状态：更新「需要验证」标记，并按窗口状态决定文案。
+///
+/// 打开失败过的窗口保留原来的错误文案——轮询状态可以推进流程，
+/// 但不能把用户看到的失败原因顶掉（#186）。
+pub(crate) fn apply_verify_window_result(
+    window: VerifyWindowState,
+    need_second_verify: &mut bool,
+    status: &mut String,
+    poll_status: String,
+    poll_need_second_verify: bool,
+    opened_text: &str,
+) {
+    *need_second_verify = poll_need_second_verify;
+    // 打开失败过的窗口：错误文案一直留到流程结束或用户重新发起登录，
+    // 哪怕这一轮服务端没再要求二次验证（#186）。
+    if window == VerifyWindowState::Failed {
+        return;
+    }
+    match verify_window_step(window, poll_need_second_verify) {
+        VerifyWindowStep::Open | VerifyWindowStep::PollStatus => *status = poll_status,
+        VerifyWindowStep::ShowOpened => *status = opened_text.to_string(),
+        VerifyWindowStep::KeepFailed => {}
+    }
 }
 
 /// 当前播放队列来源，语义对齐官方 queue metaInfo。
@@ -1918,5 +1981,99 @@ impl Render for Root {
             }
         }
         element
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_verify_window_result, verify_window_step, VerifyWindowState, VerifyWindowStep,
+    };
+
+    const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
+    const OPENED_TEXT: &str = "验证窗口已打开；完成后这里会自动更新";
+
+    /// 验证窗口只开一次；打开失败后文案不被轮询状态盖掉（#186）。
+    #[test]
+    fn verify_window_step_opens_once_and_keeps_failure_text() {
+        assert_eq!(
+            verify_window_step(VerifyWindowState::NotRequested, true),
+            VerifyWindowStep::Open,
+            "需要验证且还没试过，这一轮去打开"
+        );
+        assert_eq!(
+            verify_window_step(VerifyWindowState::Opened, true),
+            VerifyWindowStep::ShowOpened,
+            "已经打开过，不重复开窗"
+        );
+        assert_eq!(
+            verify_window_step(VerifyWindowState::Failed, true),
+            VerifyWindowStep::KeepFailed,
+            "打开失败过，保留错误文案"
+        );
+        for window in [
+            VerifyWindowState::NotRequested,
+            VerifyWindowState::Opened,
+            VerifyWindowState::Failed,
+        ] {
+            assert_eq!(
+                verify_window_step(window, false),
+                VerifyWindowStep::PollStatus,
+                "服务端不再要求验证时按轮询状态推进"
+            );
+        }
+    }
+
+    /// 失败文案真的留在状态里：模拟失败后再来一轮要求验证的轮询（#186）。
+    #[test]
+    fn failed_window_keeps_error_text_across_polls() {
+        let mut need = true;
+        let mut status = FAILED_TEXT.to_string();
+
+        apply_verify_window_result(
+            VerifyWindowState::Failed,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            true,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, FAILED_TEXT, "失败文案不能被轮询状态盖掉");
+        assert!(need, "仍然需要二次验证");
+
+        // 服务端这一轮没再要求验证，也不该把失败原因抹掉
+        apply_verify_window_result(
+            VerifyWindowState::Failed,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            false,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, FAILED_TEXT, "失败文案留到流程结束或重新登录");
+        assert!(!need);
+
+        // 打开成功：显示「已打开」
+        apply_verify_window_result(
+            VerifyWindowState::Opened,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            true,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, OPENED_TEXT);
+
+        // 服务端不再要求验证：照常显示轮询文案
+        apply_verify_window_result(
+            VerifyWindowState::Opened,
+            &mut need,
+            &mut status,
+            "已登录".to_string(),
+            false,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, "已登录");
+        assert!(!need);
     }
 }

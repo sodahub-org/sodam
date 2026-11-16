@@ -29,7 +29,7 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
             token,
             expires_at,
             need_second_verify,
-            verify_window_opened,
+            verify_window,
         } => div()
             .w(px(360.0))
             .flex()
@@ -86,25 +86,30 @@ pub fn login_modal(root: &Root, cx: &mut Context<Root>) -> gpui::AnyElement {
                     .child(
                         div()
                             .text_size(theme::Text::Tiny.size())
-                            .text_color(if *verify_window_opened {
+                            .text_color(if *verify_window == VerifyWindowState::Opened {
                                 theme::text_muted()
                             } else {
                                 theme::text_faint()
                             })
                             .child(qr_expiry_text(root, *expires_at)),
                     )
-                    .when(*need_second_verify, |this| {
-                        this.child(
-                            div()
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::warning())
-                                .child(if *verify_window_opened {
-                                    root.tr("验证窗口已打开；完成后这里会自动更新")
-                                } else {
-                                    root.tr("需要二次验证，正在打开验证窗口…")
-                                }),
-                        )
-                    }),
+                    // 打开失败时状态行已经写着错误原因，这里不再重复一句，
+                    // 更不能显示成「已打开」把人引到一个不存在的窗口（#186）。
+                    .when(
+                        *need_second_verify && *verify_window != VerifyWindowState::Failed,
+                        |this| {
+                            this.child(
+                                div()
+                                    .text_size(theme::Text::Tiny.size())
+                                    .text_color(theme::warning())
+                                    .child(if *verify_window == VerifyWindowState::Opened {
+                                        root.tr("验证窗口已打开；完成后这里会自动更新")
+                                    } else {
+                                        root.tr("需要二次验证，正在打开验证窗口…")
+                                    }),
+                            )
+                        },
+                    ),
             )
             .child(close_button(root.language, cx))
             .into_any_element(),
