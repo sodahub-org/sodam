@@ -2238,9 +2238,8 @@ impl Root {
         if self.logout_in_flight {
             return;
         }
-        // 只给这次落盘用的快照：写盘时把 Cookie 摘掉。
-        let mut logout_snapshot = self.settings.clone();
-        logout_snapshot.cookie.clear();
+        // 点登出时拍一份快照：盘上读不出来时拿它兜底（真正写盘时会摘掉 Cookie）。
+        let logout_snapshot = self.settings.clone();
         // 结果回来时对一下 Cookie：期间登录成功、换了账号或被热重载清掉，
         // 这次结果都属于旧身份，整条丢掉，不能拿它清身份。
         //
@@ -2251,12 +2250,12 @@ impl Root {
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
         //
-        // 写盘本身带身份校验：盘上的 Cookie 已经不是点击时那个，就直接跳过，
-        // 不会拿旧快照盖掉保存期间换进来的新身份（#197）。
+        // 写盘在锁里读盘上最新配置、只摘 Cookie 再写回：盘上的 Cookie 已经不是
+        // 点击时那个就整次跳过，不会拿旧快照盖掉换进来的新身份，也不吃掉
+        // 保存期间改过的主题、音量等字段（#197）。
         let expected_cookie = logout_cookie.clone();
-        let save = cx.background_spawn(async move {
-            logout_snapshot.save_if_cookie_unchanged(&expected_cookie)
-        });
+        let save =
+            cx.background_spawn(async move { logout_snapshot.save_signed_out(&expected_cookie) });
         self.logout_in_flight = true;
         // 慢盘时保存要等一会儿，先给一句反馈，别让点击看起来没反应。
         self.set_status_text(self.tr("正在退出登录…"));

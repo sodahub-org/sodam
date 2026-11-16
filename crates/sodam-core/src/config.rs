@@ -867,38 +867,47 @@ impl Settings {
         self.save_to_locked(path)
     }
 
-    /// 只有盘上 Cookie 仍是 `expected_cookie` 时才写；`false` 表示身份已经变了，
-    /// 这次写入被跳过（登出用，#197）。
+    /// 登出落盘：把**盘上最新那份配置**摘掉 Cookie 再写回去（#197）。
     ///
-    /// 比较和写入在同一把写锁里完成：外部改了 Cookie、或别处换了账号，
-    /// 都不会被这份「点登出时拍的快照」盖回去，主文件和备份也都不动。
-    pub fn save_if_cookie_unchanged(&self, expected_cookie: &str) -> anyhow::Result<bool> {
-        self.save_if_cookie_unchanged_to(&Self::config_path(), expected_cookie)
+    /// 读盘、比对、写入在同一把写锁里完成：
+    /// - 盘上 Cookie 还是 `expected_cookie`：清掉 Cookie 写回，主文件和备份一起刷新；
+    /// - 盘上本来就是空 Cookie（例如内存里的身份来自 `SODA_COOKIE`）：不用写，直接算成功；
+    /// - 盘上已经是另一个身份：`Ok(false)`，文件和备份都不动，别拿旧快照盖人。
+    ///
+    /// `self` 只当兜底：文件读不出来或解析不了时，用它摘掉 Cookie 去写
+    /// （坏原件由 `save_to_locked` 走隔离流程）。
+    pub fn save_signed_out(&self, expected_cookie: &str) -> anyhow::Result<bool> {
+        self.save_signed_out_to(&Self::config_path(), expected_cookie)
     }
 
-    pub fn save_if_cookie_unchanged_to(
-        &self,
-        path: &Path,
-        expected_cookie: &str,
-    ) -> anyhow::Result<bool> {
+    pub fn save_signed_out_to(&self, path: &Path, expected_cookie: &str) -> anyhow::Result<bool> {
         let _guard = SETTINGS_WRITE_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         Self::debug_delay_before_write();
-        // 读不出或解析不了的不比：文件不存在算首次保存，
-        // 坏原件交给 `save_to_locked` 走隔离流程，读错误也由它报。
-        let disk_cookie = std::fs::read(path)
+        let latest = std::fs::read(path)
             .ok()
-            .and_then(|bytes| parse_settings_bytes(&bytes).ok())
-            .map(|current| current.cookie);
-        // 盘上已经是别的身份：这份旧快照不许动文件和备份。
-        if disk_cookie
-            .as_deref()
-            .is_some_and(|cookie| cookie != expected_cookie)
-        {
-            return Ok(false);
+            .and_then(|bytes| parse_settings_bytes(&bytes).ok());
+        let outcome = latest.map(|mut current| {
+            // 盘上本来就没有 Cookie（内存身份来自环境变量补全）：没有可清的东西。
+            if current.cookie.trim().is_empty() {
+                return Ok(true);
+            }
+            // 盘上已经是另一个身份：旧结果不许覆盖新身份。
+            if current.cookie != expected_cookie {
+                return Ok(false);
+            }
+            // 用盘上最新配置写回，只摘 Cookie：保存期间改过的主题、音量等不会被旧快照盖掉。
+            current.cookie.clear();
+            current.save_to_locked(path)?;
+            Ok(true)
+        });
+        if let Some(result) = outcome {
+            return result;
         }
-        self.save_to_locked(path)?;
+        let mut fallback = self.clone();
+        fallback.cookie.clear();
+        fallback.save_to_locked(path)?;
         Ok(true)
     }
 
@@ -2072,38 +2081,46 @@ mod tests {
         );
     }
 
-    /// 登出写盘只在盘上 Cookie 还是原来那个时才执行（#197）。
+    /// 登出写盘：盘上身份没变才清 Cookie；换了人不许覆盖，别的字段要留住（#197）。
     #[test]
-    fn logout_save_skips_when_cookie_already_changed() {
+    fn logout_save_clears_cookie_only_for_the_same_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut signed_in = Settings::default();
         signed_in.cookie = "sessionid_ss=a".into();
+        signed_in.theme = "dark".into();
         signed_in.save_to(&path).expect("保存应成功");
 
-        let mut snapshot = signed_in.clone();
-        snapshot.cookie.clear();
+        let snapshot = signed_in.clone();
 
-        // 盘上还是 A：登出写入照常执行。
+        // 盘上还是 A：清掉 Cookie 写回，主题这类别的字段原样留住。
         assert!(snapshot
-            .save_if_cookie_unchanged_to(&path, "sessionid_ss=a")
+            .save_signed_out_to(&path, "sessionid_ss=a")
             .unwrap());
-        assert_eq!(cookie_on_disk(&path), "");
+        let disk = settings_on_disk(&path);
+        assert_eq!(disk.cookie, "");
+        assert_eq!(disk.theme, "dark");
 
-        // 盘上换成了 B：旧快照不许把它盖回去。
+        // 盘上换成 B：旧结果不许把新身份盖回去。
         let mut other = Settings::default();
         other.cookie = "sessionid_ss=b".into();
         other.save_to(&path).expect("保存应成功");
         assert!(!snapshot
-            .save_if_cookie_unchanged_to(&path, "sessionid_ss=a")
+            .save_signed_out_to(&path, "sessionid_ss=a")
             .unwrap());
-        assert_eq!(cookie_on_disk(&path), "sessionid_ss=b");
+        assert_eq!(settings_on_disk(&path).cookie, "sessionid_ss=b");
+
+        // 盘上没有 Cookie（内存身份来自环境变量补全）：不用写，也算登出成功。
+        Settings::default().save_to(&path).expect("保存应成功");
+        assert!(snapshot
+            .save_signed_out_to(&path, "sessionid_ss=a")
+            .unwrap());
+        assert_eq!(settings_on_disk(&path).cookie, "");
     }
 
-    /// 直接读盘上 JSON 里的 Cookie，绕开环境变量补全，免得用例受外部影响。
-    fn cookie_on_disk(path: &std::path::Path) -> String {
+    /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。
+    fn settings_on_disk(path: &std::path::Path) -> Settings {
         let raw = std::fs::read_to_string(path).unwrap();
-        let settings: Settings = serde_json::from_str(&raw).unwrap();
-        settings.cookie
+        serde_json::from_str(&raw).unwrap()
     }
 }
