@@ -33,8 +33,17 @@ impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
-    pub fn ensure_contributors(&mut self, cx: &mut Context<Self>) {
-        if self.contributors_image.is_some() || self.contributors_fetching {
+    ///
+    /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
+    /// 失败态由 `sodam_core::contributors::should_fetch_contributors` 判定是否停手，
+    /// 避免「失败 → notify → 重绘 → 再拉取」的死循环（#135 C）。
+    pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
+        if !sodam_core::contributors::should_fetch_contributors(
+            self.contributors_image.is_some(),
+            self.contributors_fetching,
+            self.contributors_failed,
+            force,
+        ) {
             return;
         }
         self.contributors_failed = false;

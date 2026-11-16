@@ -1317,7 +1317,8 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         .child({
             let repository = env!("CARGO_PKG_REPOSITORY");
             let contributors = root.contributors_image.clone();
-            root.ensure_contributors(cx);
+            // 渲染路径：失败态下不自动重试，否则 notify → 重绘 → 再拉取成死循环。
+            root.ensure_contributors(cx, false);
             div()
                 .id("about-footer")
                 .flex()
@@ -1450,7 +1451,8 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .text_size(theme::Text::Tiny.size())
                                 .text_color(theme::text_muted())
                                 .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                                    root.ensure_contributors(cx);
+                                    // 用户显式重试：force 越过失败态再拉一次。
+                                    root.ensure_contributors(cx, true);
                                 }))
                                 .child(root.tr("加载失败，点击重试"))
                                 .into_any_element()
