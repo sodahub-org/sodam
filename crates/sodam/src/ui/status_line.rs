@@ -114,8 +114,16 @@ impl Root {
 /// 它不挂任何交互处理器（与 `ui::message` 的浮层同型），预期不会产生命中框，
 /// 压在页面上的这几秒不该挡住下面列表的点击——这一点要在真机验收时确认。
 pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyElement> {
-    let text = root.status_line.visible(Instant::now())?.to_string();
-    root.schedule_status_clear(cx);
+    // 退出保存期间这条提示优先：切页会清空状态行，其它提示也可能顶掉它（#198）。
+    let saving = root.quit_gate.is_saving();
+    let text = if saving {
+        root.tr("正在保存…").to_string()
+    } else {
+        root.status_line.visible(Instant::now())?.to_string()
+    };
+    if !saving {
+        root.schedule_status_clear(cx);
+    }
     Some(
         div()
             .id("status-line")

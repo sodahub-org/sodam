@@ -184,3 +184,9 @@ TrackItem + cache path
 - 安装内容：`/usr/bin/sodam`、desktop entry、hicolor icon。
 - GUI 通过 `scripts/run.sh` 启动时带 `MemoryMax=2G` 护栏。
 - 托盘和窗口关闭逻辑使用显式退出模式：关闭主窗口保留进程，退出走托盘菜单。
+- 应用内退出（托盘 / ⌘Q）先过 `sodam-core` 的退出闸门：状态行提示「正在保存…」，
+  等启动期欠下的落盘（回存、首拍任务、偏好刷尾）写完再 `cx.quit()`；最长等 3 秒，
+  到点强制退出并写日志。再次点击退出立即退出；这两条强制路径不再等偏好写线程
+  `join`，避免慢盘把进程挂住。GPUI 的 `on_app_quit` 只留 200ms 兜底，只覆盖
+  GPUI 能执行退出回调的路径；SIGKILL / 任务管理器强杀不执行任何回调，这类路径
+  只能等下次启动重做。
