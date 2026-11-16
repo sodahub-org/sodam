@@ -919,6 +919,9 @@ impl Settings {
                         "backup_refresh_failed",
                         &[("detail", error.to_string().as_str())],
                     );
+                    // 刷不动备份时，退而求其次把带 Cookie 的旧备份删掉：
+                    // 留着它，主文件以后损坏走恢复会把账号找回来。
+                    Self::drop_stale_backup_cookie(path);
                 }
                 return Ok(true);
             }
@@ -929,6 +932,8 @@ impl Settings {
             // 用盘上最新配置写回，只摘 Cookie：保存期间改过的主题、音量等不会被旧快照盖掉。
             current.cookie.clear();
             current.save_to_locked(path)?;
+            // 备份写入在 `save_to_locked` 里是尽力而为：没刷成的话，这里把带 Cookie 的旧备份清掉。
+            Self::drop_stale_backup_cookie(path);
             Ok(true)
         });
         if let Some(result) = outcome {
@@ -937,7 +942,37 @@ impl Settings {
         let mut fallback = self.clone();
         fallback.cookie.clear();
         fallback.save_to_locked(path)?;
+        Self::drop_stale_backup_cookie(path);
         Ok(true)
+    }
+
+    /// 备份里还带着 Cookie 就说明刷新没成功：尽力删掉这份旧副本，
+    /// 免得主文件以后损坏时从备份把已退出的账号恢复回来（#197）。
+    ///
+    /// 删不掉只记日志，不把登出判失败：主文件已经登出，判失败反而让用户一直登不出去。
+    fn drop_stale_backup_cookie(path: &Path) {
+        let backup = settings_backup_path(path);
+        let stale = std::fs::read(&backup)
+            .ok()
+            .and_then(|bytes| parse_settings_bytes(&bytes).ok())
+            .is_some_and(|settings| !settings.cookie.trim().is_empty());
+        if !stale {
+            return;
+        }
+        match std::fs::remove_file(&backup) {
+            Ok(()) => log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "backup_removed_stale_cookie",
+                &[],
+            ),
+            Err(error) => log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "backup_stale_cookie_remains",
+                &[("detail", error.to_string().as_str())],
+            ),
+        }
     }
 
     /// 验收用：debug 构建里按 `SODAM_SLOW_SAVE_MS` 拖慢保存（#197）。
@@ -2160,6 +2195,29 @@ mod tests {
             .unwrap());
         assert_eq!(settings_on_disk(&path).cookie, "");
         assert_eq!(settings_on_disk(&settings_backup_path(&path)).cookie, "");
+    }
+
+    /// 备份刷新失败时的兜底：带 Cookie 的旧备份删掉，空 Cookie 的备份留着（#197）。
+    #[test]
+    fn stale_backup_with_cookie_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let backup = settings_backup_path(&path);
+        let signed_in = Settings {
+            cookie: "sessionid_ss=a".into(),
+            ..Settings::default()
+        };
+        std::fs::write(&backup, serde_json::to_vec_pretty(&signed_in).unwrap()).unwrap();
+        Settings::drop_stale_backup_cookie(&path);
+        assert!(!backup.exists(), "带 Cookie 的旧备份应被删掉");
+
+        std::fs::write(
+            &backup,
+            serde_json::to_vec_pretty(&Settings::default()).unwrap(),
+        )
+        .unwrap();
+        Settings::drop_stale_backup_cookie(&path);
+        assert!(backup.exists(), "空 Cookie 的备份不用删");
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。
