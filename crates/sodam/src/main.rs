@@ -140,7 +140,7 @@ fn start_tray_service(
                 cx.spawn(async move |cx| {
                     let result = cx
                         .background_executor()
-                        .spawn(async move { write_back.flush() })
+                        .spawn(async move { write_back.persist() })
                         .await;
                     if let Err(error) = result {
                         let _ = cx.update(|cx| {

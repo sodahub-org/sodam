@@ -399,8 +399,8 @@ impl Language {
             "配置文件损坏（{}）：已用默认设置启动，原文件未改动" => {
                 "Config file is corrupt ({}): started with defaults. The original file was left untouched."
             }
-            "启动配置回存失败（{}）：本次运行不受影响" => {
-                "Failed to save the startup config ({}). This session continues unaffected."
+            "启动配置回存失败：本次运行不受影响，详情见诊断日志" => {
+                "Failed to save the startup config. This session continues unaffected; see the diagnostic log for details."
             }
             "已配置登录与签名服务，可以去「搜索」或「推荐」了" => "Signed in and signer ready. Try Discover or Search.",
             "还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）" => "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL).",

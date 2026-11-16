@@ -477,6 +477,8 @@ pub enum StartupRecovery {
 pub struct StartupLoad {
     pub settings: Settings,
     pub recovery: Option<StartupRecovery>,
+    /// 启动前主文件不存在（首启）：旧行为会在启动时创建配置文件。
+    pub first_run: bool,
     /// 落盘修正（备份刷新 / 迁移回存 / 损坏隔离与恢复写回）。默认值启动时为 `None`。
     pub write_back: Option<StartupWriteBack>,
 }
@@ -500,11 +502,16 @@ impl StartupWriteBack {
     }
 
     /// 执行落盘修正。阻塞调用，必须在后台线程跑；返回第一处失败。
-    pub fn flush(self) -> Result<(), String> {
+    pub fn persist(self) -> Result<(), String> {
         let mut first_error: Option<String> = None;
         if let Some(bad_path) = self.quarantine_to.as_deref() {
-            if let Err(err) = quarantine_corrupt_file_to(&self.path, bad_path) {
-                first_error.get_or_insert_with(|| format!("隔离坏配置失败：{err}"));
+            match quarantine_corrupt_file_to(&self.path, bad_path) {
+                Ok(()) => {}
+                // 等待期间坏文件已被删掉：没有要保留的原件，按成功继续恢复写回。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    first_error.get_or_insert_with(|| format!("隔离坏配置失败：{err}"));
+                }
             }
         }
         let mut saved_main = false;
@@ -545,11 +552,10 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                 _ => None,
             };
             match backup {
-                Some(mut backup) => {
+                Some(backup) => {
                     // 备份里没带登录身份时，环境变量仍然要先生效（#186）；
                     // 备份自带的身份优先。
-                    backup.fill_login_device_from_env();
-                    backup.ensure_login_device();
+                    let (backup, _) = Settings::prepare_loaded(backup, false);
                     // 读盘阶段只算隔离目标名，不改名；坏文件等首帧后的后台修正再动。
                     let bad_path = quarantine_target(path).unwrap_or_else(|| path.to_path_buf());
                     StartupLoad {
@@ -561,6 +567,7 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                         }),
                         settings: backup,
                         recovery: Some(StartupRecovery::RecoveredFromBackup { bad_path }),
+                        first_run: false,
                     }
                 }
                 None => {
@@ -570,22 +577,33 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                     StartupLoad {
                         settings: defaults,
                         recovery: Some(StartupRecovery::FellBackToDefaults { error }),
+                        first_run: false,
                         write_back: None,
                     }
                 }
             }
         }
         outcome => {
-            let (settings, changed) = Settings::prepare_loaded(outcome);
+            let first_run = matches!(outcome, LoadOutcome::NotFound(_));
+            let (settings, changed) = match outcome {
+                LoadOutcome::NotFound(settings) => Settings::prepare_loaded(settings, false),
+                LoadOutcome::Loaded { settings, migrated } => {
+                    Settings::prepare_loaded(settings, migrated)
+                }
+                // 损坏分支已在上面单独处理；这里按默认值兜底，保证只读盘一次。
+                LoadOutcome::Corrupt { .. } => (Settings::default(), false),
+            };
             StartupLoad {
                 write_back: Some(StartupWriteBack {
                     path: path.to_path_buf(),
                     settings: settings.clone(),
                     quarantine_to: None,
-                    save_main: changed,
+                    // 首启即使身份全部来自环境变量（ensure 不生成）也要创建配置文件。
+                    save_main: changed || first_run,
                 }),
                 settings,
                 recovery: None,
+                first_run,
             }
         }
     }
@@ -640,7 +658,7 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Self {
-        let outcome = match Self::try_load_from(path) {
+        let (settings, changed) = match Self::try_load_from(path) {
             LoadOutcome::Corrupt { error } => {
                 // 坏文件绝不覆盖：用默认值继续，不生成设备身份、不回写。
                 // 备份恢复由调用方（应用启动流程）负责。
@@ -652,9 +670,9 @@ impl Settings {
                 );
                 return Self::default();
             }
-            outcome => outcome,
+            LoadOutcome::NotFound(settings) => Self::prepare_loaded(settings, false),
+            LoadOutcome::Loaded { settings, migrated } => Self::prepare_loaded(settings, migrated),
         };
-        let (settings, changed) = Self::prepare_loaded(outcome);
         // 迁移/初始化后立刻落盘：用户下次打开配置文件看到的、以及设置页显示的，
         // 都是真正生效的那份。写失败不影响启动，内存里的值已经是迁移后的。
         if changed {
@@ -669,13 +687,7 @@ impl Settings {
     /// 读盘结果的内存修正：补环境变量、生成登录设备身份，返回 `(设置, 是否需要回存)`。
     ///
     /// 不写盘：启动路径把「要不要回存」交给 [`StartupWriteBack`] 在首帧后处理（#191）。
-    fn prepare_loaded(outcome: LoadOutcome) -> (Self, bool) {
-        let (mut settings, changed) = match outcome {
-            LoadOutcome::NotFound(settings) => (settings, false),
-            LoadOutcome::Loaded { settings, migrated } => (settings, migrated),
-            // 调用方已单独处理损坏分支；这里按默认值兜底，保持纯函数。
-            LoadOutcome::Corrupt { .. } => (Self::default(), false),
-        };
+    fn prepare_loaded(mut settings: Self, changed: bool) -> (Self, bool) {
         // 环境变量补在身份生成之前：首启时 `SODA_LOGIN_DEVICE_ID` / `SODA_LOGIN_INSTALL_ID`
         // 才能决定这份身份，否则身份先生成落盘，环境变量永远补不进去（#186）。
         // 已存的身份非空，照旧优先于环境变量。
@@ -1700,13 +1712,13 @@ mod tests {
         // 恢复的落盘修正要在首帧后由后台执行（#191）。
         load.write_back
             .expect("备份恢复应欠落盘修正")
-            .flush()
+            .persist()
             .expect("后台修正应成功");
     }
 
-    /// 读盘阶段不写盘：正常路径只在内存里补身份 / 迁移，备份与回存都等 flush（#191）。
+    /// 读盘阶段不写盘：正常路径只在内存里补身份 / 迁移，备份与回存都等 persist（#191）。
     #[test]
-    fn load_for_startup_defers_disk_writes_until_flush() {
+    fn load_for_startup_defers_disk_writes_until_persist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"cookie":"sessionid_ss=x","theme":"dark"}"#).unwrap();
@@ -1724,14 +1736,14 @@ mod tests {
 
         load.write_back
             .expect("正常路径应欠一次备份刷新")
-            .flush()
+            .persist()
             .expect("后台修正应成功");
         assert!(settings_backup_path(&path).exists(), "首帧后应补上备份");
     }
 
-    /// 损坏路径：读盘阶段只算隔离目标，坏文件不动；flush 之后才改名保留并恢复主文件。
+    /// 损坏路径：读盘阶段只算隔离目标，坏文件不动；persist 之后才改名保留并恢复主文件。
     #[test]
-    fn load_for_startup_defers_corrupt_quarantine_until_flush() {
+    fn load_for_startup_defers_corrupt_quarantine_until_persist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let backup = Settings {
@@ -1755,11 +1767,11 @@ mod tests {
 
         load.write_back
             .expect("损坏恢复应欠落盘修正")
-            .flush()
+            .persist()
             .expect("后台修正应成功");
         assert!(
             bad_path.exists(),
-            "flush 后坏文件应保留在 {}",
+            "persist 后坏文件应保留在 {}",
             bad_path.display()
         );
         assert_eq!(std::fs::read_to_string(&bad_path).unwrap(), "corrupt!");
@@ -1786,6 +1798,39 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "corrupt!",
             "坏文件必须原样保留"
+        );
+    }
+
+    /// 首启（主文件不存在）必须安排创建配置文件：身份全由环境变量给齐时也要建。
+    #[test]
+    fn first_run_always_schedules_config_file_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let load = load_for_startup(&path);
+        assert!(load.first_run, "主文件不存在应标记首启");
+        let write_back = load.write_back.expect("首启应安排落盘修正");
+        assert!(write_back.save_main, "首启必须创建配置文件");
+        write_back.persist().expect("首启落盘应成功");
+        assert!(path.exists(), "首启 persist 后应生成配置文件");
+    }
+
+    /// 落盘失败只回报错误，不 panic；状态行提示由 UI 侧负责。
+    #[test]
+    fn startup_write_back_reports_first_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // 父路径是普通文件：创建目录与写文件都会失败。
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, "file").unwrap();
+        let write_back = StartupWriteBack {
+            path: blocker.join("config.json"),
+            settings: Settings::default(),
+            quarantine_to: None,
+            save_main: false,
+        };
+        assert!(
+            write_back.persist().is_err(),
+            "写不进去应返回错误而不是 panic"
         );
     }
 

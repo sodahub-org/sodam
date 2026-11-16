@@ -642,13 +642,13 @@ impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config_path = Settings::config_path();
-        let config_existed = config_path.exists();
         // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
         // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
         // 读盘阶段只做内存修正，备份 / 回存 / 隔离改名全部留给首帧后的后台任务（#191）。
         let sodam_core::config::StartupLoad {
             settings,
             recovery,
+            first_run,
             mut write_back,
         } = sodam_core::config::load_for_startup(&config_path);
         let mut settings = settings.merged_with_env();
@@ -659,7 +659,7 @@ impl Root {
         settings.volume = engine.snapshot().volume;
         // 首次运行要落盘（用户可以直接编辑 config.json 换签名服务 / 钉死设备指纹）。
         // 旧行为保存的是补过环境变量的这份设置；内容交给首帧后的后台回存，不在 UI 线程写。
-        if !config_existed {
+        if first_run {
             if let Some(write_back) = write_back.as_mut() {
                 write_back.adopt_settings(settings.clone());
             }
@@ -1569,14 +1569,17 @@ impl Root {
         self.startup_write_back.take()
     }
 
-    /// 启动期后台回存失败：写日志并在状态行补一条，本次运行不受影响。
+    /// 启动期后台回存失败：技术原文进日志，状态行只给人话，本次运行不受影响。
     pub(crate) fn report_startup_write_back_failure(
         &mut self,
         error: String,
         cx: &mut Context<Self>,
     ) {
-        self.log_failure("启动配置回存失败", &error);
-        let message = self.localized("启动配置回存失败（{}）：本次运行不受影响", &[error]);
+        let message = self.failure_text(
+            "启动配置回存失败",
+            &error,
+            "启动配置回存失败：本次运行不受影响，详情见诊断日志",
+        );
         self.set_status_text(message);
         cx.notify();
     }
