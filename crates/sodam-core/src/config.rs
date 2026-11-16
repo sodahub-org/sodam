@@ -1473,7 +1473,11 @@ mod tests {
         let _cookie_guard = EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
         let _signer_guard = EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
 
-        let skipped = Settings::default().fill_empty_from_env(EnvCookieFill::Skip);
+        // 签名地址有内置默认值，先清空，才能验证「Skip 只跳过 Cookie、其余字段照补」。
+        let mut base = Settings::default();
+        base.signer_url.clear();
+
+        let skipped = base.clone().fill_empty_from_env(EnvCookieFill::Skip);
         assert!(
             skipped.cookie.is_empty(),
             "登出记号置位时不能用环境变量补 Cookie"
@@ -1481,7 +1485,7 @@ mod tests {
         assert_eq!(skipped.signer_url, "https://signer.example");
 
         // 对照：没有记号时照旧补 Cookie，证明跳过不是「环境变量没设」造成的。
-        let allowed = Settings::default().fill_empty_from_env(EnvCookieFill::Allow);
+        let allowed = base.fill_empty_from_env(EnvCookieFill::Allow);
         assert_eq!(allowed.cookie, "cookie-from-env");
     }
 
