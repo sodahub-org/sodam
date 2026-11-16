@@ -230,7 +230,7 @@ pub(crate) fn verify_window_step(
 /// 打开失败过的窗口保留原来的错误文案——轮询状态可以推进流程，
 /// 但不能把用户看到的失败原因顶掉（#186）。
 pub(crate) fn apply_verify_window_result(
-    window: &mut VerifyWindowState,
+    window: VerifyWindowState,
     need_second_verify: &mut bool,
     status: &mut String,
     poll_status: String,
@@ -238,7 +238,7 @@ pub(crate) fn apply_verify_window_result(
     opened_text: &str,
 ) {
     *need_second_verify = poll_need_second_verify;
-    match verify_window_step(*window, poll_need_second_verify) {
+    match verify_window_step(window, poll_need_second_verify) {
         VerifyWindowStep::Open | VerifyWindowStep::PollStatus => *status = poll_status,
         VerifyWindowStep::ShowOpened => *status = opened_text.to_string(),
         VerifyWindowStep::KeepFailed => {}
@@ -2022,12 +2022,11 @@ mod tests {
     /// 失败文案真的留在状态里：模拟失败后再来一轮要求验证的轮询（#186）。
     #[test]
     fn failed_window_keeps_error_text_across_polls() {
-        let mut window = VerifyWindowState::Failed;
         let mut need = true;
         let mut status = FAILED_TEXT.to_string();
 
         apply_verify_window_result(
-            &mut window,
+            VerifyWindowState::Failed,
             &mut need,
             &mut status,
             "等待扫码…".to_string(),
@@ -2036,12 +2035,10 @@ mod tests {
         );
         assert_eq!(status, FAILED_TEXT, "失败文案不能被轮询状态盖掉");
         assert!(need, "仍然需要二次验证");
-        assert_eq!(window, VerifyWindowState::Failed, "不能变回已打开");
 
         // 打开成功：显示「已打开」
-        let mut window = VerifyWindowState::Opened;
         apply_verify_window_result(
-            &mut window,
+            VerifyWindowState::Opened,
             &mut need,
             &mut status,
             "等待扫码…".to_string(),
@@ -2052,7 +2049,7 @@ mod tests {
 
         // 服务端不再要求验证：照常显示轮询文案
         apply_verify_window_result(
-            &mut window,
+            VerifyWindowState::Opened,
             &mut need,
             &mut status,
             "已登录".to_string(),

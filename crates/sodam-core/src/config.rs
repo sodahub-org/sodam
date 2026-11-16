@@ -906,6 +906,7 @@ impl Settings {
     /// 只补环境变量，不生成设备身份：热重载轮询与启动共用同一套补全逻辑
     /// （优先级一致），设备身份交给调用方决定要不要生成。
     pub(crate) fn fill_empty_from_env(mut self) -> Self {
+        self.fill_login_device_from_env();
         let pairs = [
             ("SODA_COOKIE", &mut self.cookie),
             ("QISHUI_SIGNER_URL", &mut self.signer_url),
@@ -913,8 +914,6 @@ impl Settings {
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
-            (ENV_LOGIN_DEVICE_ID, &mut self.login_device_id),
-            (ENV_LOGIN_INSTALL_ID, &mut self.login_install_id),
         ];
         for (key, slot) in pairs {
             Self::fill_slot_from_env(slot, key);

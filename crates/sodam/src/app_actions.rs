@@ -789,6 +789,9 @@ impl Root {
             // 二次验证窗口只自动拉起一次（失败也不重试，用户可关掉重开登录流程）；
             // 完成后轮询自动领取结果
             let mut verify_window = VerifyWindowState::NotRequested;
+            let opened_text = language
+                .text("验证窗口已打开；完成后这里会自动更新")
+                .to_string();
             let mut last_login_phase = String::new();
             for _ in 0..80 {
                 // 6 秒一次：3 秒会触发服务端限流（error_code=7），确认握手会被丢掉
@@ -808,8 +811,16 @@ impl Root {
                             // 先记原文、先取文案：下面要对 root.login 取可变借用。
                             root.log_failure("登录轮询异常", &err);
                             let status_text = root.tr(RETRY_TEXT).to_string();
-                            if let LoginState::Waiting { status, .. } = &mut root.login {
-                                *status = status_text;
+                            if let LoginState::Waiting {
+                                status,
+                                verify_window,
+                                ..
+                            } = &mut root.login
+                            {
+                                // 验证窗口打开失败的原因留着：一次网络抖动不该把它换掉。
+                                if *verify_window != VerifyWindowState::Failed {
+                                    *status = status_text;
+                                }
                             }
                             cx.notify();
                         });
@@ -862,10 +873,10 @@ impl Root {
                         "login_success",
                         &[(
                             "second_verify",
-                            if verify_window == VerifyWindowState::NotRequested {
-                                "false"
-                            } else {
+                            if verify_window == VerifyWindowState::Opened {
                                 "true"
+                            } else {
+                                "false"
                             },
                         )],
                     );
@@ -988,9 +999,6 @@ impl Root {
                         cx.notify();
                     });
                 }
-                let opened_text = language
-                    .text("验证窗口已打开；完成后这里会自动更新")
-                    .to_string();
                 let _ = this.update(cx, |root, cx| {
                     if let LoginState::Waiting {
                         status: slot,
@@ -1000,7 +1008,7 @@ impl Root {
                     } = &mut root.login
                     {
                         apply_verify_window_result(
-                            state,
+                            *state,
                             flag,
                             slot,
                             status,
