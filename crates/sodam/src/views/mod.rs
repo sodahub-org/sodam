@@ -6,7 +6,7 @@ use gpui::{
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Window,
 };
 
-use crate::app::{LoginState, Nav, Root};
+use crate::app::{LoginState, Nav, Root, VerifyWindowState};
 use crate::ui::artwork::{cover, scene_image};
 use crate::ui::icons;
 use crate::ui::middle_drag::DragTarget;
