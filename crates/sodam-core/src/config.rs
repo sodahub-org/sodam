@@ -2086,9 +2086,11 @@ mod tests {
     fn logout_save_clears_cookie_only_for_the_same_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let mut signed_in = Settings::default();
-        signed_in.cookie = "sessionid_ss=a".into();
-        signed_in.theme = "dark".into();
+        let signed_in = Settings {
+            cookie: "sessionid_ss=a".into(),
+            theme: "dark".into(),
+            ..Settings::default()
+        };
         signed_in.save_to(&path).expect("保存应成功");
 
         let snapshot = signed_in.clone();
@@ -2102,8 +2104,10 @@ mod tests {
         assert_eq!(disk.theme, "dark");
 
         // 盘上换成 B：旧结果不许把新身份盖回去。
-        let mut other = Settings::default();
-        other.cookie = "sessionid_ss=b".into();
+        let other = Settings {
+            cookie: "sessionid_ss=b".into(),
+            ..Settings::default()
+        };
         other.save_to(&path).expect("保存应成功");
         assert!(!snapshot
             .save_signed_out_to(&path, "sessionid_ss=a")
