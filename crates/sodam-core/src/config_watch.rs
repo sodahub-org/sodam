@@ -75,6 +75,13 @@ impl ReloadTracker {
         self.pending = PendingChange::default();
     }
 
+    /// 把路径当前状态记为基线。启动期落盘修正会在这之后改写文件（#191），
+    /// 先把加载时的指纹记下来，慢盘上就不会把「正在恢复」误报成外部损坏。
+    /// 指纹只用来判断之后有没有变化，不判断内容是否有效。
+    pub fn acknowledge_path(&mut self, path: &Path) {
+        self.acknowledge(fingerprint(path));
+    }
+
     /// 轮询一次。读盘与解析都在本调用线程完成。
     ///
     /// `self_write_recent` 由调用方传入 [`crate::config::recent_self_write`]，

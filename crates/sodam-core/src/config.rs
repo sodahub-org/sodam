@@ -653,10 +653,14 @@ impl Settings {
     }
 
     /// 读配置；文件不存在时返回默认值（不报错）。
+    ///
+    /// 同步读写的便捷入口（示例 / 工具用）。应用启动请走 [`load_for_startup`]：
+    /// 那条路径只读，落盘修正留给首帧后的后台任务（#191）。
     pub fn load() -> Self {
         Self::load_from(&Self::config_path())
     }
 
+    /// 同步加载：读 + 内存修正 + 立即回存 / 备份（阻塞调用）。
     pub fn load_from(path: &Path) -> Self {
         let (settings, changed) = match Self::try_load_from(path) {
             LoadOutcome::Corrupt { error } => {
@@ -715,8 +719,9 @@ impl Settings {
     ///   与设备身份）；无法识别的枚举值（播放模式等）由字段自己的反序列化回退默认。
     /// - 数值越界由 `normalize_playback` 钳制。
     /// - 只有语法层面的损坏（连 JSON 都不是、或结构对不上）才算 [`LoadOutcome::Corrupt`]。
-    /// - 旧格式迁移只改内存值；是否回存由 [`Self::load_from`]（启动）决定，
-    ///   热重载路径拿到 `migrated` 也不回写，避免外部编辑被立刻覆盖。
+    /// - 旧格式迁移只改内存值；是否回存由调用方决定：[`load_for_startup`] 把落盘
+    ///   推迟到首帧后，[`Self::load_from`] 同步落盘；热重载路径拿到 `migrated`
+    ///   也不回写，避免外部编辑被立刻覆盖。
     pub fn try_load_from(path: &Path) -> LoadOutcome {
         // 与保存共用同一把写锁：轮询读文件不会被并发保存的原子替换序列读到中间态。
         let _guard = SETTINGS_WRITE_LOCK

@@ -713,6 +713,13 @@ impl Root {
 
         let logged_in = !settings.cookie.trim().is_empty();
         let play_reporter = PlayReporter::new(settings.clone());
+        let config_reload = {
+            let mut tracker = sodam_core::config_watch::ReloadTracker::new();
+            // 以加载时的文件状态作基线：首帧后的隔离 / 回写不算外部改动，
+            // 慢盘上也不会把「正在恢复」误报成配置文件损坏（#191）。
+            tracker.acknowledge_path(&config_path);
+            Arc::new(Mutex::new(tracker))
+        };
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -894,13 +901,17 @@ impl Root {
             account: None,
             engine,
             play_reporter,
-            config_reload: Arc::new(Mutex::new(sodam_core::config_watch::ReloadTracker::new())),
+            config_reload,
             config_poll_busy: false,
             volume_scrubbing: false,
             startup_write_back: write_back,
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
+            // 心跳首拍之前就退出：补做还没跑的启动落盘修正（小文件，退出期一次性）。
+            if let Some(write_back) = root.startup_write_back.take() {
+                let _ = write_back.persist();
+            }
             root.preferences_writer.flush()
         })
         .detach();
@@ -1575,11 +1586,8 @@ impl Root {
         error: String,
         cx: &mut Context<Self>,
     ) {
-        let message = self.failure_text(
-            "启动配置回存失败",
-            &error,
-            "启动配置回存失败：本次运行不受影响，详情见诊断日志",
-        );
+        // 复用本地保存类失败的统一说法；「本次运行不受影响」留在日志上下文里。
+        let message = self.failure_text("启动配置回存失败", &error, SAVE_TEXT);
         self.set_status_text(message);
         cx.notify();
     }
