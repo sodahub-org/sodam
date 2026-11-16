@@ -2238,30 +2238,23 @@ impl Root {
         if self.logout_in_flight {
             return;
         }
-        let mut settings = self.settings.clone();
-        settings.cookie.clear();
+        // 只给这次落盘用的快照：写盘时把 Cookie 摘掉。
+        let mut logout_settings = self.settings.clone();
+        logout_settings.cookie.clear();
         // 结果回来时拿这份代数对一下：保存期间登录成功或换了账号，
         // 这次结果属于旧身份，整条丢掉，不能拿它清掉新身份。
         let auth_epoch = self.auth_epoch;
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
-        let save_settings = settings.clone();
-        let save = cx.background_spawn(async move { save_settings.save() });
+        let save = cx.background_spawn(async move { logout_settings.save() });
         self.logout_in_flight = true;
         cx.spawn(async move |this, cx| {
             let outcome = save.await;
             let _ = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
                 if root.auth_epoch != auth_epoch {
-                    // 保存期间换过身份：这份结果已经过期，不能拿来清身份。
-                    // 但盘上刚被写成「无 Cookie」；用内存里最新的设置再写一次，
-                    // 免得界面是登录态、盘上却是登出态，重启就变成没登录。
-                    let latest = root.settings.clone();
-                    cx.background_spawn(async move {
-                        let _ = latest.save();
-                    })
-                    .detach();
+                    // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
                     return;
                 }
                 match outcome {
@@ -2269,11 +2262,13 @@ impl Root {
                         // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
                         // 记号不落盘，重启后仍按环境变量启动。
                         root.env_cookie_opted_out = true;
-                        // 盘上已经是登出状态，这里只重建会话，不再写一次盘。
+                        // 只在内存里摘掉 Cookie：保存期间改过的其它设置（音量、日志等）
+                        // 不跟着回滚到点击那一刻的快照。
+                        root.settings.cookie.clear();
+                        // 盘上已经写成登出状态，这里只重建会话，不再写一次盘。
                         if let Some(session) = root.session.as_mut() {
-                            session.adopt(settings.clone());
+                            session.adopt(root.settings.clone());
                         }
-                        root.settings = settings;
                         root.clear_identity_state(cx);
                         // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
                         // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
