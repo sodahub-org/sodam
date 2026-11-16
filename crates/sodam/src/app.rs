@@ -1719,7 +1719,8 @@ impl Root {
         })
         .detach();
 
-        // 用通道 + 轮询而不是 select：仓库没有跨平台的 futures 依赖，20ms 一拍足够。
+        // 用通道 + 轮询而不是 select：`futures-lite` 只在 Linux 目标下引入，
+        // 这里保持跨平台，20ms 一拍足够。
         cx.spawn(async move |this, cx| {
             loop {
                 if matches!(
