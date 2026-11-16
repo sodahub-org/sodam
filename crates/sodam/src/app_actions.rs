@@ -22,8 +22,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    status_label, verify_window_step, BatchUpgradeProgress, LoginState, Nav, QueueOrigin, Root,
-    VerifyWindowState, VerifyWindowStep, REMOTE_TEXT, RETRY_TEXT, ROW_BATCH, SAVE_TEXT,
+    apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
+    Nav, QueueOrigin, Root, VerifyWindowState, VerifyWindowStep, REMOTE_TEXT, RETRY_TEXT,
+    ROW_BATCH, SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -976,40 +977,36 @@ impl Root {
                         if let LoginState::Waiting {
                             status: slot,
                             need_second_verify: flag,
-                            verify_window: window,
+                            verify_window: state,
                             ..
                         } = &mut root.login
                         {
                             *flag = true;
-                            *window = window_state;
+                            *state = window_state;
                             *slot = message;
                         }
                         cx.notify();
                     });
                 }
+                let opened_text = language
+                    .text("验证窗口已打开；完成后这里会自动更新")
+                    .to_string();
                 let _ = this.update(cx, |root, cx| {
                     if let LoginState::Waiting {
                         status: slot,
                         need_second_verify: flag,
-                        verify_window: window,
+                        verify_window: state,
                         ..
                     } = &mut root.login
                     {
-                        *flag = result.need_second_verify;
-                        match verify_window_step(*window, result.need_second_verify) {
-                            VerifyWindowStep::ShowOpened => {
-                                *slot = language
-                                    .text("验证窗口已打开；完成后这里会自动更新")
-                                    .to_string();
-                            }
-                            // 打开失败：保留错误文案，别被轮询状态盖掉
-                            VerifyWindowStep::KeepFailed => {}
-                            // 本轮刚开完窗时状态已由上面的 update 写好；
-                            // 不需要验证时按轮询状态推进
-                            VerifyWindowStep::Open | VerifyWindowStep::PollStatus => {
-                                *slot = status;
-                            }
-                        }
+                        apply_verify_window_result(
+                            state,
+                            flag,
+                            slot,
+                            status,
+                            result.need_second_verify,
+                            &opened_text,
+                        );
                     }
                     cx.notify();
                 });

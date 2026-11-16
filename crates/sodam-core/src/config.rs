@@ -17,6 +17,10 @@ static LAST_SELF_WRITE: Mutex<Option<Instant>> = Mutex::new(None);
 /// 覆盖整份保存与音量写线程的合并保存（两者都走 [`Self::save_to_locked`]）。
 const SELF_WRITE_WINDOW: Duration = Duration::from_millis(1500);
 
+/// 登录设备身份的环境变量名：启动期补全、公共合并与单测共用一份名字。
+const ENV_LOGIN_DEVICE_ID: &str = "SODA_LOGIN_DEVICE_ID";
+const ENV_LOGIN_INSTALL_ID: &str = "SODA_LOGIN_INSTALL_ID";
+
 /// 记录一次应用自身写盘（保存成功后调用）。
 fn note_self_write() {
     let mut slot = LAST_SELF_WRITE
@@ -909,8 +913,8 @@ impl Settings {
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
-            ("SODA_LOGIN_DEVICE_ID", &mut self.login_device_id),
-            ("SODA_LOGIN_INSTALL_ID", &mut self.login_install_id),
+            (ENV_LOGIN_DEVICE_ID, &mut self.login_device_id),
+            (ENV_LOGIN_INSTALL_ID, &mut self.login_install_id),
         ];
         for (key, slot) in pairs {
             Self::fill_slot_from_env(slot, key);
@@ -943,8 +947,8 @@ impl Settings {
     /// [`Self::ensure_login_device`] 之前：首启时它们要能决定生成什么身份，
     /// 否则身份先生成并落盘，环境变量永远补不进去（#186）。
     fn fill_login_device_from_env(&mut self) {
-        Self::fill_slot_from_env(&mut self.login_device_id, "SODA_LOGIN_DEVICE_ID");
-        Self::fill_slot_from_env(&mut self.login_install_id, "SODA_LOGIN_INSTALL_ID");
+        Self::fill_slot_from_env(&mut self.login_device_id, ENV_LOGIN_DEVICE_ID);
+        Self::fill_slot_from_env(&mut self.login_install_id, ENV_LOGIN_INSTALL_ID);
     }
 
     /// 会话输入字段是否与另一份设置不同：签名地址/Token、Cookie、签名设备身份
@@ -972,6 +976,26 @@ mod tests {
 
     /// 改 `SODA_LOGIN_*` 的用例串行跑：环境变量是进程级的，并行会互相踩。
     static LOGIN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 一对合法的登录设备身份（16 位 + 15 位数字，见 libresoda `QrDevice::is_valid`）。
+    const DEVICE_ID: &str = "1234567890123456";
+    const INSTALL_ID: &str = "123456789012345";
+
+    /// 设置登录身份环境变量，离开作用域时清掉，避免污染同进程的其它用例。
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    fn set_login_device_env(device: &str, install: &str) -> (EnvGuard, EnvGuard) {
+        let device_guard = EnvGuard(ENV_LOGIN_DEVICE_ID);
+        let install_guard = EnvGuard(ENV_LOGIN_INSTALL_ID);
+        std::env::set_var(ENV_LOGIN_DEVICE_ID, device);
+        std::env::set_var(ENV_LOGIN_INSTALL_ID, install);
+        (device_guard, install_guard)
+    }
 
     #[test]
     fn legacy_config_has_ten_gib_limit_and_audio_defaults() {
@@ -1051,24 +1075,14 @@ mod tests {
     /// 不能先生成一份再让环境变量补不进去（#186）。
     #[test]
     fn login_device_env_wins_on_first_start() {
-        struct EnvGuard(&'static str);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
-
-        let _guard = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let _device = EnvGuard("SODA_LOGIN_DEVICE_ID");
-        let _install = EnvGuard("SODA_LOGIN_INSTALL_ID");
-        std::env::set_var("SODA_LOGIN_DEVICE_ID", "1234567890123456");
-        std::env::set_var("SODA_LOGIN_INSTALL_ID", "123456789012345");
+        let _lock = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env = set_login_device_env(DEVICE_ID, INSTALL_ID);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let loaded = Settings::load_from(&path);
-        assert_eq!(loaded.login_device_id, "1234567890123456");
-        assert_eq!(loaded.login_install_id, "123456789012345");
+        assert_eq!(loaded.login_device_id, DEVICE_ID);
+        assert_eq!(loaded.login_install_id, INSTALL_ID);
         assert!(
             !path.exists(),
             "环境变量已经给全身份，load_from 不该再生成并落盘另一份"
@@ -1078,30 +1092,20 @@ mod tests {
     /// 已有配置里的身份优先于环境变量：环境变量只补空字段（#186）。
     #[test]
     fn existing_login_device_beats_env() {
-        struct EnvGuard(&'static str);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
-
-        let _guard = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let _device = EnvGuard("SODA_LOGIN_DEVICE_ID");
-        let _install = EnvGuard("SODA_LOGIN_INSTALL_ID");
-        std::env::set_var("SODA_LOGIN_DEVICE_ID", "9999999999999999");
-        std::env::set_var("SODA_LOGIN_INSTALL_ID", "999999999999999");
+        let _lock = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env = set_login_device_env("9999999999999999", "999999999999999");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(
             &path,
-            r#"{"login_device_id":"1234567890123456","login_install_id":"123456789012345"}"#,
+            format!(r#"{{"login_device_id":"{DEVICE_ID}","login_install_id":"{INSTALL_ID}"}}"#),
         )
         .unwrap();
 
         let loaded = Settings::load_from(&path);
-        assert_eq!(loaded.login_device_id, "1234567890123456");
-        assert_eq!(loaded.login_install_id, "123456789012345");
+        assert_eq!(loaded.login_device_id, DEVICE_ID);
+        assert_eq!(loaded.login_install_id, INSTALL_ID);
     }
 
     #[test]

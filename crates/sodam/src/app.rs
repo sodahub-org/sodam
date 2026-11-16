@@ -225,6 +225,26 @@ pub(crate) fn verify_window_step(
     }
 }
 
+/// 把一轮轮询结果落进登录状态：更新「需要验证」标记，并按窗口状态决定文案。
+///
+/// 打开失败过的窗口保留原来的错误文案——轮询状态可以推进流程，
+/// 但不能把用户看到的失败原因顶掉（#186）。
+pub(crate) fn apply_verify_window_result(
+    window: &mut VerifyWindowState,
+    need_second_verify: &mut bool,
+    status: &mut String,
+    poll_status: String,
+    poll_need_second_verify: bool,
+    opened_text: &str,
+) {
+    *need_second_verify = poll_need_second_verify;
+    match verify_window_step(*window, poll_need_second_verify) {
+        VerifyWindowStep::Open | VerifyWindowStep::PollStatus => *status = poll_status,
+        VerifyWindowStep::ShowOpened => *status = opened_text.to_string(),
+        VerifyWindowStep::KeepFailed => {}
+    }
+}
+
 /// 当前播放队列来源，语义对齐官方 queue metaInfo。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueOrigin {
@@ -1961,7 +1981,12 @@ impl Render for Root {
 
 #[cfg(test)]
 mod tests {
-    use super::{verify_window_step, VerifyWindowState, VerifyWindowStep};
+    use super::{
+        apply_verify_window_result, verify_window_step, VerifyWindowState, VerifyWindowStep,
+    };
+
+    const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
+    const OPENED_TEXT: &str = "验证窗口已打开；完成后这里会自动更新";
 
     /// 验证窗口只开一次；打开失败后文案不被轮询状态盖掉（#186）。
     #[test]
@@ -1992,5 +2017,49 @@ mod tests {
                 "服务端不再要求验证时按轮询状态推进"
             );
         }
+    }
+
+    /// 失败文案真的留在状态里：模拟失败后再来一轮要求验证的轮询（#186）。
+    #[test]
+    fn failed_window_keeps_error_text_across_polls() {
+        let mut window = VerifyWindowState::Failed;
+        let mut need = true;
+        let mut status = FAILED_TEXT.to_string();
+
+        apply_verify_window_result(
+            &mut window,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            true,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, FAILED_TEXT, "失败文案不能被轮询状态盖掉");
+        assert!(need, "仍然需要二次验证");
+        assert_eq!(window, VerifyWindowState::Failed, "不能变回已打开");
+
+        // 打开成功：显示「已打开」
+        let mut window = VerifyWindowState::Opened;
+        apply_verify_window_result(
+            &mut window,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            true,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, OPENED_TEXT);
+
+        // 服务端不再要求验证：照常显示轮询文案
+        apply_verify_window_result(
+            &mut window,
+            &mut need,
+            &mut status,
+            "已登录".to_string(),
+            false,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, "已登录");
+        assert!(!need);
     }
 }
