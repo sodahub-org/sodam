@@ -2239,22 +2239,31 @@ impl Root {
             return;
         }
         // 只给这次落盘用的快照：写盘时把 Cookie 摘掉。
-        let mut logout_settings = self.settings.clone();
-        logout_settings.cookie.clear();
+        let mut logout_snapshot = self.settings.clone();
+        logout_snapshot.cookie.clear();
         // 结果回来时拿这份代数对一下：保存期间登录成功或换了账号，
         // 这次结果属于旧身份，整条丢掉，不能拿它清掉新身份。
         let auth_epoch = self.auth_epoch;
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
-        let save = cx.background_spawn(async move { logout_settings.save() });
+        let save = cx.background_spawn(async move { logout_snapshot.save() });
         self.logout_in_flight = true;
+        // 慢盘时保存要等一会儿，先给一句反馈，别让点击看起来没反应。
+        self.set_status_text(self.tr("正在退出登录…"));
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let outcome = save.await;
             let _ = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
                 if root.auth_epoch != auth_epoch {
                     // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
+                    // 状态行还挂着「正在退出登录…」：现在确实没登录就改回一句实话，
+                    // 换了别的账号则让登录流程自己的状态行留着。
+                    if root.settings.cookie.trim().is_empty() {
+                        root.set_status_text(root.tr("已退出登录"));
+                    }
+                    cx.notify();
                     return;
                 }
                 match outcome {
@@ -2270,18 +2279,7 @@ impl Root {
                             session.adopt(root.settings.clone());
                         }
                         root.clear_identity_state(cx);
-                        // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
-                        // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
-                        // 文件 IO 放后台，不占 UI 线程。
-                        let backup_settings = root.settings.clone();
-                        let backup_path = Settings::config_path();
-                        cx.background_spawn(async move {
-                            let _ = sodam_core::config::write_settings_backup(
-                                &backup_path,
-                                &backup_settings,
-                            );
-                        })
-                        .detach();
+                        // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
                         if sodam_core::config::env_cookie_present() {
                             root.set_status_text(root.tr(
                                 "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
@@ -2291,14 +2289,14 @@ impl Root {
                         }
                     }
                     Err(err) => {
-                        root.notify_error_once(
-                            "logout-save-failed",
-                            root.failure_text(
-                                "保存退出登录状态",
-                                &err,
-                                "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
-                            ),
+                        let message = root.failure_text(
+                            "保存退出登录状态",
+                            &err,
+                            "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
                         );
+                        // 状态行前面挂着「正在退出登录…」，失败时要换掉，别留一句假话。
+                        root.set_status_text(message.clone());
+                        root.notify_error_once("logout-save-failed", message);
                     }
                 }
                 cx.notify();
