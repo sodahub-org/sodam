@@ -371,15 +371,19 @@ mod tests {
     /// 不会再被 `SODA_COOKIE` 补回身份；没有记号时照旧复活（#192）。
     #[test]
     fn env_cookie_opt_out_prevents_logout_resurrection() {
-        struct EnvGuard;
+        /// 离开作用域时还原到设值前的状态（本机原本设过这个变量也不丢）。
+        struct EnvGuard(Option<std::ffi::OsString>);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var(crate::config::ENV_COOKIE_KEY);
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::ENV_COOKIE_KEY, value),
+                    None => std::env::remove_var(crate::config::ENV_COOKIE_KEY),
+                }
             }
         }
 
         let _serial = crate::env_test_lock();
-        let _env = EnvGuard;
+        let _env = EnvGuard(std::env::var_os(crate::config::ENV_COOKIE_KEY));
         std::env::set_var(crate::config::ENV_COOKIE_KEY, "cookie-from-env");
 
         // 登出后的磁盘与内存：Cookie 都是空的。

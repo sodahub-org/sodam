@@ -1448,18 +1448,30 @@ mod tests {
     /// 显式登出后只停用 Cookie 的环境变量补全，签名地址等其余字段照常补（#192）。
     #[test]
     fn env_fill_can_skip_cookie_only() {
-        struct EnvGuard(&'static str);
+        /// 离开作用域时还原到设值前的状态（本机原本设过这个变量也不丢）。
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, previous }
+            }
+        }
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var(self.0);
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
             }
         }
 
         let _lock = crate::env_test_lock();
-        let _cookie_guard = EnvGuard(ENV_COOKIE_KEY);
-        let _signer_guard = EnvGuard("QISHUI_SIGNER_URL");
-        std::env::set_var(ENV_COOKIE_KEY, "cookie-from-env");
-        std::env::set_var("QISHUI_SIGNER_URL", "https://signer.example");
+        let _cookie_guard = EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
+        let _signer_guard = EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
 
         let skipped = Settings::default().fill_empty_from_env(EnvCookieFill::Skip);
         assert!(
