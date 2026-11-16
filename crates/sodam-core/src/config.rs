@@ -21,7 +21,7 @@ const SELF_WRITE_WINDOW: Duration = Duration::from_millis(1500);
 const ENV_LOGIN_DEVICE_ID: &str = "SODA_LOGIN_DEVICE_ID";
 const ENV_LOGIN_INSTALL_ID: &str = "SODA_LOGIN_INSTALL_ID";
 
-/// 登录 Cookie 的环境变量名：补全与登出提示共用一份名字。
+/// 登录 Cookie 的环境变量名：补全与「环境里有没有 Cookie」的判断共用。
 pub(crate) const ENV_COOKIE_KEY: &str = "SODA_COOKIE";
 
 /// 补环境变量时要不要用 `SODA_COOKIE` 补回登录身份（#192）。

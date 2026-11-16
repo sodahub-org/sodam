@@ -2261,7 +2261,7 @@ impl Root {
                 .detach();
                 if sodam_core::config::env_cookie_present() {
                     self.set_status_text(self.tr(
-                        "已退出登录；环境变量 SODA_COOKIE 仍然设着，重启后会按它重新登录（要彻底退出请取消这个环境变量）",
+                        "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
                     ));
                 } else {
                     self.set_status_text(self.tr("已退出登录"));
@@ -2271,7 +2271,7 @@ impl Root {
                 self.notify_error_once(
                     "logout-save-failed",
                     self.failure_text(
-                        "退出登录失败",
+                        "保存退出登录状态",
                         &err,
                         "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
                     ),
