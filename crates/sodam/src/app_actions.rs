@@ -3970,6 +3970,13 @@ impl Root {
                 // 本地没动过才应用；应用了才确认这份指纹——被丢弃时留给下一轮
                 // 重新处理（下一轮拿新快照比较，文件没变就 Unchanged 收尾）。
                 if self.settings == snapshot {
+                    // 登出记号只在「外部文件写进非空 Cookie」时解除。记号生效时
+                    // 轮询传 `EnvCookieFill::Skip`，补出来的 Cookie 一定是空的；
+                    // 能走到这里说明非空 Cookie 来自文件（手动粘贴/换号）——这个
+                    // 结论依赖上面这条快照守卫，所以判断放在守卫里面（#192）。
+                    if !settings.cookie.trim().is_empty() && settings.cookie != snapshot.cookie {
+                        self.env_cookie_opted_out = false;
+                    }
                     self.apply_external_settings(*settings, cx);
                     let mut tracker = self
                         .config_reload
@@ -4018,13 +4025,6 @@ impl Root {
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
         let session_changed = incoming.session_inputs_differ(&old);
         let cookie_changed = incoming.cookie != old.cookie;
-        // 外部文件写入非空 Cookie（手动粘贴/换号）：解除登出记号，环境变量补全恢复。
-        // 记号生效时轮询传 `EnvCookieFill::Skip`，补出来的 Cookie 一定是空的；
-        // 所以这里的非空 Cookie 只可能来自文件。前提是 `finish_config_poll` 只应用
-        // 本地没动过的那份外部快照——那条守卫放开时这里要重新审。
-        if cookie_changed && !incoming.cookie.trim().is_empty() {
-            self.env_cookie_opted_out = false;
-        }
         self.settings = incoming.clone();
 
         // 主题：与 `set_ui_theme*` 同一套应用逻辑（认不得的值回到跟随系统），不落盘。
