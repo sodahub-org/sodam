@@ -1723,9 +1723,14 @@ impl Root {
         cx.notify();
 
         // 取走这轮要等的落盘工作，后台等完再回主线程退出。
+        // 登出落盘还没回来时也算一份：慢盘上别把「已退出登录」留在内存、盘上还是旧 Cookie（#197）。
+        let logout_task = self.logout_save_task.take();
         let work = self.take_pending_startup_persist(cx);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         cx.background_spawn(async move {
+            if let Some(task) = logout_task {
+                task.await;
+            }
             let result = work.wait().await;
             log_startup_persist_failure(&result);
             let _ = done_tx.send(());
