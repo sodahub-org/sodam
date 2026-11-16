@@ -2231,54 +2231,112 @@ impl Root {
     ///
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
     /// 封面本地缓存只按 URL 索引，可以复用，不涉及凭据。
+    ///
+    /// 落盘放后台线程：磁盘慢或写锁被占时界面不跟着卡（#197）。
     pub fn logout(&mut self, cx: &mut Context<Self>) {
-        let mut settings = self.settings.clone();
-        settings.cookie.clear();
+        // 落盘期间再点只算一次：不起第二个保存，也不把状态清理跑两遍。
+        // 正在排队退出时也不接新的登出：退出流程只等它开始那一刻已有的保存，
+        // 这时候再起一个新保存没人等，慢盘上会带着旧 Cookie 退出（#197）。
+        if self.logout_in_flight || self.quit_gate.is_saving() {
+            return;
+        }
+        // 点登出时拍一份快照：盘上读不出来时拿它兜底（真正写盘时会摘掉 Cookie）。
+        let logout_snapshot = self.settings.clone();
+        // 结果回来时对一下 Cookie：期间登录成功、换了账号或被热重载清掉，
+        // 这次结果都属于旧身份，整条丢掉，不能拿它清身份。
+        //
+        // 这里不看 `auth_epoch`：同账号的会员状态刷新也会推进它，
+        // 那种情况身份没变，登出该照常完成（#197）。
+        let logout_cookie = self.settings.cookie.clone();
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
-        let save_result = if let Some(session) = self.session.as_mut() {
-            session.apply(settings.clone())
-        } else {
-            settings.save()
-        };
-        match save_result {
-            Ok(()) => {
-                // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
-                // 记号不落盘，重启后仍按环境变量启动。
-                self.env_cookie_opted_out = true;
-                self.settings = settings;
-                self.clear_identity_state(cx);
-                // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
-                // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
-                // 文件 IO 放后台，不占 UI 线程。
-                let backup_settings = self.settings.clone();
-                let backup_path = Settings::config_path();
-                cx.background_spawn(async move {
-                    let _ =
-                        sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
-                })
-                .detach();
-                if sodam_core::config::env_cookie_present() {
-                    self.set_status_text(self.tr(
-                        "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
-                    ));
-                } else {
-                    self.set_status_text(self.tr("已退出登录"));
-                }
-            }
-            Err(err) => {
-                self.notify_error_once(
-                    "logout-save-failed",
-                    self.failure_text(
-                        "保存退出登录状态",
-                        &err,
-                        "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
-                    ),
-                );
-            }
-        }
+        //
+        // 写盘在锁里读盘上最新配置、只摘 Cookie 再写回：盘上的 Cookie 已经不是
+        // 点击时那个就整次跳过，不会拿旧快照盖掉换进来的新身份，也不吃掉
+        // 保存期间改过的主题、音量等字段（#197）。
+        let expected_cookie = logout_cookie.clone();
+        let save =
+            cx.background_spawn(async move { logout_snapshot.save_signed_out(&expected_cookie) });
+        self.logout_in_flight = true;
+        // 慢盘时保存要等一会儿，先给一句反馈，别让点击看起来没反应。
+        self.set_status_text(self.tr("正在退出登录…"));
         cx.notify();
+        // 句柄留在 `Root` 上：退出应用时 `on_app_quit` 要等它写完，
+        // 否则保存没落盘就退出，盘上还留着旧 Cookie。
+        let handle = cx.spawn(async move |this, cx| {
+            let outcome = save.await;
+            let confirm = this.update(cx, |root, cx| {
+                root.logout_in_flight = false;
+                if root.settings.cookie != logout_cookie {
+                    // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
+                    // 状态行还挂着「正在退出登录…」：现在确实没登录就改回一句实话，
+                    // 换了别的账号则让登录流程自己的状态行留着。
+                    if root.settings.cookie.trim().is_empty() {
+                        root.set_status_text(root.tr("已退出登录"));
+                    }
+                    cx.notify();
+                    return None;
+                }
+                let confirm = match outcome {
+                    Ok(true) => {
+                        // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
+                        // 记号不落盘，重启后仍按环境变量启动。
+                        root.env_cookie_opted_out = true;
+                        // 只在内存里摘掉 Cookie：保存期间改过的其它设置（音量、日志等）
+                        // 不跟着回滚到点击那一刻的快照。
+                        root.settings.cookie.clear();
+                        // 盘上已经写成登出状态，这里只重建会话，不再写一次盘。
+                        if let Some(session) = root.session.as_mut() {
+                            session.adopt(root.settings.clone());
+                        }
+                        // 收尾再确认一次：登出保存持锁期间，别的保存可能正在 UI 线程
+                        // 排队等锁，随后把还带旧 Cookie 的设置写回盘（#197 复审）。
+                        // 只清「盘上仍是旧 Cookie」的情况；已经空了不写，换过身份也跳过。
+                        Some((root.settings.clone(), logout_cookie.clone()))
+                    }
+                    Ok(false) => {
+                        // 盘上身份已经变了，这次写入被跳过：什么都不改，
+                        // 等热重载或登录流程把它们自己的状态行发出来。
+                        None
+                    }
+                    Err(err) => {
+                        // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
+                        root.notify_error_once(
+                            "logout-save-failed",
+                            root.failure_text(
+                                "保存退出登录状态",
+                                &err,
+                                "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                            ),
+                        );
+                        None
+                    }
+                };
+                if confirm.is_some() {
+                    root.clear_identity_state(cx);
+                    // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
+                    if sodam_core::config::env_cookie_present() {
+                        root.set_status_text(root.tr(
+                            "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
+                        ));
+                    } else {
+                        root.set_status_text(root.tr("已退出登录"));
+                    }
+                }
+                cx.notify();
+                confirm
+            });
+            // 收尾确认跑在登出这条任务链里：退出时等 `logout_save_task` 就一起等到了，
+            // 不会出现「退出流程结束、确认写入还在跑」的窗口（#197 复审）。
+            if let Ok(Some((settings, expected))) = confirm {
+                cx.background_spawn(async move {
+                    let _ = settings.save_signed_out(&expected);
+                })
+                .await;
+            }
+        });
+        self.logout_save_task = Some(handle);
     }
 
     /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。

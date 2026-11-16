@@ -554,6 +554,11 @@ pub struct Root {
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
     /// 结论），回来时不能挂起刚恢复的管线，也不能写回已作废的不可播集合。
     pub(crate) auth_epoch: u64,
+    /// 退出登录的落盘还在后台跑：这段时间里再点登出直接忽略，
+    /// 免得连点起两个保存、把状态清理跑两遍（#197）。
+    pub(crate) logout_in_flight: bool,
+    /// 登出收尾任务的句柄：退出应用时要等它写完，别让旧 Cookie 留在盘上（#197）。
+    pub(crate) logout_save_task: Option<gpui::Task<()>>,
     /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
     /// 与 `prefetch_cooldown_since`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
@@ -930,6 +935,8 @@ impl Root {
             prefetch_cooldown_since: HashMap::new(),
             prefetch_patrol: 0,
             auth_epoch: 0,
+            logout_in_flight: false,
+            logout_save_task: None,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_maintenance_running: false,
@@ -974,9 +981,13 @@ impl Root {
         };
         cx.on_app_quit(|root, cx| {
             sodam_core::flush_global();
-            // 心跳首拍之前就退出：补做也放后台，退出 future 里等它写完，不在 UI 线程碰磁盘。
+            // 登出落盘还没回来就退出：等它写完，别让旧 Cookie 留在盘上（#197）。
+            let logout_task = root.logout_save_task.take();
             let work = root.take_pending_startup_persist(cx);
             async move {
+                if let Some(task) = logout_task {
+                    task.await;
+                }
                 let result = work.wait().await;
                 log_startup_persist_failure(&result);
                 // 上面的日志可能是在第一次 flush 之后写的，退出前再刷一次。
@@ -1712,9 +1723,14 @@ impl Root {
         cx.notify();
 
         // 取走这轮要等的落盘工作，后台等完再回主线程退出。
+        // 登出落盘还没回来时也算一份：慢盘上别把「已退出登录」留在内存、盘上还是旧 Cookie（#197）。
+        let logout_task = self.logout_save_task.take();
         let work = self.take_pending_startup_persist(cx);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         cx.background_spawn(async move {
+            if let Some(task) = logout_task {
+                task.await;
+            }
             let result = work.wait().await;
             log_startup_persist_failure(&result);
             let _ = done_tx.send(());
