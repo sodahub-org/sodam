@@ -145,7 +145,7 @@ fn start_tray_service(
                             .spawn(async move { write_back.persist() })
                             .await;
                         if let Err(error) = result {
-                            let _ = cx.update(|cx| {
+                            cx.update(|cx| {
                                 app.update(cx, |root, cx| {
                                     root.report_startup_write_back_failure(error, cx)
                                 })
