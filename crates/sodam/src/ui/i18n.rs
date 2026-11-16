@@ -76,6 +76,7 @@ impl Language {
             "登录成功" => "Signed in",
             "已过期" => "Expired",
             "失败" => "Failed",
+            "正在保存…" => "Saving…",
             "已配置登录与签名服务，可以去「搜索」或「推荐」了" => "Signed in and signer ready. Try Discover or Search.",
             "还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）" => "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL).",
             "推荐队列" => "Recommendation queue",

@@ -100,7 +100,9 @@
 4. 渲染只读取 `Arc` 缓存，不深拷贝大列表。
 5. `SODAM_FRAME_LOG=1` 可观察超过 16ms 的帧；
    `SODAM_SCROLL_TEST=1` 可做滚动压测；
-   `SODAM_SLOW_SAVE_MS=3000`（仅调试构建）把每次配置保存拖慢，用来验收慢盘时界面不冻结。
+   `SODAM_SLOW_SAVE_MS=3000`（仅调试构建）把每次配置保存拖慢，用来验收慢盘时界面不冻结；
+   `SODAM_DEBUG_SLOW_CONFIG_PERSIST_MS=<毫秒>`（仅 debug 构建）可把启动回存拖慢，
+   用来验证退出前会等落盘写完（#198）。
 
 ## 7. GPUI 版本
 
