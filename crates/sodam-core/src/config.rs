@@ -889,8 +889,18 @@ impl Settings {
             .ok()
             .and_then(|bytes| parse_settings_bytes(&bytes).ok());
         let outcome = latest.map(|mut current| {
-            // 盘上本来就没有 Cookie（内存身份来自环境变量补全）：没有可清的东西。
+            // 盘上本来就没有 Cookie（内存身份来自环境变量补全）：主文件不用改，
+            // 但备份也要刷成同样的内容——备份里留着旧 Cookie 的话，
+            // 以后主文件损坏走恢复，会把已经退出的账号又登回来。
             if current.cookie.trim().is_empty() {
+                if let Err(error) = write_settings_backup_locked(path, &current) {
+                    log_event(
+                        LogLevel::Warn,
+                        LogTopic::App,
+                        "backup_refresh_failed",
+                        &[("detail", error.to_string().as_str())],
+                    );
+                }
                 return Ok(true);
             }
             // 盘上已经是另一个身份：旧结果不许覆盖新身份。
@@ -2114,12 +2124,23 @@ mod tests {
             .unwrap());
         assert_eq!(settings_on_disk(&path).cookie, "sessionid_ss=b");
 
-        // 盘上没有 Cookie（内存身份来自环境变量补全）：不用写，也算登出成功。
-        Settings::default().save_to(&path).expect("保存应成功");
+        // 盘上没有 Cookie（内存身份来自环境变量补全）：主文件不用改，
+        // 但备份里留着的旧 Cookie 必须一起刷掉，免得以后从备份恢复出账号。
+        std::fs::write(
+            settings_backup_path(&path),
+            serde_json::to_vec_pretty(&signed_in).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&Settings::default()).unwrap(),
+        )
+        .unwrap();
         assert!(snapshot
             .save_signed_out_to(&path, "sessionid_ss=a")
             .unwrap());
         assert_eq!(settings_on_disk(&path).cookie, "");
+        assert_eq!(settings_on_disk(&settings_backup_path(&path)).cookie, "");
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。
