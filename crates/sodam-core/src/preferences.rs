@@ -2,6 +2,7 @@
 
 use crate::config::{Settings, SETTINGS_WRITE_LOCK};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -52,6 +53,8 @@ pub struct PreferencesWriter {
     tx: mpsc::Sender<Message>,
     thread: Option<std::thread::JoinHandle<()>>,
     error: Arc<Mutex<Option<String>>>,
+    /// 强制退出：析构时不再等写线程（慢盘 / 写锁被占时 join 会把进程挂住，#198）。
+    abandon_on_drop: AtomicBool,
 }
 
 impl PreferencesWriter {
@@ -104,7 +107,20 @@ impl PreferencesWriter {
                 None
             }
         };
-        Self { tx, thread, error }
+        Self {
+            tx,
+            thread,
+            error,
+            abandon_on_drop: AtomicBool::new(false),
+        }
+    }
+
+    /// 强制退出（3 秒超时，或用户在等待期间再点一次退出）时调用：
+    /// 析构不再等写线程，避免它卡在慢 IO / 配置写锁上把进程拖住（#198）。
+    ///
+    /// 正常退出不走这里：`flush()` 已经等到刷尾，析构的 join 是兜底。
+    pub fn abandon_on_drop(&self) {
+        self.abandon_on_drop.store(true, Ordering::Relaxed);
     }
 
     pub fn schedule(&self, settings: &Settings) {
@@ -129,6 +145,11 @@ impl Drop for PreferencesWriter {
     fn drop(&mut self) {
         // 仅在 Root/应用销毁时等待最后一次本地写盘，正常调音量从不等磁盘。
         let _ = self.tx.send(Message::Shutdown);
+        if self.abandon_on_drop.load(Ordering::Relaxed) {
+            // 强制退出：写线程可能卡在慢 IO 或配置写锁上，丢下它，进程退出会带走。
+            let _ = self.thread.take();
+            return;
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

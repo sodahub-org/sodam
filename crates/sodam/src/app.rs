@@ -1703,6 +1703,8 @@ impl Root {
     /// [`sodam_core::quit_gate::QUIT_PERSIST_TIMEOUT`]，就强制退出。
     pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
         if self.quit_gate.request(std::time::Instant::now()) == QuitRequest::QuitNow {
+            // 用户再点一次：不再等写线程，慢盘上也退得掉（#198）。
+            self.preferences_writer.abandon_on_drop();
             cx.quit();
             return;
         }
@@ -1730,7 +1732,12 @@ impl Root {
                     break;
                 }
                 match this.update(cx, |root, _| {
-                    root.quit_gate.timed_out(std::time::Instant::now())
+                    let timed_out = root.quit_gate.timed_out(std::time::Instant::now());
+                    if timed_out {
+                        // 超时强制退出：析构时不再等可能卡在慢 IO 的偏好写线程。
+                        root.preferences_writer.abandon_on_drop();
+                    }
+                    timed_out
                 }) {
                     Ok(false) => {}
                     // 到点不等了：让用户退得掉，把超时写进日志。
