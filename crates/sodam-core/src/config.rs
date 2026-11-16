@@ -467,6 +467,9 @@ pub fn load_for_startup(path: &Path) -> (Settings, Option<StartupRecovery>) {
         };
         return match backup {
             Some(mut backup) => {
+                // 备份里没带登录身份时，环境变量仍然要先生效（#186）；
+                // 备份自带的身份优先。
+                backup.fill_login_device_from_env();
                 backup.ensure_login_device();
                 let bad_path = quarantine_corrupt_file(path).unwrap_or_else(|| path.to_path_buf());
                 // 恢复内容写回主文件与备份；写失败不影响用内存里的值继续。
@@ -555,6 +558,10 @@ impl Settings {
             LoadOutcome::NotFound(settings) => (settings, false),
             LoadOutcome::Loaded { settings, migrated } => (settings, migrated),
         };
+        // 环境变量补在身份生成之前：首启时 `SODA_LOGIN_DEVICE_ID` / `SODA_LOGIN_INSTALL_ID`
+        // 才能决定这份身份，否则身份先生成落盘，环境变量永远补不进去（#186）。
+        // 已存的身份非空，照旧优先于环境变量。
+        settings.fill_login_device_from_env();
         // 老版本把登录设备身份存在 libresoda 自己的文件里；首次升级时搬进 config.json，
         // 保住已经积累的服务端设备信誉。之后二维码只使用配置里的这份身份。
         if settings.ensure_login_device() {
@@ -906,13 +913,7 @@ impl Settings {
             ("SODA_LOGIN_INSTALL_ID", &mut self.login_install_id),
         ];
         for (key, slot) in pairs {
-            if slot.trim().is_empty() {
-                if let Ok(value) = std::env::var(key) {
-                    if !value.trim().is_empty() {
-                        *slot = value.trim().to_string();
-                    }
-                }
-            }
+            Self::fill_slot_from_env(slot, key);
         }
         if self.quality_source != crate::quality::QualitySource::User
             && self.quality_intent() == crate::quality::QualityIntent::Auto
@@ -925,6 +926,25 @@ impl Settings {
             }
         }
         self
+    }
+
+    /// 字段为空时用同名环境变量补上；文件里已有的值优先。
+    fn fill_slot_from_env(slot: &mut String, key: &str) {
+        if slot.trim().is_empty() {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    *slot = value.trim().to_string();
+                }
+            }
+        }
+    }
+
+    /// 启动期只补登录设备身份的两个环境变量，且必须跑在
+    /// [`Self::ensure_login_device`] 之前：首启时它们要能决定生成什么身份，
+    /// 否则身份先生成并落盘，环境变量永远补不进去（#186）。
+    fn fill_login_device_from_env(&mut self) {
+        Self::fill_slot_from_env(&mut self.login_device_id, "SODA_LOGIN_DEVICE_ID");
+        Self::fill_slot_from_env(&mut self.login_install_id, "SODA_LOGIN_INSTALL_ID");
     }
 
     /// 会话输入字段是否与另一份设置不同：签名地址/Token、Cookie、签名设备身份
@@ -949,6 +969,9 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 改 `SODA_LOGIN_*` 的用例串行跑：环境变量是进程级的，并行会互相踩。
+    static LOGIN_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn legacy_config_has_ten_gib_limit_and_audio_defaults() {
@@ -1022,6 +1045,63 @@ mod tests {
         settings.save_to(&path).expect("save");
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.login_device(), device, "重载后设备身份必须保持稳定");
+    }
+
+    /// 首启（没有 config.json）时，登录身份必须由 `SODA_LOGIN_*` 决定，
+    /// 不能先生成一份再让环境变量补不进去（#186）。
+    #[test]
+    fn login_device_env_wins_on_first_start() {
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let _guard = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _device = EnvGuard("SODA_LOGIN_DEVICE_ID");
+        let _install = EnvGuard("SODA_LOGIN_INSTALL_ID");
+        std::env::set_var("SODA_LOGIN_DEVICE_ID", "1234567890123456");
+        std::env::set_var("SODA_LOGIN_INSTALL_ID", "123456789012345");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.login_device_id, "1234567890123456");
+        assert_eq!(loaded.login_install_id, "123456789012345");
+        assert!(
+            !path.exists(),
+            "环境变量已经给全身份，load_from 不该再生成并落盘另一份"
+        );
+    }
+
+    /// 已有配置里的身份优先于环境变量：环境变量只补空字段（#186）。
+    #[test]
+    fn existing_login_device_beats_env() {
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let _guard = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _device = EnvGuard("SODA_LOGIN_DEVICE_ID");
+        let _install = EnvGuard("SODA_LOGIN_INSTALL_ID");
+        std::env::set_var("SODA_LOGIN_DEVICE_ID", "9999999999999999");
+        std::env::set_var("SODA_LOGIN_INSTALL_ID", "999999999999999");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"login_device_id":"1234567890123456","login_install_id":"123456789012345"}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.login_device_id, "1234567890123456");
+        assert_eq!(loaded.login_install_id, "123456789012345");
     }
 
     #[test]
