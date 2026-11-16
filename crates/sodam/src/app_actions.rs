@@ -2241,12 +2241,16 @@ impl Root {
         // 只给这次落盘用的快照：写盘时把 Cookie 摘掉。
         let mut logout_snapshot = self.settings.clone();
         logout_snapshot.cookie.clear();
+        // 内存里也马上摘掉 Cookie：保存期间别的动作（改音量、切音质、改日志）
+        // 也会整份写盘，它们拿到的就是没有 Cookie 的设置，不会把旧凭据写回去（#192）。
+        // 落盘失败再放回来；这段时间新发起的账号请求按未登录处理，窗口通常很短。
+        let logout_cookie = std::mem::take(&mut self.settings.cookie);
         // 结果回来时对一下 Cookie：期间登录成功、换了账号或被热重载清掉，
         // 这次结果都属于旧身份，整条丢掉，不能拿它清身份。
         //
         // 这里不看 `auth_epoch`：同账号的会员状态刷新也会推进它，
         // 那种情况身份没变，登出该照常完成（#197）。
-        let logout_cookie = self.settings.cookie.clone();
+        // （`logout_cookie` 就是上面摘下来的那一份。）
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
@@ -2274,10 +2278,8 @@ impl Root {
                         // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
                         // 记号不落盘，重启后仍按环境变量启动。
                         root.env_cookie_opted_out = true;
-                        // 只在内存里摘掉 Cookie：保存期间改过的其它设置（音量、日志等）
-                        // 不跟着回滚到点击那一刻的快照。
-                        root.settings.cookie.clear();
-                        // 盘上已经写成登出状态，这里只重建会话，不再写一次盘。
+                        // 内存里的 Cookie 在点登出时就已经摘掉；盘上此刻也是登出状态，
+                        // 这里只重建会话，不再写一次盘。
                         if let Some(session) = root.session.as_mut() {
                             session.adopt(root.settings.clone());
                         }
@@ -2292,6 +2294,8 @@ impl Root {
                         }
                     }
                     Err(err) => {
+                        // 落盘没成：Cookie 放回去，界面和配置都还是登录态。
+                        root.settings.cookie = logout_cookie;
                         // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
                         root.notify_error_once(
                             "logout-save-failed",
