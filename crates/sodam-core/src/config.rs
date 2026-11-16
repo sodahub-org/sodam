@@ -520,20 +520,15 @@ impl StartupWriteBack {
                 }
             }
         }
-        let mut saved_main = false;
         if self.save_main {
-            match self.settings.save_to(&self.path) {
-                Ok(()) => saved_main = true,
-                Err(err) => {
-                    first_error.get_or_insert_with(|| format!("回存配置失败：{err}"));
-                }
+            if let Err(err) = self.settings.save_to(&self.path) {
+                first_error.get_or_insert_with(|| format!("回存配置失败：{err}"));
             }
         }
-        // `save_to` 已经顺手刷新备份；没保存主文件（或保存失败）时单独补一份最新备份。
-        if !saved_main {
-            if let Err(err) = write_settings_backup(&self.path, &self.settings) {
-                first_error.get_or_insert_with(|| format!("写配置备份失败：{err}"));
-            }
+        // `save_to` 内部会吞掉备份写错误，所以这里总是单独刷新一次并报告失败，
+        // 避免主文件保存成功、备份没更新却没人知道。
+        if let Err(err) = write_settings_backup(&self.path, &self.settings) {
+            first_error.get_or_insert_with(|| format!("写配置备份失败：{err}"));
         }
         match first_error {
             Some(error) => Err(error),

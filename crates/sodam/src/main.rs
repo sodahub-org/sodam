@@ -138,21 +138,26 @@ fn start_tray_service(
                 if let Some(write_back) =
                     cx.update(|cx| app.update(cx, |root, _cx| root.take_startup_write_back()))
                 {
-                    let app = app.clone();
-                    cx.spawn(async move |cx| {
-                        let result = cx
-                            .background_executor()
-                            .spawn(async move { write_back.persist() })
-                            .await;
-                        if let Err(error) = result {
-                            cx.update(|cx| {
-                                app.update(cx, |root, cx| {
-                                    root.report_startup_write_back_failure(error, cx)
-                                })
-                            });
-                        }
-                    })
-                    .detach();
+                    let task = {
+                        let report_app = app.clone();
+                        cx.spawn(async move |cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move { write_back.persist() })
+                                .await;
+                            if let Err(error) = result {
+                                cx.update(|cx| {
+                                    report_app.update(cx, |root, cx| {
+                                        root.report_startup_write_back_failure(error, cx)
+                                    })
+                                });
+                            }
+                        })
+                    };
+                    // 任务存进 Root：退出时要等它写完，不能 detached 放着。
+                    cx.update(|cx| {
+                        app.update(cx, |root, _cx| root.startup_persist_task = Some(task))
+                    });
                 }
             }
             // 配置热重载巡检：每 ~500ms 一次，读盘与解析放后台线程，结果回 UI 应用（#185）。

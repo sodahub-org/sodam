@@ -38,7 +38,8 @@ pub enum ReloadEvent {
     Corrupt(String),
 }
 
-fn fingerprint(path: &Path) -> Option<Fingerprint> {
+/// 读一次文件指纹。启动加载在读盘前取一次，作为热重载基线（#191）。
+pub fn fingerprint(path: &Path) -> Option<Fingerprint> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
 }
@@ -73,13 +74,6 @@ impl ReloadTracker {
     pub fn acknowledge(&mut self, fingerprint: Option<Fingerprint>) {
         self.seen = fingerprint;
         self.pending = PendingChange::default();
-    }
-
-    /// 把路径当前状态记为基线。启动期落盘修正会在这之后改写文件（#191），
-    /// 先把加载时的指纹记下来，慢盘上就不会把「正在恢复」误报成外部损坏。
-    /// 指纹只用来判断之后有没有变化，不判断内容是否有效。
-    pub fn acknowledge_path(&mut self, path: &Path) {
-        self.acknowledge(fingerprint(path));
     }
 
     /// 轮询一次。读盘与解析都在本调用线程完成。
