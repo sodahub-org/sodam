@@ -238,6 +238,11 @@ pub(crate) fn apply_verify_window_result(
     opened_text: &str,
 ) {
     *need_second_verify = poll_need_second_verify;
+    // 打开失败过的窗口：错误文案一直留到流程结束或用户重新发起登录，
+    // 哪怕这一轮服务端没再要求二次验证（#186）。
+    if window == VerifyWindowState::Failed {
+        return;
+    }
     match verify_window_step(window, poll_need_second_verify) {
         VerifyWindowStep::Open | VerifyWindowStep::PollStatus => *status = poll_status,
         VerifyWindowStep::ShowOpened => *status = opened_text.to_string(),
@@ -2035,6 +2040,18 @@ mod tests {
         );
         assert_eq!(status, FAILED_TEXT, "失败文案不能被轮询状态盖掉");
         assert!(need, "仍然需要二次验证");
+
+        // 服务端这一轮没再要求验证，也不该把失败原因抹掉
+        apply_verify_window_result(
+            VerifyWindowState::Failed,
+            &mut need,
+            &mut status,
+            "等待扫码…".to_string(),
+            false,
+            OPENED_TEXT,
+        );
+        assert_eq!(status, FAILED_TEXT, "失败文案留到流程结束或重新登录");
+        assert!(!need);
 
         // 打开成功：显示「已打开」
         apply_verify_window_result(
