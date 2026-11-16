@@ -617,6 +617,8 @@ pub struct Root {
     pub(crate) startup_write_back: Option<sodam_core::config::StartupWriteBack>,
     /// 首拍取走后的后台落盘任务：退出时等它写完，不能 detached 放着（#191）。
     pub(crate) startup_persist_task: Option<gpui::Task<()>>,
+    /// 启动落盘结果：后台任务写、心跳取走提示；退出时兜底写日志（#191）。
+    pub(crate) startup_persist_result: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 /// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
@@ -910,6 +912,7 @@ impl Root {
             volume_scrubbing: false,
             startup_write_back: write_back,
             startup_persist_task: None,
+            startup_persist_result: Arc::new(Mutex::new(None)),
         };
         cx.on_app_quit(|root, cx| {
             sodam_core::flush_global();
@@ -929,8 +932,10 @@ impl Root {
                     }
                 })
             });
-            // 首拍已经取走任务时，退出要等它写完，别让 detached 任务被截断。
+            // 首拍已经取走任务时，退出要等它写完；这里等的是后台任务，主线程阻塞也能完成。
             let persist_task = root.startup_persist_task.take();
+            // 首拍任务失败但心跳还没来得及提示：至少把原文补进日志。
+            let persist_result = root.startup_persist_result.clone();
             let preferences = root.preferences_writer.flush();
             async move {
                 if let Some(task) = fallback {
@@ -939,6 +944,20 @@ impl Root {
                 if let Some(task) = persist_task {
                     task.await;
                 }
+                let error = persist_result
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .take();
+                if let Some(Err(error)) = error {
+                    log_event(
+                        LogLevel::Error,
+                        LogTopic::App,
+                        "failure",
+                        &[("context", "启动配置回存失败"), ("detail", error.as_str())],
+                    );
+                }
+                // 上面的日志可能是在第一次 flush 之后写的，退出前再刷一次。
+                sodam_core::flush_global();
                 preferences.await;
             }
         })
@@ -1608,16 +1627,19 @@ impl Root {
         self.startup_write_back.take()
     }
 
-    /// 启动期后台回存失败：技术原文进日志，状态行只给人话，本次运行不受影响。
-    pub(crate) fn report_startup_write_back_failure(
-        &mut self,
-        error: String,
-        cx: &mut Context<Self>,
-    ) {
-        // 复用本地保存类失败的统一说法；「本次运行不受影响」留在日志上下文里。
-        let message = self.failure_text("启动配置回存失败", &error, SAVE_TEXT);
-        self.set_status_text(message);
-        cx.notify();
+    /// 心跳每拍检查一次启动落盘结果：失败时技术原文进日志，状态行只给人话。
+    pub(crate) fn report_startup_persist_result(&mut self, cx: &mut Context<Self>) {
+        let result = self
+            .startup_persist_result
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(Err(error)) = result {
+            // 复用本地保存类失败的统一说法；「本次运行不受影响」留在日志上下文里。
+            let message = self.failure_text("启动配置回存失败", &error, SAVE_TEXT);
+            self.set_status_text(message);
+            cx.notify();
+        }
     }
 
     /// 技术原文的唯一去处：诊断日志（默认开，写在本机日志目录）。
