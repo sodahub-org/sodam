@@ -663,8 +663,10 @@ impl ConfigPollRequest {
 /// 退出有两条路（`on_app_quit` 的 200ms 兜底、`Root::request_quit` 的主动等待），
 /// 要等的是同一批东西，收在这里，避免两边各写一份（#191 / #198）。
 struct PendingStartupPersist {
-    fallback: Option<gpui::Task<()>>,
-    task: Option<gpui::Task<()>>,
+    /// 退出时补做的启动回存（首拍还没取走时）。
+    write_back: Option<gpui::Task<()>>,
+    /// 心跳首拍已经交给后台的那次回存。
+    heartbeat_task: Option<gpui::Task<()>>,
     preferences: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     result: Arc<Mutex<Option<Result<(), String>>>>,
 }
@@ -672,10 +674,10 @@ struct PendingStartupPersist {
 impl PendingStartupPersist {
     /// 等全部写完；在后台线程跑，别在 UI 线程等磁盘。
     async fn wait(self) -> Arc<Mutex<Option<Result<(), String>>>> {
-        if let Some(task) = self.fallback {
+        if let Some(task) = self.write_back {
             task.await;
         }
-        if let Some(task) = self.task {
+        if let Some(task) = self.heartbeat_task {
             task.await;
         }
         self.preferences.await;
@@ -1651,7 +1653,7 @@ impl Root {
     ///
     /// 两条退出路径共用：`on_app_quit` 的兜底与 `request_quit` 的主动等待。
     fn take_pending_startup_persist(&mut self, cx: &mut Context<Self>) -> PendingStartupPersist {
-        let fallback = self.startup_write_back.take().map(|write_back| {
+        let write_back = self.startup_write_back.take().map(|write_back| {
             cx.background_spawn(async move {
                 if let Err(error) = write_back.persist() {
                     log_event(
@@ -1667,8 +1669,8 @@ impl Root {
             })
         });
         PendingStartupPersist {
-            fallback,
-            task: self.startup_persist_task.take(),
+            write_back,
+            heartbeat_task: self.startup_persist_task.take(),
             preferences: Box::pin(self.preferences_writer.flush()),
             result: self.startup_persist_result.clone(),
         }
@@ -1750,6 +1752,7 @@ impl Root {
             }
             // 实体不在了说明应用正在销毁，退出已经在路上，不用再补 `cx.quit()`
             // （`AsyncApp::update` 在 app 已释放时会 panic，不能拿来兜底）。
+            // 这里用 WeakEntity 更新：实体没了就返回 Err，忽略即可。
             let _ = this.update(cx, |root, cx| {
                 root.quit_gate.complete();
                 cx.quit();
