@@ -613,6 +613,8 @@ pub struct Root {
     pub(crate) config_poll_busy: bool,
     /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
     pub(crate) volume_scrubbing: bool,
+    /// 启动期欠下的落盘修正：首帧后由心跳取走，在后台线程执行（#191）。
+    pub(crate) startup_write_back: Option<sodam_core::config::StartupWriteBack>,
 }
 
 /// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
@@ -640,19 +642,27 @@ impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config_path = Settings::config_path();
+        let config_existed = config_path.exists();
         // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
         // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
-        let (settings, recovery) = sodam_core::config::load_for_startup(&config_path);
+        // 读盘阶段只做内存修正，备份 / 回存 / 隔离改名全部留给首帧后的后台任务（#191）。
+        let sodam_core::config::StartupLoad {
+            settings,
+            recovery,
+            mut write_back,
+        } = sodam_core::config::load_for_startup(&config_path);
         let mut settings = settings.merged_with_env();
         // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
         // 这里补上开关状态（环境变量那一路已在出口初始化时读过，两者取并集）。
         log_outlet::set_global_detailed(settings.detailed_logs);
         let engine = PlaybackEngine::with_volume(settings.volume);
         settings.volume = engine.snapshot().volume;
-        // 首次运行就把配置落盘：用户可以直接编辑 ~/.config/sodam/config.json
-        // 换签名服务 / 钉死设备指纹（默认值已内置，见 sodam_core::config）
-        if !config_path.exists() {
-            let _ = settings.save();
+        // 首次运行要落盘（用户可以直接编辑 config.json 换签名服务 / 钉死设备指纹）。
+        // 旧行为保存的是补过环境变量的这份设置；内容交给首帧后的后台回存，不在 UI 线程写。
+        if !config_existed {
+            if let Some(write_back) = write_back.as_mut() {
+                write_back.adopt_settings(settings.clone());
+            }
         }
         let theme_follows_system = ThemeKind::from_key(&settings.theme).is_none();
         let theme = ThemeKind::from_key(&settings.theme)
@@ -887,6 +897,7 @@ impl Root {
             config_reload: Arc::new(Mutex::new(sodam_core::config_watch::ReloadTracker::new())),
             config_poll_busy: false,
             volume_scrubbing: false,
+            startup_write_back: write_back,
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
@@ -1549,6 +1560,25 @@ impl Root {
         let text = sodam_core::failure::strip_urls_for_user(&text.into());
         self.status_line.set(text.clone());
         text
+    }
+
+    /// 取走启动期欠下的落盘修正（心跳首拍在首帧后调用，见 main.rs）。
+    pub(crate) fn take_startup_write_back(
+        &mut self,
+    ) -> Option<sodam_core::config::StartupWriteBack> {
+        self.startup_write_back.take()
+    }
+
+    /// 启动期后台回存失败：写日志并在状态行补一条，本次运行不受影响。
+    pub(crate) fn report_startup_write_back_failure(
+        &mut self,
+        error: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.log_failure("启动配置回存失败", &error);
+        let message = self.localized("启动配置回存失败（{}）：本次运行不受影响", &[error]);
+        self.set_status_text(message);
+        cx.notify();
     }
 
     /// 技术原文的唯一去处：诊断日志（默认开，写在本机日志目录）。
