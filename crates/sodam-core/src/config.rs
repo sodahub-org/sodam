@@ -21,6 +21,28 @@ const SELF_WRITE_WINDOW: Duration = Duration::from_millis(1500);
 const ENV_LOGIN_DEVICE_ID: &str = "SODA_LOGIN_DEVICE_ID";
 const ENV_LOGIN_INSTALL_ID: &str = "SODA_LOGIN_INSTALL_ID";
 
+/// 登录 Cookie 的环境变量名：补全与「环境里有没有 Cookie」的判断共用。
+pub(crate) const ENV_COOKIE_KEY: &str = "SODA_COOKIE";
+
+/// 补环境变量时要不要用 `SODA_COOKIE` 补回登录身份（#192）。
+///
+/// 用户在界面上显式登出后，本次运行里只跳过 Cookie，其余字段照常补；
+/// 启动路径不受影响，重启仍按环境变量走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvCookieFill {
+    /// 与启动时一致：空 Cookie 用环境变量补。
+    Allow,
+    /// 显式登出后的进程内记号生效：跳过 Cookie。
+    Skip,
+}
+
+/// 进程环境里是否有非空的 `SODA_COOKIE`：登出提示用，判空口径与补全一致。
+pub fn env_cookie_present() -> bool {
+    std::env::var(ENV_COOKIE_KEY)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// 记录一次应用自身写盘（保存成功后调用）。
 fn note_self_write() {
     let mut slot = LAST_SELF_WRITE
@@ -898,17 +920,23 @@ impl Settings {
     /// 热重载路径请用 [`Self::fill_empty_from_env`]——轮询里不能现生成设备身份，
     /// 否则外部文件没带身份时会在后台悄悄轮换一份。
     pub fn merged_with_env(self) -> Self {
-        let mut settings = self.fill_empty_from_env();
+        let mut settings = self.fill_empty_from_env(EnvCookieFill::Allow);
         settings.ensure_login_device();
         settings
     }
 
     /// 只补环境变量，不生成设备身份：热重载轮询与启动共用同一套补全逻辑
     /// （优先级一致），设备身份交给调用方决定要不要生成。
-    pub(crate) fn fill_empty_from_env(mut self) -> Self {
+    ///
+    /// [`EnvCookieFill::Skip`] 时跳过 `SODA_COOKIE`，其余字段照常补：
+    /// 用户在界面上显式登出后，本次运行里环境变量不能再把身份补回来（#192）。
+    /// 重启后仍按环境变量启动，启动期契约不变。
+    pub(crate) fn fill_empty_from_env(mut self, cookie_fill: EnvCookieFill) -> Self {
         self.fill_login_device_from_env();
+        if cookie_fill == EnvCookieFill::Allow {
+            Self::fill_slot_from_env(&mut self.cookie, ENV_COOKIE_KEY);
+        }
         let pairs = [
-            ("SODA_COOKIE", &mut self.cookie),
             ("QISHUI_SIGNER_URL", &mut self.signer_url),
             ("QISHUI_SIGNER_TOKEN", &mut self.signer_token),
             ("SODA_DEVICE_ID", &mut self.device_id),
@@ -972,9 +1000,6 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 改 `SODA_LOGIN_*` 的用例串行跑：环境变量是进程级的，并行会互相踩。
-    static LOGIN_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// 一对合法的登录设备身份（16 位 + 15 位数字，见 libresoda `QrDevice::is_valid`）。
     const DEVICE_ID: &str = "1234567890123456";
@@ -1074,7 +1099,7 @@ mod tests {
     /// 不能先生成一份再让环境变量补不进去（#186）。
     #[test]
     fn login_device_env_wins_on_first_start() {
-        let _lock = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _lock = crate::env_test_lock();
         let _env = set_login_device_env(DEVICE_ID, INSTALL_ID);
 
         let dir = tempfile::tempdir().unwrap();
@@ -1091,7 +1116,7 @@ mod tests {
     /// 已有配置里的身份优先于环境变量：环境变量只补空字段（#186）。
     #[test]
     fn existing_login_device_beats_env() {
-        let _lock = LOGIN_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _lock = crate::env_test_lock();
         let _env = set_login_device_env("9999999999999999", "999999999999999");
 
         let dir = tempfile::tempdir().unwrap();
@@ -1395,6 +1420,8 @@ mod tests {
     fn env_quality_override_records_derived_source_and_respects_user_choice() {
         use crate::quality::{QualityIntent, QualitySource};
 
+        let _lock = crate::env_test_lock();
+
         struct EnvGuard(&'static str);
         impl Drop for EnvGuard {
             fn drop(&mut self) {
@@ -1416,6 +1443,50 @@ mod tests {
         let user_merged = user_picked.merged_with_env();
         assert_eq!(user_merged.quality, "auto");
         assert_eq!(user_merged.quality_source(), QualitySource::User);
+    }
+
+    /// 显式登出后只停用 Cookie 的环境变量补全，签名地址等其余字段照常补（#192）。
+    #[test]
+    fn env_fill_can_skip_cookie_only() {
+        /// 离开作用域时还原到设值前的状态（本机原本设过这个变量也不丢）。
+        struct EnvGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, previous }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let _lock = crate::env_test_lock();
+        let _cookie_guard = EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
+        let _signer_guard = EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
+
+        // 签名地址有内置默认值，先清空，才能验证「Skip 只跳过 Cookie、其余字段照补」。
+        let mut base = Settings::default();
+        base.signer_url.clear();
+
+        let skipped = base.clone().fill_empty_from_env(EnvCookieFill::Skip);
+        assert!(
+            skipped.cookie.is_empty(),
+            "登出记号置位时不能用环境变量补 Cookie"
+        );
+        assert_eq!(skipped.signer_url, "https://signer.example");
+
+        // 对照：没有记号时照旧补 Cookie，证明跳过不是「环境变量没设」造成的。
+        let allowed = base.fill_empty_from_env(EnvCookieFill::Allow);
+        assert_eq!(allowed.cookie, "cookie-from-env");
     }
 
     /// 详细日志：新配置默认关闭，旧配置缺字段也能读。

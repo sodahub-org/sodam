@@ -8,6 +8,7 @@ use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
+use sodam_core::config::EnvCookieFill;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -889,6 +890,8 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
+                                        // 扫码登录成功：解除登出记号，环境变量补全恢复（#192）。
+                                        root.env_cookie_opted_out = false;
                                         // 换了一份登录凭据：旧账号的不可播结论与逐曲冷却
                                         // 一并作废。账号 id / 会员状态的逐项比较在
                                         // `refresh_account` 里，但账号信息读取失败时拿不到
@@ -2224,7 +2227,7 @@ impl Root {
         self.clear_round_exhaustion();
     }
 
-    /// 退出登录：清除 Cookie 并立即回到未登录状态。
+    /// 退出登录：落盘成功后清除 Cookie 并回到未登录状态；落盘失败保持登录。
     ///
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
     /// 封面本地缓存只按 URL 索引，可以复用，不涉及凭据。
@@ -2232,16 +2235,20 @@ impl Root {
         let mut settings = self.settings.clone();
         settings.cookie.clear();
 
-        self.clear_identity_state(cx);
-
+        // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
+        // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
         let save_result = if let Some(session) = self.session.as_mut() {
             session.apply(settings.clone())
         } else {
             settings.save()
         };
-        self.settings = settings;
         match save_result {
             Ok(()) => {
+                // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
+                // 记号不落盘，重启后仍按环境变量启动。
+                self.env_cookie_opted_out = true;
+                self.settings = settings;
+                self.clear_identity_state(cx);
                 // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
                 // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
                 // 文件 IO 放后台，不占 UI 线程。
@@ -2252,12 +2259,22 @@ impl Root {
                         sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
                 })
                 .detach();
-                self.set_status_text(self.tr("已退出登录"));
+                if sodam_core::config::env_cookie_present() {
+                    self.set_status_text(self.tr(
+                        "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
+                    ));
+                } else {
+                    self.set_status_text(self.tr("已退出登录"));
+                }
             }
             Err(err) => {
                 self.notify_error_once(
                     "logout-save-failed",
-                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
+                    self.failure_text(
+                        "保存退出登录状态",
+                        &err,
+                        "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                    ),
                 );
             }
         }
@@ -3927,6 +3944,11 @@ impl Root {
             tracker: self.config_reload.clone(),
             path: Settings::config_path(),
             current: self.settings.clone(),
+            cookie_fill: if self.env_cookie_opted_out {
+                EnvCookieFill::Skip
+            } else {
+                EnvCookieFill::Allow
+            },
         })
     }
 
@@ -3952,6 +3974,13 @@ impl Root {
                 // 本地没动过才应用；应用了才确认这份指纹——被丢弃时留给下一轮
                 // 重新处理（下一轮拿新快照比较，文件没变就 Unchanged 收尾）。
                 if self.settings == snapshot {
+                    // 登出记号只在「外部文件写进非空 Cookie」时解除。记号生效时
+                    // 轮询传 `EnvCookieFill::Skip`，补出来的 Cookie 一定是空的；
+                    // 能走到这里，且本地这份快照还是登出后的空 Cookie，说明非空
+                    // Cookie 来自文件（手动粘贴/换号），不是环境变量（#192）。
+                    if !settings.cookie.trim().is_empty() {
+                        self.env_cookie_opted_out = false;
+                    }
                     self.apply_external_settings(*settings, cx);
                     let mut tracker = self
                         .config_reload

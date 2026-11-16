@@ -128,6 +128,12 @@ impl Language {
             "歌单「{}」没有可播放曲目" => "Playlist {} has no playable tracks",
             "推荐队列已追加 {added} 首" => "Added {} recommendation tracks",
             "已退出登录" => "Signed out",
+            "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录" => {
+                "Signed out. Unset SODA_COOKIE to stay signed out; next launch signs back in."
+            }
+            "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。" => {
+                "Sign-out failed; you are still signed in. Check that the config file is writable, then try again."
+            }
             "已收藏：{}" => "Liked: {}",
             "已取消收藏：{}" => "Unliked: {}",
             "已入队：{title}" => "Queued: {title}",
