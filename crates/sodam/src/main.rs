@@ -97,7 +97,10 @@ fn start_tray_service(
                     tray::TrayCommand::Next => {
                         cx.update(|cx| app.update(cx, |root, cx| root.next_track(cx)))
                     }
-                    tray::TrayCommand::Quit => cx.update(|cx| cx.quit()),
+                    // 先等启动期落盘做完再退（#198）；再按一次会直接退出。
+                    tray::TrayCommand::Quit => {
+                        cx.update(|cx| app.update(cx, |root, cx| root.request_quit(cx)))
+                    }
                 };
             }
 
@@ -272,7 +275,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 let language = app.read(cx).language;
-                menus::install(cx, language);
+                menus::install(cx, language, app.downgrade());
             }
             // 播放快捷键：应用内三键（可在设置页重绑）。
             let settings = app.read(cx).settings.clone();

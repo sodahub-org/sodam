@@ -504,6 +504,24 @@ pub struct StartupLoad {
     pub write_back: Option<StartupWriteBack>,
 }
 
+/// 开发后门：把启动回存故意拖慢，用来验证退出前会等它写完（#198）。
+///
+/// 只在 debug 构建生效，取值上限 10 秒，防止误设把应用拖死。
+/// 用法：设 `SODAM_DEBUG_SLOW_CONFIG_PERSIST_MS=1500` 启动，开窗后立刻从托盘退出，
+/// 重启确认 `config.json` 已经按合并后的内容写出来。
+#[cfg(debug_assertions)]
+fn debug_delay_persist() {
+    let Ok(ms) = std::env::var("SODAM_DEBUG_SLOW_CONFIG_PERSIST_MS") else {
+        return;
+    };
+    if let Ok(ms) = ms.trim().parse::<u64>() {
+        std::thread::sleep(Duration::from_millis(ms.min(10_000)));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_delay_persist() {}
+
 /// 启动期欠下的落盘修正：读盘阶段只收集，首帧后到后台线程执行（#191）。
 ///
 /// 这几步都是有副作用的小文件操作，不能放在 UI 线程；失败只上报，不影响本次运行。
@@ -529,6 +547,7 @@ impl StartupWriteBack {
     /// 主文件保存与备份刷新在同一把写锁内完成：要么一起刷新到同一份内容，要么都不动。
     /// 回写前指纹对不上（外部已改过文件）就整体跳过，交给热重载应用新内容。
     pub fn persist(self) -> Result<(), String> {
+        debug_delay_persist();
         let _guard = SETTINGS_WRITE_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());

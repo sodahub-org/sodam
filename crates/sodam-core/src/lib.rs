@@ -20,6 +20,7 @@ pub mod preferences;
 pub mod prefetch;
 pub mod quality;
 pub mod queue;
+pub mod quit_gate;
 pub mod session;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};

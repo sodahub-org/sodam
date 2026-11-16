@@ -623,6 +623,8 @@ pub struct Root {
     pub(crate) startup_persist_task: Option<gpui::Task<()>>,
     /// 启动落盘结果：后台任务写、心跳取走提示；退出时兜底写日志（#191）。
     pub(crate) startup_persist_result: Arc<Mutex<Option<Result<(), String>>>>,
+    /// 主动退出闸门：托盘 / ⌘Q 先等启动期落盘做完再退（#198）。
+    pub(crate) quit_gate: sodam_core::quit_gate::QuitGate,
 }
 
 /// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
@@ -926,6 +928,7 @@ impl Root {
             startup_write_back: write_back,
             startup_persist_task: None,
             startup_persist_result: Arc::new(Mutex::new(None)),
+            quit_gate: sodam_core::quit_gate::QuitGate::default(),
         };
         cx.on_app_quit(|root, cx| {
             sodam_core::flush_global();
@@ -1653,6 +1656,99 @@ impl Root {
             self.set_status_text(message);
             cx.notify();
         }
+    }
+
+    /// 应用内主动退出（托盘「退出」、macOS ⌘Q）：先等启动期欠下的落盘做完，
+    /// 再真正退出（#198）。
+    ///
+    /// GPUI 只给 `on_app_quit` 的等待约 200ms；慢盘 / 杀软扫描 / 写锁被占时写不完。
+    /// 这里把等待放到自己的任务里，期间界面保持可交互；再点一次退出，或等满
+    /// [`sodam_core::quit_gate::QUIT_PERSIST_TIMEOUT`]，就强制退出。
+    pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quit_gate.request() == sodam_core::quit_gate::QuitRequest::QuitNow {
+            cx.quit();
+            return;
+        }
+        self.set_status_text(self.tr("正在保存…"));
+        cx.notify();
+
+        // 与 on_app_quit 补做的是同一批工作，先取走，避免两边同时写。
+        let fallback = self.startup_write_back.take().map(|write_back| {
+            cx.background_spawn(async move {
+                if let Err(error) = write_back.persist() {
+                    log_event(
+                        LogLevel::Error,
+                        LogTopic::App,
+                        "failure",
+                        &[
+                            ("context", "退出前回存启动配置失败"),
+                            ("detail", error.as_str()),
+                        ],
+                    );
+                }
+            })
+        });
+        let persist_task = self.startup_persist_task.take();
+        let preferences = self.preferences_writer.flush();
+        let persist_result = self.startup_persist_result.clone();
+
+        // 等完三件事（回存、首拍任务、偏好刷尾）再回主线程退出；落盘全在后台线程。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        cx.background_spawn(async move {
+            if let Some(task) = fallback {
+                task.await;
+            }
+            if let Some(task) = persist_task {
+                task.await;
+            }
+            preferences.await;
+            let _ = done_tx.send(());
+        })
+        .detach();
+
+        let timeout = sodam_core::quit_gate::QUIT_PERSIST_TIMEOUT;
+        cx.spawn(async move |this, cx| {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match done_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            // 到点不等了：让用户退得掉，把超时写进日志。
+                            let timeout_ms = timeout.as_millis().to_string();
+                            log_event(
+                                LogLevel::Error,
+                                LogTopic::App,
+                                "quit_persist_timeout",
+                                &[("timeout_ms", timeout_ms.as_str())],
+                            );
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(20))
+                            .await;
+                    }
+                }
+            }
+            // 首拍任务失败但心跳没来得及提示：退出前至少把原文写进日志。
+            let error = persist_result
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .take();
+            if let Some(Err(error)) = error {
+                log_event(
+                    LogLevel::Error,
+                    LogTopic::App,
+                    "failure",
+                    &[("context", "启动配置回存失败"), ("detail", error.as_str())],
+                );
+            }
+            let _ = this.update(cx, |root, cx| {
+                root.quit_gate.finish();
+                cx.quit();
+            });
+        })
+        .detach();
     }
 
     /// 技术原文的唯一去处：诊断日志（默认开，写在本机日志目录）。

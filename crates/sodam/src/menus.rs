@@ -8,16 +8,23 @@
 //! ⌘W 只关窗不退出：应用是常驻托盘的（`QuitMode::Explicit`），关窗后可以从托盘
 //! 「显示主窗口」再打开，⌘Q 才真正退出进程。
 
-use gpui::{actions, App, KeyBinding, Menu, MenuItem, Window};
+use gpui::{actions, App, KeyBinding, Menu, MenuItem, WeakEntity, Window};
 
+use crate::app::Root;
 use crate::ui::i18n::Language;
 
 actions!(sodam, [QuitApp, MinimizeWindow, CloseWindow]);
 
 /// 注册动作处理器与菜单栏。启动时调用一次。
-pub fn install(cx: &mut App, language: Language) {
+pub fn install(cx: &mut App, language: Language, app: WeakEntity<Root>) {
     // 三个动作都走应用级监听器：⌘W 关掉窗口后没有窗口可派发，菜单仍要能退出。
-    cx.on_action(|_: &QuitApp, cx: &mut App| cx.quit());
+    cx.on_action(move |_: &QuitApp, cx: &mut App| {
+        let Some(app) = app.upgrade() else {
+            return;
+        };
+        // 先等启动期落盘做完再退（#198）；再按一次会直接退出。
+        app.update(cx, |root, cx| root.request_quit(cx));
+    });
     cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
         with_main_window(cx, |window| window.minimize_window())
     });
