@@ -865,7 +865,7 @@ impl Settings {
             .unwrap_or_else(|err| err.into_inner());
         #[cfg(debug_assertions)]
         if let Some(delay) =
-            debug_slow_save_delay(std::env::var("SODAM_SLOW_SAVE_MS").ok().as_deref())
+            Self::debug_slow_save_delay(std::env::var("SODAM_SLOW_SAVE_MS").ok().as_deref())
         {
             std::thread::sleep(delay);
         }
@@ -2021,13 +2021,13 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn slow_save_delay_parsing() {
-        assert_eq!(debug_slow_save_delay(None), None);
-        assert_eq!(debug_slow_save_delay(Some("")), None);
-        assert_eq!(debug_slow_save_delay(Some("0")), None);
-        assert_eq!(debug_slow_save_delay(Some("-5")), None);
-        assert_eq!(debug_slow_save_delay(Some("abc")), None);
+        assert_eq!(Settings::debug_slow_save_delay(None), None);
+        assert_eq!(Settings::debug_slow_save_delay(Some("")), None);
+        assert_eq!(Settings::debug_slow_save_delay(Some("0")), None);
+        assert_eq!(Settings::debug_slow_save_delay(Some("-5")), None);
+        assert_eq!(Settings::debug_slow_save_delay(Some("abc")), None);
         assert_eq!(
-            debug_slow_save_delay(Some(" 250 ")),
+            Settings::debug_slow_save_delay(Some(" 250 ")),
             Some(std::time::Duration::from_millis(250))
         );
     }
