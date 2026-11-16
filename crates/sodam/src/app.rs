@@ -11,6 +11,7 @@ use gpui::{
     Window,
 };
 use sodam_core::{
+    config::EnvCookieFill,
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -623,8 +624,8 @@ pub(crate) struct ConfigPollRequest {
     tracker: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
     path: PathBuf,
     current: Settings,
-    /// 显式登出后为 `false`：热重载跳过 `SODA_COOKIE` 补全（#192）。
-    allow_env_cookie: bool,
+    /// 显式登出后为 `Skip`：热重载跳过 `SODA_COOKIE` 补全（#192）。
+    cookie_fill: EnvCookieFill,
 }
 
 impl ConfigPollRequest {
@@ -641,7 +642,7 @@ impl ConfigPollRequest {
             &self.current,
             now,
             self_write_recent,
-            self.allow_env_cookie,
+            self.cookie_fill,
         );
         (event, self.current)
     }

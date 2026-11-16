@@ -6,7 +6,7 @@
 //! 防抖要处理的正是外部编辑器的「先截断再写入」：截断态解析失败不报错，
 //! 等文件稳定且能解析了才应用；稳定损坏（改完放在那不动）才提示一次。
 
-use crate::config::{LoadOutcome, Settings};
+use crate::config::{EnvCookieFill, LoadOutcome, Settings};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -80,15 +80,16 @@ impl ReloadTracker {
     /// `self_write_recent` 由调用方传入 [`crate::config::recent_self_write`]，
     /// 测试可注入固定值，避免并行测试互相干扰。
     ///
-    /// `allow_env_cookie` 由调用方决定：用户在界面上显式登出后传 `false`，
-    /// 本次运行里不再用 `SODA_COOKIE` 把身份补回来（#192）；其余字段照常补。
+    /// `cookie_fill` 由调用方决定：用户在界面上显式登出后传
+    /// [`EnvCookieFill::Skip`]，本次运行里不再用 `SODA_COOKIE` 把身份补回来（#192）；
+    /// 其余字段照常补。
     pub fn poll(
         &mut self,
         path: &Path,
         current: &Settings,
         now: Instant,
         self_write_recent: bool,
-        allow_env_cookie: bool,
+        cookie_fill: EnvCookieFill,
     ) -> ReloadEvent {
         let observed = fingerprint(path);
         if observed == self.seen {
@@ -156,7 +157,7 @@ impl ReloadTracker {
                 // 显式登出后只跳过 Cookie（#192）。
                 // 这里故意不做 ensure_login_device：文件没带设备身份时不能在轮询里
                 // 现生成一份（会悄悄轮换身份），交给应用侧沿用当前身份。
-                let settings = settings.fill_empty_from_env(allow_env_cookie);
+                let settings = settings.fill_empty_from_env(cookie_fill);
                 // 第一次解析成功只记账：等指纹稳定跨过 APPLY_AFTER 再应用，
                 // 编辑器「截断 → 写全」的中间态不会被当成损坏，也不会应用半份。
                 let good_since = *self.pending.good_since.get_or_insert(now);
@@ -183,17 +184,10 @@ impl ReloadTracker {
 mod tests {
     use super::*;
 
-    /// 进程环境变量是全局的：这些用例统一串行，避免一个用例设的 `SODA_COOKIE`
-    /// 泄漏到并行跑的其他用例里。
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|err| err.into_inner())
-    }
-
     /// 外部改动（内容与内存不同）：防抖窗口过后应用一次。
     #[test]
     fn external_change_applies_after_stability_window() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut tracker = ReloadTracker::new();
@@ -202,19 +196,19 @@ mod tests {
 
         // 没有文件：安静。
         assert!(matches!(
-            tracker.poll(&path, &current, now, false, true),
+            tracker.poll(&path, &current, now, false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
 
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         // 第一次看到变化：只进入防抖，不立刻应用。
         assert!(matches!(
-            tracker.poll(&path, &current, now, false, true),
+            tracker.poll(&path, &current, now, false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
 
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
-        match tracker.poll(&path, &current, Instant::now(), false, true) {
+        match tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow) {
             ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "dark"),
             other => panic!("稳定后应应用新内容，实际 {other:?}"),
         }
@@ -222,7 +216,7 @@ mod tests {
         // 未确认前轮询会重复报 Apply，避免被丢弃的外部改动从此无人处理。
         tracker.acknowledge(fingerprint(&path));
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
     }
@@ -230,7 +224,7 @@ mod tests {
     /// 内容与应用内一致：不提示、不应用（编辑器回存同一份内容不打扰用户）。
     #[test]
     fn identical_content_settles_silently() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let current = Settings::default();
@@ -238,12 +232,12 @@ mod tests {
         let mut tracker = ReloadTracker::new();
 
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Unchanged
         ));
     }
@@ -252,7 +246,7 @@ mod tests {
     /// 自然按 Unchanged 收尾，不会丢掉任何东西。
     #[test]
     fn self_write_is_skipped_then_settles_as_unchanged() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let current = Settings::default();
@@ -260,18 +254,18 @@ mod tests {
         let mut tracker = ReloadTracker::new();
 
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), true, true),
+            tracker.poll(&path, &current, Instant::now(), true, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         // 自写窗口过后：先进入防抖（第一次解析成功只记账），再按 Unchanged 收尾。
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Unchanged
         ));
     }
@@ -279,7 +273,7 @@ mod tests {
     /// 编辑器「先截断再写全」：截断态解析失败不报损坏，写全后照常应用。
     #[test]
     fn truncated_then_full_write_is_not_treated_as_corrupt() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let current = Settings::default();
@@ -287,17 +281,17 @@ mod tests {
 
         std::fs::write(&path, r#"{"theme":"dar"#).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet,
         ));
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet,
         ));
 
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
-        match tracker.poll(&path, &current, Instant::now(), false, true) {
+        match tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow) {
             ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "dark"),
             other => panic!("写全后应应用新内容，实际 {other:?}"),
         }
@@ -306,7 +300,7 @@ mod tests {
     /// 稳定损坏：提示一次（不重复刷屏）；内存设置由上层保持，文件不动。
     #[test]
     fn stable_corruption_reports_once() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let current = Settings::default();
@@ -314,28 +308,28 @@ mod tests {
 
         std::fs::write(&path, "{oops").unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet,
         ));
 
         std::thread::sleep(CORRUPT_AFTER + Duration::from_millis(100));
-        match tracker.poll(&path, &current, Instant::now(), false, true) {
+        match tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow) {
             ReloadEvent::Corrupt(error) => assert!(error.contains("line"), "{error}"),
             other => panic!("稳定损坏应提示一次，实际 {other:?}"),
         }
         // 同一份坏文件不再重复提示。
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         // 用户修好之后照常应用。
         std::fs::write(&path, r#"{"theme":"light"}"#).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet,
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
-        match tracker.poll(&path, &current, Instant::now(), false, true) {
+        match tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow) {
             ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "light"),
             other => panic!("修好后应应用新内容，实际 {other:?}"),
         }
@@ -344,7 +338,7 @@ mod tests {
     /// 文件被外部删掉：不动内存设置，等它回来再重载。
     #[test]
     fn missing_file_is_ignored_until_it_returns() {
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let current = Settings::default();
@@ -352,41 +346,41 @@ mod tests {
 
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         std::fs::remove_file(&path).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         std::fs::write(&path, r#"{"theme":"light"}"#).unwrap();
         assert!(matches!(
-            tracker.poll(&path, &current, Instant::now(), false, true),
+            tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
-        match tracker.poll(&path, &current, Instant::now(), false, true) {
+        match tracker.poll(&path, &current, Instant::now(), false, EnvCookieFill::Allow) {
             ReloadEvent::Apply { settings, .. } => assert_eq!(settings.theme, "light"),
             other => panic!("文件回来后应应用新内容，实际 {other:?}"),
         }
     }
 
-    /// 显式登出后（调用方传 `allow_env_cookie = false`）：同一份空 Cookie 文件
+    /// 显式登出后（调用方传 `EnvCookieFill::Skip`）：同一份空 Cookie 文件
     /// 不会再被 `SODA_COOKIE` 补回身份；没有记号时照旧复活（#192）。
     #[test]
     fn env_cookie_opt_out_prevents_logout_resurrection() {
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var("SODA_COOKIE");
+                std::env::remove_var(crate::config::ENV_COOKIE_KEY);
             }
         }
 
-        let _serial = serial();
+        let _serial = crate::env_test_lock();
         let _env = EnvGuard;
-        std::env::set_var("SODA_COOKIE", "cookie-from-env");
+        std::env::set_var(crate::config::ENV_COOKIE_KEY, "cookie-from-env");
 
         // 登出后的磁盘与内存：Cookie 都是空的。
         let current = Settings::default();
@@ -398,12 +392,12 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
         let mut opted_out = ReloadTracker::new();
         assert!(matches!(
-            opted_out.poll(&path, &current, Instant::now(), false, false),
+            opted_out.poll(&path, &current, Instant::now(), false, EnvCookieFill::Skip),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
         assert!(matches!(
-            opted_out.poll(&path, &current, Instant::now(), false, false),
+            opted_out.poll(&path, &current, Instant::now(), false, EnvCookieFill::Skip),
             ReloadEvent::Unchanged
         ));
 
@@ -413,11 +407,23 @@ mod tests {
         std::fs::write(&other_path, &content).unwrap();
         let mut plain = ReloadTracker::new();
         assert!(matches!(
-            plain.poll(&other_path, &current, Instant::now(), false, true),
+            plain.poll(
+                &other_path,
+                &current,
+                Instant::now(),
+                false,
+                EnvCookieFill::Allow
+            ),
             ReloadEvent::Quiet
         ));
         std::thread::sleep(APPLY_AFTER + Duration::from_millis(100));
-        match plain.poll(&other_path, &current, Instant::now(), false, true) {
+        match plain.poll(
+            &other_path,
+            &current,
+            Instant::now(),
+            false,
+            EnvCookieFill::Allow,
+        ) {
             ReloadEvent::Apply { settings, .. } => {
                 assert_eq!(settings.cookie, "cookie-from-env")
             }

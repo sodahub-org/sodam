@@ -8,6 +8,7 @@ use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
+use sodam_core::config::EnvCookieFill;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -2231,25 +2232,23 @@ impl Root {
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
     /// 封面本地缓存只按 URL 索引，可以复用，不涉及凭据。
     pub fn logout(&mut self, cx: &mut Context<Self>) {
-        // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
-        // 记号不落盘，重启后仍按环境变量启动。
-        self.env_cookie_opted_out = true;
-        let cookie_env_set = std::env::var("SODA_COOKIE")
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
         let mut settings = self.settings.clone();
         settings.cookie.clear();
 
-        self.clear_identity_state(cx);
-
+        // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
+        // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
         let save_result = if let Some(session) = self.session.as_mut() {
             session.apply(settings.clone())
         } else {
             settings.save()
         };
-        self.settings = settings;
         match save_result {
             Ok(()) => {
+                // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
+                // 记号不落盘，重启后仍按环境变量启动。
+                self.env_cookie_opted_out = true;
+                self.settings = settings;
+                self.clear_identity_state(cx);
                 // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
                 // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
                 // 文件 IO 放后台，不占 UI 线程。
@@ -2260,7 +2259,7 @@ impl Root {
                         sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
                 })
                 .detach();
-                if cookie_env_set {
+                if sodam_core::config::env_cookie_present() {
                     self.set_status_text(self.tr(
                         "已退出登录；环境变量 SODA_COOKIE 仍然设着，重启后会按它重新登录（要彻底退出请取消这个环境变量）",
                     ));
@@ -2271,7 +2270,7 @@ impl Root {
             Err(err) => {
                 self.notify_error_once(
                     "logout-save-failed",
-                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
+                    self.failure_text("退出登录失败", &err, "退出登录失败，账号仍保持登录。"),
                 );
             }
         }
@@ -3941,7 +3940,11 @@ impl Root {
             tracker: self.config_reload.clone(),
             path: Settings::config_path(),
             current: self.settings.clone(),
-            allow_env_cookie: !self.env_cookie_opted_out,
+            cookie_fill: if self.env_cookie_opted_out {
+                EnvCookieFill::Skip
+            } else {
+                EnvCookieFill::Allow
+            },
         })
     }
 
@@ -4016,7 +4019,9 @@ impl Root {
         let session_changed = incoming.session_inputs_differ(&old);
         let cookie_changed = incoming.cookie != old.cookie;
         // 外部文件写入非空 Cookie（手动粘贴/换号）：解除登出记号，环境变量补全恢复。
-        // 记号生效时热重载不补环境变量，所以这里的非空 Cookie 只可能来自文件（#192）。
+        // 记号生效时轮询传 `EnvCookieFill::Skip`，补出来的 Cookie 一定是空的；
+        // 所以这里的非空 Cookie 只可能来自文件。前提是 `finish_config_poll` 只应用
+        // 本地没动过的那份外部快照——那条守卫放开时这里要重新审。
         if cookie_changed && !incoming.cookie.trim().is_empty() {
             self.env_cookie_opted_out = false;
         }

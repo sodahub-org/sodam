@@ -29,3 +29,11 @@ pub use models::{PlaylistItem, SceneItem, TrackItem};
 pub use play_report::PlayReporter;
 pub use queue::{PlayMode, Queue};
 pub use session::Session;
+
+/// 测试用：进程环境变量是全局的，同 crate 里改环境变量的用例共用这把锁，
+/// 避免一个用例设/清变量时被并行跑的用例看到（#192）。
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
