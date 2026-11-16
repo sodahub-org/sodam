@@ -2235,7 +2235,9 @@ impl Root {
     /// 落盘放后台线程：磁盘慢或写锁被占时界面不跟着卡（#197）。
     pub fn logout(&mut self, cx: &mut Context<Self>) {
         // 落盘期间再点只算一次：不起第二个保存，也不把状态清理跑两遍。
-        if self.logout_in_flight {
+        // 正在排队退出时也不接新的登出：退出流程只等它开始那一刻已有的保存，
+        // 这时候再起一个新保存没人等，慢盘上会带着旧 Cookie 退出（#197）。
+        if self.logout_in_flight || self.quit_gate.is_saving() {
             return;
         }
         // 点登出时拍一份快照：盘上读不出来时拿它兜底（真正写盘时会摘掉 Cookie）。
@@ -2264,7 +2266,7 @@ impl Root {
         // 否则保存没落盘就退出，盘上还留着旧 Cookie。
         let handle = cx.spawn(async move |this, cx| {
             let outcome = save.await;
-            let _ = this.update(cx, |root, cx| {
+            let confirm = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
                 if root.settings.cookie != logout_cookie {
                     // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
@@ -2274,9 +2276,9 @@ impl Root {
                         root.set_status_text(root.tr("已退出登录"));
                     }
                     cx.notify();
-                    return;
+                    return None;
                 }
-                match outcome {
+                let confirm = match outcome {
                     Ok(true) => {
                         // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
                         // 记号不落盘，重启后仍按环境变量启动。
@@ -2290,27 +2292,13 @@ impl Root {
                         }
                         // 收尾再确认一次：登出保存持锁期间，别的保存可能正在 UI 线程
                         // 排队等锁，随后把还带旧 Cookie 的设置写回盘（#197 复审）。
-                        // 这里只在盘上 Cookie 仍是旧值时再清一次；已经空了不写，
-                        // 盘上换了别的身份也直接跳过。
-                        let confirm = root.settings.clone();
-                        let expected = logout_cookie.clone();
-                        cx.background_spawn(async move {
-                            let _ = confirm.save_signed_out(&expected);
-                        })
-                        .detach();
-                        root.clear_identity_state(cx);
-                        // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
-                        if sodam_core::config::env_cookie_present() {
-                            root.set_status_text(root.tr(
-                                "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
-                            ));
-                        } else {
-                            root.set_status_text(root.tr("已退出登录"));
-                        }
+                        // 只清「盘上仍是旧 Cookie」的情况；已经空了不写，换过身份也跳过。
+                        Some((root.settings.clone(), logout_cookie.clone()))
                     }
                     Ok(false) => {
                         // 盘上身份已经变了，这次写入被跳过：什么都不改，
                         // 等热重载或登录流程把它们自己的状态行发出来。
+                        None
                     }
                     Err(err) => {
                         // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
@@ -2322,10 +2310,31 @@ impl Root {
                                 "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
                             ),
                         );
+                        None
+                    }
+                };
+                if confirm.is_some() {
+                    root.clear_identity_state(cx);
+                    // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
+                    if sodam_core::config::env_cookie_present() {
+                        root.set_status_text(root.tr(
+                            "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
+                        ));
+                    } else {
+                        root.set_status_text(root.tr("已退出登录"));
                     }
                 }
                 cx.notify();
+                confirm
             });
+            // 收尾确认跑在登出这条任务链里：退出时等 `logout_save_task` 就一起等到了，
+            // 不会出现「退出流程结束、确认写入还在跑」的窗口（#197 复审）。
+            if let Ok(Some((settings, expected))) = confirm {
+                cx.background_spawn(async move {
+                    let _ = settings.save_signed_out(&expected);
+                })
+                .await;
+            }
         });
         self.logout_save_task = Some(handle);
     }

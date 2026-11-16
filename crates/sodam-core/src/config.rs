@@ -952,10 +952,23 @@ impl Settings {
     /// 删不掉只记日志，不把登出判失败：主文件已经登出，判失败反而让用户一直登不出去。
     fn drop_stale_backup_cookie(path: &Path) {
         let backup = settings_backup_path(path);
-        let stale = std::fs::read(&backup)
-            .ok()
-            .and_then(|bytes| parse_settings_bytes(&bytes).ok())
-            .is_some_and(|settings| !settings.cookie.trim().is_empty());
+        let stale = match std::fs::read(&backup) {
+            Ok(bytes) => parse_settings_bytes(&bytes)
+                .map(|settings| !settings.cookie.trim().is_empty())
+                .unwrap_or(false),
+            // 没有备份就没什么可清的。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                // 备份存在却读不出来：没法确认里面有没有 Cookie，记一笔再尽量删掉。
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::App,
+                    "backup_unreadable_after_refresh_failed",
+                    &[("detail", error.to_string().as_str())],
+                );
+                true
+            }
+        };
         if !stale {
             return;
         }
@@ -2218,6 +2231,13 @@ mod tests {
         .unwrap();
         Settings::drop_stale_backup_cookie(&path);
         assert!(backup.exists(), "空 Cookie 的备份不用删");
+
+        // 备份被占成目录、读不出来：不 panic，删不掉就留着。
+        let unreadable = dir.path().join("unreadable-config.json");
+        let unreadable_backup = settings_backup_path(&unreadable);
+        std::fs::create_dir_all(&unreadable_backup).unwrap();
+        Settings::drop_stale_backup_cookie(&unreadable);
+        assert!(unreadable_backup.exists(), "读不出又删不掉的备份保持原样");
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。
