@@ -2231,54 +2231,85 @@ impl Root {
     ///
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
     /// 封面本地缓存只按 URL 索引，可以复用，不涉及凭据。
+    ///
+    /// 落盘放后台线程：磁盘慢或写锁被占时界面不跟着卡（#197）。
     pub fn logout(&mut self, cx: &mut Context<Self>) {
+        // 落盘期间再点只算一次：不起第二个保存，也不把状态清理跑两遍。
+        if self.logout_in_flight {
+            return;
+        }
         let mut settings = self.settings.clone();
         settings.cookie.clear();
+        // 结果回来时拿这份代数对一下：保存期间登录成功或换了账号，
+        // 这次结果属于旧身份，整条丢掉，不能拿它清掉新身份。
+        let auth_epoch = self.auth_epoch;
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
-        let save_result = if let Some(session) = self.session.as_mut() {
-            session.apply(settings.clone())
-        } else {
-            settings.save()
-        };
-        match save_result {
-            Ok(()) => {
-                // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
-                // 记号不落盘，重启后仍按环境变量启动。
-                self.env_cookie_opted_out = true;
-                self.settings = settings;
-                self.clear_identity_state(cx);
-                // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
-                // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
-                // 文件 IO 放后台，不占 UI 线程。
-                let backup_settings = self.settings.clone();
-                let backup_path = Settings::config_path();
-                cx.background_spawn(async move {
-                    let _ =
-                        sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
-                })
-                .detach();
-                if sodam_core::config::env_cookie_present() {
-                    self.set_status_text(self.tr(
-                        "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
-                    ));
-                } else {
-                    self.set_status_text(self.tr("已退出登录"));
+        let save_settings = settings.clone();
+        let save = cx.background_spawn(async move { save_settings.save() });
+        self.logout_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let outcome = save.await;
+            let _ = this.update(cx, |root, cx| {
+                root.logout_in_flight = false;
+                if root.auth_epoch != auth_epoch {
+                    // 保存期间换过身份：这份结果已经过期，不能拿来清身份。
+                    // 但盘上刚被写成「无 Cookie」；用内存里最新的设置再写一次，
+                    // 免得界面是登录态、盘上却是登出态，重启就变成没登录。
+                    let latest = root.settings.clone();
+                    cx.background_spawn(async move {
+                        let _ = latest.save();
+                    })
+                    .detach();
+                    return;
                 }
-            }
-            Err(err) => {
-                self.notify_error_once(
-                    "logout-save-failed",
-                    self.failure_text(
-                        "保存退出登录状态",
-                        &err,
-                        "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
-                    ),
-                );
-            }
-        }
-        cx.notify();
+                match outcome {
+                    Ok(()) => {
+                        // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
+                        // 记号不落盘，重启后仍按环境变量启动。
+                        root.env_cookie_opted_out = true;
+                        // 盘上已经是登出状态，这里只重建会话，不再写一次盘。
+                        if let Some(session) = root.session.as_mut() {
+                            session.adopt(settings.clone());
+                        }
+                        root.settings = settings;
+                        root.clear_identity_state(cx);
+                        // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
+                        // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
+                        // 文件 IO 放后台，不占 UI 线程。
+                        let backup_settings = root.settings.clone();
+                        let backup_path = Settings::config_path();
+                        cx.background_spawn(async move {
+                            let _ = sodam_core::config::write_settings_backup(
+                                &backup_path,
+                                &backup_settings,
+                            );
+                        })
+                        .detach();
+                        if sodam_core::config::env_cookie_present() {
+                            root.set_status_text(root.tr(
+                                "已退出登录；要彻底退出请取消环境变量 SODA_COOKIE，否则重启会重新登录",
+                            ));
+                        } else {
+                            root.set_status_text(root.tr("已退出登录"));
+                        }
+                    }
+                    Err(err) => {
+                        root.notify_error_once(
+                            "logout-save-failed",
+                            root.failure_text(
+                                "保存退出登录状态",
+                                &err,
+                                "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                            ),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。

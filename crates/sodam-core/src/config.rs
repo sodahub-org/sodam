@@ -863,7 +863,26 @@ impl Settings {
         let _guard = SETTINGS_WRITE_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        #[cfg(debug_assertions)]
+        if let Some(delay) =
+            debug_slow_save_delay(std::env::var("SODAM_SLOW_SAVE_MS").ok().as_deref())
+        {
+            std::thread::sleep(delay);
+        }
         self.save_to_locked(path)
+    }
+
+    /// 调试开关：验收「慢盘 / 写锁被占时界面不冻结」时给每次保存加固定延迟（#197）。
+    ///
+    /// 写锁是进程内的 Mutex，外部进程占不住。真机验收用 `SODAM_SLOW_SAVE_MS=3000`
+    /// 让保存持着锁睡一会儿，看界面是否还跟手。只在 debug 构建里生效。
+    #[cfg(debug_assertions)]
+    fn debug_slow_save_delay(raw: Option<&str>) -> Option<std::time::Duration> {
+        let ms = raw?.trim().parse::<u64>().ok()?;
+        if ms == 0 {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(ms))
     }
 
     pub(crate) fn save_to_locked(&self, path: &Path) -> anyhow::Result<()> {
@@ -1995,6 +2014,21 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(quarantined[0].path()).unwrap(),
             "null"
+        );
+    }
+
+    /// 慢盘调试开关只认正整数毫秒，其它写法一律当没设（#197）。
+    #[cfg(debug_assertions)]
+    #[test]
+    fn slow_save_delay_parsing() {
+        assert_eq!(debug_slow_save_delay(None), None);
+        assert_eq!(debug_slow_save_delay(Some("")), None);
+        assert_eq!(debug_slow_save_delay(Some("0")), None);
+        assert_eq!(debug_slow_save_delay(Some("-5")), None);
+        assert_eq!(debug_slow_save_delay(Some("abc")), None);
+        assert_eq!(
+            debug_slow_save_delay(Some(" 250 ")),
+            Some(std::time::Duration::from_millis(250))
         );
     }
 }
