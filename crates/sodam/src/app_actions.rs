@@ -2250,12 +2250,20 @@ impl Root {
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
-        let save = cx.background_spawn(async move { logout_snapshot.save() });
+        //
+        // 写盘本身带身份校验：盘上的 Cookie 已经不是点击时那个，就直接跳过，
+        // 不会拿旧快照盖掉保存期间换进来的新身份（#197）。
+        let expected_cookie = logout_cookie.clone();
+        let save = cx.background_spawn(async move {
+            logout_snapshot.save_if_cookie_unchanged(&expected_cookie)
+        });
         self.logout_in_flight = true;
         // 慢盘时保存要等一会儿，先给一句反馈，别让点击看起来没反应。
         self.set_status_text(self.tr("正在退出登录…"));
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        // 句柄留在 `Root` 上：退出应用时 `on_app_quit` 要等它写完，
+        // 否则保存没落盘就退出，盘上还留着旧 Cookie。
+        let handle = cx.spawn(async move |this, cx| {
             let outcome = save.await;
             let _ = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
@@ -2270,7 +2278,7 @@ impl Root {
                     return;
                 }
                 match outcome {
-                    Ok(()) => {
+                    Ok(true) => {
                         // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
                         // 记号不落盘，重启后仍按环境变量启动。
                         root.env_cookie_opted_out = true;
@@ -2291,6 +2299,10 @@ impl Root {
                             root.set_status_text(root.tr("已退出登录"));
                         }
                     }
+                    Ok(false) => {
+                        // 盘上身份已经变了，这次写入被跳过：什么都不改，
+                        // 等热重载或登录流程把它们自己的状态行发出来。
+                    }
                     Err(err) => {
                         // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
                         root.notify_error_once(
@@ -2305,8 +2317,8 @@ impl Root {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.logout_save_task = Some(handle);
     }
 
     /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。

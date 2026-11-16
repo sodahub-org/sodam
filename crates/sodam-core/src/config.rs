@@ -863,13 +863,50 @@ impl Settings {
         let _guard = SETTINGS_WRITE_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        Self::debug_delay_before_write();
+        self.save_to_locked(path)
+    }
+
+    /// 只有盘上 Cookie 仍是 `expected_cookie` 时才写；`false` 表示身份已经变了，
+    /// 这次写入被跳过（登出用，#197）。
+    ///
+    /// 比较和写入在同一把写锁里完成：外部改了 Cookie、或别处换了账号，
+    /// 都不会被这份「点登出时拍的快照」盖回去，主文件和备份也都不动。
+    pub fn save_if_cookie_unchanged(&self, expected_cookie: &str) -> anyhow::Result<bool> {
+        self.save_if_cookie_unchanged_to(&Self::config_path(), expected_cookie)
+    }
+
+    pub fn save_if_cookie_unchanged_to(
+        &self,
+        path: &Path,
+        expected_cookie: &str,
+    ) -> anyhow::Result<bool> {
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        Self::debug_delay_before_write();
+        match std::fs::read(path) {
+            Ok(bytes) => match parse_settings_bytes(&bytes) {
+                // 盘上已经是别的身份：这份旧快照不许动文件和备份。
+                Ok(current) if current.cookie != expected_cookie => return Ok(false),
+                // 坏原件没有可用身份可比：照常交给 `save_to_locked` 走隔离流程。
+                _ => {}
+            },
+            // 文件不存在 = 首次保存；读不出来 = 让 `save_to_locked` 自己报错。
+            Err(_) => {}
+        }
+        self.save_to_locked(path)?;
+        Ok(true)
+    }
+
+    /// 验收用：debug 构建里按 `SODAM_SLOW_SAVE_MS` 拖慢保存（#197）。
+    fn debug_delay_before_write() {
         #[cfg(debug_assertions)]
         if let Some(delay) =
             Self::debug_slow_save_delay(std::env::var("SODAM_SLOW_SAVE_MS").ok().as_deref())
         {
             std::thread::sleep(delay);
         }
-        self.save_to_locked(path)
     }
 
     /// 调试开关：验收「慢盘 / 写锁被占时界面不冻结」时给每次保存加固定延迟（#197）。
@@ -2030,5 +2067,40 @@ mod tests {
             Settings::debug_slow_save_delay(Some(" 250 ")),
             Some(std::time::Duration::from_millis(250))
         );
+    }
+
+    /// 登出写盘只在盘上 Cookie 还是原来那个时才执行（#197）。
+    #[test]
+    fn logout_save_skips_when_cookie_already_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut signed_in = Settings::default();
+        signed_in.cookie = "sessionid_ss=a".into();
+        signed_in.save_to(&path).expect("保存应成功");
+
+        let mut snapshot = signed_in.clone();
+        snapshot.cookie.clear();
+
+        // 盘上还是 A：登出写入照常执行。
+        assert!(snapshot
+            .save_if_cookie_unchanged_to(&path, "sessionid_ss=a")
+            .unwrap());
+        assert_eq!(cookie_on_disk(&path), "");
+
+        // 盘上换成了 B：旧快照不许把它盖回去。
+        let mut other = Settings::default();
+        other.cookie = "sessionid_ss=b".into();
+        other.save_to(&path).expect("保存应成功");
+        assert!(!snapshot
+            .save_if_cookie_unchanged_to(&path, "sessionid_ss=a")
+            .unwrap());
+        assert_eq!(cookie_on_disk(&path), "sessionid_ss=b");
+    }
+
+    /// 直接读盘上 JSON 里的 Cookie，绕开环境变量补全，免得用例受外部影响。
+    fn cookie_on_disk(path: &std::path::Path) -> String {
+        let raw = std::fs::read_to_string(path).unwrap();
+        let settings: Settings = serde_json::from_str(&raw).unwrap();
+        settings.cookie
     }
 }

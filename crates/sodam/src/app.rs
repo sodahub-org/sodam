@@ -555,6 +555,8 @@ pub struct Root {
     /// 退出登录的落盘还在后台跑：这段时间里再点登出直接忽略，
     /// 免得连点起两个保存、把状态清理跑两遍（#197）。
     pub(crate) logout_in_flight: bool,
+    /// 登出收尾任务的句柄：退出应用时要等它写完，别让旧 Cookie 留在盘上（#197）。
+    pub(crate) logout_save_task: Option<gpui::Task<()>>,
     /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
     /// 与 `prefetch_cooldown_since`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
@@ -890,6 +892,7 @@ impl Root {
             prefetch_patrol: 0,
             auth_epoch: 0,
             logout_in_flight: false,
+            logout_save_task: None,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_maintenance_running: false,
@@ -951,10 +954,15 @@ impl Root {
             });
             // 首拍已经取走任务时，退出要等它写完；这里等的是后台任务，主线程阻塞也能完成。
             let persist_task = root.startup_persist_task.take();
+            // 登出落盘还没回来就退出：等它写完，别让旧 Cookie 留在盘上（#197）。
+            let logout_task = root.logout_save_task.take();
             // 首拍任务失败但心跳还没来得及提示：至少把原文补进日志。
             let persist_result = root.startup_persist_result.clone();
             let preferences = root.preferences_writer.flush();
             async move {
+                if let Some(task) = logout_task {
+                    task.await;
+                }
                 if let Some(task) = fallback {
                     task.await;
                 }
