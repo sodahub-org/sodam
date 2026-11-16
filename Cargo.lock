@@ -3215,7 +3215,7 @@ dependencies = [
 [[package]]
 name = "libresoda"
 version = "0.1.0"
-source = "git+https://github.com/sodahub-org/libresoda.git?rev=8d35f59#8d35f596b7a6e62423b6819086d43fbc94a44e16"
+source = "git+https://github.com/sodahub-org/libresoda.git?rev=32fe0f9#32fe0f9a95a51bcdf1c35576ecaf8aa5a786039b"
 dependencies = [
  "aes",
  "base64",
@@ -3226,6 +3226,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "url",
  "windows-sys 0.61.2",
 ]
 
