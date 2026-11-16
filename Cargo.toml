@@ -22,6 +22,4 @@ sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 
-# 过渡依赖：libresoda PR #146 尚未合并，先钉到分支提交验证；合并后改回 main 的 rev/版本。
-# 32fe0f9：libresoda#52 修好验证桥接的 userinfo 绕过与明文 HTTP（libresoda#53 合并提交）。
 libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "32fe0f9" }
