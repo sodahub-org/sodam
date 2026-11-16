@@ -2288,6 +2288,16 @@ impl Root {
                         if let Some(session) = root.session.as_mut() {
                             session.adopt(root.settings.clone());
                         }
+                        // 收尾再确认一次：登出保存持锁期间，别的保存可能正在 UI 线程
+                        // 排队等锁，随后把还带旧 Cookie 的设置写回盘（#197 复审）。
+                        // 这里只在盘上 Cookie 仍是旧值时再清一次；已经空了不写，
+                        // 盘上换了别的身份也直接跳过。
+                        let confirm = root.settings.clone();
+                        let expected = logout_cookie.clone();
+                        cx.background_spawn(async move {
+                            let _ = confirm.save_signed_out(&expected);
+                        })
+                        .detach();
                         root.clear_identity_state(cx);
                         // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
                         if sodam_core::config::env_cookie_present() {
