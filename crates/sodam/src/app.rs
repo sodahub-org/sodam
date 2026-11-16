@@ -611,6 +611,9 @@ pub struct Root {
     pub(crate) config_reload: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
     /// 一次配置轮询在途标记：心跳周期短于轮询耗时，防止重叠发起。
     pub(crate) config_poll_busy: bool,
+    /// 显式登出后的进程内记号：本次运行里不再用 `SODA_COOKIE` 把身份补回来（#192）。
+    /// 扫码登录成功或外部写入非空 Cookie 后清零；重启不保留，启动仍按环境变量走。
+    pub(crate) env_cookie_opted_out: bool,
     /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
     pub(crate) volume_scrubbing: bool,
 }
@@ -620,6 +623,8 @@ pub(crate) struct ConfigPollRequest {
     tracker: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
     path: PathBuf,
     current: Settings,
+    /// 显式登出后为 `false`：热重载跳过 `SODA_COOKIE` 补全（#192）。
+    allow_env_cookie: bool,
 }
 
 impl ConfigPollRequest {
@@ -631,7 +636,13 @@ impl ConfigPollRequest {
         let now = std::time::Instant::now();
         let self_write_recent = sodam_core::config::recent_self_write();
         let mut tracker = self.tracker.lock().unwrap_or_else(|err| err.into_inner());
-        let event = tracker.poll(&self.path, &self.current, now, self_write_recent);
+        let event = tracker.poll(
+            &self.path,
+            &self.current,
+            now,
+            self_write_recent,
+            self.allow_env_cookie,
+        );
         (event, self.current)
     }
 }
@@ -886,6 +897,7 @@ impl Root {
             play_reporter,
             config_reload: Arc::new(Mutex::new(sodam_core::config_watch::ReloadTracker::new())),
             config_poll_busy: false,
+            env_cookie_opted_out: false,
             volume_scrubbing: false,
         };
         cx.on_app_quit(|root, _cx| {

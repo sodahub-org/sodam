@@ -889,6 +889,8 @@ impl Root {
                                 match session.apply_login_cookie(&cookie) {
                                     Ok(()) => {
                                         root.settings = session.settings().clone();
+                                        // 扫码登录成功：解除登出记号，环境变量补全恢复（#192）。
+                                        root.env_cookie_opted_out = false;
                                         // 换了一份登录凭据：旧账号的不可播结论与逐曲冷却
                                         // 一并作废。账号 id / 会员状态的逐项比较在
                                         // `refresh_account` 里，但账号信息读取失败时拿不到
@@ -2229,6 +2231,12 @@ impl Root {
     /// 播放和队列一并停止，避免旧账号的歌单/收藏继续留在界面上；
     /// 封面本地缓存只按 URL 索引，可以复用，不涉及凭据。
     pub fn logout(&mut self, cx: &mut Context<Self>) {
+        // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
+        // 记号不落盘，重启后仍按环境变量启动。
+        self.env_cookie_opted_out = true;
+        let cookie_env_set = std::env::var("SODA_COOKIE")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
         let mut settings = self.settings.clone();
         settings.cookie.clear();
 
@@ -2252,7 +2260,13 @@ impl Root {
                         sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
                 })
                 .detach();
-                self.set_status_text(self.tr("已退出登录"));
+                if cookie_env_set {
+                    self.set_status_text(self.tr(
+                        "已退出登录；环境变量 SODA_COOKIE 仍然设着，重启后会按它重新登录（要彻底退出请取消这个环境变量）",
+                    ));
+                } else {
+                    self.set_status_text(self.tr("已退出登录"));
+                }
             }
             Err(err) => {
                 self.notify_error_once(
@@ -3927,6 +3941,7 @@ impl Root {
             tracker: self.config_reload.clone(),
             path: Settings::config_path(),
             current: self.settings.clone(),
+            allow_env_cookie: !self.env_cookie_opted_out,
         })
     }
 
@@ -4000,6 +4015,11 @@ impl Root {
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
         let session_changed = incoming.session_inputs_differ(&old);
         let cookie_changed = incoming.cookie != old.cookie;
+        // 外部文件写入非空 Cookie（手动粘贴/换号）：解除登出记号，环境变量补全恢复。
+        // 记号生效时热重载不补环境变量，所以这里的非空 Cookie 只可能来自文件（#192）。
+        if cookie_changed && !incoming.cookie.trim().is_empty() {
+            self.env_cookie_opted_out = false;
+        }
         self.settings = incoming.clone();
 
         // 主题：与 `set_ui_theme*` 同一套应用逻辑（认不得的值回到跟随系统），不落盘。

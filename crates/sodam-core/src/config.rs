@@ -898,17 +898,23 @@ impl Settings {
     /// 热重载路径请用 [`Self::fill_empty_from_env`]——轮询里不能现生成设备身份，
     /// 否则外部文件没带身份时会在后台悄悄轮换一份。
     pub fn merged_with_env(self) -> Self {
-        let mut settings = self.fill_empty_from_env();
+        let mut settings = self.fill_empty_from_env(true);
         settings.ensure_login_device();
         settings
     }
 
     /// 只补环境变量，不生成设备身份：热重载轮询与启动共用同一套补全逻辑
     /// （优先级一致），设备身份交给调用方决定要不要生成。
-    pub(crate) fn fill_empty_from_env(mut self) -> Self {
+    ///
+    /// `allow_env_cookie` 为 `false` 时跳过 `SODA_COOKIE`，其余字段照常补：
+    /// 用户在界面上显式登出后，本次运行里环境变量不能再把身份补回来（#192）。
+    /// 重启后仍按环境变量启动，启动期契约不变。
+    pub(crate) fn fill_empty_from_env(mut self, allow_env_cookie: bool) -> Self {
         self.fill_login_device_from_env();
+        if allow_env_cookie {
+            Self::fill_slot_from_env(&mut self.cookie, "SODA_COOKIE");
+        }
         let pairs = [
-            ("SODA_COOKIE", &mut self.cookie),
             ("QISHUI_SIGNER_URL", &mut self.signer_url),
             ("QISHUI_SIGNER_TOKEN", &mut self.signer_token),
             ("SODA_DEVICE_ID", &mut self.device_id),
@@ -1416,6 +1422,27 @@ mod tests {
         let user_merged = user_picked.merged_with_env();
         assert_eq!(user_merged.quality, "auto");
         assert_eq!(user_merged.quality_source(), QualitySource::User);
+    }
+
+    /// 显式登出后只停用 Cookie 的环境变量补全，签名地址等其余字段照常补（#192）。
+    #[test]
+    fn env_fill_can_skip_cookie_only() {
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let env_key = "QISHUI_SIGNER_URL";
+        let _guard = EnvGuard(env_key);
+        std::env::set_var(env_key, "https://signer.example");
+        let skipped = Settings::default().fill_empty_from_env(false);
+        assert!(
+            skipped.cookie.is_empty(),
+            "登出记号置位时不能用环境变量补 Cookie"
+        );
+        assert_eq!(skipped.signer_url, "https://signer.example");
     }
 
     /// 详细日志：新配置默认关闭，旧配置缺字段也能读。

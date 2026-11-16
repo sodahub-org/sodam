@@ -128,6 +128,9 @@ impl Language {
             "歌单「{}」没有可播放曲目" => "Playlist {} has no playable tracks",
             "推荐队列已追加 {added} 首" => "Added {} recommendation tracks",
             "已退出登录" => "Signed out",
+            "已退出登录；环境变量 SODA_COOKIE 仍然设着，重启后会按它重新登录（要彻底退出请取消这个环境变量）" => {
+                "Signed out. SODA_COOKIE is still set, so the app will sign in with it again on next launch (unset it to stay signed out)."
+            }
             "已收藏：{}" => "Liked: {}",
             "已取消收藏：{}" => "Unliked: {}",
             "已入队：{title}" => "Queued: {title}",
