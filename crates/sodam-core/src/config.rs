@@ -462,13 +462,25 @@ pub fn quarantine_corrupt_file(path: &Path) -> Option<PathBuf> {
 
 /// [`Self::save_to_locked`] 持锁期间用的隔离变体（锁不可重入，勿混用）。
 fn quarantine_corrupt_file_locked(path: &Path) -> Option<PathBuf> {
+    let bad_path = quarantine_target(path)?;
+    std::fs::rename(path, &bad_path).ok()?;
+    Some(bad_path)
+}
+
+/// 坏文件隔离的目标名：`config.json` → `config.json.bad-<毫秒时间戳>`。
+///
+/// 只算名字、不动文件：读盘阶段先定好目标，真正改名留到首帧后的后台修正（#191）。
+fn quarantine_target(path: &Path) -> Option<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     let stamp = now.as_millis();
-    let bad_path = path.with_extension(format!("json.bad-{stamp}"));
-    std::fs::rename(path, &bad_path).ok()?;
-    Some(bad_path)
+    Some(path.with_extension(format!("json.bad-{stamp}")))
+}
+
+/// 把坏文件改名到预先算好的目标。调用方必须持有 `SETTINGS_WRITE_LOCK`（锁不可重入）。
+fn quarantine_corrupt_file_to_locked(path: &Path, bad_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(path, bad_path)
 }
 
 /// 启动期加载的恢复结果：主文件损坏时用了哪条路，界面据此提示（#185）。
@@ -480,44 +492,165 @@ pub enum StartupRecovery {
     FellBackToDefaults { error: String },
 }
 
-/// 启动加载：正常路径走 [`Self::load_from`]（迁移回存 + 设备身份 + 备份）；
-/// 主文件损坏时先试备份——备份可用就用备份继续、坏文件改名保留；无备份则
-/// 默认值启动且绝不碰坏文件。恢复编排收在领域层，UI 只拿结果拼文案。
-pub fn load_for_startup(path: &Path) -> (Settings, Option<StartupRecovery>) {
-    if let LoadOutcome::Corrupt { error } = Settings::try_load_from(path) {
-        // 备份走与主文件完全相同的加载管线（try_load_from：字段容错 + 迁移 +
-        // 数值钳制 + 搜索历史清理），备份里存了什么形态都不能绕过归一化。
-        let backup = match Settings::try_load_from(&settings_backup_path(path)) {
-            LoadOutcome::Loaded { settings, .. } => Some(settings),
-            _ => None,
-        };
-        return match backup {
-            Some(mut backup) => {
-                // 备份里没带登录身份时，环境变量仍然要先生效（#186）；
-                // 备份自带的身份优先。
-                backup.fill_login_device_from_env();
-                backup.ensure_login_device();
-                let bad_path = quarantine_corrupt_file(path).unwrap_or_else(|| path.to_path_buf());
-                // 恢复内容写回主文件与备份；写失败不影响用内存里的值继续。
-                let _ = backup.save_to(path);
-                let _ = write_settings_backup(path, &backup);
-                (
-                    backup,
-                    Some(StartupRecovery::RecoveredFromBackup { bad_path }),
-                )
-            }
-            None => {
-                // 不生成设备身份、不回存：坏文件在磁盘上原样保留。
-                let mut defaults = Settings::default();
-                defaults.normalize_playback();
-                (
-                    defaults,
-                    Some(StartupRecovery::FellBackToDefaults { error }),
-                )
-            }
-        };
+/// 启动加载的内存结果：设置、恢复提示，以及需要在首帧后台补做的落盘修正。
+pub struct StartupLoad {
+    pub settings: Settings,
+    pub recovery: Option<StartupRecovery>,
+    /// 启动前主文件不存在（首启）：旧行为会在启动时创建配置文件。
+    pub first_run: bool,
+    /// 读盘前记下的文件指纹：热重载基线与后台回写的并发保护都用这一份。
+    pub baseline: Option<crate::config_watch::Fingerprint>,
+    /// 落盘修正（备份刷新 / 迁移回存 / 损坏隔离与恢复写回）。默认值启动时为 `None`。
+    pub write_back: Option<StartupWriteBack>,
+}
+
+/// 启动期欠下的落盘修正：读盘阶段只收集，首帧后到后台线程执行（#191）。
+///
+/// 这几步都是有副作用的小文件操作，不能放在 UI 线程；失败只上报，不影响本次运行。
+pub struct StartupWriteBack {
+    path: PathBuf,
+    settings: Settings,
+    /// 损坏路径：坏文件改名到这个目标，再做恢复写回。
+    quarantine_to: Option<PathBuf>,
+    /// 迁移 / 补身份后是否需要回存主文件。
+    save_main: bool,
+    /// 读盘前的文件指纹：回写前对不上就说明外部改过，放弃覆盖。
+    expected: Option<crate::config_watch::Fingerprint>,
+}
+
+impl StartupWriteBack {
+    /// 首启时把补过环境变量的内存设置作为落盘内容：旧行为首启保存的就是合并后的这份。
+    pub fn adopt_settings(&mut self, settings: Settings) {
+        self.settings = settings;
     }
-    (Settings::load_from(path), None)
+
+    /// 执行落盘修正。阻塞调用，必须在后台线程跑；返回第一处失败。
+    ///
+    /// 主文件保存与备份刷新在同一把写锁内完成：要么一起刷新到同一份内容，要么都不动。
+    /// 回写前指纹对不上（外部已改过文件）就整体跳过，交给热重载应用新内容。
+    pub fn persist(self) -> Result<(), String> {
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if crate::config_watch::fingerprint(&self.path) != self.expected {
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "startup_config_write_back_skipped",
+                &[],
+            );
+            return Ok(());
+        }
+        let mut first_error: Option<String> = None;
+        if let Some(bad_path) = self.quarantine_to.as_deref() {
+            match quarantine_corrupt_file_to_locked(&self.path, bad_path) {
+                Ok(()) => {}
+                // 等待期间坏文件已被删掉：没有要保留的原件，按成功继续恢复写回。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    first_error.get_or_insert_with(|| format!("隔离坏配置失败：{err}"));
+                }
+            }
+        }
+        if self.save_main {
+            if let Err(err) = self.settings.save_to_locked(&self.path) {
+                first_error.get_or_insert_with(|| format!("回存配置失败：{err}"));
+            }
+        }
+        // `save_to_locked` 内部会吞掉备份写错误，所以这里总是单独刷新一次并报告失败，
+        // 避免主文件保存成功、备份没更新却没人知道。
+        if let Err(err) = write_settings_backup_locked(&self.path, &self.settings) {
+            first_error.get_or_insert_with(|| format!("写配置备份失败：{err}"));
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 启动加载：只读 + 内存修正，不写盘（#191）。
+///
+/// 正常路径读主文件、补环境变量、生成登录设备身份并做旧格式迁移，全部只在内存里；
+/// 该落盘的修正放进 [`StartupWriteBack`]，由调用方在首帧后到后台线程执行。
+/// 主文件损坏时先试备份——备份可用就用备份继续、坏文件改名保留；无备份则默认值
+/// 启动且绝不碰坏文件。
+pub fn load_for_startup(path: &Path) -> StartupLoad {
+    // 读盘前先记指纹：热重载基线和后台回写的并发保护都用这一份。
+    let baseline = crate::config_watch::fingerprint(path);
+    match Settings::try_load_from(path) {
+        LoadOutcome::Corrupt { error } => {
+            // 备份走与主文件完全相同的加载管线（try_load_from：字段容错 + 迁移 +
+            // 数值钳制 + 搜索历史清理），备份里存了什么形态都不能绕过归一化。
+            let backup = match Settings::try_load_from(&settings_backup_path(path)) {
+                LoadOutcome::Loaded { settings, .. } => Some(settings),
+                _ => None,
+            };
+            match backup {
+                Some(backup) => {
+                    // 备份里没带登录身份时，环境变量仍然要先生效（#186）；
+                    // 备份自带的身份优先。
+                    let (backup, _) = Settings::prepare_loaded(backup, false);
+                    // 读盘阶段只算隔离目标名，不改名；坏文件等首帧后的后台修正再动。
+                    let bad_path = quarantine_target(path).unwrap_or_else(|| path.to_path_buf());
+                    StartupLoad {
+                        write_back: Some(StartupWriteBack {
+                            path: path.to_path_buf(),
+                            settings: backup.clone(),
+                            quarantine_to: Some(bad_path.clone()),
+                            save_main: true,
+                            expected: baseline,
+                        }),
+                        settings: backup,
+                        recovery: Some(StartupRecovery::RecoveredFromBackup { bad_path }),
+                        first_run: false,
+                        baseline,
+                    }
+                }
+                None => {
+                    // 不生成设备身份、不回存：坏文件在磁盘上原样保留。
+                    let mut defaults = Settings::default();
+                    defaults.normalize_playback();
+                    StartupLoad {
+                        settings: defaults,
+                        recovery: Some(StartupRecovery::FellBackToDefaults { error }),
+                        first_run: false,
+                        baseline,
+                        write_back: None,
+                    }
+                }
+            }
+        }
+        LoadOutcome::NotFound(settings) => startup_load_from(path, settings, false, true, baseline),
+        LoadOutcome::Loaded { settings, migrated } => {
+            startup_load_from(path, settings, migrated, false, baseline)
+        }
+    }
+}
+
+/// 正常读盘结果 → 内存设置 + 落盘修正（备份必刷；迁移 / 首启要回存主文件）。
+fn startup_load_from(
+    path: &Path,
+    settings: Settings,
+    migrated: bool,
+    first_run: bool,
+    baseline: Option<crate::config_watch::Fingerprint>,
+) -> StartupLoad {
+    let (settings, changed) = Settings::prepare_loaded(settings, migrated);
+    StartupLoad {
+        write_back: Some(StartupWriteBack {
+            path: path.to_path_buf(),
+            settings: settings.clone(),
+            quarantine_to: None,
+            // 首启即使身份全部来自环境变量（ensure 不生成）也要创建配置文件。
+            save_main: changed || first_run,
+            expected: baseline,
+        }),
+        settings,
+        recovery: None,
+        first_run,
+        baseline,
+    }
 }
 
 impl Default for Settings {
@@ -564,12 +697,16 @@ impl Settings {
     }
 
     /// 读配置；文件不存在时返回默认值（不报错）。
+    ///
+    /// 同步读写的便捷入口（示例 / 工具用）。应用启动请走 [`load_for_startup`]：
+    /// 那条路径只读，落盘修正留给首帧后的后台任务（#191）。
     pub fn load() -> Self {
         Self::load_from(&Self::config_path())
     }
 
+    /// 同步加载：读 + 内存修正 + 立即回存 / 备份（阻塞调用）。
     pub fn load_from(path: &Path) -> Self {
-        let (mut settings, mut changed) = match Self::try_load_from(path) {
+        let (settings, changed) = match Self::try_load_from(path) {
             LoadOutcome::Corrupt { error } => {
                 // 坏文件绝不覆盖：用默认值继续，不生成设备身份、不回写。
                 // 备份恢复由调用方（应用启动流程）负责。
@@ -581,25 +718,9 @@ impl Settings {
                 );
                 return Self::default();
             }
-            LoadOutcome::NotFound(settings) => (settings, false),
-            LoadOutcome::Loaded { settings, migrated } => (settings, migrated),
+            LoadOutcome::NotFound(settings) => Self::prepare_loaded(settings, false),
+            LoadOutcome::Loaded { settings, migrated } => Self::prepare_loaded(settings, migrated),
         };
-        // 环境变量补在身份生成之前：首启时 `SODA_LOGIN_DEVICE_ID` / `SODA_LOGIN_INSTALL_ID`
-        // 才能决定这份身份，否则身份先生成落盘，环境变量永远补不进去（#186）。
-        // 已存的身份非空，照旧优先于环境变量。
-        settings.fill_login_device_from_env();
-        // 老版本把登录设备身份存在 libresoda 自己的文件里；首次升级时搬进 config.json，
-        // 保住已经积累的服务端设备信誉。之后二维码只使用配置里的这份身份。
-        if settings.ensure_login_device() {
-            // 只记「初始化过」这件事，不记 device_id/install_id 本身。
-            log_event(
-                LogLevel::Info,
-                LogTopic::App,
-                "login_device_initialized",
-                &[],
-            );
-            changed = true;
-        }
         // 迁移/初始化后立刻落盘：用户下次打开配置文件看到的、以及设置页显示的，
         // 都是真正生效的那份。写失败不影响启动，内存里的值已经是迁移后的。
         if changed {
@@ -611,14 +732,40 @@ impl Settings {
         settings
     }
 
+    /// 读盘结果的内存修正：补环境变量、生成登录设备身份，返回 `(设置, 是否需要回存)`。
+    ///
+    /// 不写盘：启动路径把「要不要回存」交给 [`StartupWriteBack`] 在首帧后处理（#191）。
+    fn prepare_loaded(mut settings: Self, changed: bool) -> (Self, bool) {
+        // 环境变量补在身份生成之前：首启时 `SODA_LOGIN_DEVICE_ID` / `SODA_LOGIN_INSTALL_ID`
+        // 才能决定这份身份，否则身份先生成落盘，环境变量永远补不进去（#186）。
+        // 已存的身份非空，照旧优先于环境变量。
+        settings.fill_login_device_from_env();
+        // 老版本把登录设备身份存在 libresoda 自己的文件里；首次升级时搬进 config.json，
+        // 保住已经积累的服务端设备信誉。之后二维码只使用配置里的这份身份。
+        let changed = if settings.ensure_login_device() {
+            // 只记「初始化过」这件事，不记 device_id/install_id 本身。
+            log_event(
+                LogLevel::Info,
+                LogTopic::App,
+                "login_device_initialized",
+                &[],
+            );
+            true
+        } else {
+            changed
+        };
+        (settings, changed)
+    }
+
     /// 安全读取：不写盘、无副作用，返回三态结果（不存在 / 正常 / 坏了）。
     ///
     /// - 单个字段类型不对：丢掉该字段补默认值，其余字段照常生效（尤其保住 Cookie
     ///   与设备身份）；无法识别的枚举值（播放模式等）由字段自己的反序列化回退默认。
     /// - 数值越界由 `normalize_playback` 钳制。
     /// - 只有语法层面的损坏（连 JSON 都不是、或结构对不上）才算 [`LoadOutcome::Corrupt`]。
-    /// - 旧格式迁移只改内存值；是否回存由 [`Self::load_from`]（启动）决定，
-    ///   热重载路径拿到 `migrated` 也不回写，避免外部编辑被立刻覆盖。
+    /// - 旧格式迁移只改内存值；是否回存由调用方决定：[`load_for_startup`] 把落盘
+    ///   推迟到首帧后，[`Self::load_from`] 同步落盘；热重载路径拿到 `migrated`
+    ///   也不回写，避免外部编辑被立刻覆盖。
     pub fn try_load_from(path: &Path) -> LoadOutcome {
         // 与保存共用同一把写锁：轮询读文件不会被并发保存的原子替换序列读到中间态。
         let _guard = SETTINGS_WRITE_LOCK
@@ -1645,18 +1792,166 @@ mod tests {
         .unwrap();
         std::fs::write(&path, "corrupt!").unwrap();
 
-        let (settings, recovery) = load_for_startup(&path);
+        let load = load_for_startup(&path);
         assert!(
-            matches!(recovery, Some(StartupRecovery::RecoveredFromBackup { .. })),
+            matches!(
+                load.recovery,
+                Some(StartupRecovery::RecoveredFromBackup { .. })
+            ),
             "备份可用应走恢复分支"
         );
-        assert_eq!(settings.cookie, "sessionid_ss=x");
-        assert_eq!(settings.volume, 1.0, "备份里的越界音量要钳制");
-        assert_eq!(settings.audio_cache_limit_mb, 1024);
+        assert_eq!(load.settings.cookie, "sessionid_ss=x");
+        assert_eq!(load.settings.volume, 1.0, "备份里的越界音量要钳制");
+        assert_eq!(load.settings.audio_cache_limit_mb, 1024);
         assert!(
-            settings.search_history.is_empty(),
+            load.settings.search_history.is_empty(),
             "关闭搜索历史后不得残留旧记录"
         );
+        // 恢复的落盘修正要在首帧后由后台执行（#191）。
+        load.write_back
+            .expect("备份恢复应欠落盘修正")
+            .persist()
+            .expect("后台修正应成功");
+    }
+
+    /// 读盘阶段不写盘：正常路径只在内存里补身份 / 迁移，备份与回存都等 persist（#191）。
+    #[test]
+    fn load_for_startup_defers_disk_writes_until_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"cookie":"sessionid_ss=x","theme":"dark"}"#).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let load = load_for_startup(&path);
+        assert!(load.recovery.is_none());
+        assert_eq!(load.settings.cookie, "sessionid_ss=x");
+        assert!(!settings_backup_path(&path).exists(), "读盘阶段不得写备份");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "读盘阶段不得改主文件"
+        );
+
+        load.write_back
+            .expect("正常路径应欠一次备份刷新")
+            .persist()
+            .expect("后台修正应成功");
+        assert!(settings_backup_path(&path).exists(), "首帧后应补上备份");
+    }
+
+    /// 损坏路径：读盘阶段只算隔离目标，坏文件不动；persist 之后才改名保留并恢复主文件。
+    #[test]
+    fn load_for_startup_defers_corrupt_quarantine_until_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let backup = Settings {
+            cookie: "sessionid_ss=x".into(),
+            ..Default::default()
+        };
+        write_settings_backup(&path, &backup).unwrap();
+        std::fs::write(&path, "corrupt!").unwrap();
+
+        let load = load_for_startup(&path);
+        let bad_path = match &load.recovery {
+            Some(StartupRecovery::RecoveredFromBackup { bad_path }) => bad_path.clone(),
+            other => panic!("应走备份恢复分支：{other:?}"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "corrupt!",
+            "读盘阶段不得动坏文件"
+        );
+        assert!(!bad_path.exists(), "读盘阶段不得改名");
+
+        load.write_back
+            .expect("损坏恢复应欠落盘修正")
+            .persist()
+            .expect("后台修正应成功");
+        assert!(
+            bad_path.exists(),
+            "persist 后坏文件应保留在 {}",
+            bad_path.display()
+        );
+        assert_eq!(std::fs::read_to_string(&bad_path).unwrap(), "corrupt!");
+        assert_eq!(Settings::load_from(&path).cookie, "sessionid_ss=x");
+    }
+
+    /// 无备份的损坏：默认值启动，不欠任何写操作，坏文件原样保留。
+    #[test]
+    fn load_for_startup_defaults_without_scheduling_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "corrupt!").unwrap();
+
+        let load = load_for_startup(&path);
+        assert!(
+            matches!(
+                load.recovery,
+                Some(StartupRecovery::FellBackToDefaults { .. })
+            ),
+            "无备份应回默认值"
+        );
+        assert!(load.write_back.is_none(), "默认值启动不应安排落盘修正");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "corrupt!",
+            "坏文件必须原样保留"
+        );
+    }
+
+    /// 首启（主文件不存在）必须安排创建配置文件：身份全由环境变量给齐时也要建。
+    #[test]
+    fn first_run_always_schedules_config_file_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let load = load_for_startup(&path);
+        assert!(load.first_run, "主文件不存在应标记首启");
+        let write_back = load.write_back.expect("首启应安排落盘修正");
+        assert!(write_back.save_main, "首启必须创建配置文件");
+        write_back.persist().expect("首启落盘应成功");
+        assert!(path.exists(), "首启 persist 后应生成配置文件");
+    }
+
+    /// 落盘失败只回报错误，不 panic；状态行提示由 UI 侧负责。
+    #[test]
+    fn startup_write_back_reports_first_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // 父路径是普通文件：创建目录与写文件都会失败。
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, "file").unwrap();
+        let write_back = StartupWriteBack {
+            path: blocker.join("config.json"),
+            settings: Settings::default(),
+            quarantine_to: None,
+            save_main: false,
+            expected: None,
+        };
+        assert!(
+            write_back.persist().is_err(),
+            "写不进去应返回错误而不是 panic"
+        );
+    }
+
+    /// 读盘后、回写前文件被外部改过：放弃覆盖，磁盘上的新内容保持不动。
+    #[test]
+    fn startup_write_back_skips_when_file_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"cookie":"sessionid_ss=old"}"#).unwrap();
+
+        let load = load_for_startup(&path);
+        let write_back = load.write_back.expect("正常路径应欠备份刷新");
+        // 模拟外部在首帧后改写了配置（长度不同，指纹必然变化）。
+        std::fs::write(&path, r#"{"cookie":"sessionid_ss=definitely-new"}"#).unwrap();
+        write_back.persist().expect("指纹不符应安静跳过");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"cookie":"sessionid_ss=definitely-new"}"#,
+            "外部新内容不能被启动快照覆盖"
+        );
+        assert!(!settings_backup_path(&path).exists(), "跳过时不应刷新备份");
     }
 
     /// 保存时目标文件已是坏配置：先改名保留原件，再写新内容，用户能找回原文件。

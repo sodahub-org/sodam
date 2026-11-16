@@ -38,7 +38,8 @@ pub enum ReloadEvent {
     Corrupt(String),
 }
 
-fn fingerprint(path: &Path) -> Option<Fingerprint> {
+/// 读一次文件指纹。启动加载在读盘前取一次，作为热重载基线与回写保护（#191）。
+pub(crate) fn fingerprint(path: &Path) -> Option<Fingerprint> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
 }
