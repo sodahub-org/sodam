@@ -505,6 +505,12 @@ impl StartupWriteBack {
     pub fn persist(self) -> Result<(), String> {
         let mut first_error: Option<String> = None;
         if let Some(bad_path) = self.quarantine_to.as_deref() {
+            // 读盘到真正落盘之间隔了至少一帧：先看磁盘现状，不盲改名。
+            // 外部已经修好这份文件时，不再隔离，也不拿旧备份覆盖新的内容。
+            match Settings::try_load_from(&self.path) {
+                LoadOutcome::Loaded { .. } => return Ok(()),
+                LoadOutcome::Corrupt { .. } | LoadOutcome::NotFound(_) => {}
+            }
             match quarantine_corrupt_file_to(&self.path, bad_path) {
                 Ok(()) => {}
                 // 等待期间坏文件已被删掉：没有要保留的原件，按成功继续恢复写回。
