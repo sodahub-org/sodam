@@ -2241,9 +2241,12 @@ impl Root {
         // 只给这次落盘用的快照：写盘时把 Cookie 摘掉。
         let mut logout_snapshot = self.settings.clone();
         logout_snapshot.cookie.clear();
-        // 结果回来时拿这份代数对一下：保存期间登录成功或换了账号，
-        // 这次结果属于旧身份，整条丢掉，不能拿它清掉新身份。
-        let auth_epoch = self.auth_epoch;
+        // 结果回来时对一下 Cookie：期间登录成功、换了账号或被热重载清掉，
+        // 这次结果都属于旧身份，整条丢掉，不能拿它清身份。
+        //
+        // 这里不看 `auth_epoch`：同账号的会员状态刷新也会推进它，
+        // 那种情况身份没变，登出该照常完成（#197）。
+        let logout_cookie = self.settings.cookie.clone();
 
         // 先落盘、成功后再清身份：落盘失败时保持「还在登录」，免得内存已登出、
         // 磁盘还留着旧 Cookie，热重载下一轮又把身份放回来（#192）。
@@ -2256,7 +2259,7 @@ impl Root {
             let outcome = save.await;
             let _ = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
-                if root.auth_epoch != auth_epoch {
+                if root.settings.cookie != logout_cookie {
                     // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
                     // 状态行还挂着「正在退出登录…」：现在确实没登录就改回一句实话，
                     // 换了别的账号则让登录流程自己的状态行留着。
