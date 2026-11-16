@@ -4173,9 +4173,9 @@ impl Root {
         })
         .detach();
 
-        // 同一来源的重复提示只保留一条。
-        let message = self.tr("配置文件已更新，改动已生效").to_string();
-        self.notify_success_once("config-hot-reload", message);
+        // 普通反馈只走底部状态行（#203）：状态行本身是新文案顶掉旧文案，
+        // 不会再叠出第二条；全局轻提示留给需要叫住用户的事件。
+        self.set_status_text(self.tr("配置文件已更新，改动已生效"));
         cx.notify();
     }
 }
