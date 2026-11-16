@@ -2289,14 +2289,15 @@ impl Root {
                         }
                     }
                     Err(err) => {
-                        let message = root.failure_text(
-                            "保存退出登录状态",
-                            &err,
-                            "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                        // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
+                        root.notify_error_once(
+                            "logout-save-failed",
+                            root.failure_text(
+                                "保存退出登录状态",
+                                &err,
+                                "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
+                            ),
                         );
-                        // 状态行前面挂着「正在退出登录…」，失败时要换掉，别留一句假话。
-                        root.set_status_text(message.clone());
-                        root.notify_error_once("logout-save-failed", message);
                     }
                 }
                 cx.notify();
