@@ -911,18 +911,31 @@ impl Root {
             startup_write_back: write_back,
             startup_persist_task: None,
         };
-        cx.on_app_quit(|root, _cx| {
+        cx.on_app_quit(|root, cx| {
             sodam_core::flush_global();
-            // 心跳首拍之前就退出：补做还没跑的启动落盘修正（小文件，退出期一次性）。
-            if let Some(write_back) = root.startup_write_back.take() {
-                if let Err(error) = write_back.persist() {
-                    root.log_failure("启动配置回存失败（退出前补做）", &error);
-                }
-            }
+            // 心跳首拍之前就退出：补做也放后台，退出 future 里等它写完，不在 UI 线程碰磁盘。
+            let fallback = root.startup_write_back.take().map(|write_back| {
+                cx.background_spawn(async move {
+                    if let Err(error) = write_back.persist() {
+                        log_event(
+                            LogLevel::Error,
+                            LogTopic::App,
+                            "failure",
+                            &[
+                                ("context", "启动配置回存失败（退出前补做）"),
+                                ("detail", error.as_str()),
+                            ],
+                        );
+                    }
+                })
+            });
             // 首拍已经取走任务时，退出要等它写完，别让 detached 任务被截断。
             let persist_task = root.startup_persist_task.take();
             let preferences = root.preferences_writer.flush();
             async move {
+                if let Some(task) = fallback {
+                    task.await;
+                }
                 if let Some(task) = persist_task {
                     task.await;
                 }
