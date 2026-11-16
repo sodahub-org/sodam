@@ -132,6 +132,22 @@ fn start_tray_service(
             }
 
             tick += 1;
+            // 配置热重载巡检：每 ~500ms 一次，读盘与解析放后台线程，结果回 UI 应用（#185）。
+            // 错开托盘同步的那一拍，避免同帧做两批后台活。
+            if tick % 5 == 2 {
+                let request = cx.update(|cx| app.update(cx, |root, _cx| root.begin_config_poll()));
+                if let Some(request) = request {
+                    let app = app.clone();
+                    cx.spawn(async move |cx| {
+                        let (event, snapshot) = cx
+                            .background_executor()
+                            .spawn(async move { request.poll() })
+                            .await;
+                        app.update(cx, |root, cx| root.finish_config_poll(event, snapshot, cx));
+                    })
+                    .detach();
+                }
+            }
             if tick % 5 == 0 {
                 let now = cx.update(|cx| {
                     app.update(cx, |root, _cx| {

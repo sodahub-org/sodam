@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::models::TrackItem;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum PlayMode {
     /// 列表循环：播到末尾回到第一首。
     #[default]
@@ -42,6 +42,23 @@ impl PlayMode {
             PlayMode::RepeatOne => "repeat-1",
             PlayMode::Shuffle => "shuffle",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayMode {
+    /// 容错反序列化：认得的值照常读，认不得的一律回退列表循环（默认）。
+    /// 单个字段写了不存在的值，不该让整份配置解析失败（#185）。
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "RepeatOne" => PlayMode::RepeatOne,
+            "Shuffle" => PlayMode::Shuffle,
+            // ListLoop / 旧别名 Sequential / 一切不认识的值都按列表循环。
+            _ => PlayMode::ListLoop,
+        })
     }
 }
 

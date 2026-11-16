@@ -6,6 +6,7 @@ pub mod audio;
 pub mod cache;
 pub mod color;
 pub mod config;
+pub mod config_watch;
 pub mod contributors;
 pub mod failure;
 pub mod library;

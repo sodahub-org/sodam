@@ -389,6 +389,16 @@ impl Language {
             "没有可用歌词" => "No lyrics available",
             "正在读取歌词…" => "Loading lyrics…",
             "设置已保存" => "Settings saved",
+            "配置文件已更新，改动已生效" => "Config file updated; changes are now live.",
+            "配置文件解析失败（{}）：已保留当前设置，未改动文件" => {
+                "Failed to parse the config file ({}). Current settings kept; file untouched."
+            }
+            "配置文件损坏，已从备份恢复；坏文件保留在 {}" => {
+                "Config file was corrupt; recovered from backup. The broken file is saved at {}."
+            }
+            "配置文件损坏（{}）：已用默认设置启动，原文件未改动" => {
+                "Config file is corrupt ({}): started with defaults. The original file was left untouched."
+            }
             "已配置登录与签名服务，可以去「搜索」或「推荐」了" => "Signed in and signer ready. Try Discover or Search.",
             "还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）" => "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL).",
             "推荐队列" => "Recommendation queue",

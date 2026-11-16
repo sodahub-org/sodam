@@ -544,12 +544,43 @@ pub struct Root {
     pub engine: PlaybackEngine,
     /// 播放进度 / 时长上报（喂引擎快照，内部异步发请求）。
     pub play_reporter: PlayReporter,
+    /// 配置热重载状态机：读盘解析在后台线程，事件回 UI 线程应用（见 main.rs 心跳）。
+    pub(crate) config_reload: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
+    /// 一次配置轮询在途标记：心跳周期短于轮询耗时，防止重叠发起。
+    pub(crate) config_poll_busy: bool,
+    /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
+    pub(crate) volume_scrubbing: bool,
+}
+
+/// 一次配置热重载轮询的输入：后台线程按它读盘解析，事件回 UI 线程应用。
+pub(crate) struct ConfigPollRequest {
+    tracker: Arc<Mutex<sodam_core::config_watch::ReloadTracker>>,
+    path: PathBuf,
+    current: Settings,
+}
+
+impl ConfigPollRequest {
+    /// 读盘 + 解析（阻塞调用，必须放到后台线程跑，见 #185 约定）。
+    ///
+    /// 连同发起时的设置快照一起返回：UI 侧要判断轮询往返期间本地是否又有改动，
+    /// 避免拿旧快照整份覆盖用户刚保存的新值（#185 审计）。
+    pub(crate) fn poll(self) -> (sodam_core::config_watch::ReloadEvent, Settings) {
+        let now = std::time::Instant::now();
+        let self_write_recent = sodam_core::config::recent_self_write();
+        let mut tracker = self.tracker.lock().unwrap_or_else(|err| err.into_inner());
+        let event = tracker.poll(&self.path, &self.current, now, self_write_recent);
+        (event, self.current)
+    }
 }
 
 impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut settings = Settings::load().merged_with_env();
+        let config_path = Settings::config_path();
+        // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
+        // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
+        let (settings, recovery) = sodam_core::config::load_for_startup(&config_path);
+        let mut settings = settings.merged_with_env();
         // 设置页的「详细日志」要覆盖启动就生效：日志出口在 `main` 里已建好，
         // 这里补上开关状态（环境变量那一路已在出口初始化时读过，两者取并集）。
         log_outlet::set_global_detailed(settings.detailed_logs);
@@ -557,7 +588,7 @@ impl Root {
         settings.volume = engine.snapshot().volume;
         // 首次运行就把配置落盘：用户可以直接编辑 ~/.config/sodam/config.json
         // 换签名服务 / 钉死设备指纹（默认值已内置，见 sodam_core::config）
-        if !Settings::config_path().exists() {
+        if !config_path.exists() {
             let _ = settings.save();
         }
         let theme_follows_system = ThemeKind::from_key(&settings.theme).is_none();
@@ -569,19 +600,33 @@ impl Root {
             Some(language) => (language, false),
         };
         let session = Session::new(settings.clone());
-        let status = if settings.is_ready_for_vip() {
-            if language.is_zh() {
-                language
-                    .text("已配置登录与签名服务，可以去「搜索」或「推荐」了")
-                    .to_string()
-            } else {
-                "Signed in and signer ready. Try Discover or Search.".to_string()
-            }
-        } else {
-            if language.is_zh() {
-                language.text("还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）").to_string()
-            } else {
-                "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
+        // 后面还要用 recovery 判断要不要展示登录提示，先存一份（match 会移动它）。
+        let had_startup_recovery = recovery.is_some();
+        let status = match recovery {
+            Some(sodam_core::config::StartupRecovery::RecoveredFromBackup { bad_path }) => language
+                .textf(
+                    "配置文件损坏，已从备份恢复；坏文件保留在 {}",
+                    &[bad_path.display().to_string()],
+                ),
+            Some(sodam_core::config::StartupRecovery::FellBackToDefaults { error }) => language
+                .textf(
+                    "配置文件损坏（{}）：已用默认设置启动，原文件未改动",
+                    &[error],
+                ),
+            None => {
+                if settings.is_ready_for_vip() {
+                    if language.is_zh() {
+                        language
+                            .text("已配置登录与签名服务，可以去「搜索」或「推荐」了")
+                            .to_string()
+                    } else {
+                        "Signed in and signer ready. Try Discover or Search.".to_string()
+                    }
+                } else if language.is_zh() {
+                    language.text("还没配好：请在「设置」里填 Cookie 与签名服务地址（或设 SODA_COOKIE / QISHUI_SIGNER_URL）").to_string()
+                } else {
+                    "Not ready: set Cookie and signer URL in Settings (or use SODA_COOKIE / QISHUI_SIGNER_URL)".to_string()
+                }
             }
         };
         // 启动文案是写死的常量，不含接口地址，不需要脱敏；构造期也还没有 `Root`，
@@ -776,6 +821,9 @@ impl Root {
             account: None,
             engine,
             play_reporter,
+            config_reload: Arc::new(Mutex::new(sodam_core::config_watch::ReloadTracker::new())),
+            config_poll_busy: false,
+            volume_scrubbing: false,
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
@@ -787,7 +835,8 @@ impl Root {
             root.refresh_account(cx);
             root.load_liked_ids(cx);
             root.start_recommendation(false, cx);
-        } else {
+        } else if !had_startup_recovery {
+            // 配置恢复提示已在状态行里：不要被登录提示覆盖，用户需要知道坏文件的去向。
             root.set_status_text(root.tr("请先在「设置 → 账户」扫码登录"));
         }
         // 开发/验证便利：`SODAM_QUERY="周杰伦" cargo run -p sodam` 启动即搜索一次
@@ -1514,9 +1563,30 @@ impl Root {
         self.push_message_with_key(kind, message, Some(ui::message::DEFAULT_DURATION), key)
     }
 
+    /// 只应用语言、不保存：设置页与热重载共用这一套应用逻辑（#185）。
+    ///
+    /// 空/未识别的值回退到跟随系统；调用方自己决定要不要回写 `settings.language`。
+    pub(crate) fn apply_language_state(&mut self, key: &str, cx: &mut Context<Self>) {
+        // 只有 macOS 要刷菜单栏；其它平台该参数用不上。
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
+        match Language::from_key(key) {
+            Some(Language::System) | None => {
+                self.language = Language::system_locale();
+                self.language_follows_system = true;
+            }
+            Some(language) => {
+                self.language = language;
+                self.language_follows_system = false;
+            }
+        }
+        // macOS 菜单栏的标题也要跟着换语言。
+        #[cfg(target_os = "macos")]
+        crate::menus::refresh(cx, self.language);
+    }
+
     pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
-        self.language = language;
-        self.language_follows_system = false;
+        self.apply_language_state(language.key(), cx);
         self.settings.language = language.key().to_string();
         let save_result = self.settings.save();
         match save_result {
@@ -1533,9 +1603,6 @@ impl Root {
                 self.notify_warning_once("language-save-failed", message);
             }
         }
-        // macOS 菜单栏的标题也要跟着换语言。
-        #[cfg(target_os = "macos")]
-        crate::menus::refresh(cx, language);
         cx.notify();
     }
 }

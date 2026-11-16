@@ -1086,13 +1086,28 @@ impl Root {
         .detach();
     }
 
+    /// 只应用主题、不保存：设置页与热重载共用这一套应用逻辑（#185）。
+    ///
+    /// 空/未识别的值回退到跟随系统；调用方自己决定要不要回写 `settings.theme`。
+    pub(crate) fn apply_theme_state(&mut self, key: &str, cx: &mut Context<Self>) {
+        match ThemeKind::from_key(key) {
+            Some(theme) => {
+                self.theme = theme;
+                self.theme_follows_system = false;
+            }
+            None => {
+                self.theme_follows_system = true;
+                self.theme = theme::theme_from_appearance(cx.window_appearance());
+            }
+        }
+        theme::set_theme(self.theme);
+    }
+
     /// 设置界面主题并写入配置；一旦手动选择，不再跟随系统。
     pub fn set_ui_theme(&mut self, theme: ThemeKind, cx: &mut Context<Self>) {
-        self.theme = theme;
-        self.theme_follows_system = false;
+        self.apply_theme_state(theme.key(), cx);
         self.settings.theme = theme.key().to_string();
         let save_result = self.settings.save();
-        theme::set_theme(theme);
         match save_result {
             Ok(()) => {
                 // 文案要过词典：状态行现在真的会显示，英文界面不能露出中文。
@@ -1116,11 +1131,9 @@ impl Root {
 
     /// 主题恢复为跟随系统：清空配置里的 theme（空串 = auto），渲染时按窗口外观取值。
     pub fn set_ui_theme_system(&mut self, cx: &mut Context<Self>) {
-        self.theme_follows_system = true;
-        self.theme = theme::theme_from_appearance(cx.window_appearance());
+        self.apply_theme_state("", cx);
         self.settings.theme = String::new();
         let save_result = self.settings.save();
-        theme::set_theme(self.theme);
         match save_result {
             Ok(()) => self.set_status_text(self.tr("主题已恢复为跟随系统")),
             Err(err) => {
@@ -2195,10 +2208,56 @@ impl Root {
         let mut settings = self.settings.clone();
         settings.cookie.clear();
 
+        self.clear_identity_state(cx);
+
+        let save_result = if let Some(session) = self.session.as_mut() {
+            session.apply(settings.clone())
+        } else {
+            settings.save()
+        };
+        self.settings = settings;
+        match save_result {
+            Ok(()) => {
+                // 备份跟着刷新到登出状态：备份是独立于主文件的凭据副本，
+                // 不刷新的话，之后主文件损坏走恢复会把旧 Cookie 复活（#185）。
+                // 文件 IO 放后台，不占 UI 线程。
+                let backup_settings = self.settings.clone();
+                let backup_path = Settings::config_path();
+                cx.background_spawn(async move {
+                    let _ =
+                        sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
+                })
+                .detach();
+                self.set_status_text(self.tr("已退出登录"));
+            }
+            Err(err) => {
+                self.notify_error_once(
+                    "logout-save-failed",
+                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。
+    ///
+    /// 退出登录与「外部把 Cookie 清空了」（热重载）共用这一份，不做保存。
+    fn clear_identity_state(&mut self, cx: &mut Context<Self>) {
         self.engine.stop();
         self.playing = false;
         self.pending_track = None;
         self.playback_error = None;
+        // 推进播放请求序号：正在下载的旧身份装载回来会被序号检查拒绝，
+        // 否则清空队列后旧下载成功仍会把旧曲目塞回引擎（#185）。
+        self.play_seq = self.play_seq.wrapping_add(1);
+        // 在途的队列请求（推荐/听歌模式/加载更多）一并作废：旧回调过了序号
+        // 检查仍会重建队列并开始装载，退出/换号后还能把旧队列播起来。
+        self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+        self.loading_recommendation = false;
+        self.recommendation_error = None;
+        self.switching_queue = None;
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
         self.invalidate_identity_conclusions();
@@ -2220,23 +2279,6 @@ impl Root {
         self.track_menu = None;
         self.queue_menu = None;
         self.set_nav(Nav::Settings, cx);
-
-        let save_result = if let Some(session) = self.session.as_mut() {
-            session.apply(settings.clone())
-        } else {
-            settings.save()
-        };
-        self.settings = settings;
-        match save_result {
-            Ok(()) => self.set_status_text(self.tr("已退出登录")),
-            Err(err) => {
-                self.notify_error_once(
-                    "logout-save-failed",
-                    self.failure_text("已退出，但保存配置失败", &err, SAVE_TEXT),
-                );
-            }
-        }
-        cx.notify();
     }
 
     /// 详情列表内的加载更多分发。
@@ -2895,6 +2937,9 @@ impl Root {
         self.loading_library = true;
         self.set_status_text(self.tr("正在读取歌单…"));
         cx.notify();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃，不让旧账号的
+        // 歌单写回缓存，也把新身份的重拉接上（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             sodam_core::library::user_playlists(&session)
@@ -2903,6 +2948,12 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.loading_library = false;
+                if root.auth_epoch != auth_epoch {
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_playlists(cx);
+                    }
+                    return;
+                }
                 match result {
                     Ok(playlists) => {
                         root.set_status("共 {} 个歌单", &[playlists.len().to_string()]);
@@ -2932,6 +2983,9 @@ impl Root {
         }
         self.liked_loading = true;
         let settings = self.settings.clone();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃，不让旧账号的
+        // ids 写进新会话（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             // 启动时网络/接口可能未就绪：最多尝试 3 次（2s / 4s 退避），
@@ -2952,6 +3006,13 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.liked_loading = false;
+                if root.auth_epoch != auth_epoch {
+                    // 旧身份的结果不要：新身份还没拉过 ids，接着拉一次。
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_liked_ids(cx);
+                    }
+                    return;
+                }
                 match result {
                     Ok(ids) => {
                         root.liked_ids = Arc::new(ids);
@@ -3059,6 +3120,8 @@ impl Root {
         self.loading_liked = true;
         self.set_status_text(self.tr("正在读取我喜欢的音乐…"));
         cx.notify();
+        // 请求归属发起时的身份：外部换号后旧结果整份丢弃（#185）。
+        let auth_epoch = self.auth_epoch;
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
             sodam_core::library::liked_songs(&session)
@@ -3067,6 +3130,13 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.loading_liked = false;
+                if root.auth_epoch != auth_epoch {
+                    // 旧身份的结果不要；新身份还没拉过完整收藏，接着拉一次。
+                    if !root.settings.cookie.trim().is_empty() {
+                        root.load_liked(cx);
+                    }
+                    return;
+                }
                 match result {
                     Ok(tracks) => {
                         root.liked_loaded = true;
@@ -3819,6 +3889,174 @@ impl Root {
             }
         }
         self.play_reporter.apply_settings(reporter_settings);
+    }
+
+    /// 发起一次配置热重载轮询（main.rs 心跳每 ~500ms 调用一次）。
+    ///
+    /// 返回 `None` 表示上一次轮询还在后台跑，这次跳过。
+    pub(crate) fn begin_config_poll(&mut self) -> Option<super::ConfigPollRequest> {
+        if self.config_poll_busy {
+            return None;
+        }
+        self.config_poll_busy = true;
+        Some(super::ConfigPollRequest {
+            tracker: self.config_reload.clone(),
+            path: Settings::config_path(),
+            current: self.settings.clone(),
+        })
+    }
+
+    /// 收轮询结果并应用（UI 线程）。
+    ///
+    /// `snapshot` 是发起轮询时的设置快照：若本地在这段往返时间里又改过，
+    /// 就不拿旧快照之后的外部结果整份覆盖新值（#185 审计）——丢弃本次应用且
+    /// 不确认指纹，下一轮轮询会拿新快照重新比较，外部改动不会被吞掉。
+    pub(crate) fn finish_config_poll(
+        &mut self,
+        event: sodam_core::config_watch::ReloadEvent,
+        snapshot: Settings,
+        cx: &mut Context<Self>,
+    ) {
+        self.config_poll_busy = false;
+        match event {
+            sodam_core::config_watch::ReloadEvent::Quiet
+            | sodam_core::config_watch::ReloadEvent::Unchanged => {}
+            sodam_core::config_watch::ReloadEvent::Apply {
+                settings,
+                fingerprint,
+            } => {
+                // 本地没动过才应用；应用了才确认这份指纹——被丢弃时留给下一轮
+                // 重新处理（下一轮拿新快照比较，文件没变就 Unchanged 收尾）。
+                if self.settings == snapshot {
+                    self.apply_external_settings(*settings, cx);
+                    let mut tracker = self
+                        .config_reload
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    tracker.acknowledge(Some(fingerprint));
+                }
+            }
+            sodam_core::config_watch::ReloadEvent::Corrupt(error) => {
+                self.log_failure("配置文件热重载解析失败", &error);
+                let message = self.localized(
+                    "配置文件解析失败（{}）：已保留当前设置，未改动文件",
+                    &[error],
+                );
+                self.notify_warning_once("config-reload-corrupt", message);
+                cx.notify();
+            }
+        }
+    }
+
+    /// 外部改动的配置热生效：只应用、不保存（#185）。
+    ///
+    /// 字段分三类：
+    /// * 已有即时生效路径的（主题/语言/音量/播放模式/缓存上限/详细日志/快捷键）——
+    ///   沿用同样的应用逻辑，只是不回写文件；
+    /// * 会话类（签名地址/Token/Cookie/设备身份/音质意图）——重建会话，当前曲目
+    ///   不断，下一次取流/搜索/上报用新值；Cookie 变更视为换身份；
+    /// * 其余（搜索历史、titlebar 等）——随 `settings` 整体替换自然生效。
+    fn apply_external_settings(&mut self, mut incoming: Settings, cx: &mut Context<Self>) {
+        let old = self.settings.clone();
+
+        // 防回跳：用户正拖着音量滑条时，外部重载不动音量。
+        if self.volume_scrubbing {
+            incoming.volume = old.volume;
+            incoming.volume_before_mute = old.volume_before_mute;
+        }
+        // 设备身份不轮换：外部文件没带（或带坏了）身份时，沿用当前已生成的这份。
+        if !incoming.login_device().is_valid() && old.login_device().is_valid() {
+            incoming.login_device_id = old.login_device_id.clone();
+            incoming.login_install_id = old.login_install_id.clone();
+        }
+        let shortcuts_changed = old.shortcut_toggle != incoming.shortcut_toggle
+            || old.shortcut_previous != incoming.shortcut_previous
+            || old.shortcut_next != incoming.shortcut_next;
+        let quality_changed =
+            old.quality != incoming.quality || old.quality_source != incoming.quality_source;
+        let session_changed = incoming.session_inputs_differ(&old);
+        let cookie_changed = incoming.cookie != old.cookie;
+        self.settings = incoming.clone();
+
+        // 主题：与 `set_ui_theme*` 同一套应用逻辑（认不得的值回到跟随系统），不落盘。
+        if old.theme != incoming.theme {
+            self.apply_theme_state(&incoming.theme, cx);
+        }
+        // 语言：与 `set_language` 同一套应用逻辑，但不落盘。
+        if old.language != incoming.language {
+            self.apply_language_state(&incoming.language, cx);
+        }
+        // 详细日志即时生效。
+        if old.detailed_logs != incoming.detailed_logs {
+            log_outlet::set_global_detailed(incoming.detailed_logs);
+        }
+        // 音量与静音前音量：直接喂引擎（set_volume 内部已钳制）。
+        if old.volume != incoming.volume || old.volume_before_mute != incoming.volume_before_mute {
+            self.engine.set_volume(incoming.volume);
+        }
+        // 播放模式：队列按钮在播放栏，settings 换掉后同步给队列。
+        // 切到随机要重建随机轮次：面板的「接下来」直接读 shuffle_round，
+        // 不重建会显示空列表或旧模式残留的顺序。
+        if old.play_mode != incoming.play_mode {
+            self.queue.mode = incoming.play_mode;
+            self.queue.reset_shuffle_round();
+            self.queue.prepare_shuffle_round();
+        }
+        // 缓存上限：触一次维护，让超限的旧缓存马上被清。
+        if old.audio_cache_limit_mb != incoming.audio_cache_limit_mb {
+            self.maintain_cache(cx);
+        }
+        // 快捷键：置脏位，main.rs 心跳里统一重绑（清空 + 重建 keymap）。
+        if shortcuts_changed {
+            self.shortcuts_dirty = true;
+        }
+        // 会话类改动：重建会话（不落盘）。当前曲目不断；下一次取流/搜索/上报用新值。
+        if session_changed {
+            match self.session.as_mut() {
+                Some(session) => session.adopt(incoming.clone()),
+                None => self.session = Some(Session::new(incoming.clone())),
+            }
+        }
+        self.play_reporter.apply_settings(incoming.clone());
+        // Cookie 变了就是换了身份：旧身份的结论全部作废，账号与「我喜欢的」按新身份刷新。
+        if cookie_changed {
+            if incoming.cookie.trim().is_empty() {
+                self.clear_identity_state(cx);
+            } else {
+                self.invalidate_identity_conclusions();
+                // A 的账号信息（昵称/VIP）不再代表当前身份：先清空，刷新成功写入
+                // B 的信息；刷新失败时 VIP 状态按未知处理，不按 A 的算（#185 审计）。
+                self.account = None;
+                // 旧账号的歌单/收藏缓存是身份私有数据：换号不清，新账号会直接
+                // 看到旧账号的列表（加载守卫会拦住重拉）。保留当前播放。
+                self.playlists.clear();
+                self.liked = Arc::new(Vec::new());
+                self.liked_ids = Arc::new(HashSet::new());
+                self.liked_ids_failed = false;
+                self.liked_loaded = false;
+                self.open_playlist = None;
+                self.refresh_account(cx);
+                self.load_liked_ids(cx);
+            }
+        }
+        // 音质意图变了：按新意图重新预取下一首（正在播的这首不受影响）。
+        if quality_changed {
+            self.spawn_prefetch(cx);
+        }
+
+        // 接受了外部改动，备份也跟上：热重载不写盘，备份不同步的话，
+        // 之后主文件损坏走恢复会退回加载时的旧值（#185 审计）。IO 放后台。
+        let backup_path = Settings::config_path();
+        let backup_settings = self.settings.clone();
+        cx.background_spawn(async move {
+            let _ = sodam_core::config::write_settings_backup(&backup_path, &backup_settings);
+        })
+        .detach();
+
+        // 同一来源的重复提示只保留一条。
+        let message = self.tr("配置文件已更新，改动已生效").to_string();
+        self.notify_success_once("config-hot-reload", message);
+        cx.notify();
     }
 }
 

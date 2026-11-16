@@ -6,7 +6,7 @@
 use gpui::prelude::*;
 use gpui::{
     canvas, div, px, svg, uniform_list, ClickEvent, Context, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent,
 };
 
 use crate::app::Root;
@@ -111,14 +111,33 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |root, event: &MouseDownEvent, _window, cx| {
+                        // 拖动期间外部配置重载不得把滑条值弹回去（#185）。
+                        root.volume_scrubbing = true;
                         apply_down(f32::from(event.position.x), root, cx);
                     }),
                 )
                 .on_mouse_move(
                     cx.listener(move |root, event: &MouseMoveEvent, _window, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
+                            root.volume_scrubbing = true;
                             apply_move(f32::from(event.position.x), root, cx);
+                        } else {
+                            root.volume_scrubbing = false;
                         }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
+                        root.volume_scrubbing = false;
+                    }),
+                )
+                // 拖出滑条外松手收不到 on_mouse_up，用元素外的 up 兜底，
+                // 否则标记卡 true，之后的外部音量重载会一直被吞（#185）。
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
+                        root.volume_scrubbing = false;
                     }),
                 ),
         )
