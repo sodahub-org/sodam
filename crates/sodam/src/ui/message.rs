@@ -86,8 +86,11 @@ impl Root {
 
     /// 同 key 的消息替换旧消息；频率由调用方按事件类型控制。
     ///
-    /// 零时长（`Some(Duration::ZERO)`）等于"这条不显示"：既不入队，也不动同 key 的
-    /// 现有消息——免得一次空更新把手里那条关键错误顺手抹掉。
+    /// 零时长（`Some(Duration::ZERO)`）等于"这条不显示"：四种类型都不入队，也不动
+    /// 同 key 的现有消息——免得一次空更新把手里那条关键错误顺手抹掉。
+    ///
+    /// 返回的 id 不一定代表队列里的消息：零时长、以及队列被 Error/Warning 占满时
+    /// 进来的普通提示，都不入队，但照样返回一个新 id。调用方不要拿它去假设消息存在。
     pub fn push_message_with_key(
         &mut self,
         kind: MessageKind,
@@ -179,9 +182,10 @@ fn upsert_message(
         created_at,
         key,
     };
-    // 一来就已经过期的（零时长）不占名额，也不动同 key 的现有消息——
-    // 否则一次"不显示"的更新会把手里那条关键错误顺手抹掉。
-    if incoming.should_prune(created_at) {
+    // 零时长等于"这条不显示"：四种类型一视同仁，不入队、也不动同 key 的现有消息。
+    // 不能只靠 should_prune——它对 Error/Warning 恒为 false，零时长的错误会照样
+    // 挤掉别人再被计时器瞬间关掉。
+    if incoming.duration == Some(Duration::ZERO) || incoming.should_prune(created_at) {
         return id;
     }
     // 先剪掉已经过期的，别让它们白占队列名额。
@@ -600,11 +604,12 @@ mod tests {
             Some("save-failed"),
         );
 
-        // 零时长的同 key 更新：这条自己不会显示，也不能把手里那条错误抹掉。
+        // 零时长的同 key 更新（用 Warning 覆盖 Error/Warning 这条分支）：
+        // 这条自己不会显示，也不能把手里那条错误抹掉。
         upsert_message(
             &mut messages,
             &mut next_id,
-            MessageKind::Info,
+            MessageKind::Warning,
             "".into(),
             Some(Duration::ZERO),
             now,
@@ -614,6 +619,34 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].kind, MessageKind::Error, "原错误还在");
         assert_eq!(messages[0].text, "保存失败");
+    }
+
+    #[test]
+    fn a_zero_duration_error_never_evicts_a_live_error() {
+        let now = Instant::now();
+        let mut messages = Vec::new();
+        for index in 0..MAX_VISIBLE_MESSAGES {
+            let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
+            message.id = index as u64 + 1;
+            messages.push(message);
+        }
+        let mut next_id = MAX_VISIBLE_MESSAGES as u64;
+        // 零时长的 Error 不等于"要显示 0 秒"；它压根不该换掉一条正在等补弹的错误。
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "".into(),
+            Some(Duration::ZERO),
+            now,
+            None,
+        );
+
+        assert_eq!(
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "四条 Error 原封不动"
+        );
     }
 
     #[test]
