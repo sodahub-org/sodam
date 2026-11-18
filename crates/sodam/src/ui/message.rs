@@ -175,8 +175,7 @@ fn upsert_message(
         }
     }
     // 先剪掉已经过期的，免得它们白占名额、把真正要补弹的 Error/Warning 挤出去。
-    // 剪在 push 之前：刚入队这条的 created_at 就是 created_at，必不会过期，
-    // 不会被自己剪掉；也避开 duration 为零时"刚推入就消失"的边角。
+    // 剪在 push 之前，刚入队这条还没进队列，不会被自己剪掉。
     messages.retain(|message| !message.should_prune(created_at));
     *next_id = next_id.wrapping_add(1);
     let id = *next_id;
@@ -188,9 +187,13 @@ fn upsert_message(
         created_at,
         key,
     });
-    if messages.len() > MAX_VISIBLE_MESSAGES {
-        // 全都是活的，才按最旧的先走。
-        messages.drain(0..messages.len() - MAX_VISIBLE_MESSAGES);
+    // 超额时先挤最旧的普通提示，Error/Warning 扛到最后才挤——它们要留着补弹（#212）。
+    while messages.len() > MAX_VISIBLE_MESSAGES {
+        let victim = messages
+            .iter()
+            .position(|message| !replays_on_reopen(message.kind))
+            .unwrap_or(0);
+        messages.remove(victim);
     }
     id
 }
@@ -499,6 +502,8 @@ mod tests {
         let mut timers = HashSet::from([10, 20]);
 
         prune_expired(&mut messages, &mut timers, now);
+        // 再裁一次结果不变：活的两轮之后还得在，计时 id 不被误清。
+        prune_expired(&mut messages, &mut timers, now);
 
         assert_eq!(messages.len(), 1, "过期的那条要被丢掉");
         assert_eq!(messages[0].id, 20, "没过期的那条留着");
@@ -506,24 +511,34 @@ mod tests {
     }
 
     #[test]
-    fn pruning_twice_leaves_the_same_result() {
-        let old = Instant::now();
-        let now = old + Duration::from_secs(3600);
-        // 一条已过期、一条还活着：只该丢掉过期那条，活的连着裁两次都得在。
+    fn live_info_never_evicts_a_live_error() {
+        let now = Instant::now();
+        // 4 条都还活着，队列已满：再来一条 Info 时，不能把最旧的 Error 挤掉。
         let mut messages = vec![
-            sample(old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
             sample(now, Some(DEFAULT_DURATION)),
         ];
-        messages[0].id = 1;
-        messages[1].id = 2;
-        let mut timers = HashSet::from([1, 2]);
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        let mut next_id = 4;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
 
-        prune_expired(&mut messages, &mut timers, now);
-        prune_expired(&mut messages, &mut timers, now);
-
-        assert_eq!(messages.len(), 1, "只有过期那条被丢");
-        assert_eq!(messages[0].id, 2, "活的两轮之后还在");
-        assert_eq!(timers, HashSet::from([2]), "活消息的计时 id 不被误清");
+        assert_eq!(messages.len(), MAX_VISIBLE_MESSAGES);
+        assert!(
+            messages.iter().any(|m| m.kind == MessageKind::Error),
+            "超额时该先挤普通提示，Error 不能被挤掉"
+        );
     }
 
     #[test]
