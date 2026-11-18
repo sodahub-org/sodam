@@ -85,6 +85,9 @@ impl Root {
     }
 
     /// 同 key 的消息替换旧消息；频率由调用方按事件类型控制。
+    ///
+    /// 零时长（`Some(Duration::ZERO)`）等于"这条不显示"：既不入队，也不动同 key 的
+    /// 现有消息——免得一次空更新把手里那条关键错误顺手抹掉。
     pub fn push_message_with_key(
         &mut self,
         kind: MessageKind,
@@ -166,17 +169,6 @@ fn upsert_message(
     key: Option<&str>,
 ) -> u64 {
     let key = key.map(str::to_string);
-    if let Some(key) = key.as_deref() {
-        if let Some(index) = messages
-            .iter()
-            .position(|message| message.key.as_deref() == Some(key))
-        {
-            messages.remove(index);
-        }
-    }
-    // 先剪掉已经过期的，别让它们白占队列名额。剪在 push 之前：
-    // 刚入队这条还没进队列，不会被自己剪掉。
-    messages.retain(|message| !message.should_prune(created_at));
     *next_id = next_id.wrapping_add(1);
     let id = *next_id;
     let incoming = Message {
@@ -187,21 +179,38 @@ fn upsert_message(
         created_at,
         key,
     };
-    // 一来就已经过期的（比如零时长）不占名额，也不挤掉别人。
+    // 一来就已经过期的（零时长）不占名额，也不动同 key 的现有消息——
+    // 否则一次"不显示"的更新会把手里那条关键错误顺手抹掉。
     if incoming.should_prune(created_at) {
         return id;
     }
-    messages.push(incoming);
-    // 超额时先挤最旧的普通提示，Error/Warning 扛到最后才挤——它们要留着补弹（#212）。
-    // 选受害者必须排除刚入队这条，否则全是 Error 时它会被当成"唯一的普通提示"删掉。
-    // 兜底：整队全是 Error/Warning 时没有普通提示可牺牲，只能删最旧的那条。
-    while messages.len() > MAX_VISIBLE_MESSAGES {
-        let victim = messages
+    // 先剪掉已经过期的，别让它们白占队列名额。
+    messages.retain(|message| !message.should_prune(created_at));
+    // 同 key 替换旧的。
+    if let Some(key) = incoming.key.as_deref() {
+        if let Some(index) = messages
             .iter()
-            .position(|message| message.id != id && !replays_on_reopen(message.kind))
-            .unwrap_or(0);
-        messages.remove(victim);
+            .position(|message| message.key.as_deref() == Some(key))
+        {
+            messages.remove(index);
+        }
     }
+    // 名额满了先腾位置。顺序：先挤最旧的普通提示；没有普通提示可挤时，
+    // 新来的若只是普通提示就直接不显示（3 秒的事，犯不上换掉一条错误），
+    // 新来的也是 Error/Warning 才删最旧的那条。硬上限 4 条不能让队列无限长（#212）。
+    if messages.len() >= MAX_VISIBLE_MESSAGES {
+        if let Some(index) = messages
+            .iter()
+            .position(|message| !replays_on_reopen(message.kind))
+        {
+            messages.remove(index);
+        } else if !replays_on_reopen(incoming.kind) {
+            return id;
+        } else {
+            messages.remove(0);
+        }
+    }
+    messages.push(incoming);
     id
 }
 
@@ -577,9 +586,40 @@ mod tests {
     }
 
     #[test]
-    fn new_info_still_shows_when_the_queue_is_full_of_errors() {
+    fn a_zero_duration_update_never_wipes_the_same_key_message() {
         let now = Instant::now();
-        // 4 条 Error 占满队列，再来一条 Info：不能把它自己删掉，得挤掉最旧的一条 Error。
+        let mut messages = Vec::new();
+        let mut next_id = 0;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "保存失败".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            Some("save-failed"),
+        );
+
+        // 零时长的同 key 更新：这条自己不会显示，也不能把手里那条错误抹掉。
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "".into(),
+            Some(Duration::ZERO),
+            now,
+            Some("save-failed"),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind, MessageKind::Error, "原错误还在");
+        assert_eq!(messages[0].text, "保存失败");
+    }
+
+    #[test]
+    fn a_new_info_is_dropped_when_the_queue_is_full_of_errors() {
+        let now = Instant::now();
+        // 4 条 Error 占满队列，再来一条 Info：Info 3 秒就没，不值当换掉一条关键错误。
         let mut messages = Vec::new();
         for index in 0..MAX_VISIBLE_MESSAGES {
             let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
@@ -587,7 +627,7 @@ mod tests {
             messages.push(message);
         }
         let mut next_id = MAX_VISIBLE_MESSAGES as u64;
-        upsert_message(
+        let dropped = upsert_message(
             &mut messages,
             &mut next_id,
             MessageKind::Info,
@@ -597,13 +637,15 @@ mod tests {
             None,
         );
 
-        assert_eq!(messages.len(), MAX_VISIBLE_MESSAGES);
         assert_eq!(
             messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5],
-            "新消息（id 5）必须还在，被挤掉的是最旧的 Error（id 1）"
+            vec![1, 2, 3, 4],
+            "四条 Error 都留着，Info 不占名额"
         );
-        assert_eq!(messages[MAX_VISIBLE_MESSAGES - 1].kind, MessageKind::Info);
+        assert!(
+            !messages.iter().any(|m| m.id == dropped),
+            "返回的 id 指向一条没入队的消息"
+        );
     }
 
     #[test]
