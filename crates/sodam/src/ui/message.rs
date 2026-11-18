@@ -37,30 +37,15 @@ pub struct Message {
 }
 
 impl Message {
-    /// 这类消息关窗期间不能被吞，重开时补弹一次完整时长（#212）。
-    /// 失败多半发生在后台、正好赶窗口关着，按产生时刻算会在重开时被裁掉。
-    fn replays_on_reopen(&self) -> bool {
-        replays_on_reopen(self.kind)
-    }
-
-    /// 从 `now` 起还要等多久才自动关闭；`None` = 本就不自动关闭。
+    /// 按产生时刻是否已经过期、该被剪掉。
     ///
-    /// Info/Success 按产生时刻扣减：首帧来得晚、或任务排队起跑晚了，都只等剩下的。
-    /// [`Message::replays_on_reopen`] 的类型不看产生时刻，拿完整时长。
-    pub fn close_after(&self, now: Instant) -> Option<Duration> {
-        self.duration
-            .map(|duration| close_after(self.kind, duration, self.created_at, now))
-    }
-
-    /// 这条消息该不该在首帧被裁掉（即按产生时刻已经过期）。
-    ///
-    /// 只有 Info/Success 会过期；不自动关闭的消息和会补弹的类型都不裁
-    ///（理由见 [`Message::replays_on_reopen`]）。
-    pub fn should_drop_on_first_frame(&self, now: Instant) -> bool {
+    /// 只有 Info/Success 会过期；不自动关闭的消息和会补弹的类型都不剪
+    ///（理由见 [`replays_on_reopen`]）。渲染首帧和入队时都用它。
+    fn should_prune(&self, now: Instant) -> bool {
         let Some(duration) = self.duration else {
             return false;
         };
-        !self.replays_on_reopen() && now.saturating_duration_since(self.created_at) >= duration
+        !replays_on_reopen(self.kind) && now.saturating_duration_since(self.created_at) >= duration
     }
 
     fn accent(&self) -> gpui::Rgba {
@@ -189,6 +174,10 @@ fn upsert_message(
             messages.remove(index);
         }
     }
+    // 先剪掉已经过期的，免得它们白占名额、把真正要补弹的 Error/Warning 挤出去。
+    // 剪在 push 之前：刚入队这条的 created_at 就是 created_at，必不会过期，
+    // 不会被自己剪掉；也避开 duration 为零时"刚推入就消失"的边角。
+    messages.retain(|message| !message.should_prune(created_at));
     *next_id = next_id.wrapping_add(1);
     let id = *next_id;
     messages.push(Message {
@@ -199,9 +188,6 @@ fn upsert_message(
         created_at,
         key,
     });
-    // 先剪掉已经过期的，免得它们白占名额、把真正要补弹的 Error/Warning 挤出去。
-    // 用入队时刻当基准，和 `created_at` 是同一个时刻。
-    messages.retain(|message| !message.should_drop_on_first_frame(created_at));
     if messages.len() > MAX_VISIBLE_MESSAGES {
         // 全都是活的，才按最旧的先走。
         messages.drain(0..messages.len() - MAX_VISIBLE_MESSAGES);
@@ -230,14 +216,13 @@ fn close_after(
     duration.saturating_sub(now.saturating_duration_since(created_at))
 }
 
-/// 裁掉过期消息，并同步清掉它们对应的计时器 id。
+/// 渲染路径上的裁剪：丢掉过期消息，并同步清掉它们对应的计时器 id。
 ///
 /// 只裁 Info/Success（按产生时刻过期）；Error/Warning 留着重开补弹一次。
-/// 渲染首帧和入队时（`upsert_message`）各调一次：入队那次是为了别让过期项白占
-/// 队列名额、把等补弹的 Error/Warning 挤出去。两边都不同步删计时任务，计时器
-/// 靠 `message_timers` 按 id 去重，到期和点击关闭时各自摘掉。
+/// 入队路径（`upsert_message`）只剪消息、不碰计时器——那里没有 timers，
+/// 被换掉/挤出的 id 由 `push_message_with_key` 统一 retain 掉。
 fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
-    messages.retain(|message| !message.should_drop_on_first_frame(now));
+    messages.retain(|message| !message.should_prune(now));
     timers.retain(|id| messages.iter().any(|message| message.id == *id));
 }
 
@@ -328,6 +313,13 @@ mod tests {
         sample_kind(MessageKind::Info, created_at, duration)
     }
 
+    /// 测试里问"这条消息从 now 起还要等多久"：生产侧走的是自由函数 `close_after`。
+    fn close_after_of(message: &Message, now: Instant) -> Option<Duration> {
+        message
+            .duration
+            .map(|duration| close_after(message.kind, duration, message.created_at, now))
+    }
+
     #[test]
     fn default_message_uses_three_seconds() {
         assert_eq!(DEFAULT_DURATION, Duration::from_secs(3));
@@ -356,7 +348,7 @@ mod tests {
     fn a_fresh_message_has_its_whole_duration_left() {
         let now = Instant::now();
         let message = sample(now, Some(DEFAULT_DURATION));
-        assert_eq!(message.close_after(now), Some(DEFAULT_DURATION));
+        assert_eq!(close_after_of(&message, now), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -365,7 +357,7 @@ mod tests {
         let message = sample(now, Some(DEFAULT_DURATION));
         // 首次画到它时已经过去 2 秒：只能再留 1 秒，不能重新计满 3 秒。
         let late = now + Duration::from_secs(2);
-        assert_eq!(message.close_after(late), Some(Duration::from_secs(1)));
+        assert_eq!(close_after_of(&message, late), Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -373,9 +365,9 @@ mod tests {
         let now = Instant::now();
         let message = sample(now, Some(DEFAULT_DURATION));
         let later = now + DEFAULT_DURATION;
-        assert!(message.should_drop_on_first_frame(later));
+        assert!(message.should_prune(later));
         assert_eq!(
-            message.close_after(later),
+            close_after_of(&message, later),
             Some(Duration::ZERO),
             "已过期就立刻关，不再等"
         );
@@ -388,12 +380,9 @@ mod tests {
         let created = Instant::now();
         let now = created + Duration::from_secs(3600);
         let error = sample_kind(MessageKind::Error, created, Some(DEFAULT_DURATION));
-        assert!(
-            !error.should_drop_on_first_frame(now),
-            "Error 不按产生时刻过期"
-        );
+        assert!(!error.should_prune(now), "Error 不按产生时刻过期");
         assert_eq!(
-            error.close_after(now),
+            close_after_of(&error, now),
             Some(DEFAULT_DURATION),
             "补弹一次要给完整时长"
         );
@@ -404,8 +393,8 @@ mod tests {
         let created = Instant::now();
         let now = created + Duration::from_secs(3600);
         let warning = sample_kind(MessageKind::Warning, created, Some(DEFAULT_DURATION));
-        assert!(!warning.should_drop_on_first_frame(now));
-        assert_eq!(warning.close_after(now), Some(DEFAULT_DURATION));
+        assert!(!warning.should_prune(now));
+        assert_eq!(close_after_of(&warning, now), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -436,8 +425,12 @@ mod tests {
         let now = Instant::now();
         let message = sample(now, None);
         let much_later = now + Duration::from_secs(3600);
-        assert!(!message.should_drop_on_first_frame(much_later));
-        assert_eq!(message.close_after(much_later), None, "None = 不自动关闭");
+        assert!(!message.should_prune(much_later));
+        assert_eq!(
+            close_after_of(&message, much_later),
+            None,
+            "None = 不自动关闭"
+        );
     }
 
     #[test]
@@ -474,7 +467,7 @@ mod tests {
         );
         // 隔了整个时长，旧消息本该已经过期。
         let stale = start + DEFAULT_DURATION;
-        assert!(messages[0].should_drop_on_first_frame(stale));
+        assert!(messages[0].should_prune(stale));
 
         // 同一来源重试：换一条新消息，从新的产生时刻重新计时。
         let retry = stale + Duration::from_secs(1);
@@ -490,7 +483,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].created_at, retry);
-        assert_eq!(messages[0].close_after(retry), Some(DEFAULT_DURATION));
+        assert_eq!(close_after_of(&messages[0], retry), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -516,15 +509,21 @@ mod tests {
     fn pruning_twice_leaves_the_same_result() {
         let old = Instant::now();
         let now = old + Duration::from_secs(3600);
-        let mut messages = vec![sample(old, Some(DEFAULT_DURATION))];
+        // 一条已过期、一条还活着：只该丢掉过期那条，活的连着裁两次都得在。
+        let mut messages = vec![
+            sample(old, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+        ];
         messages[0].id = 1;
-        let mut timers = HashSet::from([1]);
+        messages[1].id = 2;
+        let mut timers = HashSet::from([1, 2]);
 
         prune_expired(&mut messages, &mut timers, now);
         prune_expired(&mut messages, &mut timers, now);
 
-        assert!(messages.is_empty(), "第二次裁不会有新东西可裁");
-        assert!(timers.is_empty());
+        assert_eq!(messages.len(), 1, "只有过期那条被丢");
+        assert_eq!(messages[0].id, 2, "活的两轮之后还在");
+        assert_eq!(timers, HashSet::from([2]), "活消息的计时 id 不被误清");
     }
 
     #[test]
