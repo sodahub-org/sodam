@@ -1818,14 +1818,16 @@ impl Root {
         // 达不到理想目标时，偏移会被 gpui 钳在最大滚动量上，补间永远差一截，
         // 每帧都会重新起补间（表现为结尾句反复小幅抖动）。钳位后补间能落到
         // 终点，动画自然收敛。顶端目标同样钳位，保证开场判定与实际一致。
-        let last_bottom = self
-            .lyrics_scroll
-            .bounds_for_item(self.lyrics.len().saturating_sub(1))
-            .map(|bounds| f32::from(bounds.bottom()))
-            .unwrap_or(f32::from(first_top));
-        let max_scroll =
-            ((last_bottom - f32::from(first_top)) - f32::from(viewport.size.height)).max(0.0);
+        // 可滚动范围直接用 gpui 量好的 `max_offset()`：它包含列表上下 padding。
+        // 自己拿首尾句拼范围会漏掉 padding，把所有目标都钳成 0，歌词完全不滚
+        // （实测踩过：0be11d2 的回归）。
+        let max_scroll = f32::from(self.lyrics_scroll.max_offset().y).max(0.0);
         let clamp_to_range = |value: f32| value.clamp(-max_scroll, 0.0);
+        // 第一句始终用顶端目标：折行成长句时首句中心在顶端偏移下会低于跟随线，
+        // 走几何判定会把它滚出视口顶端，截掉句首。
+        if index == 0 {
+            return Some(clamp_to_range(intro_offset));
+        }
         if intro_screen_center <= viewport_center {
             return Some(clamp_to_range(intro_offset));
         }
