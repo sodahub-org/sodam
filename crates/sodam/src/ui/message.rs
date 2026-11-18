@@ -1,5 +1,6 @@
 //! 全局 message：Ant Design 风格的多条轻提示队列。
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
@@ -46,7 +47,10 @@ impl Message {
 
     /// 这条消息是否已经过期。不自动关闭的消息永不过期。
     pub fn expired(&self, now: Instant) -> bool {
-        self.remaining(now).is_none() && self.duration.is_some()
+        let Some(duration) = self.duration else {
+            return false;
+        };
+        now.saturating_duration_since(self.created_at) >= duration
     }
 
     fn accent(&self) -> gpui::Rgba {
@@ -187,14 +191,21 @@ fn upsert_message(
     id
 }
 
+/// 按产生时刻裁掉过期消息，并同步清掉它们对应的计时器 id。
+///
+/// 唯一的清理点：入队时（`push_message_with_key`）清的是被替换/挤出队列的，
+/// 这里清的是自己过期的。两者都不在渲染中途删消息，所以排完计时不用再清一遍。
+fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
+    messages.retain(|message| !message.expired(now));
+    timers.retain(|id| messages.iter().any(|message| message.id == *id));
+}
+
 /// 最高层浮层：多条消息按插入顺序堆叠，各自独立计时。
 pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyElement> {
-    // 关窗期间（没有渲染）攒下的消息，到这里先按产生时刻筛一遍：过期的直接丢掉，
-    // 不补弹、也不重置计时（#212）。首帧就是过期判定的时机。
+    // 关窗期间（没有渲染）攒下的消息，首帧按产生时刻筛一遍：过期的直接丢掉，
+    // 不补弹、也不重置计时（#212）。
     let now = Instant::now();
-    root.messages.retain(|message| !message.expired(now));
-    root.message_timers
-        .retain(|id| root.messages.iter().any(|message| message.id == *id));
+    prune_expired(&mut root.messages, &mut root.message_timers, now);
 
     if root.messages.is_empty() {
         return None;
@@ -209,8 +220,6 @@ pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyEleme
             root.schedule_message_close(id, now, cx);
         }
     }
-    root.message_timers
-        .retain(|id| root.messages.iter().any(|message| message.id == *id));
 
     let messages = root.messages.clone();
     Some(
@@ -382,6 +391,40 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].created_at, retry);
         assert_eq!(messages[0].remaining(retry), Some(DEFAULT_DURATION));
+    }
+
+    #[test]
+    fn pruning_drops_expired_messages_and_their_timer_ids() {
+        let now = Instant::now();
+        let mut messages = vec![
+            sample(
+                now - DEFAULT_DURATION - Duration::from_secs(1),
+                Some(DEFAULT_DURATION),
+            ),
+            sample(now, Some(DEFAULT_DURATION)),
+        ];
+        messages[0].id = 10;
+        messages[1].id = 20;
+        let mut timers = HashSet::from([10, 20]);
+
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 1, "过期的那条要被丢掉");
+        assert_eq!(messages[0].id, 20, "没过期的那条留着");
+        assert_eq!(timers, HashSet::from([20]), "被丢消息的计时 id 要同步清掉");
+    }
+
+    #[test]
+    fn pruning_keeps_messages_that_never_expire() {
+        let now = Instant::now();
+        let mut messages = vec![sample(now - Duration::from_secs(3600), None)];
+        messages[0].id = 7;
+        let mut timers = HashSet::from([7]);
+
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 1, "不自动关闭的消息永不过期");
+        assert_eq!(timers, HashSet::from([7]));
     }
 
     #[test]
