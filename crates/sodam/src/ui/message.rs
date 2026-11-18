@@ -174,8 +174,8 @@ fn upsert_message(
             messages.remove(index);
         }
     }
-    // 先剪掉已经过期的，免得它们白占名额、把真正要补弹的 Error/Warning 挤出去。
-    // 剪在 push 之前，刚入队这条还没进队列，不会被自己剪掉。
+    // 先剪掉已经过期的，别让它们白占队列名额。剪在 push 之前：
+    // 刚入队这条还没进队列，不会被自己剪掉。
     messages.retain(|message| !message.should_prune(created_at));
     *next_id = next_id.wrapping_add(1);
     let id = *next_id;
@@ -188,6 +188,8 @@ fn upsert_message(
         key,
     });
     // 超额时先挤最旧的普通提示，Error/Warning 扛到最后才挤——它们要留着补弹（#212）。
+    // 兜底：整队全是 Error/Warning 时没有普通提示可牺牲，只能删最旧的那条，
+    // 硬上限 4 条不能让队列无限长。
     while messages.len() > MAX_VISIBLE_MESSAGES {
         let victim = messages
             .iter()
@@ -508,6 +510,32 @@ mod tests {
         assert_eq!(messages.len(), 1, "过期的那条要被丢掉");
         assert_eq!(messages[0].id, 20, "没过期的那条留着");
         assert_eq!(timers, HashSet::from([20]), "被丢消息的计时 id 要同步清掉");
+    }
+
+    #[test]
+    fn a_full_queue_of_errors_falls_back_to_dropping_the_oldest() {
+        let now = Instant::now();
+        // 5 条 Error 挤 4 个位置：没有普通提示可牺牲，只能删最旧的，保留最新的 4 条。
+        let mut messages = Vec::new();
+        for index in 0..MAX_VISIBLE_MESSAGES {
+            let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
+            message.id = index as u64 + 1;
+            messages.push(message);
+        }
+        let mut next_id = MAX_VISIBLE_MESSAGES as u64;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert_eq!(messages.len(), MAX_VISIBLE_MESSAGES, "硬上限仍是 4 条");
+        assert_eq!(messages[0].id, 2, "最旧的那条被挤掉");
+        assert_eq!(messages[MAX_VISIBLE_MESSAGES - 1].id, 5, "最新那条留着");
     }
 
     #[test]
