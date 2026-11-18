@@ -22,4 +22,4 @@ sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 
-libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "32fe0f9" }
+libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "c057371" }
