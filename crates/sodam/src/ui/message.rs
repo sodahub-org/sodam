@@ -1,6 +1,7 @@
 //! 全局 message：Ant Design 风格的多条轻提示队列。
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context};
@@ -29,11 +30,24 @@ pub struct Message {
     pub text: String,
     /// `None` 表示不自动关闭；默认见 [`DEFAULT_DURATION`]。
     pub duration: Option<Duration>,
+    /// 产生时刻。显示时长从这里扣，不从首次渲染算起——窗口关着时消息照样在变旧（#212）。
+    pub created_at: Instant,
     /// 同一来源的提示会替换旧的，避免定时失败等重复事件堆成消息墙。
     pub key: Option<String>,
 }
 
 impl Message {
+    /// 按产生时刻是否已经过期、该被剪掉。
+    ///
+    /// 只有 Info/Success 会过期；不自动关闭的消息和会补弹的类型都不剪
+    ///（理由见 [`replays_on_reopen`]）。渲染首帧和入队时都用它。
+    fn should_prune(&self, now: Instant) -> bool {
+        let Some(duration) = self.duration else {
+            return false;
+        };
+        !replays_on_reopen(self.kind) && now.saturating_duration_since(self.created_at) >= duration
+    }
+
     fn accent(&self) -> gpui::Rgba {
         match self.kind {
             MessageKind::Info => theme::text_muted(),
@@ -71,6 +85,12 @@ impl Root {
     }
 
     /// 同 key 的消息替换旧消息；频率由调用方按事件类型控制。
+    ///
+    /// 零时长（`Some(Duration::ZERO)`）等于"这条不显示"：四种类型都不入队，也不动
+    /// 同 key 的现有消息——免得一次空更新把手里那条关键错误顺手抹掉。
+    ///
+    /// 返回的 id 不一定代表队列里的消息：零时长、以及队列被 Error/Warning 占满时
+    /// 进来的普通提示，都不入队，但照样返回一个新 id。调用方不要拿它去假设消息存在。
     pub fn push_message_with_key(
         &mut self,
         kind: MessageKind,
@@ -84,6 +104,7 @@ impl Root {
             kind,
             text.into(),
             duration,
+            Instant::now(),
             key,
         );
         self.message_timers.retain(|message_id| {
@@ -112,17 +133,27 @@ impl Root {
     }
 
     /// 启动该条消息的计时器；消息被替换/关闭后计时器会安全退出。
+    ///
+    /// 等多久不在这里定死：任务真正起跑时按当时的时刻再算一次
+    ///（[`close_after`]），把"从算出时长到任务被调度"的排队时间也扣掉，
+    /// 免得 Info/Success 晚关（#212）。Error/Warning 始终拿完整时长，补弹一次看得见。
     pub(crate) fn schedule_message_close(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(message) = self.messages.iter().find(|message| message.id == id) else {
             return;
         };
         let Some(duration) = message.duration else {
+            // 本就不自动关闭的消息不排计时。
             return;
         };
+        let (kind, created_at) = (message.kind, message.created_at);
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(duration).await;
+            let wait = close_after(kind, duration, created_at, Instant::now());
+            if !wait.is_zero() {
+                cx.background_executor().timer(wait).await;
+            }
             let _ = this.update(cx, |root, cx| {
                 if root.close_message(id) {
+                    root.message_timers.remove(&id);
                     cx.notify();
                 }
             });
@@ -137,10 +168,30 @@ fn upsert_message(
     kind: MessageKind,
     text: String,
     duration: Option<Duration>,
+    created_at: Instant,
     key: Option<&str>,
 ) -> u64 {
     let key = key.map(str::to_string);
-    if let Some(key) = key.as_deref() {
+    *next_id = next_id.wrapping_add(1);
+    let id = *next_id;
+    let incoming = Message {
+        id,
+        kind,
+        text,
+        duration,
+        created_at,
+        key,
+    };
+    // 零时长等于"这条不显示"：四种类型一视同仁，不入队、也不动同 key 的现有消息。
+    // 不能只靠 should_prune——它对 Error/Warning 恒为 false，零时长的错误会照样
+    // 挤掉别人再被计时器瞬间关掉。
+    if incoming.duration == Some(Duration::ZERO) || incoming.should_prune(created_at) {
+        return id;
+    }
+    // 先剪掉已经过期的，别让它们白占队列名额。
+    messages.retain(|message| !message.should_prune(created_at));
+    // 同 key 替换旧的。
+    if let Some(key) = incoming.key.as_deref() {
         if let Some(index) = messages
             .iter()
             .position(|message| message.key.as_deref() == Some(key))
@@ -148,23 +199,63 @@ fn upsert_message(
             messages.remove(index);
         }
     }
-    *next_id = next_id.wrapping_add(1);
-    let id = *next_id;
-    messages.push(Message {
-        id,
-        kind,
-        text,
-        duration,
-        key,
-    });
-    if messages.len() > MAX_VISIBLE_MESSAGES {
-        messages.drain(0..messages.len() - MAX_VISIBLE_MESSAGES);
+    // 名额满了先腾位置。顺序：先挤最旧的普通提示；没有普通提示可挤时，
+    // 新来的若只是普通提示就直接不显示（3 秒的事，犯不上换掉一条错误），
+    // 新来的也是 Error/Warning 才删最旧的那条。硬上限 4 条不能让队列无限长（#212）。
+    if messages.len() >= MAX_VISIBLE_MESSAGES {
+        if let Some(index) = messages
+            .iter()
+            .position(|message| !replays_on_reopen(message.kind))
+        {
+            messages.remove(index);
+        } else if !replays_on_reopen(incoming.kind) {
+            return id;
+        } else {
+            messages.remove(0);
+        }
     }
+    messages.push(incoming);
     id
+}
+
+/// 这类消息关窗期间不能被吞，重开时补弹一次完整时长（#212）。
+fn replays_on_reopen(kind: MessageKind) -> bool {
+    matches!(kind, MessageKind::Error | MessageKind::Warning)
+}
+
+/// 从 `now` 起还要等多久才关闭。Info/Success 扣掉已过去的时长，其余类型给满时长。
+///
+/// 抽成自由函数，是因为关闭任务真正起跑时还要按当时的时刻再算一次：
+/// 从算出时长到任务被调度之间也有一段排队时间，不扣掉就会晚关（#212）。
+fn close_after(
+    kind: MessageKind,
+    duration: Duration,
+    created_at: Instant,
+    now: Instant,
+) -> Duration {
+    if replays_on_reopen(kind) {
+        return duration;
+    }
+    duration.saturating_sub(now.saturating_duration_since(created_at))
+}
+
+/// 渲染路径上的裁剪：丢掉过期消息，并同步清掉它们对应的计时器 id。
+///
+/// 只裁 Info/Success（按产生时刻过期）；Error/Warning 留着重开补弹一次。
+/// 入队路径（`upsert_message`）只剪消息、不碰计时器——那里没有 timers，
+/// 被换掉/挤出的 id 由 `push_message_with_key` 统一 retain 掉。
+fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
+    messages.retain(|message| !message.should_prune(now));
+    timers.retain(|id| messages.iter().any(|message| message.id == *id));
 }
 
 /// 最高层浮层：多条消息按插入顺序堆叠，各自独立计时。
 pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyElement> {
+    // 关窗期间攒下的消息，首帧筛一遍：Info/Success 按产生时刻裁掉，
+    // Error/Warning 留着重开补弹一次（#212）。计时器按 id 去重，每条只排一次。
+    let now = Instant::now();
+    prune_expired(&mut root.messages, &mut root.message_timers, now);
+
     if root.messages.is_empty() {
         return None;
     }
@@ -178,8 +269,6 @@ pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyEleme
             root.schedule_message_close(id, cx);
         }
     }
-    root.message_timers
-        .retain(|id| root.messages.iter().any(|message| message.id == *id));
 
     let messages = root.messages.clone();
     Some(
@@ -232,6 +321,28 @@ pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyEleme
 mod tests {
     use super::*;
 
+    fn sample_kind(kind: MessageKind, created_at: Instant, duration: Option<Duration>) -> Message {
+        Message {
+            id: 1,
+            kind,
+            text: "test".into(),
+            duration,
+            created_at,
+            key: None,
+        }
+    }
+
+    fn sample(created_at: Instant, duration: Option<Duration>) -> Message {
+        sample_kind(MessageKind::Info, created_at, duration)
+    }
+
+    /// 测试里问"这条消息从 now 起还要等多久"：生产侧走的是自由函数 `close_after`。
+    fn close_after_of(message: &Message, now: Instant) -> Option<Duration> {
+        message
+            .duration
+            .map(|duration| close_after(message.kind, duration, message.created_at, now))
+    }
+
     #[test]
     fn default_message_uses_three_seconds() {
         assert_eq!(DEFAULT_DURATION, Duration::from_secs(3));
@@ -239,13 +350,7 @@ mod tests {
 
     #[test]
     fn message_kinds_have_distinct_visual_tokens() {
-        let base = Message {
-            id: 1,
-            kind: MessageKind::Info,
-            text: "info".into(),
-            duration: None,
-            key: None,
-        };
+        let base = sample(Instant::now(), None);
         let success = Message {
             kind: MessageKind::Success,
             ..base.clone()
@@ -263,7 +368,370 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_message_has_its_whole_duration_left() {
+        let now = Instant::now();
+        let message = sample(now, Some(DEFAULT_DURATION));
+        assert_eq!(close_after_of(&message, now), Some(DEFAULT_DURATION));
+    }
+
+    #[test]
+    fn a_message_first_seen_late_only_gets_the_remaining_time() {
+        let now = Instant::now();
+        let message = sample(now, Some(DEFAULT_DURATION));
+        // 首次画到它时已经过去 2 秒：只能再留 1 秒，不能重新计满 3 秒。
+        let late = now + Duration::from_secs(2);
+        assert_eq!(close_after_of(&message, late), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_expired_message_is_not_shown_anymore() {
+        let now = Instant::now();
+        let message = sample(now, Some(DEFAULT_DURATION));
+        let later = now + DEFAULT_DURATION;
+        assert!(message.should_prune(later));
+        assert_eq!(
+            close_after_of(&message, later),
+            Some(Duration::ZERO),
+            "已过期就立刻关，不再等"
+        );
+    }
+
+    #[test]
+    fn an_old_error_still_shows_a_whole_window_on_reopen() {
+        // 签名超时发生在关窗期间，隔了 1 小时才重开首帧。
+        // 用加法从过去推到现在，不用 now - 1h：CI 新机器 uptime 不足 1h 时后者会 panic。
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let error = sample_kind(MessageKind::Error, created, Some(DEFAULT_DURATION));
+        assert!(!error.should_prune(now), "Error 不按产生时刻过期");
+        assert_eq!(
+            close_after_of(&error, now),
+            Some(DEFAULT_DURATION),
+            "补弹一次要给完整时长"
+        );
+    }
+
+    #[test]
+    fn an_old_warning_is_kept_just_like_an_error() {
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let warning = sample_kind(MessageKind::Warning, created, Some(DEFAULT_DURATION));
+        assert!(!warning.should_prune(now));
+        assert_eq!(close_after_of(&warning, now), Some(DEFAULT_DURATION));
+    }
+
+    #[test]
+    fn pruning_keeps_old_errors_but_drops_old_info() {
+        let old = Instant::now();
+        let now = old + Duration::from_secs(3600);
+        let mut messages = vec![
+            sample_kind(MessageKind::Error, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Warning, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Info, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Success, old, Some(DEFAULT_DURATION)),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        let mut timers = HashSet::from([1, 2, 3, 4]);
+
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 2, "Error/Warning 留着，Info/Success 裁掉");
+        assert_eq!(messages[0].kind, MessageKind::Error);
+        assert_eq!(messages[1].kind, MessageKind::Warning);
+        assert_eq!(timers, HashSet::from([1, 2]), "被裁消息的计时 id 同步清掉");
+    }
+
+    #[test]
+    fn a_message_without_a_deadline_never_expires_or_claims_a_timer() {
+        let now = Instant::now();
+        let message = sample(now, None);
+        let much_later = now + Duration::from_secs(3600);
+        assert!(!message.should_prune(much_later));
+        assert_eq!(
+            close_after_of(&message, much_later),
+            None,
+            "None = 不自动关闭"
+        );
+    }
+
+    #[test]
+    fn pushing_a_message_stamps_when_it_was_created() {
+        let now = Instant::now();
+        let mut messages = Vec::new();
+        let mut next_id = 0;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "hi".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+        assert_eq!(messages[0].created_at, now);
+    }
+
+    #[test]
+    fn replacing_the_same_key_starts_a_fresh_lifetime() {
+        let start = Instant::now();
+        let mut messages = Vec::new();
+        let mut next_id = 0;
+        // 用 Info：Error/Warning 本就不按产生时刻过期，测不出「重新计时」。
+        let first = upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "同一来源提示".into(),
+            Some(DEFAULT_DURATION),
+            start,
+            Some("same-source"),
+        );
+        // 隔了整个时长，旧消息本该已经过期。
+        let stale = start + DEFAULT_DURATION;
+        assert!(messages[0].should_prune(stale));
+
+        // 同一来源重试：换一条新消息，从新的产生时刻重新计时。
+        let retry = stale + Duration::from_secs(1);
+        let second = upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "同一来源提示，更新".into(),
+            Some(DEFAULT_DURATION),
+            retry,
+            Some("same-source"),
+        );
+        assert_ne!(first, second);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].created_at, retry);
+        assert_eq!(close_after_of(&messages[0], retry), Some(DEFAULT_DURATION));
+    }
+
+    #[test]
+    fn pruning_drops_expired_messages_and_their_timer_ids() {
+        let fresh = Instant::now();
+        let now = fresh + DEFAULT_DURATION + Duration::from_secs(1);
+        let mut messages = vec![
+            sample(fresh, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+        ];
+        messages[0].id = 10;
+        messages[1].id = 20;
+        let mut timers = HashSet::from([10, 20]);
+
+        prune_expired(&mut messages, &mut timers, now);
+        // 再裁一次结果不变：活的两轮之后还得在，计时 id 不被误清。
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 1, "过期的那条要被丢掉");
+        assert_eq!(messages[0].id, 20, "没过期的那条留着");
+        assert_eq!(timers, HashSet::from([20]), "被丢消息的计时 id 要同步清掉");
+    }
+
+    #[test]
+    fn a_full_queue_of_errors_falls_back_to_dropping_the_oldest() {
+        let now = Instant::now();
+        // 5 条 Error 挤 4 个位置：没有普通提示可牺牲，只能删最旧的，保留最新的 4 条。
+        let mut messages = Vec::new();
+        for index in 0..MAX_VISIBLE_MESSAGES {
+            let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
+            message.id = index as u64 + 1;
+            messages.push(message);
+        }
+        let mut next_id = MAX_VISIBLE_MESSAGES as u64;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert_eq!(messages.len(), MAX_VISIBLE_MESSAGES, "硬上限仍是 4 条");
+        assert_eq!(messages[0].id, 2, "最旧的那条被挤掉");
+        assert_eq!(messages[MAX_VISIBLE_MESSAGES - 1].id, 5, "最新那条留着");
+    }
+
+    #[test]
+    fn live_info_never_evicts_a_live_error() {
+        let now = Instant::now();
+        // 4 条都还活着，队列已满：再来一条 Info 时，不能把最旧的 Error 挤掉。
+        let mut messages = vec![
+            sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+            sample(now, Some(DEFAULT_DURATION)),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        let mut next_id = 4;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert_eq!(messages.len(), MAX_VISIBLE_MESSAGES);
+        assert_eq!(
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 3, 4, 5],
+            "该挤掉最旧的普通提示（id 2），Error 和新消息都留着"
+        );
+        assert!(messages.iter().any(|m| m.kind == MessageKind::Error));
+    }
+
+    #[test]
+    fn a_zero_duration_update_never_wipes_the_same_key_message() {
+        let now = Instant::now();
+        let mut messages = Vec::new();
+        let mut next_id = 0;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "保存失败".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            Some("save-failed"),
+        );
+
+        // 零时长的同 key 更新（用 Warning 覆盖 Error/Warning 这条分支）：
+        // 这条自己不会显示，也不能把手里那条错误抹掉。
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Warning,
+            "".into(),
+            Some(Duration::ZERO),
+            now,
+            Some("save-failed"),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind, MessageKind::Error, "原错误还在");
+        assert_eq!(messages[0].text, "保存失败");
+    }
+
+    #[test]
+    fn a_zero_duration_error_never_evicts_a_live_error() {
+        let now = Instant::now();
+        let mut messages = Vec::new();
+        for index in 0..MAX_VISIBLE_MESSAGES {
+            let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
+            message.id = index as u64 + 1;
+            messages.push(message);
+        }
+        let mut next_id = MAX_VISIBLE_MESSAGES as u64;
+        // 零时长的 Error 不等于"要显示 0 秒"；它压根不该换掉一条正在等补弹的错误。
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Error,
+            "".into(),
+            Some(Duration::ZERO),
+            now,
+            None,
+        );
+
+        assert_eq!(
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "四条 Error 原封不动"
+        );
+    }
+
+    #[test]
+    fn a_new_info_is_dropped_when_the_queue_is_full_of_errors() {
+        let now = Instant::now();
+        // 4 条 Error 占满队列，再来一条 Info：Info 3 秒就没，不值当换掉一条关键错误。
+        let mut messages = Vec::new();
+        for index in 0..MAX_VISIBLE_MESSAGES {
+            let mut message = sample_kind(MessageKind::Error, now, Some(DEFAULT_DURATION));
+            message.id = index as u64 + 1;
+            messages.push(message);
+        }
+        let mut next_id = MAX_VISIBLE_MESSAGES as u64;
+        let dropped = upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "新提示".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert_eq!(
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "四条 Error 都留着，Info 不占名额"
+        );
+        assert!(
+            !messages.iter().any(|m| m.id == dropped),
+            "返回的 id 指向一条没入队的消息"
+        );
+    }
+
+    #[test]
+    fn expired_info_never_evicts_a_waiting_error() {
+        let old = Instant::now();
+        let now = old + Duration::from_secs(3600);
+        // 关窗期间攒了 1 条 Error + 3 条早已过期的 Info，队列已满 4 条。
+        let mut messages = vec![
+            sample_kind(MessageKind::Error, old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        // 第 5 条又进来：先剪掉过期的 Info，Error 不该被挤出队列。
+        let mut next_id = 4;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert_eq!(
+            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 5],
+            "过期的 Info 全被剪掉，只剩 Error 和新消息"
+        );
+        assert_eq!(messages[0].kind, MessageKind::Error);
+    }
+
+    #[test]
+    fn pruning_keeps_messages_that_never_expire() {
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let mut messages = vec![sample(created, None)];
+        messages[0].id = 7;
+        let mut timers = HashSet::from([7]);
+
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 1, "不自动关闭的消息永不过期");
+        assert_eq!(timers, HashSet::from([7]));
+    }
+
+    #[test]
     fn same_message_key_replaces_the_existing_entry_and_restarts_timer() {
+        let now = Instant::now();
         let mut messages = Vec::new();
         let mut next_id = 0;
         let first = upsert_message(
@@ -272,6 +740,7 @@ mod tests {
             MessageKind::Error,
             "same failure".into(),
             Some(DEFAULT_DURATION),
+            now,
             Some("save-failed"),
         );
         let second = upsert_message(
@@ -280,6 +749,7 @@ mod tests {
             MessageKind::Warning,
             "same failure, newer".into(),
             Some(DEFAULT_DURATION),
+            now,
             Some("save-failed"),
         );
         assert_ne!(first, second);
@@ -293,6 +763,8 @@ mod tests {
     fn message_buffer_keeps_only_the_newest_entries() {
         let mut messages = Vec::new();
         let mut next_id = 0;
+        // 同一个时间戳：测试跑得慢也不会让先入队的消息因过期被剪掉。
+        let now = Instant::now();
         for index in 0..=MAX_VISIBLE_MESSAGES {
             upsert_message(
                 &mut messages,
@@ -300,6 +772,7 @@ mod tests {
                 MessageKind::Info,
                 format!("message {index}"),
                 Some(DEFAULT_DURATION),
+                now,
                 None,
             );
         }
