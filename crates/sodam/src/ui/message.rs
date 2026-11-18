@@ -37,19 +37,30 @@ pub struct Message {
 }
 
 impl Message {
-    /// 从产生时刻算起，还剩多少显示时间；`None` = 已过期或本就不自动关闭。
+    /// 还剩多少显示时间；`None` = 已过期或本就不自动关闭。
+    ///
+    /// Info/Success 按产生时刻扣减：首帧来得晚就只显示剩余时间。
+    /// Error/Warning 不按产生时刻扣：失败多半发生在后台、正好赶窗口关着，
+    /// 按产生时刻算会让它们在重开时被裁掉、用户永远看不到。这类消息的首帧
+    /// 拿到完整时长，等于「重开窗口补弹一次」（#212）。
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
         let duration = self.duration?;
-        let elapsed = now.saturating_duration_since(self.created_at);
-        let left = duration.saturating_sub(elapsed);
+        if matches!(self.kind, MessageKind::Error | MessageKind::Warning) {
+            return Some(duration);
+        }
+        let left = duration.saturating_sub(now.saturating_duration_since(self.created_at));
         (left > Duration::ZERO).then_some(left)
     }
 
-    /// 这条消息是否已经过期。不自动关闭的消息永不过期。
+    /// 这条消息是否该在首帧被裁掉。不自动关闭的消息、以及 Error/Warning 都不裁
+    ///（理由见 [`Message::remaining`]）。
     pub fn expired(&self, now: Instant) -> bool {
         let Some(duration) = self.duration else {
             return false;
         };
+        if matches!(self.kind, MessageKind::Error | MessageKind::Warning) {
+            return false;
+        }
         now.saturating_duration_since(self.created_at) >= duration
     }
 
@@ -133,7 +144,8 @@ impl Root {
 
     /// 启动该条消息的计时器；消息被替换/关闭后计时器会安全退出。
     ///
-    /// 计时从**产生时刻**算：首帧来得晚就只等剩下的时间，不会重新计满一整段（#212）。
+    /// 等的时间就是该条 [`Message::remaining`]：Info/Success 从产生时刻扣，首帧
+    /// 来得晚就只等剩下的；Error/Warning 从首帧起算完整时长，保证补弹一次看得见（#212）。
     /// `now` 由渲染方传入，与"筛掉过期消息"用同一个时刻，避免同一帧两次取时间
     /// 让刚过期的消息多活一帧。
     pub(crate) fn schedule_message_close(&mut self, id: u64, now: Instant, cx: &mut Context<Self>) {
@@ -191,8 +203,9 @@ fn upsert_message(
     id
 }
 
-/// 按产生时刻裁掉过期消息，并同步清掉它们对应的计时器 id。
+/// 裁掉过期消息，并同步清掉它们对应的计时器 id。
 ///
+/// 只裁 Info/Success（按产生时刻过期）；Error/Warning 留着重开补弹一次。
 /// 唯一的清理点：入队时（`push_message_with_key`）清的是被替换/挤出队列的，
 /// 这里清的是自己过期的。两者都不在渲染中途删消息，所以排完计时不用再清一遍。
 fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
@@ -202,8 +215,8 @@ fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: In
 
 /// 最高层浮层：多条消息按插入顺序堆叠，各自独立计时。
 pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyElement> {
-    // 关窗期间（没有渲染）攒下的消息，首帧按产生时刻筛一遍：过期的直接丢掉，
-    // 不补弹、也不重置计时（#212）。
+    // 关窗期间攒下的消息，首帧筛一遍：Info/Success 按产生时刻裁掉，
+    // Error/Warning 留着重开补弹一次（#212）。计时器按 id 去重，每条只排一次。
     let now = Instant::now();
     prune_expired(&mut root.messages, &mut root.message_timers, now);
 
@@ -272,15 +285,19 @@ pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyEleme
 mod tests {
     use super::*;
 
-    fn sample(created_at: Instant, duration: Option<Duration>) -> Message {
+    fn sample_kind(kind: MessageKind, created_at: Instant, duration: Option<Duration>) -> Message {
         Message {
             id: 1,
-            kind: MessageKind::Info,
+            kind,
             text: "test".into(),
             duration,
             created_at,
             key: None,
         }
+    }
+
+    fn sample(created_at: Instant, duration: Option<Duration>) -> Message {
+        sample_kind(MessageKind::Info, created_at, duration)
     }
 
     #[test]
@@ -333,6 +350,58 @@ mod tests {
     }
 
     #[test]
+    fn an_old_error_still_shows_a_whole_window_on_reopen() {
+        let now = Instant::now();
+        // 签名超时发生在关窗期间，隔了 1 小时才重开首帧。
+        let error = sample_kind(
+            MessageKind::Error,
+            now - Duration::from_secs(3600),
+            Some(DEFAULT_DURATION),
+        );
+        assert!(!error.expired(now), "Error 不按产生时刻过期");
+        assert_eq!(
+            error.remaining(now),
+            Some(DEFAULT_DURATION),
+            "补弹一次要给完整时长"
+        );
+    }
+
+    #[test]
+    fn an_old_warning_is_kept_just_like_an_error() {
+        let now = Instant::now();
+        let warning = sample_kind(
+            MessageKind::Warning,
+            now - Duration::from_secs(3600),
+            Some(DEFAULT_DURATION),
+        );
+        assert!(!warning.expired(now));
+        assert_eq!(warning.remaining(now), Some(DEFAULT_DURATION));
+    }
+
+    #[test]
+    fn pruning_keeps_old_errors_but_drops_old_info() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(3600);
+        let mut messages = vec![
+            sample_kind(MessageKind::Error, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Warning, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Info, old, Some(DEFAULT_DURATION)),
+            sample_kind(MessageKind::Success, old, Some(DEFAULT_DURATION)),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        let mut timers = HashSet::from([1, 2, 3, 4]);
+
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert_eq!(messages.len(), 2, "Error/Warning 留着，Info/Success 裁掉");
+        assert_eq!(messages[0].kind, MessageKind::Error);
+        assert_eq!(messages[1].kind, MessageKind::Warning);
+        assert_eq!(timers, HashSet::from([1, 2]), "被裁消息的计时 id 同步清掉");
+    }
+
+    #[test]
     fn a_message_without_a_deadline_never_expires_or_claims_a_timer() {
         let now = Instant::now();
         let message = sample(now, None);
@@ -363,14 +432,15 @@ mod tests {
         let start = Instant::now();
         let mut messages = Vec::new();
         let mut next_id = 0;
+        // 用 Info：Error/Warning 本就不按产生时刻过期，测不出「重新计时」。
         let first = upsert_message(
             &mut messages,
             &mut next_id,
-            MessageKind::Warning,
-            "网络错误".into(),
+            MessageKind::Info,
+            "同一来源提示".into(),
             Some(DEFAULT_DURATION),
             start,
-            Some("recommend-more"),
+            Some("same-source"),
         );
         // 隔了整个时长，旧消息本该已经过期。
         let stale = start + DEFAULT_DURATION;
@@ -381,11 +451,11 @@ mod tests {
         let second = upsert_message(
             &mut messages,
             &mut next_id,
-            MessageKind::Warning,
-            "网络错误".into(),
+            MessageKind::Info,
+            "同一来源提示，更新".into(),
             Some(DEFAULT_DURATION),
             retry,
-            Some("recommend-more"),
+            Some("same-source"),
         );
         assert_ne!(first, second);
         assert_eq!(messages.len(), 1);
