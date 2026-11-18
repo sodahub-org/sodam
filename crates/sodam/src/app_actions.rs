@@ -1773,20 +1773,71 @@ impl Root {
         std::time::Duration::from_secs_f32(ms / 1000.0)
     }
 
-    /// 计算「让第 `index` 句停在视口顶部 + 80px」所需的滚动偏移。
+    /// 计算「让第 `index` 句停在歌词视口中心上方一行」所需的滚动偏移。
+    ///
+    /// 第一句特殊：不居中，改为对齐封面顶部（列表顶端），避免开头就把列表
+    /// 滚进上方留白。
+    ///
+    /// 之前是「顶部 + 80px」，高亮句会整体偏上；列表首尾各留了半个视口的
+    /// padding，所以第一句/最后一句也能滚到正中间。16px 是实测校准：
+    /// 文字行的视觉重心略低于几何中心（汉字下沉、行高上下留白不对称）。
     fn lyrics_scroll_target(&self, index: usize) -> Option<f32> {
-        const LYRIC_TOP_INSET: f32 = 80.0;
-        let bounds = self.lyrics_scroll.bounds_for_item(index)?;
-        let viewport_top = self.lyrics_scroll.bounds().top();
-        // offset 为负表示内容上移，所以取「该句顶部 - 视口顶 - 80」的相反数。
-        let distance = bounds.top() - viewport_top - gpui::px(LYRIC_TOP_INSET);
-        Some(-f32::from(distance))
+        // 对齐目标是**封面中心**：歌词视口与封面列在同一水平带内，
+        // 但歌词视口本身不居中（受窗口布局影响），直接用视口中心会偏。
+        // 封面在窗口里的垂直中心 = 播放区（窗口高 - 底部播放条）的中心。
+        let viewport = self.lyrics_scroll.bounds();
+        // 直接用滚动视口自身的中心（窗口坐标）：布局就是「左封面 + 右歌词」
+        // 在同一水平带内居中排列，视口中心即封面中心；之前的窗口高换算把
+        // 外层 padding 也算进去，反而造成固定偏移。
+        // 再向上偏一行（64px = 单句 32 + 间距 32）：官方播放页高亮句停在中线上方
+        // 一行的位置，下方能看到下一句的走势；16px 是文字视觉重心的校准。
+        const LYRIC_CENTER_OFFSET: f32 =
+            crate::views::lyrics::LYRIC_ROW_GAP + crate::views::lyrics::LYRIC_LINE_HEIGHT + 16.0;
+        let viewport_center = viewport.center().y - gpui::px(LYRIC_CENTER_OFFSET);
+        let line_center = self.lyrics_scroll.bounds_for_item(index)?.center().y;
+        // offset 为负表示内容上移：把该句中心推到视口中心上方一行。
+        let distance = line_center - viewport_center;
+        let target = -f32::from(distance);
+        // 开场规则（issue #180 讨论）：歌词列表**先不动**——高亮句随播放
+        // 一句句往下走；直到高亮句在**屏幕上**走到中线附近，才开始常规的
+        // 中线跟随滚动。判定用的是「该句在**顶端偏移**下的屏幕位置」
+        // （内容坐标 + intro_offset），不是当前滚动偏移下的位置：居中之后
+        // 高亮句恰好压在跟随线上，若按当前偏移判定会翻转回顶端目标，
+        // 两个目标间来回振荡（实测踩过）。顶端偏移是常量，判定结果与
+        // 当前滚动无关，每句的结论恒定。
+        // 顶端偏移：把第一句顶部推到视口顶部（滚掉列表的半屏 padding）。
+        let first_top = self.lyrics_scroll.bounds_for_item(0)?.top();
+        let intro_offset = f32::from(viewport.top() - first_top);
+        // 「还在开场」的判定必须只依赖**内容几何**（每句的固定位置），不能依赖
+        // 当前偏移：居中之后高亮句的屏幕位置恰好压在跟随线上，若用屏幕位置
+        // 判定会在「顶端 ↔ 居中」两个目标间来回翻转（实测上下振荡）。
+        // 用「该句在顶端偏移下的屏幕位置是否已越过跟随线」则与偏移无关，
+        // 每句的判定结果恒定，越过线后自然切到居中跟随。
+        let intro_screen_center = line_center + gpui::px(intro_offset);
+        // 目标必须夹进**实际可滚动的范围**：短歌词（尤其只有几句）的尾部
+        // 达不到理想目标时，偏移会被 gpui 钳在最大滚动量上，补间永远差一截，
+        // 每帧都会重新起补间（表现为结尾句反复小幅抖动）。钳位后补间能落到
+        // 终点，动画自然收敛。顶端目标同样钳位，保证开场判定与实际一致。
+        // 可滚动范围直接用 gpui 量好的 `max_offset()`：它包含列表上下 padding。
+        // 自己拿首尾句拼范围会漏掉 padding，把所有目标都钳成 0，歌词完全不滚
+        // （实测踩过：0be11d2 的回归）。
+        let max_scroll = f32::from(self.lyrics_scroll.max_offset().y).max(0.0);
+        let clamp_to_range = |value: f32| value.clamp(-max_scroll, 0.0);
+        // 第一句始终用顶端目标：折行成长句时首句中心在顶端偏移下会低于跟随线，
+        // 走几何判定会把它滚出视口顶端，截掉句首。
+        if index == 0 {
+            return Some(clamp_to_range(intro_offset));
+        }
+        if intro_screen_center <= viewport_center {
+            return Some(clamp_to_range(intro_offset));
+        }
+        Some(clamp_to_range(target))
     }
 
     /// 把歌词滚到指定句，**走过渡动画**。
     ///
-    /// 定位沿用之前的行为：当前句顶部落在视口顶部往下 80px 处（`offsetTop - 80`），
-    /// 不做垂直居中。列表顶部留了半屏空白，所以首句也能停在这个位置。
+    /// 定位：当前句的**垂直中心**对齐歌词视口中心（issue #180）。列表顶部
+    /// 留了半屏空白，所以首句也能停在视口中间；不再使用顶部固定 80px 的偏上位置。
     ///
     /// 布局还没就绪时（切歌、拖动进度后的第一帧）记下目标句，由下一帧的
     /// `flush_pending_lyrics_scroll` 补上，避免歌词停在上一首的位置。
