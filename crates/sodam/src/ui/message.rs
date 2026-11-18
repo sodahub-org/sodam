@@ -37,28 +37,32 @@ pub struct Message {
 }
 
 impl Message {
+    /// 这类消息关窗期间不能被吞，重开时补弹一次完整时长（#212）。
+    /// 失败多半发生在后台、正好赶窗口关着，按产生时刻算会在重开时被裁掉。
+    fn replays_on_reopen(&self) -> bool {
+        matches!(self.kind, MessageKind::Error | MessageKind::Warning)
+    }
+
     /// 还剩多少显示时间；`None` = 已过期或本就不自动关闭。
     ///
     /// Info/Success 按产生时刻扣减：首帧来得晚就只显示剩余时间。
-    /// Error/Warning 不按产生时刻扣：失败多半发生在后台、正好赶窗口关着，
-    /// 按产生时刻算会让它们在重开时被裁掉、用户永远看不到。这类消息的首帧
-    /// 拿到完整时长，等于「重开窗口补弹一次」（#212）。
+    /// [`Message::replays_on_reopen`] 的类型不看产生时刻，首帧拿到完整时长。
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
         let duration = self.duration?;
-        if matches!(self.kind, MessageKind::Error | MessageKind::Warning) {
+        if self.replays_on_reopen() {
             return Some(duration);
         }
         let left = duration.saturating_sub(now.saturating_duration_since(self.created_at));
         (left > Duration::ZERO).then_some(left)
     }
 
-    /// 这条消息是否该在首帧被裁掉。不自动关闭的消息、以及 Error/Warning 都不裁
-    ///（理由见 [`Message::remaining`]）。
+    /// 这条消息是否该在首帧被裁掉。不自动关闭的消息、以及会补弹的类型都不裁
+    ///（理由见 [`Message::replays_on_reopen`]）。
     pub fn expired(&self, now: Instant) -> bool {
         let Some(duration) = self.duration else {
             return false;
         };
-        if matches!(self.kind, MessageKind::Error | MessageKind::Warning) {
+        if self.replays_on_reopen() {
             return false;
         }
         now.saturating_duration_since(self.created_at) >= duration
@@ -206,8 +210,9 @@ fn upsert_message(
 /// 裁掉过期消息，并同步清掉它们对应的计时器 id。
 ///
 /// 只裁 Info/Success（按产生时刻过期）；Error/Warning 留着重开补弹一次。
-/// 唯一的清理点：入队时（`push_message_with_key`）清的是被替换/挤出队列的，
-/// 这里清的是自己过期的。两者都不在渲染中途删消息，所以排完计时不用再清一遍。
+/// 这是渲染路径上的清理点，配合另外三处：入队时清被替换/挤出队列的
+///（`push_message_with_key`）、计时到期和点击关闭时各清自己的 id。
+/// 这几处都不在渲染中途删消息，所以排完计时不用再清一遍。
 fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
     messages.retain(|message| !message.expired(now));
     timers.retain(|id| messages.iter().any(|message| message.id == *id));
@@ -351,13 +356,11 @@ mod tests {
 
     #[test]
     fn an_old_error_still_shows_a_whole_window_on_reopen() {
-        let now = Instant::now();
         // 签名超时发生在关窗期间，隔了 1 小时才重开首帧。
-        let error = sample_kind(
-            MessageKind::Error,
-            now - Duration::from_secs(3600),
-            Some(DEFAULT_DURATION),
-        );
+        // 用加法从过去推到现在，不用 now - 1h：CI 新机器 uptime 不足 1h 时后者会 panic。
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let error = sample_kind(MessageKind::Error, created, Some(DEFAULT_DURATION));
         assert!(!error.expired(now), "Error 不按产生时刻过期");
         assert_eq!(
             error.remaining(now),
@@ -368,20 +371,17 @@ mod tests {
 
     #[test]
     fn an_old_warning_is_kept_just_like_an_error() {
-        let now = Instant::now();
-        let warning = sample_kind(
-            MessageKind::Warning,
-            now - Duration::from_secs(3600),
-            Some(DEFAULT_DURATION),
-        );
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let warning = sample_kind(MessageKind::Warning, created, Some(DEFAULT_DURATION));
         assert!(!warning.expired(now));
         assert_eq!(warning.remaining(now), Some(DEFAULT_DURATION));
     }
 
     #[test]
     fn pruning_keeps_old_errors_but_drops_old_info() {
-        let now = Instant::now();
-        let old = now - Duration::from_secs(3600);
+        let old = Instant::now();
+        let now = old + Duration::from_secs(3600);
         let mut messages = vec![
             sample_kind(MessageKind::Error, old, Some(DEFAULT_DURATION)),
             sample_kind(MessageKind::Warning, old, Some(DEFAULT_DURATION)),
@@ -465,12 +465,10 @@ mod tests {
 
     #[test]
     fn pruning_drops_expired_messages_and_their_timer_ids() {
-        let now = Instant::now();
+        let fresh = Instant::now();
+        let now = fresh + DEFAULT_DURATION + Duration::from_secs(1);
         let mut messages = vec![
-            sample(
-                now - DEFAULT_DURATION - Duration::from_secs(1),
-                Some(DEFAULT_DURATION),
-            ),
+            sample(fresh, Some(DEFAULT_DURATION)),
             sample(now, Some(DEFAULT_DURATION)),
         ];
         messages[0].id = 10;
@@ -486,8 +484,9 @@ mod tests {
 
     #[test]
     fn pruning_keeps_messages_that_never_expire() {
-        let now = Instant::now();
-        let mut messages = vec![sample(now - Duration::from_secs(3600), None)];
+        let created = Instant::now();
+        let now = created + Duration::from_secs(3600);
+        let mut messages = vec![sample(created, None)];
         messages[0].id = 7;
         let mut timers = HashSet::from([7]);
 
