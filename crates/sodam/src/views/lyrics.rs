@@ -5,9 +5,9 @@ use super::*;
 
 /// 歌词排版沿用 SodaM 原本的样式：字号 `Text::Large`、行高 32、每句间距 32。
 /// 不采用官方客户端的 24px/34 字号行高——那套在 SodaM 里显得过大。
-const LYRIC_LINE_HEIGHT: f32 = 32.0;
+pub(crate) const LYRIC_LINE_HEIGHT: f32 = 32.0;
 /// 相邻两句之间的间距（单句文本 32 + 间距 32 = 原来每行 64 的效果）。
-const LYRIC_ROW_GAP: f32 = 32.0;
+pub(crate) const LYRIC_ROW_GAP: f32 = 32.0;
 
 /// 一行歌词的逐字高亮文字。
 ///
