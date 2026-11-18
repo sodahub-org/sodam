@@ -40,32 +40,27 @@ impl Message {
     /// 这类消息关窗期间不能被吞，重开时补弹一次完整时长（#212）。
     /// 失败多半发生在后台、正好赶窗口关着，按产生时刻算会在重开时被裁掉。
     fn replays_on_reopen(&self) -> bool {
-        matches!(self.kind, MessageKind::Error | MessageKind::Warning)
+        replays_on_reopen(self.kind)
     }
 
-    /// 还剩多少显示时间；`None` = 已过期或本就不自动关闭。
+    /// 从 `now` 起还要等多久才自动关闭；`None` = 本就不自动关闭。
     ///
-    /// Info/Success 按产生时刻扣减：首帧来得晚就只显示剩余时间。
-    /// [`Message::replays_on_reopen`] 的类型不看产生时刻，首帧拿到完整时长。
-    pub fn remaining(&self, now: Instant) -> Option<Duration> {
-        let duration = self.duration?;
-        if self.replays_on_reopen() {
-            return Some(duration);
-        }
-        let left = duration.saturating_sub(now.saturating_duration_since(self.created_at));
-        (left > Duration::ZERO).then_some(left)
+    /// Info/Success 按产生时刻扣减：首帧来得晚、或任务排队起跑晚了，都只等剩下的。
+    /// [`Message::replays_on_reopen`] 的类型不看产生时刻，拿完整时长。
+    pub fn close_after(&self, now: Instant) -> Option<Duration> {
+        self.duration
+            .map(|duration| close_after(self.kind, duration, self.created_at, now))
     }
 
-    /// 这条消息是否该在首帧被裁掉。不自动关闭的消息、以及会补弹的类型都不裁
+    /// 这条消息该不该在首帧被裁掉（即按产生时刻已经过期）。
+    ///
+    /// 只有 Info/Success 会过期；不自动关闭的消息和会补弹的类型都不裁
     ///（理由见 [`Message::replays_on_reopen`]）。
-    pub fn expired(&self, now: Instant) -> bool {
+    pub fn should_drop_on_first_frame(&self, now: Instant) -> bool {
         let Some(duration) = self.duration else {
             return false;
         };
-        if self.replays_on_reopen() {
-            return false;
-        }
-        now.saturating_duration_since(self.created_at) >= duration
+        !self.replays_on_reopen() && now.saturating_duration_since(self.created_at) >= duration
     }
 
     fn accent(&self) -> gpui::Rgba {
@@ -148,20 +143,23 @@ impl Root {
 
     /// 启动该条消息的计时器；消息被替换/关闭后计时器会安全退出。
     ///
-    /// 等的时间就是该条 [`Message::remaining`]：Info/Success 从产生时刻扣，首帧
-    /// 来得晚就只等剩下的；Error/Warning 从首帧起算完整时长，保证补弹一次看得见（#212）。
-    /// `now` 由渲染方传入，与"筛掉过期消息"用同一个时刻，避免同一帧两次取时间
-    /// 让刚过期的消息多活一帧。
-    pub(crate) fn schedule_message_close(&mut self, id: u64, now: Instant, cx: &mut Context<Self>) {
+    /// 等多久不在这里定死：任务真正起跑时按当时的时刻再算一次
+    ///（[`close_after`]），把"从算出时长到任务被调度"的排队时间也扣掉，
+    /// 免得 Info/Success 晚关（#212）。Error/Warning 始终拿完整时长，补弹一次看得见。
+    pub(crate) fn schedule_message_close(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(message) = self.messages.iter().find(|message| message.id == id) else {
             return;
         };
-        let Some(remaining) = message.remaining(now) else {
-            // 已过期或本就不自动关闭的消息都不排计时。
+        let Some(duration) = message.duration else {
+            // 本就不自动关闭的消息不排计时。
             return;
         };
+        let (kind, created_at) = (message.kind, message.created_at);
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(remaining).await;
+            let wait = close_after(kind, duration, created_at, Instant::now());
+            if !wait.is_zero() {
+                cx.background_executor().timer(wait).await;
+            }
             let _ = this.update(cx, |root, cx| {
                 if root.close_message(id) {
                     root.message_timers.remove(&id);
@@ -201,20 +199,45 @@ fn upsert_message(
         created_at,
         key,
     });
+    // 先剪掉已经过期的，免得它们白占名额、把真正要补弹的 Error/Warning 挤出去。
+    // 用入队时刻当基准，和 `created_at` 是同一个时刻。
+    messages.retain(|message| !message.should_drop_on_first_frame(created_at));
     if messages.len() > MAX_VISIBLE_MESSAGES {
+        // 全都是活的，才按最旧的先走。
         messages.drain(0..messages.len() - MAX_VISIBLE_MESSAGES);
     }
     id
 }
 
+/// 这类消息关窗期间不能被吞，重开时补弹一次完整时长（#212）。
+fn replays_on_reopen(kind: MessageKind) -> bool {
+    matches!(kind, MessageKind::Error | MessageKind::Warning)
+}
+
+/// 从 `now` 起还要等多久才关闭。Info/Success 扣掉已过去的时长，其余类型给满时长。
+///
+/// 抽成自由函数，是因为关闭任务真正起跑时还要按当时的时刻再算一次：
+/// 从算出时长到任务被调度之间也有一段排队时间，不扣掉就会晚关（#212）。
+fn close_after(
+    kind: MessageKind,
+    duration: Duration,
+    created_at: Instant,
+    now: Instant,
+) -> Duration {
+    if replays_on_reopen(kind) {
+        return duration;
+    }
+    duration.saturating_sub(now.saturating_duration_since(created_at))
+}
+
 /// 裁掉过期消息，并同步清掉它们对应的计时器 id。
 ///
 /// 只裁 Info/Success（按产生时刻过期）；Error/Warning 留着重开补弹一次。
-/// 这是渲染路径上的清理点，配合另外三处：入队时清被替换/挤出队列的
-///（`push_message_with_key`）、计时到期和点击关闭时各清自己的 id。
-/// 这几处都不在渲染中途删消息，所以排完计时不用再清一遍。
+/// 渲染首帧和入队时（`upsert_message`）各调一次：入队那次是为了别让过期项白占
+/// 队列名额、把等补弹的 Error/Warning 挤出去。两边都不同步删计时任务，计时器
+/// 靠 `message_timers` 按 id 去重，到期和点击关闭时各自摘掉。
 fn prune_expired(messages: &mut Vec<Message>, timers: &mut HashSet<u64>, now: Instant) {
-    messages.retain(|message| !message.expired(now));
+    messages.retain(|message| !message.should_drop_on_first_frame(now));
     timers.retain(|id| messages.iter().any(|message| message.id == *id));
 }
 
@@ -235,7 +258,7 @@ pub(crate) fn render(root: &mut Root, cx: &mut Context<Root>) -> Option<AnyEleme
         .collect();
     for id in ids {
         if root.message_timers.insert(id) {
-            root.schedule_message_close(id, now, cx);
+            root.schedule_message_close(id, cx);
         }
     }
 
@@ -333,7 +356,7 @@ mod tests {
     fn a_fresh_message_has_its_whole_duration_left() {
         let now = Instant::now();
         let message = sample(now, Some(DEFAULT_DURATION));
-        assert_eq!(message.remaining(now), Some(DEFAULT_DURATION));
+        assert_eq!(message.close_after(now), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -342,7 +365,7 @@ mod tests {
         let message = sample(now, Some(DEFAULT_DURATION));
         // 首次画到它时已经过去 2 秒：只能再留 1 秒，不能重新计满 3 秒。
         let late = now + Duration::from_secs(2);
-        assert_eq!(message.remaining(late), Some(Duration::from_secs(1)));
+        assert_eq!(message.close_after(late), Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -350,8 +373,12 @@ mod tests {
         let now = Instant::now();
         let message = sample(now, Some(DEFAULT_DURATION));
         let later = now + DEFAULT_DURATION;
-        assert!(message.expired(later));
-        assert_eq!(message.remaining(later), None);
+        assert!(message.should_drop_on_first_frame(later));
+        assert_eq!(
+            message.close_after(later),
+            Some(Duration::ZERO),
+            "已过期就立刻关，不再等"
+        );
     }
 
     #[test]
@@ -361,9 +388,12 @@ mod tests {
         let created = Instant::now();
         let now = created + Duration::from_secs(3600);
         let error = sample_kind(MessageKind::Error, created, Some(DEFAULT_DURATION));
-        assert!(!error.expired(now), "Error 不按产生时刻过期");
+        assert!(
+            !error.should_drop_on_first_frame(now),
+            "Error 不按产生时刻过期"
+        );
         assert_eq!(
-            error.remaining(now),
+            error.close_after(now),
             Some(DEFAULT_DURATION),
             "补弹一次要给完整时长"
         );
@@ -374,8 +404,8 @@ mod tests {
         let created = Instant::now();
         let now = created + Duration::from_secs(3600);
         let warning = sample_kind(MessageKind::Warning, created, Some(DEFAULT_DURATION));
-        assert!(!warning.expired(now));
-        assert_eq!(warning.remaining(now), Some(DEFAULT_DURATION));
+        assert!(!warning.should_drop_on_first_frame(now));
+        assert_eq!(warning.close_after(now), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -406,8 +436,8 @@ mod tests {
         let now = Instant::now();
         let message = sample(now, None);
         let much_later = now + Duration::from_secs(3600);
-        assert!(!message.expired(much_later));
-        assert_eq!(message.remaining(much_later), None);
+        assert!(!message.should_drop_on_first_frame(much_later));
+        assert_eq!(message.close_after(much_later), None, "None = 不自动关闭");
     }
 
     #[test]
@@ -444,7 +474,7 @@ mod tests {
         );
         // 隔了整个时长，旧消息本该已经过期。
         let stale = start + DEFAULT_DURATION;
-        assert!(messages[0].expired(stale));
+        assert!(messages[0].should_drop_on_first_frame(stale));
 
         // 同一来源重试：换一条新消息，从新的产生时刻重新计时。
         let retry = stale + Duration::from_secs(1);
@@ -460,7 +490,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].created_at, retry);
-        assert_eq!(messages[0].remaining(retry), Some(DEFAULT_DURATION));
+        assert_eq!(messages[0].close_after(retry), Some(DEFAULT_DURATION));
     }
 
     #[test]
@@ -480,6 +510,53 @@ mod tests {
         assert_eq!(messages.len(), 1, "过期的那条要被丢掉");
         assert_eq!(messages[0].id, 20, "没过期的那条留着");
         assert_eq!(timers, HashSet::from([20]), "被丢消息的计时 id 要同步清掉");
+    }
+
+    #[test]
+    fn pruning_twice_leaves_the_same_result() {
+        let old = Instant::now();
+        let now = old + Duration::from_secs(3600);
+        let mut messages = vec![sample(old, Some(DEFAULT_DURATION))];
+        messages[0].id = 1;
+        let mut timers = HashSet::from([1]);
+
+        prune_expired(&mut messages, &mut timers, now);
+        prune_expired(&mut messages, &mut timers, now);
+
+        assert!(messages.is_empty(), "第二次裁不会有新东西可裁");
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn expired_info_never_evicts_a_waiting_error() {
+        let old = Instant::now();
+        let now = old + Duration::from_secs(3600);
+        // 关窗期间攒了 1 条 Error + 3 条早已过期的 Info，队列已满 4 条。
+        let mut messages = vec![
+            sample_kind(MessageKind::Error, old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+            sample(old, Some(DEFAULT_DURATION)),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index as u64 + 1;
+        }
+        // 第 5 条又进来：先剪掉过期的 Info，Error 不该被挤出队列。
+        let mut next_id = 4;
+        upsert_message(
+            &mut messages,
+            &mut next_id,
+            MessageKind::Info,
+            "第五条".into(),
+            Some(DEFAULT_DURATION),
+            now,
+            None,
+        );
+
+        assert!(
+            messages.iter().any(|m| m.kind == MessageKind::Error),
+            "过期的 Info 不能把等补弹的 Error 挤掉"
+        );
     }
 
     #[test]
