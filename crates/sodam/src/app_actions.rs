@@ -1800,13 +1800,11 @@ impl Root {
         let target = -f32::from(distance);
         // 开场规则（issue #180 讨论）：歌词列表**先不动**——高亮句随播放
         // 一句句往下走；直到高亮句在**屏幕上**走到中线附近，才开始常规的
-        // 中线跟随滚动。判定必须用「该句此刻在屏幕上的位置」（内容坐标 +
-        // 当前偏移），不能拿内容坐标直接跟窗口坐标比 —— 两个坐标系差一个
-        // 滚动偏移，混用会让第一句永远判定为"已过线"直接跳到中线。
-        //
-        // 屏幕位置换算：screen_y = content_y + offset（由上方平衡方程推出，
-        // 旧「顶部 + 80」公式在同一定义下自洽）。此刻它与中线只差几像素，
-        // 补间几乎无位移，自然衔接；之后每句都是常规的一行滚动。
+        // 中线跟随滚动。判定用的是「该句在**顶端偏移**下的屏幕位置」
+        // （内容坐标 + intro_offset），不是当前滚动偏移下的位置：居中之后
+        // 高亮句恰好压在跟随线上，若按当前偏移判定会翻转回顶端目标，
+        // 两个目标间来回振荡（实测踩过）。顶端偏移是常量，判定结果与
+        // 当前滚动无关，每句的结论恒定。
         // 顶端偏移：把第一句顶部推到视口顶部（滚掉列表的半屏 padding）。
         let first_top = self.lyrics_scroll.bounds_for_item(0)?.top();
         let intro_offset = f32::from(viewport.top() - first_top);
@@ -1816,10 +1814,22 @@ impl Root {
         // 用「该句在顶端偏移下的屏幕位置是否已越过跟随线」则与偏移无关，
         // 每句的判定结果恒定，越过线后自然切到居中跟随。
         let intro_screen_center = line_center + gpui::px(intro_offset);
+        // 目标必须夹进**实际可滚动的范围**：短歌词（尤其只有几句）的尾部
+        // 达不到理想目标时，偏移会被 gpui 钳在最大滚动量上，补间永远差一截，
+        // 每帧都会重新起补间（表现为结尾句反复小幅抖动）。钳位后补间能落到
+        // 终点，动画自然收敛。顶端目标同样钳位，保证开场判定与实际一致。
+        let last_bottom = self
+            .lyrics_scroll
+            .bounds_for_item(self.lyrics.len().saturating_sub(1))
+            .map(|bounds| f32::from(bounds.bottom()))
+            .unwrap_or(f32::from(first_top));
+        let max_scroll =
+            ((last_bottom - f32::from(first_top)) - f32::from(viewport.size.height)).max(0.0);
+        let clamp_to_range = |value: f32| value.clamp(-max_scroll, 0.0);
         if intro_screen_center <= viewport_center {
-            return Some(intro_offset);
+            return Some(clamp_to_range(intro_offset));
         }
-        Some(target)
+        Some(clamp_to_range(target))
     }
 
     /// 把歌词滚到指定句，**走过渡动画**。

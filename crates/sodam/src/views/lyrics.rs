@@ -431,6 +431,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
     let lyrics_viewport_height =
         (f32::from(window.viewport_size().height) - theme::PLAYER_H).max(360.0);
     let lyric_padding = lyrics_viewport_height / 2.0;
+    // 底部 padding 额外加上「跟随线偏移」：最后一句也要能滚到跟随线
+    // （视口中心上方一行），否则短歌词的结尾停不到目标位置。
+    let lyric_bottom_padding = lyric_padding + LYRIC_ROW_GAP + LYRIC_LINE_HEIGHT + 16.0;
     let list = if root.lyrics.is_empty() {
         None
     } else {
@@ -445,7 +448,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
                 .flex_1()
                 .min_h(px(0.0))
                 .pt(px(lyric_padding))
-                .pb(px(lyric_padding))
+                .pb(px(lyric_bottom_padding))
                 .overflow_y_scroll()
                 .track_scroll(&root.lyrics_scroll)
                 // 用户滚动时暂停自动跟随 5 秒（官方行为），否则往回翻会被拽回当前句。
