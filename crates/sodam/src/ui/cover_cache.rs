@@ -4,7 +4,7 @@
 //! 几十张就吃掉几百 MB 显存/堆。sonora 的做法是让缓存 key 带上**目标边长 `edge`**，
 //! 解码后先 `resize_exact` 到实际显示尺寸再交给 gpui，于是 48px 的缩略图只占 64×64。
 //!
-//! 预算也小得多：64MiB 起步，并随「一个满屏像素」增长；再加 512 条的条数上限。
+//! 预算有上界：64MiB 起步，并随「一个满屏像素」增长；再加 512 条的条数上限。
 //! （sonora 实测 footprint 67MB / IOAccelerator 8.4MB。）
 
 use std::collections::HashMap;
@@ -213,7 +213,6 @@ impl CoverImageCache {
     fn evict(&mut self, window: &mut Window, cx: &mut App) {
         let budget = self.budget();
         if self.bytes <= budget && self.items.len() <= CACHE_ITEMS {
-            self.log_stats(budget);
             return;
         }
 
@@ -241,27 +240,21 @@ impl CoverImageCache {
             }
         }
 
-        self.log_stats(budget);
-    }
-
-    /// 调试日志：随时能读出当前预算和实际占用（未开 Debug 时直接跳过）。
-    fn log_stats(&self, budget: usize) {
-        if !log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
-            return;
+        if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+            let held = self.items.len().to_string();
+            let kib = (self.bytes / 1024).to_string();
+            let budget_kib = (budget / 1024).to_string();
+            log_event(
+                LogLevel::Debug,
+                LogTopic::App,
+                "cover_cache_stats",
+                &[
+                    ("held", held.as_str()),
+                    ("kib", kib.as_str()),
+                    ("budget_kib", budget_kib.as_str()),
+                ],
+            );
         }
-        let held = self.items.len().to_string();
-        let kib = (self.bytes / 1024).to_string();
-        let budget_kib = (budget / 1024).to_string();
-        log_event(
-            LogLevel::Debug,
-            LogTopic::App,
-            "cover_cache_stats",
-            &[
-                ("held", held.as_str()),
-                ("kib", kib.as_str()),
-                ("budget_kib", budget_kib.as_str()),
-            ],
-        );
     }
 }
 
