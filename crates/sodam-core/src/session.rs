@@ -11,6 +11,29 @@ use std::sync::Arc;
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
 
+/// 封面落盘。写失败照样返回 `None`（界面显示占位图、下次重试），
+/// 但留一条 debug 日志：光看界面只看到「封面不显示」，
+/// 到底是磁盘满还是换文件那一步失败，得有地方查。
+fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    use crate::log_outlet::{enabled, log_event, LogLevel, LogTopic};
+    match crate::cache::write_cache_file_atomic(path, bytes) {
+        Ok(()) => Some(()),
+        Err(err) => {
+            if enabled(LogLevel::Debug, LogTopic::App) {
+                let file = path.display().to_string();
+                let error = err.to_string();
+                log_event(
+                    LogLevel::Debug,
+                    LogTopic::App,
+                    "cover_write_failed",
+                    &[("file", file.as_str()), ("error", error.as_str())],
+                );
+            }
+            None
+        }
+    }
+}
+
 /// 预取/播放两条路径可能**并发下载同一首**（预取进行中用户又手动点了它），
 /// 固定的 .part 名会让两个写者互相踩踏（remove + 交错写 + 错误的 rename 对象）。
 /// 用「进程号 + 进程内序号」保证每次下载写自己的临时文件。
@@ -992,7 +1015,7 @@ impl Session {
             return None;
         }
         // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
-        crate::cache::write_cache_file_atomic(&path, &bytes).ok()?;
+        save_cover_file(&path, &bytes)?;
         Some(path)
     }
 
@@ -1047,11 +1070,11 @@ impl Session {
             Some(image) => {
                 let mut encoded = std::io::Cursor::new(Vec::new());
                 image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
-                crate::cache::write_cache_file_atomic(&path, &encoded.into_inner()).ok()?;
+                save_cover_file(&path, &encoded.into_inner())?;
             }
             None => {
                 // 解码不了（罕见格式）就存原图，至少能显示
-                crate::cache::write_cache_file_atomic(&path, &bytes).ok()?;
+                save_cover_file(&path, &bytes)?;
             }
         }
         Some(path)
