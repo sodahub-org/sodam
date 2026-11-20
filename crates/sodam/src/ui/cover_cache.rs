@@ -4,7 +4,7 @@
 //! 几十张就吃掉几百 MB 显存/堆。sonora 的做法是让缓存 key 带上**目标边长 `edge`**，
 //! 解码后先 `resize_exact` 到实际显示尺寸再交给 gpui，于是 48px 的缩略图只占 64×64。
 //!
-//! 预算也小得多：16MB 起步，并随「一个满屏像素」增长；再加 256 条的条数上限。
+//! 预算也小得多：64MiB 起步，并随「一个满屏像素」增长；再加 512 条的条数上限。
 //! （sonora 实测 footprint 67MB / IOAccelerator 8.4MB。）
 
 use std::collections::HashMap;
@@ -19,9 +19,9 @@ use image::{imageops, DynamicImage, Frame, ImageFormat, RgbaImage};
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 
 /// 缓存预算下限（超出后淘汰）；实际预算 = `max(这个, 一个满屏像素)`。
-const CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// 条数上限。
-const CACHE_ITEMS: usize = 256;
+const CACHE_ITEMS: usize = 512;
 /// 解码边长向上取整到 64 的倍数（2 的幂会让像素数最多翻 4 倍）。
 const EDGE_STEP: u32 = 64;
 /// 解码边长上限：只用来拦住几千像素的本地原图整张保留。
@@ -213,6 +213,7 @@ impl CoverImageCache {
     fn evict(&mut self, window: &mut Window, cx: &mut App) {
         let budget = self.budget();
         if self.bytes <= budget && self.items.len() <= CACHE_ITEMS {
+            self.log_stats(budget);
             return;
         }
 
@@ -240,21 +241,27 @@ impl CoverImageCache {
             }
         }
 
-        if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
-            let held = self.items.len().to_string();
-            let kib = (self.bytes / 1024).to_string();
-            let budget_kib = (budget / 1024).to_string();
-            log_event(
-                LogLevel::Debug,
-                LogTopic::App,
-                "cover_cache_stats",
-                &[
-                    ("held", held.as_str()),
-                    ("kib", kib.as_str()),
-                    ("budget_kib", budget_kib.as_str()),
-                ],
-            );
+        self.log_stats(budget);
+    }
+
+    /// 调试日志：随时能读出当前预算和实际占用（未开 Debug 时直接跳过）。
+    fn log_stats(&self, budget: usize) {
+        if !log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+            return;
         }
+        let held = self.items.len().to_string();
+        let kib = (self.bytes / 1024).to_string();
+        let budget_kib = (budget / 1024).to_string();
+        log_event(
+            LogLevel::Debug,
+            LogTopic::App,
+            "cover_cache_stats",
+            &[
+                ("held", held.as_str()),
+                ("kib", kib.as_str()),
+                ("budget_kib", budget_kib.as_str()),
+            ],
+        );
     }
 }
 
@@ -273,6 +280,30 @@ impl ImageCache for CoverImageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_cache(screen: usize) -> CoverImageCache {
+        CoverImageCache {
+            items: HashMap::new(),
+            bytes: 0,
+            screen,
+        }
+    }
+
+    #[test]
+    fn budget_floor_is_64_mib() {
+        assert_eq!(empty_cache(0).budget(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn budget_still_follows_larger_screen() {
+        let full_screen = 100 * 1024 * 1024;
+        assert_eq!(empty_cache(full_screen).budget(), full_screen);
+    }
+
+    #[test]
+    fn item_limit_is_512() {
+        assert_eq!(CACHE_ITEMS, 512);
+    }
 
     #[test]
     fn sample_edge_rounds_up_to_step() {
