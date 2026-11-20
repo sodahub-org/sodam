@@ -1148,7 +1148,9 @@ mod tests {
     ///
     /// 这里手工把它造成「目标已经有一份可用内容」，生产上走到这个分支靠的是
     /// 两路并发下载同一张封面、另一路刚好写完了。
-    /// 制造写失败靠目录只读，root 下这条拦不住（CI 跑在普通用户下，那边会真的跑到）。
+    /// 制造写失败靠目录只读：root 不看权限，这条用例在 root 下验不了兜底分支，
+    /// 会直接返回（`log_migration` 那条守卫不许在代码里用 println/eprintln 打提示）。
+    /// CI 跑在普通用户下，那边会真的走到兜底分支。
     #[cfg(unix)]
     #[test]
     fn cover_write_failure_reuses_usable_target() {
@@ -1168,7 +1170,7 @@ mod tests {
 
         if bypassed {
             let _ = std::fs::remove_file(dir.path().join("probe"));
-            eprintln!("skip: 当前是 root，造不出写失败，这条用例没验到兜底分支");
+            // root 下权限拦不住写入，兜底分支造不出来，这条用例在 root 下不算数。
             return;
         }
         assert!(saved, "目标还能用就该把它交回去");
