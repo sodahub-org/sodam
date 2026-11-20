@@ -1144,7 +1144,10 @@ mod tests {
         );
     }
 
-    /// 写盘失败但目标已经能用（另一路刚写完）时，返回 true 直接用它。
+    /// 写盘失败但目标这会儿已经能用时，返回 true 直接用它。
+    ///
+    /// 这里手工把它造成「目标已经有一份可用内容」，生产上走到这个分支靠的是
+    /// 两路并发下载同一张封面、另一路刚好写完了。
     #[cfg(unix)]
     #[test]
     fn cover_write_failure_reuses_usable_target() {
@@ -1163,7 +1166,14 @@ mod tests {
         std::fs::set_permissions(dir.path(), original).unwrap();
 
         if bypassed {
+            // root 下权限拦不住写入，兜底分支造不出来；至少确认这次是真写进去了，
+            // 别让这条用例一条断言都不跑就绿。
             let _ = std::fs::remove_file(dir.path().join("probe"));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"new-cover",
+                "root 下写盘不会失败，只能验写成功"
+            );
             return;
         }
         assert!(saved, "目标还能用就该把它交回去");
