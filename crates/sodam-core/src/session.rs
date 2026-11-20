@@ -991,7 +991,8 @@ impl Session {
         if bytes.is_empty() {
             return None;
         }
-        std::fs::write(&path, bytes).ok()?;
+        // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
+        crate::cache::write_cache_file_atomic(&path, &bytes).ok()?;
         Some(path)
     }
 
@@ -1046,11 +1047,11 @@ impl Session {
             Some(image) => {
                 let mut encoded = std::io::Cursor::new(Vec::new());
                 image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
-                std::fs::write(&path, encoded.into_inner()).ok()?;
+                crate::cache::write_cache_file_atomic(&path, &encoded.into_inner()).ok()?;
             }
             None => {
                 // 解码不了（罕见格式）就存原图，至少能显示
-                std::fs::write(&path, &bytes).ok()?;
+                crate::cache::write_cache_file_atomic(&path, &bytes).ok()?;
             }
         }
         Some(path)
