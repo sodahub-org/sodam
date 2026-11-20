@@ -1146,17 +1146,16 @@ mod tests {
 
     /// 写盘失败但目标这会儿已经能用时，返回 true 直接用它。
     ///
-    /// 目标用一条 253 字节的超长文件名来造：临时文件会在它后面再拼 `.<进程号>-<序号>.part`，
-    /// 超过文件名 255 字节的上限，写临时文件这一步必然失败，跟当前用户是不是 root 无关。
+    /// 目标用一条 253 字节的文件名来造：临时文件会在它后面再拼 `.<进程号>-<序号>.part`，
+    /// 超过文件名 255 字节的上限，`fs::write` 这一步直接报错，跟权限无关。
+    /// 只在 Unix 上跑：Windows 的临时目录路径加上 253 字节的名字会顶到路径长度上限，
+    /// 前置条件造不出来。
     #[cfg(unix)]
     #[test]
     fn cover_write_failure_reuses_usable_target() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(format!("{}.img", "a".repeat(249)));
-        if std::fs::write(&path, b"old-cover").is_err() {
-            // 文件系统连 253 字节的名字都不收（比如某些加密目录），这条用例造不出目标
-            return;
-        }
+        std::fs::write(&path, b"old-cover").expect("造不出 253 字节文件名的目标");
 
         assert!(
             save_cover_file(&path, b"new-cover"),
