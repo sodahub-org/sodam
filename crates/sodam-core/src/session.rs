@@ -18,12 +18,10 @@ fn cover_file_usable(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 封面落盘。
+/// 封面落盘。写成功返回 true。
 ///
-/// 写失败按 warn 记一条 `cover_write_failed`（文件名 + 错误）：日志级别默认是 INFO，
-/// 记 debug 等于默认什么都不留，而「封面不显示」正要靠这条分清是磁盘满还是换文件那步被占用。
-/// 返回值只在一种情况下不受失败影响：两路同时下载同一张封面时，
-/// 另一路可能刚好在这几秒里写完了，能用就直接用它。
+/// 失败时记一条 warn 的 `cover_write_failed`（文件名 + 错误），然后看目标这会儿能不能用：
+/// 能用（另一个写者刚写完）就返回 true，否则返回 false，由调用方显示占位图。
 fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     use crate::log_outlet::{log_event, LogLevel, LogTopic};
     match crate::cache::write_cache_file_atomic(path, bytes) {
@@ -1128,7 +1126,7 @@ mod tests {
         assert!(!cover_file_usable(&dir_path), "目录不是缓存文件");
     }
 
-    /// 写不进去就返回 false，目标位置上的东西一个都不许动。
+    /// 写不进去就返回 false，目标位置上的东西一个都不许动，自己的临时文件也要清干净。
     #[test]
     fn cover_write_failure_reports_unsaved_and_leaves_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -1139,6 +1137,41 @@ mod tests {
 
         assert!(!save_cover_file(&path, b"new-cover"), "换不上就不能报成功");
         assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"old-cover");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "除目标本身以外不许留东西（临时文件要清掉）"
+        );
+    }
+
+    /// 写盘失败但目标已经能用（另一路刚写完）时，返回 true 直接用它。
+    #[cfg(unix)]
+    #[test]
+    fn cover_write_failure_reuses_usable_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+        std::fs::write(&path, b"old-cover").unwrap();
+
+        // 目录设成只读：临时文件写不进去，走的就是「写盘失败」那条路
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // root 不看权限，这种情况造不出失败，直接跳过
+        let bypassed = std::fs::write(dir.path().join("probe"), b"x").is_ok();
+        let saved = save_cover_file(&path, b"new-cover");
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        if bypassed {
+            let _ = std::fs::remove_file(dir.path().join("probe"));
+            return;
+        }
+        assert!(saved, "目标还能用就该把它交回去");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old-cover",
+            "没写成，旧封面不能被改"
+        );
     }
 
     /// 试听片段不算整曲缓存：显式点播的不可播拦截只给整曲让路（父票边界）。
