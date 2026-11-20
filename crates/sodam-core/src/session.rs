@@ -11,16 +11,26 @@ use std::sync::Arc;
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
 
-/// 封面落盘。写失败照样返回 `None`（界面显示占位图、下次重试），
-/// 但留一条 debug 日志：光看界面只看到「封面不显示」，
-/// 到底是磁盘满还是换文件那一步失败，得有地方查。
-fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+/// 缓存文件能不能用：存在，而且不是 0 字节（0 字节多半是上次写坏的）。
+fn cover_file_usable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
+}
+
+/// 封面落盘。写失败不打断界面：旧封面还在就照旧用它，一张都没有才返回 false。
+/// 失败时按 debug 记一条 `cover_write_failed`（文件名 + 错误），
+/// 级别默认是 INFO，需要详细日志或 `SODAM_COVER_LOG` 才会写出来。
+fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     use crate::log_outlet::{enabled, log_event, LogLevel, LogTopic};
     match crate::cache::write_cache_file_atomic(path, bytes) {
-        Ok(()) => Some(()),
+        Ok(()) => true,
         Err(err) => {
             if enabled(LogLevel::Debug, LogTopic::App) {
-                let file = path.display().to_string();
+                let file = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let error = err.to_string();
                 log_event(
                     LogLevel::Debug,
@@ -29,7 +39,7 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
                     &[("file", file.as_str()), ("error", error.as_str())],
                 );
             }
-            None
+            cover_file_usable(path)
         }
     }
 }
@@ -994,10 +1004,7 @@ impl Session {
         let dir = crate::audio::cover_cache_dir().join("original");
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{:016x}.img", hash_url(url)));
-        if std::fs::metadata(&path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-        {
+        if cover_file_usable(&path) {
             return Some(path);
         }
 
@@ -1015,7 +1022,9 @@ impl Session {
             return None;
         }
         // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
-        save_cover_file(&path, &bytes)?;
+        if !save_cover_file(&path, &bytes) {
+            return None;
+        }
         Some(path)
     }
 
@@ -1043,10 +1052,7 @@ impl Session {
         std::fs::create_dir_all(&dir).ok()?;
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
         let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));
-        if std::fs::metadata(&path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-        {
+        if cover_file_usable(&path) {
             return Some(path);
         }
         let response = ureq::get(url)
@@ -1070,11 +1076,15 @@ impl Session {
             Some(image) => {
                 let mut encoded = std::io::Cursor::new(Vec::new());
                 image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
-                save_cover_file(&path, &encoded.into_inner())?;
+                if !save_cover_file(&path, &encoded.into_inner()) {
+                    return None;
+                }
             }
             None => {
                 // 解码不了（罕见格式）就存原图，至少能显示
-                save_cover_file(&path, &bytes)?;
+                if !save_cover_file(&path, &bytes) {
+                    return None;
+                }
             }
         }
         Some(path)
@@ -1098,6 +1108,20 @@ mod tests {
         let session = Session::new(settings);
         assert!(session.has_cookie());
         assert_eq!(session.settings().quality, "lossless");
+    }
+
+    /// 0 字节的封面文件当成没缓存：解码不出来，得重新下。
+    /// 写盘失败时也靠这个判断决定「用旧封面」还是「显示占位图」。
+    #[test]
+    fn zero_length_cover_is_not_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+
+        assert!(!cover_file_usable(&path), "文件不在就是没缓存");
+        std::fs::write(&path, b"").unwrap();
+        assert!(!cover_file_usable(&path), "0 字节等于没写");
+        std::fs::write(&path, b"cover-bytes").unwrap();
+        assert!(cover_file_usable(&path));
     }
 
     /// 试听片段不算整曲缓存：显式点播的不可播拦截只给整曲让路（父票边界）。
