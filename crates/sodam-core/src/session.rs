@@ -11,34 +11,35 @@ use std::sync::Arc;
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
 
-/// 缓存文件能不能用：存在，而且不是 0 字节（0 字节多半是上次写坏的）。
+/// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
 fn cover_file_usable(path: &std::path::Path) -> bool {
     std::fs::metadata(path)
-        .map(|meta| meta.len() > 0)
+        .map(|meta| meta.is_file() && meta.len() > 0)
         .unwrap_or(false)
 }
 
-/// 封面落盘。写失败不打断界面：旧封面还在就照旧用它，一张都没有才返回 false。
-/// 失败时按 debug 记一条 `cover_write_failed`（文件名 + 错误），
-/// 级别默认是 INFO，需要详细日志或 `SODAM_COVER_LOG` 才会写出来。
+/// 封面落盘。
+///
+/// 写失败按 warn 记一条 `cover_write_failed`（文件名 + 错误）：日志级别默认是 INFO，
+/// 记 debug 等于默认什么都不留，而「封面不显示」正要靠这条分清是磁盘满还是换文件那步被占用。
+/// 返回值只在一种情况下不受失败影响：两路同时下载同一张封面时，
+/// 另一路可能刚好在这几秒里写完了，能用就直接用它。
 fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
-    use crate::log_outlet::{enabled, log_event, LogLevel, LogTopic};
+    use crate::log_outlet::{log_event, LogLevel, LogTopic};
     match crate::cache::write_cache_file_atomic(path, bytes) {
         Ok(()) => true,
         Err(err) => {
-            if enabled(LogLevel::Debug, LogTopic::App) {
-                let file = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let error = err.to_string();
-                log_event(
-                    LogLevel::Debug,
-                    LogTopic::App,
-                    "cover_write_failed",
-                    &[("file", file.as_str()), ("error", error.as_str())],
-                );
-            }
+            let file = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let error = err.to_string();
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "cover_write_failed",
+                &[("file", file.as_str()), ("error", error.as_str())],
+            );
             cover_file_usable(path)
         }
     }
@@ -1110,10 +1111,9 @@ mod tests {
         assert_eq!(session.settings().quality, "lossless");
     }
 
-    /// 0 字节的封面文件当成没缓存：解码不出来，得重新下。
-    /// 写盘失败时也靠这个判断决定「用旧封面」还是「显示占位图」。
+    /// 0 字节、或者目标根本不是个普通文件，都算没缓存：这种文件解码不出来，得重新下。
     #[test]
-    fn zero_length_cover_is_not_usable() {
+    fn unusable_cover_files_are_not_cached() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0000abcd-160.img");
 
@@ -1122,6 +1122,23 @@ mod tests {
         assert!(!cover_file_usable(&path), "0 字节等于没写");
         std::fs::write(&path, b"cover-bytes").unwrap();
         assert!(cover_file_usable(&path));
+
+        let dir_path = dir.path().join("0000abcd-320.img");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert!(!cover_file_usable(&dir_path), "目录不是缓存文件");
+    }
+
+    /// 写不进去就返回 false，目标位置上的东西一个都不许动。
+    #[test]
+    fn cover_write_failure_reports_unsaved_and_leaves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+        // 用目录占住目标路径，换文件这一步必然失败
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"old-cover").unwrap();
+
+        assert!(!save_cover_file(&path, b"new-cover"), "换不上就不能报成功");
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"old-cover");
     }
 
     /// 试听片段不算整曲缓存：显式点播的不可播拦截只给整曲让路（父票边界）。
