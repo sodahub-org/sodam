@@ -758,35 +758,13 @@ fn unique_tag() -> String {
     format!("{}-{seq}", std::process::id())
 }
 
-/// 退一步的换法：先把老文件挪成备份，再把新文件放上去。
-///
-/// 只有「一步直接换」不成时才走到这里——Windows 上目标文件被占着就是这个样子。
-/// 新文件放好后删备份；还是不成，就把备份挪回原位，老封面还在。
-fn install_atomic(tmp: &Path, target: &Path, backup: &Path) -> std::io::Result<()> {
-    // 符号链接也算「已经存在」：按文件系统里真实有的东西处理，不去跟随它。
-    let had_target = std::fs::symlink_metadata(target).is_ok();
-    if had_target {
-        if let Err(err) = std::fs::rename(target, backup) {
-            let _ = std::fs::remove_file(tmp);
-            return Err(err);
-        }
-    }
-    if let Err(err) = std::fs::rename(tmp, target) {
-        if had_target {
-            // 挪不回去就把备份留在原地，别把老封面删了。
-            let _ = std::fs::rename(backup, target);
-        }
-        let _ = std::fs::remove_file(tmp);
-        return Err(err);
-    }
-    let _ = std::fs::remove_file(backup);
-    Ok(())
-}
-
 /// 写缓存文件：先往同目录的临时文件里写，整份写好了才换到正式路径。
 ///
-/// 写到一半出错（磁盘满、文件被占用）时正式文件一个字节都不动，临时文件顺手删掉，
-/// 所以缓存里不会出现半张图，重写失败也弄不丢原来的封面。
+/// 换用的是 `std::fs::rename`，三个平台上它都会把已经存在的目标整份换掉
+/// （Windows 上走 `MoveFileExW`），所以正式路径上永远不会出现写了一半的图：
+/// 要么旧封面原样还在，要么整份新封面。
+/// 换不动时（目标被别的程序占着、目录没权限）只删自己的临时文件，旧封面一动不动，
+/// 下次重试还能用。
 /// 临时名以 `.part` 结尾，跟下载中的音频一样受「24 小时内不淘汰」保护。
 /// 函数自己会用 `download_lock` 把同一目标的写者排队，调用方别再持着这把锁调进来。
 /// 调用方本来就在后台线程里跑，这里只做同步文件操作。
@@ -802,12 +780,9 @@ pub fn write_cache_file_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<(
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let tag = unique_tag();
-    let tmp = parent.join(format!("{name}.{tag}.part"));
-    let backup = parent.join(format!("{name}.{tag}.old"));
+    let tmp = parent.join(format!("{name}.{}.part", unique_tag()));
 
-    // 同一张封面的两路写者在这里排队，一个换完另一个再动，谁也不在半路上
-    // 看见「正式文件暂时不在了」。
+    // 同一张封面的两路写者在这里排队，一个换完另一个再动。
     let lock = download_lock(target);
     let _writer = lock.lock().unwrap_or_else(|err| err.into_inner());
 
@@ -815,12 +790,11 @@ pub fn write_cache_file_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<(
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
-    // 能一步换上去就一步换上去：Unix 上这步本身就是原子的，
-    // 老文件全程没被挪动过，真失败了也不怕丢。
-    if std::fs::rename(&tmp, target).is_ok() {
-        return Ok(());
+    if let Err(err) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
     }
-    install_atomic(&tmp, target, &backup)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1648,27 +1622,28 @@ mod tests {
         assert!(stray_files(dir.path(), &["0000abcd-160.img"]).is_empty());
     }
 
-    /// #216：换文件这一步失败时，老封面原地不动，临时文件被清理。
+    /// #216：换不上正式文件时，目标原地不动，临时文件也不留下。
+    ///
+    /// 用一个占着目标路径的目录来制造「换不动」：`rename` 到一个已有目录上会失败，
+    /// 和生产上「目标文件被别的程序占着换不动」是同一类结果。
     #[test]
-    fn atomic_install_failure_keeps_old_file_and_drops_temp() {
+    fn atomic_write_failure_keeps_target_and_drops_temp() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("0000abcd-160.img");
-        let tmp = dir.path().join("0000abcd-160.img.7-0.part");
-        // 备份位被一个非空目录占着：把旧文件挪过去这一步必然失败。
-        let backup = dir.path().join("0000abcd-160.img.7-0.old");
-        std::fs::write(&target, b"old-cover").unwrap();
-        std::fs::write(&tmp, b"new-cover").unwrap();
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("blocker"), b"x").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"old-cover").unwrap();
 
-        assert!(install_atomic(&tmp, &target, &backup).is_err());
+        assert!(write_cache_file_atomic(&target, b"new-cover").is_err());
 
         assert_eq!(
-            std::fs::read(&target).unwrap(),
+            std::fs::read(target.join("keep")).unwrap(),
             b"old-cover",
-            "老封面不能被弄丢"
+            "换不动就一点都别动，老封面不能被弄丢"
         );
-        assert!(!tmp.exists(), "临时文件要清理掉");
+        assert!(
+            stray_files(dir.path(), &["0000abcd-160.img"]).is_empty(),
+            "临时文件要清理掉"
+        );
     }
 
     /// 目录不在时直接报错，不 panic，也不留下半个文件。
