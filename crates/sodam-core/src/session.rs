@@ -1146,34 +1146,22 @@ mod tests {
 
     /// 写盘失败但目标这会儿已经能用时，返回 true 直接用它。
     ///
-    /// 这里手工把它造成「目标已经有一份可用内容」，生产上走到这个分支靠的是
-    /// 两路并发下载同一张封面、另一路刚好写完了。
-    /// 制造写失败靠目录只读：root 不看权限，这条用例在 root 下验不了兜底分支，
-    /// 会直接返回（`log_migration` 那条守卫不许在代码里用 println/eprintln 打提示）。
-    /// CI 跑在普通用户下，那边会真的走到兜底分支。
+    /// 目标用一条 253 字节的超长文件名来造：临时文件会在它后面再拼 `.<进程号>-<序号>.part`，
+    /// 超过文件名 255 字节的上限，写临时文件这一步必然失败，跟当前用户是不是 root 无关。
     #[cfg(unix)]
     #[test]
     fn cover_write_failure_reuses_usable_target() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("0000abcd-160.img");
-        std::fs::write(&path, b"old-cover").unwrap();
-
-        // 目录设成只读：临时文件写不进去，走的就是「写盘失败」那条路
-        let original = std::fs::metadata(dir.path()).unwrap().permissions();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        // root 不看权限，这条用例在 root 下验不了兜底分支
-        let bypassed = std::fs::write(dir.path().join("probe"), b"x").is_ok();
-        let saved = save_cover_file(&path, b"new-cover");
-        std::fs::set_permissions(dir.path(), original).unwrap();
-
-        if bypassed {
-            let _ = std::fs::remove_file(dir.path().join("probe"));
-            // root 下权限拦不住写入，兜底分支造不出来，这条用例在 root 下不算数。
+        let path = dir.path().join(format!("{}.img", "a".repeat(249)));
+        if std::fs::write(&path, b"old-cover").is_err() {
+            // 文件系统连 253 字节的名字都不收（比如某些加密目录），这条用例造不出目标
             return;
         }
-        assert!(saved, "目标还能用就该把它交回去");
+
+        assert!(
+            save_cover_file(&path, b"new-cover"),
+            "目标还能用就该把它交回去"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"old-cover",
