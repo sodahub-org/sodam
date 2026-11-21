@@ -1018,7 +1018,8 @@ mod tests {
             }
         });
         assert_eq!(remaining, 10, "删失败的那 10 字节不能算释放");
-        assert_eq!(removed, vec![recent], "删失败的不能报进删除列表");
+        assert_eq!(removed.len(), 1, "只有删成功的才报进删除列表");
+        assert!(removed[0] == recent, "删失败的不能报进去");
         assert!(old.exists(), "删失败的文件还在");
         assert!(!recent.exists(), "不能因为一个删失败就中断后续淘汰");
         assert_eq!(attempts.get(), 2, "两组都要尝试过");
