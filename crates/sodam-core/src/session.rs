@@ -16,12 +16,12 @@ const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
 /// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
 /// 体积随画面复杂度与源图分辨率浮动，不写死数字。
 const COVER_JPEG_QUALITY: u8 = 85;
-/// 下载字节解码的边长上限：拦 decompression bomb（压得狠的图能解出远超
-/// 下载体积的内存）。8192 覆盖全部真实封面尺寸。
-const MAX_DECODE_EDGE: u32 = 8192;
-/// 解码分配总量上限：与边长上限共同兜底，多路并发下载同时来超大图时，
-/// 最坏瞬时内存也只有几百 MiB。显式写死，不依赖库默认值（那个默认历史上变过）。
-const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
+/// 下载字节解码的边长上限：超大图直接当解码失败，拦掉极端宽高。
+const MAX_DECODE_EDGE: u32 = 4096;
+/// 解码分配总量上限：真正拦内存的那条线——一张 4096×4096 的 RGBA 图
+/// 就要 64 MiB，解码中间缓冲还会更多，任一超限都走占位图重试。
+/// 显式写死不依赖库默认值（那个默认历史上变过）。
+const MAX_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
 fn cover_file_usable(path: &std::path::Path) -> bool {
@@ -1258,8 +1258,8 @@ mod tests {
         assert!(shrink_cover(b"not-an-image", COVER_MAX_EDGE).is_none());
     }
 
-    /// 超出解码边长上限的源图当解码失败处理（拦 decompression bomb）。
-    /// 像素量刻意很小（一条 1px 的行），编出来只有几 KB，跑得快。
+    /// 超出解码边长上限的源图当解码失败处理。像素量刻意很小
+    /// （一条 1px 的行），编出来只有几 KB，跑得快。
     #[test]
     fn shrink_cover_rejects_images_over_decode_limit() {
         let mut img = image::RgbImage::new(MAX_DECODE_EDGE + 1, 1);
@@ -1270,6 +1270,21 @@ mod tests {
         assert!(
             shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).is_none(),
             "宽超上限的图要走解码失败路径"
+        );
+    }
+
+    /// 分配总量上限是真正拦内存的线：边长合规、但解码要几十 MiB 的图
+    /// 一样走解码失败路径（纯色图编成 PNG 只有几十 KB，跑得快）。
+    #[test]
+    fn shrink_cover_rejects_images_over_alloc_limit() {
+        let mut img = image::RgbImage::new(4096, 4096);
+        img.put_pixel(0, 0, image::Rgb([1, 2, 3]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        assert!(
+            shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).is_none(),
+            "分配超限的图要走解码失败路径"
         );
     }
 
