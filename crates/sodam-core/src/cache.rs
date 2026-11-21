@@ -307,6 +307,9 @@ enum CoverTrimAction {
     EvictReadable,
 }
 
+/// 上报门里「扫描完整」的保留值；`CoverTrimAction::code` 一律不用 0。
+const ALERT_STATE_COMPLETE: u8 = 0;
+
 impl CoverTrimAction {
     const fn label(self) -> &'static str {
         match self {
@@ -315,6 +318,7 @@ impl CoverTrimAction {
         }
     }
 
+    /// 上报门内部用的状态码：`ALERT_STATE_COMPLETE` 之外的一组**非零且互不相同**的值。
     const fn code(self) -> u8 {
         match self {
             Self::Skip => 1,
@@ -352,13 +356,16 @@ impl CoverTrimAlert {
 ///
 /// 扫描一直不完整、动作一直是 `skip` 时，每轮维护（约 60 秒）都写一条 Warn 就是刷屏；
 /// 日志出口的折叠只吃「连续且完全相同」的行，字段里的字节数一变就断。所以由这里记住
-/// 上次报告的动作，同一个动作只报一次；扫描恢复完整后复位，下次出问题再报。
+/// 上次报告的动作，同一个动作只报一次；扫描恢复完整（`None`）后复位，下次出问题再报。
+///
+/// 注意这是**进程内单个封面缓存目录**的告警状态：两个目录共用一个门会互相压制告警，
+/// 也会互相复位。要按目录各自告警，就为每个目录注入自己的门（`trim_covers_scan` 就是这么收的）。
 #[derive(Default)]
 struct CoverAlertGate(AtomicU8);
 
 impl CoverAlertGate {
     fn admit(&self, action: Option<CoverTrimAction>) -> bool {
-        let state = action.map_or(0, CoverTrimAction::code);
+        let state = action.map_or(ALERT_STATE_COMPLETE, CoverTrimAction::code);
         self.0.swap(state, Ordering::Relaxed) != state
     }
 }
@@ -1374,6 +1381,61 @@ mod tests {
         assert_eq!(removed, vec![thumb.clone()]);
         assert!(!thumb.exists());
         assert!(hidden.exists(), "读不到的部分不动");
+    }
+
+    /// 复位接线要端到端验证：`admit(None)` 那行被删掉时，一次 skip 之后就永久哑火。
+    #[test]
+    fn cover_trim_realerts_after_a_complete_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), "covers/0000000000000001-160.img", 100);
+        file(dir.path(), "covers/original/0000000000000002.img", 500);
+        let denied = dir.path().join("covers/original");
+        let gate = CoverAlertGate::default();
+        let alerts = std::cell::RefCell::new(Vec::new());
+
+        // 1) 子目录读不到：跳过并报一次。
+        let scan = scan_denying(dir.path(), &denied);
+        let _ = trim_covers_scan(
+            scan,
+            1000,
+            &gate,
+            |alert| alerts.borrow_mut().push(alert),
+            |_| false,
+        );
+        assert_eq!(alerts.borrow().len(), 1);
+
+        // 2) 完整扫一轮：不报，但这一轮必须把门复位。
+        let scan = scan_files(dir.path());
+        assert!(!scan.incomplete);
+        let _ = trim_covers_scan(
+            scan,
+            1000,
+            &gate,
+            |alert| alerts.borrow_mut().push(alert),
+            |_| false,
+        );
+        assert_eq!(alerts.borrow().len(), 1, "扫描完整时不该报");
+
+        // 3) 又读不到：门复位过了，必须重新报。
+        let scan = scan_denying(dir.path(), &denied);
+        let _ = trim_covers_scan(
+            scan,
+            1000,
+            &gate,
+            |alert| alerts.borrow_mut().push(alert),
+            |_| false,
+        );
+        assert_eq!(alerts.borrow().len(), 2, "恢复完整后再出问题要重新上报");
+    }
+
+    /// 状态码约定：0 留给「扫描完整」，各动作码非零且互不相同。
+    #[test]
+    fn cover_trim_action_codes_are_distinct_and_non_zero() {
+        let skip = CoverTrimAction::Skip.code();
+        let evict = CoverTrimAction::EvictReadable.code();
+        assert_ne!(skip, ALERT_STATE_COMPLETE);
+        assert_ne!(evict, ALERT_STATE_COMPLETE);
+        assert_ne!(skip, evict);
     }
 
     /// 扫描恢复完整后复位，下次再出问题要重新上报。
