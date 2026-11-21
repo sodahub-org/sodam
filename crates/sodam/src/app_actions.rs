@@ -1320,6 +1320,10 @@ impl Root {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let first_try = attempted.insert(url.to_string());
+        if !first_try {
+            // 已尝试过（在飞/失败/排队）：不重复拉起，等既有的出口走完。
+            return;
+        }
         // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
         // 回调补上（照 CoverPool 的 pump 思路），排队的不许被丢掉；
         // 队列有界（丢最旧），且切歌时只留当前曲目（见 load_lyrics）。
