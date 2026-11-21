@@ -1330,9 +1330,11 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (80, 80));
         // PNG 无损：alpha 通道和值都原样保留。
         assert_eq!(decoded.color(), image::ColorType::Rgba8, "透明通道要保留");
+        // DynamicImage 没有 get_pixel：经 to_rgba8 落到 ImageBuffer 再取。
+        let rgba = decoded.to_rgba8();
         assert_eq!(
-            decoded.get_pixel(0, 0),
-            image::Rgba([10, 20, 30, 128]),
+            rgba.get_pixel(0, 0),
+            &image::Rgba([10, 20, 30, 128]),
             "半透明像素原样保留"
         );
     }
