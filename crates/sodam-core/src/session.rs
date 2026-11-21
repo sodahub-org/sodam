@@ -14,12 +14,14 @@ const COVER_MAX_EDGE: u32 = 160;
 /// 约 900–1700，1280 覆盖常见场景且体积可控。
 const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
 /// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
-/// 体积随画面复杂度与源图分辨率浮动，不写死数字（票面估算仅作立项依据）。
+/// 体积随画面复杂度与源图分辨率浮动，不写死数字。
 const COVER_JPEG_QUALITY: u8 = 85;
 /// 下载字节解码的边长上限：拦 decompression bomb（压得狠的图能解出远超
-/// 下载体积的内存）。8192 覆盖全部真实封面尺寸；更大的交给
-/// `Limits::default()` 自带的 512 MiB 分配上限兜底，超限走占位图重试。
+/// 下载体积的内存）。8192 覆盖全部真实封面尺寸。
 const MAX_DECODE_EDGE: u32 = 8192;
+/// 解码分配总量上限：与边长上限共同兜底，多路并发下载同时来超大图时，
+/// 最坏瞬时内存也只有几百 MiB。显式写死，不依赖库默认值（那个默认历史上变过）。
+const MAX_DECODE_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
 fn cover_file_usable(path: &std::path::Path) -> bool {
@@ -42,6 +44,7 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODE_EDGE);
     limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.limits(limits);
     let decoded = reader.with_guessed_format().ok()?.decode().ok()?;
