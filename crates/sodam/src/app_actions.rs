@@ -3151,13 +3151,17 @@ impl Root {
                             ],
                         );
                     }
-                    // 下载期间这张封面可能刚好被后台淘汰删掉。文件已经没了的路径
-                    // 不能发布，否则 map 指向空文件、还占着 attempted 不让重下。
+                    // 下载期间这张封面可能刚好被后台淘汰删掉。解析到了路径但文件
+                    // 已经没了：不发布（否则 map 指向空文件），并放行 attempted 和
+                    // pool 的 seen，让渲染能重新排队。普通下载失败（压根没解析出
+                    // 路径）保持去重，否则会每帧空转重下。
+                    let was_resolved = path.is_some();
                     let path = path.filter(|path| path.exists());
-                    if path.is_none() {
+                    if was_resolved && path.is_none() {
                         if let Ok(mut attempted) = root.cover_attempted.lock() {
                             attempted.remove(&url);
                         }
+                        root.cover_pool.release_seen(&url);
                     }
                     let has_result = path.is_some() || color.is_some();
                     if let Some(path) = path {
@@ -5279,8 +5283,7 @@ mod tests {
         // alive-thumb 两侧都没被删，谁都不该动。
         assert!(!thumbs.contains("alive-thumb"));
 
-        // 被下载重建回来的路径不再算失效，映射要留住。
-        // 只有 full-only.img 已被下载重建回来（不算缺），其余路径仍是缺的。
+        // 被下载重建回来的路径不算缺，映射要留住。
         let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
             p != std::path::Path::new("covers/original/full-only.img")
         });
