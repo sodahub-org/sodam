@@ -300,7 +300,8 @@ mod tests {
 
     #[test]
     fn item_limit_needs_eviction_at_513() {
-        let budget = 64 * 1024 * 1024;
+        // 这里只关心条数，预算直接用生产值；64MiB 本身由 budget_floor 测试锁住。
+        let budget = CACHE_BYTES;
         // 512 放得下，513 就超；没到条数但超预算也要淘汰。
         assert!(
             !CoverImageCache::needs_eviction(0, 512, budget),
