@@ -859,26 +859,11 @@ pub fn cover_cache_dir() -> std::path::PathBuf {
 ///
 /// 封面缩略图在 `covers/`，原图在 `covers/original/` 子目录 ——
 /// 只看顶层会把整个子目录漏掉（实测踩过：字节/张数都偏小）。
+/// 与淘汰共用 `cache::scan_files`：同一份遍历口径（不跟随符号链接、不重复两套实现），
+/// 读不到的部分同样不计入，统计只做展示、不影响淘汰决策。
 fn dir_usage(dir: &std::path::Path) -> (u64, usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (0, 0);
-    };
-    let mut bytes = 0u64;
-    let mut files = 0usize;
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_file() {
-            bytes += meta.len();
-            files += 1;
-        } else if meta.is_dir() {
-            let (sub_bytes, sub_files) = dir_usage(&entry.path());
-            bytes += sub_bytes;
-            files += sub_files;
-        }
-    }
-    (bytes, files)
+    let scan = crate::cache::scan_files(dir);
+    (scan.total_bytes(), scan.files.len())
 }
 
 /// 顶层目录里指定扩展名的文件数（用于「歌曲数」：只数 `.m4a`）。
