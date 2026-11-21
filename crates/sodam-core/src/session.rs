@@ -13,9 +13,12 @@ const COVER_MAX_EDGE: u32 = 160;
 /// 原图落盘目标边长：歌词页封面按窗口高度 40% 显示，4K + 高缩放下物理像素
 /// 约 900–1700，1280 覆盖常见场景且体积可控。
 const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
-/// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡
-/// （缩略图约 5–10 KB，大图约 120–250 KB）。
+/// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
+/// 体积随画面复杂度与源图分辨率浮动，不写死数字（票面估算仅作立项依据）。
 const COVER_JPEG_QUALITY: u8 = 85;
+/// 下载字节解码的边长上限：压得狠的图能解出远超下载体积的内存
+/// （decompression bomb），超限一律当解码失败，走占位图重试。
+const MAX_DECODE_EDGE: u32 = 4096;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
 fn cover_file_usable(path: &std::path::Path) -> bool {
@@ -32,7 +35,14 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     use image::codecs::jpeg::JpegEncoder;
     use image::ImageEncoder;
 
-    let decoded = image::load_from_memory(bytes).ok()?;
+    // 解码带上限：CDN 字节不可全信，16 MiB 的下载体积拦不住解压后的内存（Review Fish）。
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    reader.set_limits(image::Limits {
+        max_image_width: Some(MAX_DECODE_EDGE),
+        max_image_height: Some(MAX_DECODE_EDGE),
+        ..Default::default()
+    });
+    let decoded = reader.with_guessed_format().ok()?.decode().ok()?;
     let (width, height) = (decoded.width(), decoded.height());
     // 等比缩到长边 ≤ edge；比目标小的图原样保留，不放大。
     let (w, h) = if width <= edge && height <= edge {
@@ -55,6 +65,18 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
         )
         .ok()?;
     Some(encoded.into_inner())
+}
+
+/// 缩放/编码失败记一条 warn：整会话只剩占位图，得留排查线索（对齐 `cover_write_failed`）。
+/// `shrink_cover` 本体保持纯函数，日志在调用方落。
+fn log_cover_decode_failed(file_name: &str) {
+    use crate::log_outlet::{log_event, LogLevel, LogTopic};
+    log_event(
+        LogLevel::Warn,
+        LogTopic::App,
+        "cover_decode_failed",
+        &[("file", file_name)],
+    );
 }
 
 /// 封面落盘。写成功返回 true。
@@ -1061,9 +1083,12 @@ impl Session {
         if bytes.is_empty() {
             return None;
         }
-        // 按歌词页显示需要缩小再存 JPEG：原始字节直接落盘平均 334 KB，太占空间。
+        // 按歌词页显示需要缩小再存 JPEG：原始字节直接落盘太占空间。
         // 源图解不开就不落盘：界面显示占位图，下次可重试。
-        let shrunk = shrink_cover(&bytes, COVER_ORIGINAL_MAX_EDGE)?;
+        let Some(shrunk) = shrink_cover(&bytes, COVER_ORIGINAL_MAX_EDGE) else {
+            log_cover_decode_failed(&format!("{:016x}.img", hash_url(url)));
+            return None;
+        };
         // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
         if !save_cover_file(&path, &shrunk) {
             return None;
@@ -1113,7 +1138,10 @@ impl Session {
         }
         // 缩到列表实际需要的尺寸再存 JPEG：40px 的缩略图不需要 500px 的原图。
         // 源图解不开就不落盘：界面显示占位图，下次可重试，不再把原始字节当兜底缓存。
-        let shrunk = shrink_cover(&bytes, COVER_MAX_EDGE)?;
+        let Some(shrunk) = shrink_cover(&bytes, COVER_MAX_EDGE) else {
+            log_cover_decode_failed(&format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));
+            return None;
+        };
         if !save_cover_file(&path, &shrunk) {
             return None;
         }
