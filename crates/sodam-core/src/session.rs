@@ -16,12 +16,13 @@ const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
 /// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
 /// 体积随画面复杂度与源图分辨率浮动，不写死数字。
 const COVER_JPEG_QUALITY: u8 = 85;
-/// 下载字节解码的边长上限：超大图直接当解码失败，拦掉极端宽高。
+/// 下载字节解码的边长上限，也是解码内存的结构性上界：
+/// 4096×4096 RGBA 解码约 64 MiB，8 路并发下载最坏约 0.5 GiB 瞬时，可控。
+/// 边长超过它的图当解码失败，走占位图重试——实测 CDN 封面最长边
+/// 只有 512px，4096 是 8 倍余量。不另设 max_alloc：边长已经封顶，
+/// 再画一条分配线只会跟自己打架。
+/// Limits 是 non_exhaustive，只能 Default 后按字段赋值。
 const MAX_DECODE_EDGE: u32 = 4096;
-/// 解码分配总量上限：真正拦内存的那条线——一张 4096×4096 的 RGBA 图
-/// 就要 64 MiB，解码中间缓冲还会更多，任一超限都走占位图重试。
-/// 显式写死不依赖库默认值（那个默认历史上变过）。
-const MAX_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
 fn cover_file_usable(path: &std::path::Path) -> bool {
@@ -39,12 +40,10 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     use image::ImageEncoder;
 
     // 解码带上限：CDN 字节不可全信，下载体积拦不住解压后的内存；
-    // 超出 MAX_DECODE_EDGE 或分配上限的图一律当解码失败，走占位图重试。
-    // Limits 是 non_exhaustive，只能 Default 后按字段赋值。
+    // 边长超限一律当解码失败，走占位图重试。
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODE_EDGE);
     limits.max_image_height = Some(MAX_DECODE_EDGE);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.limits(limits);
     let decoded = reader.with_guessed_format().ok()?.decode().ok()?;
@@ -1270,21 +1269,6 @@ mod tests {
         assert!(
             shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).is_none(),
             "宽超上限的图要走解码失败路径"
-        );
-    }
-
-    /// 分配总量上限是真正拦内存的线：边长合规、但解码要几十 MiB 的图
-    /// 一样走解码失败路径（纯色图编成 PNG 只有几十 KB，跑得快）。
-    #[test]
-    fn shrink_cover_rejects_images_over_alloc_limit() {
-        let mut img = image::RgbImage::new(4096, 4096);
-        img.put_pixel(0, 0, image::Rgb([1, 2, 3]));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut bytes, image::ImageFormat::Png)
-            .expect("测试 PNG 必须编得出来");
-        assert!(
-            shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).is_none(),
-            "分配超限的图要走解码失败路径"
         );
     }
 
