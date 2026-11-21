@@ -2260,10 +2260,15 @@ mod tests {
         assert!(pool.inflight.contains("cover-a"));
 
         pool.forget("cover-a");
-        assert!(!pool.push("cover-a"), "下载中不能重复入队");
+        assert!(
+            !pool.push("cover-a"),
+            "下载中 forget 不能放行，否则同一张下两遍"
+        );
 
+        // 下载完成会写回文件，这份请求已经拿到封面；seen 保持，不需要再排队。
         pool.done("cover-a");
-        assert!(pool.push("cover-a"), "下载结束后才能重新入队");
+        assert!(!pool.inflight.contains("cover-a"));
+        assert!(!pool.push("cover-a"), "文件已下好，不该再排一次");
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
