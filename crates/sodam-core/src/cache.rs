@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -307,22 +306,11 @@ enum CoverTrimAction {
     EvictReadable,
 }
 
-/// 上报门里「扫描完整」的保留值；`CoverTrimAction::code` 一律不用 0。
-const ALERT_STATE_COMPLETE: u8 = 0;
-
 impl CoverTrimAction {
     const fn label(self) -> &'static str {
         match self {
             Self::Skip => "skip",
             Self::EvictReadable => "evict_readable",
-        }
-    }
-
-    /// 上报门内部用的状态码：`ALERT_STATE_COMPLETE` 之外的一组**非零且互不相同**的值。
-    const fn code(self) -> u8 {
-        match self {
-            Self::Skip => 1,
-            Self::EvictReadable => 2,
         }
     }
 }
@@ -361,12 +349,16 @@ impl CoverTrimAlert {
 /// 注意这是**进程内单个封面缓存目录**的告警状态：两个目录共用一个门会互相压制告警，
 /// 也会互相复位。要按目录各自告警，就为每个目录注入自己的门（`trim_covers_scan` 就是这么收的）。
 #[derive(Default)]
-struct CoverAlertGate(AtomicU8);
+struct CoverAlertGate(Mutex<Option<CoverTrimAction>>);
 
 impl CoverAlertGate {
     fn admit(&self, action: Option<CoverTrimAction>) -> bool {
-        let state = action.map_or(ALERT_STATE_COMPLETE, CoverTrimAction::code);
-        self.0.swap(state, Ordering::Relaxed) != state
+        let mut last = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if *last == action {
+            return false;
+        }
+        *last = action;
+        true
     }
 }
 
@@ -1426,16 +1418,6 @@ mod tests {
             |_| false,
         );
         assert_eq!(alerts.borrow().len(), 2, "恢复完整后再出问题要重新上报");
-    }
-
-    /// 状态码约定：0 留给「扫描完整」，各动作码非零且互不相同。
-    #[test]
-    fn cover_trim_action_codes_are_distinct_and_non_zero() {
-        let skip = CoverTrimAction::Skip.code();
-        let evict = CoverTrimAction::EvictReadable.code();
-        assert_ne!(skip, ALERT_STATE_COMPLETE);
-        assert_ne!(evict, ALERT_STATE_COMPLETE);
-        assert_ne!(skip, evict);
     }
 
     /// 扫描恢复完整后复位，下次再出问题要重新上报。
