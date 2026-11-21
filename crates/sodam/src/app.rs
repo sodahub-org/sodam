@@ -83,6 +83,13 @@ impl CoverPool {
     fn done(&mut self) {
         self.inflight = self.inflight.saturating_sub(1);
     }
+
+    /// 忘记一个 URL：从排队和去重集合里一起摘掉，让它能被干净地重新入队。
+    /// 封面被淘汰后重下时用它，否则队列里的旧请求会和新入队的重复。
+    fn forget(&mut self, url: &str) {
+        self.queue.retain(|queued| queued != url);
+        self.seen.remove(url);
+    }
 }
 
 /// 列表一次渲染的行数上限：GPUI 没有虚拟滚动，一次性布局几百行 + 解码封面

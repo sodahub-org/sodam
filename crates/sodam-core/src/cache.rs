@@ -145,13 +145,18 @@ fn cover_group_key(path: &Path) -> String {
 /// 封面缓存硬上限：缩略图加原图合计，固定 512 MiB，不做用户配置项。
 pub const COVER_LIMIT_MB: u64 = 512;
 
-/// 按组内最后访问时间淘汰封面缓存，返回淘汰后的剩余字节数。
+/// 按组内最后访问时间淘汰封面缓存，返回 `(剩余字节数, 实际删掉的文件路径)`。
 ///
 /// 目录里所有普通文件都计入总量（含原图子目录和临时文件）；24 小时内的 `.part`
 /// 只统计不淘汰。同一张封面的缩略图与原图成组，组内取最新访问时间做 LRU 键，
 /// 从最久没看的组开始整组删，删到不超上限为止。删除成功才算释放，失败不中断。
+/// 返回删掉的路径，好让调用方只清理这些文件对应的内存映射，不必全表扫盘。
 /// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
-fn trim_covers_with<F: Fn(&Path) -> bool>(dir: &Path, limit_bytes: u64, remove: F) -> u64 {
+fn trim_covers_with<F: Fn(&Path) -> bool>(
+    dir: &Path,
+    limit_bytes: u64,
+    remove: F,
+) -> (u64, Vec<PathBuf>) {
     let mut files = Vec::new();
     files_in(dir, &mut files);
     let mut groups: HashMap<String, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
@@ -174,6 +179,7 @@ fn trim_covers_with<F: Fn(&Path) -> bool>(dir: &Path, limit_bytes: u64, remove: 
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by_key(|(_, (modified, _))| *modified);
+    let mut removed = Vec::new();
     for (_, (_, files)) in groups {
         if total <= limit_bytes {
             break;
@@ -181,25 +187,26 @@ fn trim_covers_with<F: Fn(&Path) -> bool>(dir: &Path, limit_bytes: u64, remove: 
         for (path, bytes) in files {
             if remove(&path) {
                 total = total.saturating_sub(bytes);
+                removed.push(path);
             }
         }
     }
-    total
+    (total, removed)
 }
 
-pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> u64 {
+pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
     trim_covers_with(dir, limit_bytes, |path| std::fs::remove_file(path).is_ok())
 }
 
-/// 对封面缓存目录施加 MB 上限，返回剩余字节数。调用方必须在后台执行。
+/// 对封面缓存目录施加 MB 上限，返回这次实际删掉的文件路径。调用方必须在后台执行。
 ///
-/// 和 `trim_audio` 一样收 MB：单位统一，调用方直接传 `COVER_LIMIT_MB`，
-/// 不用也不能在这里手写字节换算（漏写一次就会把上限当成 512 字节，清空整个目录）。
-pub fn trim_covers(limit_mb: u64) -> u64 {
-    trim_covers_in(
+/// 和 `trim_audio` 一样收 MB。返回删掉的路径，让界面只同步这几张封面的内存状态。
+pub fn trim_covers(limit_mb: u64) -> Vec<PathBuf> {
+    let (_, removed) = trim_covers_in(
         &crate::audio::cover_cache_dir(),
         limit_mb.saturating_mul(1024 * 1024),
-    )
+    );
+    removed
 }
 
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
@@ -948,7 +955,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
         let original = file(dir.path(), "covers/original/0000000000000001.img", 100);
-        assert_eq!(trim_covers_in(dir.path(), 1000), 20);
+        let (remaining, removed) = trim_covers_in(dir.path(), 1000);
+        assert_eq!(remaining, 20);
+        assert!(removed.is_empty(), "没超限不该报任何删除");
         assert!(thumb.exists());
         assert!(original.exists());
     }
@@ -962,7 +971,10 @@ mod tests {
         let new_thumb = file(dir.path(), "covers/0000000000000002-160.img", 0);
         let new_original = file(dir.path(), "covers/original/0000000000000002.img", 0);
 
-        assert_eq!(trim_covers_in(dir.path(), 20), 20);
+        let (remaining, removed) = trim_covers_in(dir.path(), 20);
+        assert_eq!(remaining, 20);
+        assert_eq!(removed.len(), 2, "整组两个文件都报出来");
+        assert!(removed.contains(&old_thumb) && removed.contains(&old_original));
         assert!(!old_thumb.exists(), "最旧的缩略图要删");
         assert!(!old_original.exists(), "最旧的原图要一起删");
         assert!(
@@ -983,7 +995,7 @@ mod tests {
         );
         let cover = file(dir.path(), "covers/0000000000000003-160.img", 50);
 
-        assert_eq!(trim_covers_in(dir.path(), 10), 10);
+        assert_eq!(trim_covers_in(dir.path(), 10).0, 10);
         assert!(fresh.exists(), "24 小时内的临时文件不能删");
         assert!(!stale.exists(), "过期临时文件可删");
         assert!(!cover.exists(), "普通封面按顺序删");
@@ -997,7 +1009,7 @@ mod tests {
         let recent = file(dir.path(), "covers/0000000000000002-160.img", 0);
         let attempts = std::cell::Cell::new(0);
 
-        let remaining = trim_covers_with(dir.path(), 10, |path| {
+        let (remaining, removed) = trim_covers_with(dir.path(), 10, |path| {
             attempts.set(attempts.get() + 1);
             if path == old.as_path() {
                 false // 模拟这个删不掉
@@ -1006,6 +1018,7 @@ mod tests {
             }
         });
         assert_eq!(remaining, 10, "删失败的那 10 字节不能算释放");
+        assert_eq!(removed, vec![recent], "删失败的不能报进删除列表");
         assert!(old.exists(), "删失败的文件还在");
         assert!(!recent.exists(), "不能因为一个删失败就中断后续淘汰");
         assert_eq!(attempts.get(), 2, "两组都要尝试过");
@@ -1015,8 +1028,8 @@ mod tests {
     #[test]
     fn trim_covers_missing_or_empty_dir_returns_zero() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(trim_covers_in(&dir.path().join("missing"), 0), 0);
-        assert_eq!(trim_covers_in(dir.path(), 0), 0);
+        assert_eq!(trim_covers_in(&dir.path().join("missing"), 0).0, 0);
+        assert_eq!(trim_covers_in(dir.path(), 0).0, 0);
     }
 
     #[test]

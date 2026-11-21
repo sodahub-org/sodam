@@ -29,23 +29,27 @@ use super::{
 };
 use sodam_core::queue::{PlayMode, Queue};
 
-/// 从封面路径映射里挑出磁盘上已经不存在（被淘汰或外部删掉）的 URL。
+/// 按「被淘汰的文件路径」反查对应的 URL，缩略图和原图分开返回。
 ///
-/// 缩略图和原图各查一遍，同一个 URL 只留一条。存在性判断由 `exists` 注入，
-/// 这样单测不用碰文件系统；调用方拿到结果后再去清 `covers` / `original_covers`
-/// 和下载去重标记。
-fn missing_cover_urls<F: Fn(&PathBuf) -> bool>(
+/// `covers` / `original_covers` 的 value 就是磁盘路径，按 value 精确匹配即可，
+/// 只删了缩略图就不会连原图映射一起清掉；调用方据此解除下载去重标记。
+fn urls_for_removed_paths(
     covers: &HashMap<String, PathBuf>,
     original_covers: &HashMap<String, PathBuf>,
-    exists: F,
-) -> HashSet<String> {
-    let mut missing = HashSet::new();
-    for (url, path) in covers.iter().chain(original_covers.iter()) {
-        if !exists(path) {
-            missing.insert(url.clone());
-        }
-    }
-    missing
+    removed: &[PathBuf],
+) -> (HashSet<String>, HashSet<String>) {
+    let was_removed = |path: &PathBuf| removed.iter().any(|gone| gone == path);
+    let thumb_urls = covers
+        .iter()
+        .filter(|(_, path)| was_removed(path))
+        .map(|(url, _)| url.clone())
+        .collect();
+    let original_urls = original_covers
+        .iter()
+        .filter(|(_, path)| was_removed(path))
+        .map(|(url, _)| url.clone())
+        .collect();
+    (thumb_urls, original_urls)
 }
 
 impl Root {
@@ -636,18 +640,17 @@ impl Root {
         let limit = self.settings.audio_cache_limit_mb;
         let work = cx.background_spawn(async move {
             sodam_core::cache::trim_audio(limit);
-            sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB);
-            sodam_core::audio::cache_stats()
+            let removed = sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB);
+            let stats = sodam_core::audio::cache_stats();
+            (removed, stats)
         });
         cx.spawn(async move |this, cx| {
-            let stats = work.await;
+            let (removed, stats) = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
                 root.cache_summary = stats;
-                // #217：后台淘汰可能删掉界面正在显示的封面。清掉指向已不存在文件的
-                // 路径映射并解除去重标记，让渲染把这张封面重新入队下载，否则本会话
-                // 会一直停在占位图（Session 的按需重下路径被 map 命中挡住了）。
-                root.drop_missing_covers();
+                // 只同步这次真被淘汰的封面路径，不在主线程上全表扫盘。
+                root.drop_removed_covers(&removed, cx);
                 if root.settings.audio_cache_limit_mb != limit {
                     root.maintain_cache(cx);
                 }
@@ -657,34 +660,49 @@ impl Root {
         .detach();
     }
 
-    /// 封面淘汰之后调用：把指向已不存在文件的内存路径清掉，并解除对应的下载去重标记。
+    /// 淘汰删了磁盘上的封面后，同步清掉内存里指向它们的路径映射。
     ///
-    /// 只摘磁盘上真没有的那几条，不动还在用的封面；被清掉的 URL 会因为 `covers`
-    /// 不再命中而被渲染重新丢进请求池，`attempted` / `seen` 也得放行，否则重下不来。
-    pub(crate) fn drop_missing_covers(&mut self) {
-        let dropped = missing_cover_urls(&self.covers, &self.original_covers, |path| path.exists());
-        if dropped.is_empty() {
+    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各自独立，
+    /// 只删了缩略图就不动原图映射。清掉后解除对应的下载去重标记、剔掉请求池里的
+    /// 重复项，渲染才能把这几种封面重新排队下载。当前曲目的原图被删时直接补一次下载，
+    /// 歌词页没有原图的自动入队口子，不等它自己回来。
+    pub(crate) fn drop_removed_covers(&mut self, removed: &[PathBuf], cx: &mut Context<Self>) {
+        if removed.is_empty() {
+            return;
+        }
+        let (thumb_urls, original_urls) =
+            urls_for_removed_paths(&self.covers, &self.original_covers, removed);
+        if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
         {
             let covers = Arc::make_mut(&mut self.covers);
-            for url in &dropped {
+            for url in &thumb_urls {
                 covers.remove(url);
             }
         }
-        self.original_covers.retain(|url, _| !dropped.contains(url));
+        for url in &original_urls {
+            self.original_covers.remove(url);
+        }
         if let Ok(mut attempted) = self.cover_attempted.lock() {
-            for url in &dropped {
+            for url in &thumb_urls {
                 attempted.remove(url);
             }
         }
         if let Ok(mut attempted) = self.original_cover_attempted.lock() {
-            for url in &dropped {
+            for url in &original_urls {
                 attempted.remove(url);
             }
         }
-        for url in &dropped {
-            self.cover_pool.seen.remove(url);
+        for url in thumb_urls.iter().chain(original_urls.iter()) {
+            // 队列里同 URL 的旧请求一并剔掉，否则重新入队会下载两遍、白占队列上限。
+            self.cover_pool.forget(url);
+        }
+        let current_cover = self.queue.current().map(|track| track.cover.clone());
+        if let Some(url) = current_cover {
+            if original_urls.contains(&url) {
+                self.ensure_original_cover(&url, cx);
+            }
         }
     }
 
@@ -5199,33 +5217,47 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
-        missing_cover_urls,
+        urls_for_removed_paths,
     };
     use sodam_core::models::{LyricLine, LyricWord};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    /// #217：封面被淘汰后，只挑出磁盘上真没了的 URL，还在的不能误清；
-    /// 同一个 URL 的缩略图和原图都被删时也只报一次。
+    /// 只按被删的文件路径反查 URL，缩略图和原图分开；只删了一侧不能连另一侧一起清。
     #[test]
-    fn missing_cover_urls_picks_only_gone_files() {
+    fn removed_paths_map_to_the_right_side_only() {
         let path = |name: &str| PathBuf::from(name);
         let covers = HashMap::from([
-            ("alive".to_string(), path("alive")),
-            ("gone-thumb".to_string(), path("gone")),
+            ("gone-thumb".to_string(), path("covers/thumb-gone.img")),
+            ("alive-thumb".to_string(), path("covers/thumb-alive.img")),
         ]);
         let originals = HashMap::from([
-            ("alive".to_string(), path("alive")),
-            ("gone-original".to_string(), path("gone")),
-            ("gone-thumb".to_string(), path("never-existed")),
+            (
+                "gone-thumb".to_string(),
+                path("covers/original/full-gone.img"),
+            ),
+            (
+                "original-only".to_string(),
+                path("covers/original/full-only.img"),
+            ),
         ]);
-        let exists = |p: &PathBuf| p.to_string_lossy() == "alive";
 
-        let missing = missing_cover_urls(&covers, &originals, exists);
-        assert_eq!(missing.len(), 2, "alive 要留住，两个 gone 各报一次");
-        assert!(missing.contains("gone-thumb"), "缩略图被删要报");
-        assert!(missing.contains("gone-original"), "原图被删要报");
-        assert!(!missing.contains("alive"), "还在的封面不能被误清");
+        let (thumbs, originals_gone) = urls_for_removed_paths(
+            &covers,
+            &originals,
+            &[
+                path("covers/thumb-gone.img"),
+                path("covers/original/full-only.img"),
+            ],
+        );
+        assert_eq!(thumbs.len(), 1, "只有缩略图被删的那张要重下缩略图");
+        assert!(thumbs.contains("gone-thumb"));
+        assert_eq!(originals_gone.len(), 1, "只有原图被删的那张要重下原图");
+        assert!(originals_gone.contains("original-only"));
+        // gone-thumb 的原图没被删，不能因为缩略图没了就一起清掉。
+        assert!(!originals_gone.contains("gone-thumb"));
+        // alive-thumb 两侧都没被删，谁都不该动。
+        assert!(!thumbs.contains("alive-thumb"));
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
