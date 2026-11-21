@@ -11,6 +11,38 @@ use std::sync::Arc;
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
 
+/// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
+fn cover_file_usable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false)
+}
+
+/// 封面落盘。写成功返回 true。
+///
+/// 失败时记一条 warn 的 `cover_write_failed`（文件名 + 错误），然后看目标这会儿能不能用：
+/// 能用（另一个写者刚写完）就返回 true，否则返回 false，由调用方显示占位图。
+fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
+    use crate::log_outlet::{log_event, LogLevel, LogTopic};
+    match crate::cache::write_cache_file_atomic(path, bytes) {
+        Ok(()) => true,
+        Err(err) => {
+            let file = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let error = err.to_string();
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "cover_write_failed",
+                &[("file", file.as_str()), ("error", error.as_str())],
+            );
+            cover_file_usable(path)
+        }
+    }
+}
+
 /// 预取/播放两条路径可能**并发下载同一首**（预取进行中用户又手动点了它），
 /// 固定的 .part 名会让两个写者互相踩踏（remove + 交错写 + 错误的 rename 对象）。
 /// 用「进程号 + 进程内序号」保证每次下载写自己的临时文件。
@@ -971,10 +1003,7 @@ impl Session {
         let dir = crate::audio::cover_cache_dir().join("original");
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{:016x}.img", hash_url(url)));
-        if std::fs::metadata(&path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-        {
+        if cover_file_usable(&path) {
             return Some(path);
         }
 
@@ -991,7 +1020,10 @@ impl Session {
         if bytes.is_empty() {
             return None;
         }
-        std::fs::write(&path, bytes).ok()?;
+        // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
+        if !save_cover_file(&path, &bytes) {
+            return None;
+        }
         Some(path)
     }
 
@@ -1019,10 +1051,7 @@ impl Session {
         std::fs::create_dir_all(&dir).ok()?;
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
         let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));
-        if std::fs::metadata(&path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-        {
+        if cover_file_usable(&path) {
             return Some(path);
         }
         let response = ureq::get(url)
@@ -1046,11 +1075,15 @@ impl Session {
             Some(image) => {
                 let mut encoded = std::io::Cursor::new(Vec::new());
                 image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
-                std::fs::write(&path, encoded.into_inner()).ok()?;
+                if !save_cover_file(&path, &encoded.into_inner()) {
+                    return None;
+                }
             }
             None => {
                 // 解码不了（罕见格式）就存原图，至少能显示
-                std::fs::write(&path, &bytes).ok()?;
+                if !save_cover_file(&path, &bytes) {
+                    return None;
+                }
             }
         }
         Some(path)
@@ -1074,6 +1107,65 @@ mod tests {
         let session = Session::new(settings);
         assert!(session.has_cookie());
         assert_eq!(session.settings().quality, "lossless");
+    }
+
+    /// 0 字节、或者目标根本不是个普通文件，都算没缓存：这种文件解码不出来，得重新下。
+    #[test]
+    fn unusable_cover_files_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+
+        assert!(!cover_file_usable(&path), "文件不在就是没缓存");
+        std::fs::write(&path, b"").unwrap();
+        assert!(!cover_file_usable(&path), "0 字节等于没写");
+        std::fs::write(&path, b"cover-bytes").unwrap();
+        assert!(cover_file_usable(&path));
+
+        let dir_path = dir.path().join("0000abcd-320.img");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert!(!cover_file_usable(&dir_path), "目录不是缓存文件");
+    }
+
+    /// 写不进去就返回 false，目标位置上的东西一个都不许动，自己的临时文件也要清干净。
+    #[test]
+    fn cover_write_failure_reports_unsaved_and_leaves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+        // 用目录占住目标路径，换文件这一步必然失败
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"old-cover").unwrap();
+
+        assert!(!save_cover_file(&path, b"new-cover"), "换不上就不能报成功");
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"old-cover");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "除目标本身以外不许留东西（临时文件要清掉）"
+        );
+    }
+
+    /// 写盘失败但目标这会儿已经能用时，返回 true 直接用它。
+    ///
+    /// 目标用一条 253 字节的文件名来造：临时文件会在它后面再拼 `.<进程号>-<序号>.part`，
+    /// 超过文件名 255 字节的上限，`fs::write` 这一步直接报错。
+    /// 只在 Unix 上跑：Windows 的临时目录路径加上 253 字节的名字会顶到路径长度上限，
+    /// 前置条件造不出来。
+    #[cfg(unix)]
+    #[test]
+    fn cover_write_failure_reuses_usable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.img", "a".repeat(249)));
+        std::fs::write(&path, b"old-cover").expect("造不出 253 字节文件名的目标");
+
+        assert!(
+            save_cover_file(&path, b"new-cover"),
+            "目标还能用就该把它交回去"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old-cover",
+            "没写成，旧封面不能被改"
+        );
     }
 
     /// 试听片段不算整曲缓存：显式点播的不可播拦截只给整曲让路（父票边界）。

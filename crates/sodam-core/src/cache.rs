@@ -746,6 +746,57 @@ pub fn atomic_replace_cache(
     Ok(())
 }
 
+/// 每次写都用一个新的临时名：进程号 + 进程内序号。
+///
+/// 同一张封面有可能被两条路同时写（列表的请求池、歌词页的原图下载），
+/// 共用一个 `.part` 名就会打架：一个刚把文件清空，另一个接着往后面写，
+/// 最后换上去的就是一张对不上的图。
+fn unique_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{seq}", std::process::id())
+}
+
+/// 写缓存文件：先往同目录的临时文件里写，整份写好了才换到正式路径。
+///
+/// 换用的是 `std::fs::rename`，三个平台上它都会把已经存在的目标整份换掉
+/// （Windows 上走 `MoveFileExW`），所以正式路径上永远不会出现写了一半的图：
+/// 要么旧封面原样还在，要么整份新封面。
+/// 换不动时（目标被别的程序占着、目录没权限）只删自己的临时文件，旧封面一动不动，
+/// 下次重试还能用。
+/// 临时名以 `.part` 结尾，跟下载中的音频一样受「24 小时内不淘汰」保护。
+/// 函数自己会用 `download_lock` 把同一目标的写者排队，调用方别再持着这把锁调进来。
+/// 调用方本来就在后台线程里跑，这里只做同步文件操作。
+pub fn write_cache_file_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "缓存路径没带文件名")
+        })?;
+    // 临时文件必须和正式文件在同一个目录：跨盘 rename 就不是一步到位了。
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let tmp = parent.join(format!("{name}.{}.part", unique_tag()));
+
+    // 同一张封面的两路写者在这里排队，一个换完另一个再动。
+    let lock = download_lock(target);
+    let _writer = lock.lock().unwrap_or_else(|err| err.into_inner());
+
+    if let Err(err) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,6 +1572,101 @@ mod tests {
         assert!(!leftover_backup.exists());
         assert!(!leftover_sidecar.exists());
         assert!(!leftover_tmp.exists());
+    }
+
+    /// 目录里除了点名的正式文件之外还剩什么：用来查临时文件和备份有没有留下。
+    fn stray_files(dir: &Path, keep: &[&str]) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !keep.iter().any(|kept| kept == name))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #216：本地还没有这张封面时，一次写成，写的就是刚拿到的字节。
+    #[test]
+    fn atomic_write_creates_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let covers = dir.path().join("covers");
+        let target = covers.join("0000abcd-160.img");
+        std::fs::create_dir_all(&covers).unwrap();
+
+        write_cache_file_atomic(&target, b"cover-bytes").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"cover-bytes");
+        assert!(
+            stray_files(&covers, &["0000abcd-160.img"]).is_empty(),
+            "写完整份就该只剩正式文件"
+        );
+    }
+
+    /// #216：已经有旧封面时整份换掉，不能还留着上一版的长尾巴。
+    #[test]
+    fn atomic_write_replaces_existing_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("0000abcd-160.img");
+        std::fs::write(&target, vec![b'o'; 4096]).unwrap();
+
+        write_cache_file_atomic(&target, b"new").unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"new",
+            "旧内容要整份换掉，不能只把开头覆盖掉"
+        );
+        assert!(stray_files(dir.path(), &["0000abcd-160.img"]).is_empty());
+    }
+
+    /// #216：换不上正式文件时，目标原地不动，临时文件也不留下。
+    ///
+    /// 用一个占着目标路径的目录来制造「换不动」：`rename` 到一个已有目录上会失败，
+    /// 和生产上「目标文件被别的程序占着换不动」是同一类结果。
+    #[test]
+    fn atomic_write_failure_keeps_target_and_drops_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("0000abcd-160.img");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"old-cover").unwrap();
+
+        assert!(write_cache_file_atomic(&target, b"new-cover").is_err());
+
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"old-cover",
+            "换不动就一点都别动，老封面不能被弄丢"
+        );
+        assert!(
+            stray_files(dir.path(), &["0000abcd-160.img"]).is_empty(),
+            "临时文件要清理掉"
+        );
+    }
+
+    /// 目录不在时直接报错，不 panic，也不留下半个文件。
+    #[test]
+    fn atomic_write_missing_dir_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nope").join("0000abcd-160.img");
+        assert!(write_cache_file_atomic(&target, b"x").is_err());
+        assert!(!target.exists());
+    }
+
+    /// 临时名每次都不一样：同一张封面的两个写者不会写到同一个文件里。
+    /// 名字以 `.part` 结尾，所以写了一半的临时文件也享有「24 小时内不淘汰」的保护。
+    #[test]
+    fn atomic_write_temp_names_are_unique_and_protected() {
+        let first = unique_tag();
+        let second = unique_tag();
+        assert_ne!(first, second, "同一张封面两次写入的临时名必须不同");
+        let name = format!("0000abcd-160.img.{first}.part");
+        assert!(
+            is_fresh_part(Path::new(&name), SystemTime::now()),
+            "写了一半的封面不能被维护任务顺手删掉"
+        );
     }
 
     #[cfg(unix)]
