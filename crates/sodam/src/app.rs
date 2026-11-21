@@ -2228,8 +2228,27 @@ impl Render for Root {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_verify_window_result, verify_window_step, VerifyWindowState, VerifyWindowStep,
+        apply_verify_window_result, verify_window_step, CoverPool, VerifyWindowState,
+        VerifyWindowStep,
     };
+
+    /// #217：封面被淘汰后 forget 要同时摘掉排队项和去重标记，
+    /// 这样重新入队恰好一次，不会留下重复请求白占队列上限。
+    #[test]
+    fn cover_pool_forget_allows_exactly_one_requeue() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("cover-a"));
+        assert!(pool.push("cover-b"));
+        assert!(!pool.push("cover-a"), "没 forget 之前不能重复入队");
+        assert_eq!(pool.queue.len(), 2);
+
+        pool.forget("cover-a");
+        assert_eq!(pool.queue.len(), 1, "排队里的旧请求要被摘掉");
+        assert!(!pool.seen.contains("cover-a"), "去重标记也要放行");
+
+        assert!(pool.push("cover-a"), "forget 之后要能重新入队");
+        assert_eq!(pool.queue.iter().filter(|url| *url == "cover-a").count(), 1);
+    }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
     const OPENED_TEXT: &str = "验证窗口已打开；完成后这里会自动更新";

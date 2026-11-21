@@ -38,15 +38,16 @@ fn urls_for_removed_paths(
     original_covers: &HashMap<String, PathBuf>,
     removed: &[PathBuf],
 ) -> (HashSet<String>, HashSet<String>) {
-    let was_removed = |path: &PathBuf| removed.iter().any(|gone| gone == path);
+    let removed_set: HashSet<&std::path::Path> =
+        removed.iter().map(|path| path.as_path()).collect();
     let thumb_urls = covers
         .iter()
-        .filter(|(_, path)| was_removed(path))
+        .filter(|(_, path)| removed_set.contains(path.as_path()))
         .map(|(url, _)| url.clone())
         .collect();
     let original_urls = original_covers
         .iter()
-        .filter(|(_, path)| was_removed(path))
+        .filter(|(_, path)| removed_set.contains(path.as_path()))
         .map(|(url, _)| url.clone())
         .collect();
     (thumb_urls, original_urls)
@@ -698,7 +699,13 @@ impl Root {
             // 队列里同 URL 的旧请求一并剔掉，否则重新入队会下载两遍、白占队列上限。
             self.cover_pool.forget(url);
         }
-        let current_cover = self.queue.current().map(|track| track.cover.clone());
+        // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
+        // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
+        let current_cover = self
+            .pending_track
+            .as_ref()
+            .or_else(|| self.queue.current())
+            .map(|track| track.cover.clone());
         if let Some(url) = current_cover {
             if original_urls.contains(&url) {
                 self.ensure_original_cover(&url, cx);
