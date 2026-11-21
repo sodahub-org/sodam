@@ -5202,6 +5202,8 @@ mod tests {
         missing_cover_urls,
     };
     use sodam_core::models::{LyricLine, LyricWord};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// #217：封面被淘汰后，只挑出磁盘上真没了的 URL，还在的不能误清；
     /// 同一个 URL 的缩略图和原图都被删时也只报一次。
