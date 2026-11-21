@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -297,67 +298,114 @@ where
     (total, removed)
 }
 
-/// 按组内最后访问时间淘汰封面缓存，返回 `(剩余字节数, 实际删掉的文件路径)`。
-///
-/// 目录里所有普通文件都计入总量（含原图子目录和临时文件）；24 小时内的 `.part`
-/// 只统计不淘汰。同一张封面的缩略图与原图成组，组内取最新访问时间做 LRU 键，
-/// 从最久没看的组开始整组删，删到不超上限为止。删除成功才算释放，失败不中断。
-/// 返回删掉的路径，好让调用方只清理这些文件对应的内存映射，不必全表扫盘。
-/// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
-///
-/// 扫描不完整时只在「可读部分已超限」时按可读部分淘汰，否则本轮不删（见 `trim_covers_scan`）。
-fn trim_covers_with<F: FnMut(&Path) -> bool>(
-    dir: &Path,
-    limit_bytes: u64,
-    remove: F,
-) -> (u64, Vec<PathBuf>) {
-    trim_covers_scan(scan_files(dir), limit_bytes, remove)
+/// 扫描不完整时采取的动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoverTrimAction {
+    /// 可读部分自己没超限，判断不了真实占用，本轮不删。
+    Skip,
+    /// 可读部分自己已超限，按它淘汰最旧的组。
+    EvictReadable,
 }
 
-/// 封面淘汰的决策层：只在「总量一定超限」时才删。
+impl CoverTrimAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::EvictReadable => "evict_readable",
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Skip => 1,
+            Self::EvictReadable => 2,
+        }
+    }
+}
+
+/// 一次「扫描不完整」的上报内容。
+#[derive(Debug, PartialEq)]
+struct CoverTrimAlert {
+    readable_bytes: u64,
+    readable_files: usize,
+    action: CoverTrimAction,
+}
+
+impl CoverTrimAlert {
+    fn log(&self) {
+        let bytes = self.readable_bytes.to_string();
+        let files = self.readable_files.to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "cover_trim_incomplete",
+            &[
+                ("readable_bytes", bytes.as_str()),
+                ("readable_files", files.as_str()),
+                ("action", self.action.label()),
+            ],
+        );
+    }
+}
+
+/// 上报门：只在动作变化时放行。
 ///
-/// 读不到的子树会让总量偏小，所以可读部分的字节数只是一个**下界**：
-/// - 下界本身已经超限 → 真实占用必然也超限，按可读部分淘汰是对的，删掉的也确实是
-///   可读文件里最旧的那几组；一条长期读不到的条目只会让本轮少删，不会冻住整轮淘汰。
-/// - 下界还没超限 → 真实占用可能超、也可能不超，这一轮不删，并留一条 Warn 日志
-///   `cover_trim_incomplete`（`readable_bytes` / `readable_files` / `action`）。
+/// 扫描一直不完整、动作一直是 `skip` 时，每轮维护（约 60 秒）都写一条 Warn 就是刷屏；
+/// 日志出口的折叠只吃「连续且完全相同」的行，字段里的字节数一变就断。所以由这里记住
+/// 上次报告的动作，同一个动作只报一次；扫描恢复完整后复位，下次出问题再报。
+#[derive(Default)]
+struct CoverAlertGate(AtomicU8);
+
+impl CoverAlertGate {
+    fn admit(&self, action: Option<CoverTrimAction>) -> bool {
+        let state = action.map_or(0, CoverTrimAction::code);
+        self.0.swap(state, Ordering::Relaxed) != state
+    }
+}
+
+fn cover_alert_gate() -> &'static CoverAlertGate {
+    static GATE: OnceLock<CoverAlertGate> = OnceLock::new();
+    GATE.get_or_init(CoverAlertGate::default)
+}
+
+/// 封面淘汰的决策层：读不全时，只有在可读部分自己就超限时才删。
 ///
-/// 读不到的那部分有多大，任何淘汰策略都无从得知（删它也会失败），只能靠可见性上报和
-/// 权限恢复：所以这里不承诺「目录一定回到上限内」，只承诺「不拿残缺总量当完整视图」。
-/// 全程只写日志，不弹提示、不改状态行。
-fn trim_covers_scan<F: FnMut(&Path) -> bool>(
+/// 读不到的子树让总量偏小，所以可读部分的字节数只是下界：下界已超限说明真实占用必然
+/// 也超限，按可读部分淘汰最旧的组是对的；下界没超限则判断不了，本轮跳过并上报
+/// `cover_trim_incomplete`（`readable_bytes` / `readable_files` / `action`，动作变化时才写）。
+fn trim_covers_scan<F, L>(
     scan: Scan,
     limit_bytes: u64,
+    gate: &CoverAlertGate,
+    mut alert: L,
     remove: F,
-) -> (u64, Vec<PathBuf>) {
+) -> (u64, Vec<PathBuf>)
+where
+    F: FnMut(&Path) -> bool,
+    L: FnMut(CoverTrimAlert),
+{
     if !scan.incomplete {
+        gate.admit(None);
         return evict_lru(scan.files, limit_bytes, cover_group_key, remove);
     }
     let readable_bytes = scan.total_bytes();
-    let over_readable = readable_bytes > limit_bytes;
-    log_cover_trim_incomplete(readable_bytes, scan.files.len(), over_readable);
-    if over_readable {
-        evict_lru(scan.files, limit_bytes, cover_group_key, remove)
+    let action = if readable_bytes > limit_bytes {
+        CoverTrimAction::EvictReadable
     } else {
-        (readable_bytes, Vec::new())
+        CoverTrimAction::Skip
+    };
+    if gate.admit(Some(action)) {
+        alert(CoverTrimAlert {
+            readable_bytes,
+            readable_files: scan.files.len(),
+            action,
+        });
     }
-}
-
-/// 扫描不完整时的留痕。Warn 而不是 Debug：Debug 默认不写盘，那就还是「静默跳过」。
-/// 持续存在时由日志出口的连续重复行折叠压成一条带计数的记录，不会刷屏。
-fn log_cover_trim_incomplete(readable_bytes: u64, readable_files: usize, evicting: bool) {
-    let bytes = readable_bytes.to_string();
-    let files = readable_files.to_string();
-    log_event(
-        LogLevel::Warn,
-        LogTopic::App,
-        "cover_trim_incomplete",
-        &[
-            ("readable_bytes", bytes.as_str()),
-            ("readable_files", files.as_str()),
-            ("action", if evicting { "evict_readable" } else { "skip" }),
-        ],
-    );
+    if action == CoverTrimAction::Skip {
+        (readable_bytes, Vec::new())
+    } else {
+        evict_lru(scan.files, limit_bytes, cover_group_key, remove)
+    }
 }
 
 /// 按字节上限淘汰封面缓存目录，返回 `(剩余字节数, 实际删掉的路径)`。
@@ -365,7 +413,13 @@ fn log_cover_trim_incomplete(readable_bytes: u64, readable_files: usize, evictin
 /// 扫描完整时剩余字节数就是目录真实占用；扫描不完整时它只是**可读部分**的字节数
 /// （读不到的子目录不计入），所以调用方不要拿它当磁盘占用的准确值。
 pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
-    trim_covers_with(dir, limit_bytes, |path| std::fs::remove_file(path).is_ok())
+    trim_covers_scan(
+        scan_files(dir),
+        limit_bytes,
+        cover_alert_gate(),
+        |alert| alert.log(),
+        |path| std::fs::remove_file(path).is_ok(),
+    )
 }
 
 /// 对封面缓存目录施加 MB 上限，返回这次实际删掉的文件路径。调用方必须在后台执行。
@@ -1198,6 +1252,21 @@ mod tests {
         })
     }
 
+    /// 静默跑一轮封面淘汰：只关心删了什么、不关心日志的测试用它。
+    fn trim_covers_with<F: FnMut(&Path) -> bool>(
+        dir: &Path,
+        limit_bytes: u64,
+        remove: F,
+    ) -> (u64, Vec<PathBuf>) {
+        trim_covers_scan(
+            scan_files(dir),
+            limit_bytes,
+            &CoverAlertGate::default(),
+            |_alert| {},
+            remove,
+        )
+    }
+
     /// 子目录读不到、可读部分也没超限：本轮不删。
     ///
     /// 可读部分只有一个 10 字节的文件，上限远大于它，所以「超没超限」根本判断不了；
@@ -1212,14 +1281,30 @@ mod tests {
         assert_eq!(scan.total_bytes(), 10, "只统计到可读部分");
 
         let attempts = std::cell::Cell::new(0);
-        let (remaining, removed) = trim_covers_scan(scan, 1000, |_path| {
-            attempts.set(attempts.get() + 1);
-            true
-        });
+        let alerts = std::cell::RefCell::new(Vec::new());
+        let (remaining, removed) = trim_covers_scan(
+            scan,
+            1000,
+            &CoverAlertGate::default(),
+            |alert| alerts.borrow_mut().push(alert),
+            |_path| {
+                attempts.set(attempts.get() + 1);
+                true
+            },
+        );
 
         assert_eq!(attempts.get(), 0, "下界没超限时不能凭残缺总量去删");
         assert!(removed.is_empty());
         assert_eq!(remaining, 10);
+        assert_eq!(
+            alerts.borrow().as_slice(),
+            &[CoverTrimAlert {
+                readable_bytes: 10,
+                readable_files: 1,
+                action: CoverTrimAction::Skip,
+            }],
+            "跳过这一轮要留痕，且字段写的是可读部分"
+        );
         assert!(thumb.exists(), "可读的封面也不能删");
         assert!(hidden.exists(), "读不到的部分更没动过");
     }
@@ -1235,13 +1320,78 @@ mod tests {
         assert!(scan.incomplete);
 
         // 可读 20 字节、上限 10：可读部分已经超限，真实占用必然也超限。
-        let (remaining, removed) =
-            trim_covers_scan(scan, 10, |path| std::fs::remove_file(path).is_ok());
+        let (remaining, removed) = trim_covers_scan(
+            scan,
+            10,
+            &CoverAlertGate::default(),
+            |_alert| {},
+            |path| std::fs::remove_file(path).is_ok(),
+        );
         assert_eq!(remaining, 10);
         assert_eq!(removed, vec![old.clone()], "只删可读部分里最旧的那组");
         assert!(!old.exists());
         assert!(recent.exists(), "最近看过的要留住");
         assert!(hidden.exists(), "读不到的部分不动");
+    }
+
+    /// 「动作」只在变化时上报一次：一直不完整也不会每分钟写一条 Warn。
+    #[test]
+    fn cover_trim_alerts_once_per_action_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let hidden = file(dir.path(), "covers/original/0000000000000002.img", 500);
+        let denied = dir.path().join("covers/original");
+        let gate = CoverAlertGate::default();
+        let alerts = std::cell::RefCell::new(Vec::new());
+
+        // 可读 10 字节、上限 1000：判断不了，跳过；同一动作的第二轮不再上报。
+        for _ in 0..2 {
+            let scan = scan_denying(dir.path(), &denied);
+            let _ = trim_covers_scan(
+                scan,
+                1000,
+                &gate,
+                |alert| alerts.borrow_mut().push(alert),
+                |_| false,
+            );
+        }
+        assert_eq!(alerts.borrow().len(), 1, "同一个动作只报一次");
+
+        // 上限降到 0：动作变成按可读部分淘汰，再报一次，并且这一轮确实删了。
+        let scan = scan_denying(dir.path(), &denied);
+        let (remaining, removed) = trim_covers_scan(
+            scan,
+            0,
+            &gate,
+            |alert| alerts.borrow_mut().push(alert),
+            |path| std::fs::remove_file(path).is_ok(),
+        );
+        let alerts = alerts.into_inner();
+        assert_eq!(alerts.len(), 2, "动作变了要重新上报");
+        assert_eq!(alerts[1].action, CoverTrimAction::EvictReadable);
+        assert_eq!(alerts[1].readable_bytes, 10);
+        assert_eq!(remaining, 0);
+        assert_eq!(removed, vec![thumb.clone()]);
+        assert!(!thumb.exists());
+        assert!(hidden.exists(), "读不到的部分不动");
+    }
+
+    /// 扫描恢复完整后复位，下次再出问题要重新上报。
+    #[test]
+    fn cover_alert_gate_resets_after_a_complete_scan() {
+        let gate = CoverAlertGate::default();
+        assert!(gate.admit(Some(CoverTrimAction::Skip)));
+        assert!(!gate.admit(Some(CoverTrimAction::Skip)), "同一动作只报一次");
+        assert!(gate.admit(None), "恢复完整是一次状态变化");
+        assert!(!gate.admit(None));
+        assert!(
+            gate.admit(Some(CoverTrimAction::Skip)),
+            "再次出问题要重新上报"
+        );
+        assert!(
+            gate.admit(Some(CoverTrimAction::EvictReadable)),
+            "动作变了也要报"
+        );
     }
 
     /// 音频遇到同样的扫描缺口时保持既有口径（按可读部分淘汰），
