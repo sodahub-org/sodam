@@ -1220,8 +1220,158 @@ mod tests {
         assert!(!cover_file_usable(&dir_path), "目录不是缓存文件");
     }
 
-    /// #217：命中磁盘缓存把修改时间推到当前，作为 LRU 的兜底键。
+    /// 造一张 PNG 封面字节，供 `shrink_cover` 离线测试用。
+    fn png_cover_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                img.put_pixel(x, y, image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+            }
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        out.into_inner()
+    }
 
+    /// 大图缩到目标长边，且保持等比。
+    #[test]
+    fn shrink_cover_scales_long_edge_and_keeps_ratio() {
+        let shrunk =
+            shrink_cover(&png_cover_bytes(640, 400), COVER_MAX_EDGE).expect("PNG 应该解得开");
+        let decoded = image::load_from_memory(&shrunk).expect("输出必须还能解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (160, 100),
+            "长边缩到 160，等比"
+        );
+    }
+
+    /// 小图不许被放大：长边不足目标时保持原尺寸。
+    #[test]
+    fn shrink_cover_never_upscales() {
+        let shrunk = shrink_cover(&png_cover_bytes(100, 37), COVER_ORIGINAL_MAX_EDGE)
+            .expect("PNG 应该解得开");
+        let decoded = image::load_from_memory(&shrunk).expect("输出必须还能解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (100, 37),
+            "小图原样保留"
+        );
+    }
+
+    /// 输出是可解码的 JPEG（按内容嗅探），大图长边缩到 1280。
+    #[test]
+    fn shrink_cover_writes_decodable_jpeg_at_original_edge() {
+        let shrunk = shrink_cover(&png_cover_bytes(2000, 1500), COVER_ORIGINAL_MAX_EDGE)
+            .expect("PNG 应该解得开");
+        assert_eq!(
+            image::guess_format(&shrunk).unwrap(),
+            image::ImageFormat::Jpeg,
+            "落盘内容必须是 JPEG"
+        );
+        let decoded = image::load_from_memory(&shrunk).expect("JPEG 必须能再解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (1280, 960),
+            "长边缩到 1280，等比"
+        );
+    }
+
+    /// 边界内的合法大封面必须能解码成功——防止以后调小边长或加回
+    /// 别的上限，把这类图重新挡成永久占位图。
+    /// 源图边长写死 4096，故意不跟 `MAX_DECODE_EDGE` 走：常量调小后
+    /// 这条测试必须红，才算盯住了。
+    #[test]
+    fn shrink_cover_accepts_large_covers_within_limit() {
+        let img = image::RgbImage::from_pixel(4096, 4096, image::Rgb([8, 16, 32]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        let shrunk = shrink_cover(&bytes.into_inner(), COVER_ORIGINAL_MAX_EDGE)
+            .expect("边界内的大图必须能缩");
+        let decoded = image::load_from_memory(&shrunk).expect("输出必须还能解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (COVER_ORIGINAL_MAX_EDGE, COVER_ORIGINAL_MAX_EDGE),
+            "4096² 源图要缩到原图目标边长"
+        );
+    }
+
+    /// 解不开的源图返回 `None`，调用方据此不落盘、界面显示占位图。
+    #[test]
+    fn shrink_cover_rejects_undecodable_bytes() {
+        assert!(shrink_cover(b"not-an-image", COVER_MAX_EDGE).is_none());
+    }
+
+    /// 超出解码边长上限的源图当解码失败处理。像素量刻意很小
+    /// （一条 1px 的行），编出来只有几 KB，跑得快。
+    #[test]
+    fn shrink_cover_rejects_images_over_decode_limit() {
+        let mut img = image::RgbImage::new(MAX_DECODE_EDGE + 1, 1);
+        img.put_pixel(0, 0, image::Rgb([1, 2, 3]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        assert!(
+            shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).is_none(),
+            "宽超上限的图要走解码失败路径"
+        );
+    }
+
+    /// 带 alpha 的源图落 PNG 保透明（头像走这个缓存，转 JPEG 会变黑底）。
+    #[test]
+    fn shrink_cover_preserves_alpha_as_png() {
+        let mut img = image::RgbaImage::new(80, 80);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([10, 20, 30, 128]);
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        let shrunk = shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).expect("PNG 应该解得开");
+        assert_eq!(
+            image::guess_format(&shrunk).unwrap(),
+            image::ImageFormat::Png,
+            "带透明的图要落 PNG"
+        );
+        let decoded = image::load_from_memory(&shrunk).expect("PNG 必须能再解");
+        // 80×80 ≤ 160：原样保留，不放大。
+        assert_eq!((decoded.width(), decoded.height()), (80, 80));
+        // PNG 无损：alpha 通道和值都原样保留。
+        assert_eq!(decoded.color(), image::ColorType::Rgba8, "透明通道要保留");
+        // DynamicImage 没有 get_pixel：经 to_rgba8 落到 ImageBuffer 再取。
+        let rgba = decoded.to_rgba8();
+        assert_eq!(
+            rgba.get_pixel(0, 0),
+            &image::Rgba([10, 20, 30, 128]),
+            "半透明像素原样保留"
+        );
+    }
+
+    /// 全不透明的 RGBA 源图（导出工具默认带 alpha 通道）照旧走 JPEG——
+    /// 别让「带通道就落 PNG」把无损 PNG 的体积又吐回去。
+    #[test]
+    fn shrink_cover_keeps_jpeg_for_opaque_rgba_source() {
+        let img = image::RgbaImage::from_pixel(320, 200, image::Rgba([8, 16, 32, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        let shrunk = shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).expect("PNG 应该解得开");
+        assert_eq!(
+            image::guess_format(&shrunk).unwrap(),
+            image::ImageFormat::Jpeg,
+            "全不透明的源图要照旧走 JPEG"
+        );
+        let decoded = image::load_from_memory(&shrunk).expect("JPEG 必须能再解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (160, 100),
+            "长边缩到 160，等比"
+        );
+    }
+
+    /// 命中磁盘缓存把修改时间推到当前，作为 LRU 的兜底键。
     #[test]
     fn touching_cover_refreshes_modified_time() {
         use std::time::{Duration, SystemTime};
