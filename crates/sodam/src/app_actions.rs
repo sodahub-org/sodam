@@ -5278,7 +5278,7 @@ mod tests {
 
         // 被下载重建回来的路径不再算失效，映射要留住。
         let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
-            p.to_string_lossy() == "covers/original/full-only.img"
+            p.to_string_lossy() != "covers/original/full-only.img"
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
