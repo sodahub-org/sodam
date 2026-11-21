@@ -668,11 +668,18 @@ impl Root {
     /// 重复项，渲染才能把这几种封面重新排队下载。当前曲目的原图被删时直接补一次下载，
     /// 歌词页没有原图的自动入队口子，不等它自己回来。
     pub(crate) fn drop_removed_covers(&mut self, removed: &[PathBuf], cx: &mut Context<Self>) {
-        if removed.is_empty() {
+        // 淘汰到回调之间可能有下载把文件重建回来了。还活着的路径不能当成被删处理，
+        // 否则刚下好的封面会被误清、再下一遍。
+        let gone: Vec<PathBuf> = removed
+            .iter()
+            .filter(|path| !path.exists())
+            .cloned()
+            .collect();
+        if gone.is_empty() {
             return;
         }
         let (thumb_urls, original_urls) =
-            urls_for_removed_paths(&self.covers, &self.original_covers, removed);
+            urls_for_removed_paths(&self.covers, &self.original_covers, &gone);
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
@@ -695,8 +702,9 @@ impl Root {
                 attempted.remove(url);
             }
         }
-        for url in thumb_urls.iter().chain(original_urls.iter()) {
-            // 队列里同 URL 的旧请求一并剔掉，否则重新入队会下载两遍、白占队列上限。
+        // 只动缩略图请求的去重状态：原图走独立的下载任务，踢这里的队列会把
+        // 排队中的缩略图请求一起干掉，却没清 cover_attempted，导致再也排不进去。
+        for url in &thumb_urls {
             self.cover_pool.forget(url);
         }
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
@@ -3123,7 +3131,7 @@ impl Root {
             cx.spawn(async move |this, cx| {
                 let (path, color) = task.await;
                 let _ = this.update(cx, |root, cx| {
-                    root.cover_pool.done();
+                    root.cover_pool.done(&url);
                     if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
                         let file = path
                             .as_ref()
@@ -3143,6 +3151,14 @@ impl Root {
                                 ("color", color.as_str()),
                             ],
                         );
+                    }
+                    // 下载期间这张封面可能刚好被后台淘汰删掉。文件已经没了的路径
+                    // 不能发布，否则 map 指向空文件、还占着 attempted 不让重下。
+                    let path = path.filter(|path| path.exists());
+                    if path.is_none() {
+                        if let Ok(mut attempted) = root.cover_attempted.lock() {
+                            attempted.remove(&url);
+                        }
                     }
                     let has_result = path.is_some() || color.is_some();
                     if let Some(path) = path {

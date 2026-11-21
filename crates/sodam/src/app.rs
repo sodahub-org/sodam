@@ -44,7 +44,7 @@ pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 /// 其余排队；渲染永远只读缓存。
 pub(crate) struct CoverPool {
     queue: VecDeque<String>,
-    inflight: usize,
+    inflight: HashSet<String>,
     seen: HashSet<String>,
 }
 
@@ -55,7 +55,7 @@ impl CoverPool {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
-            inflight: 0,
+            inflight: HashSet::new(),
             seen: HashSet::new(),
         }
     }
@@ -72,23 +72,25 @@ impl CoverPool {
     }
 
     fn next(&mut self) -> Option<String> {
-        if self.inflight >= Self::MAX_CONCURRENCY {
+        if self.inflight.len() >= Self::MAX_CONCURRENCY {
             return None;
         }
         let url = self.queue.pop_front()?;
-        self.inflight += 1;
+        self.inflight.insert(url.clone());
         Some(url)
     }
 
-    fn done(&mut self) {
-        self.inflight = self.inflight.saturating_sub(1);
+    fn done(&mut self, url: &str) {
+        self.inflight.remove(url);
     }
 
-    /// 忘记一个 URL：从排队和去重集合里一起摘掉，让它能被干净地重新入队。
-    /// 封面被淘汰后重下时用它，否则队列里的旧请求会和新入队的重复。
+    /// 封面被淘汰后想让一个 URL 重新入队：摘掉排队中的旧请求和去重标记。
+    /// 但正在下载的那份不能放行——它马上会写回文件，再 push 一次就是重复下载。
     fn forget(&mut self, url: &str) {
         self.queue.retain(|queued| queued != url);
-        self.seen.remove(url);
+        if !self.inflight.contains(url) {
+            self.seen.remove(url);
+        }
     }
 }
 
@@ -2232,8 +2234,7 @@ mod tests {
         VerifyWindowStep,
     };
 
-    /// #217：封面被淘汰后 forget 要同时摘掉排队项和去重标记，
-    /// 这样重新入队恰好一次，不会留下重复请求白占队列上限。
+    /// forget 要同时摘掉排队项和去重标记，重新入队才不会下两遍。
     #[test]
     fn cover_pool_forget_allows_exactly_one_requeue() {
         let mut pool = CoverPool::new();
@@ -2248,6 +2249,21 @@ mod tests {
 
         assert!(pool.push("cover-a"), "forget 之后要能重新入队");
         assert_eq!(pool.queue.iter().filter(|url| *url == "cover-a").count(), 1);
+    }
+
+    /// 正在下载的封面被淘汰时，forget 不能放行去重标记，否则同一张会同时下两遍。
+    #[test]
+    fn cover_pool_forget_keeps_seen_while_inflight() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("cover-a"));
+        assert_eq!(pool.next().as_deref(), Some("cover-a"), "取出后进入下载中");
+        assert!(pool.inflight.contains("cover-a"));
+
+        pool.forget("cover-a");
+        assert!(!pool.push("cover-a"), "下载中不能重复入队");
+
+        pool.done("cover-a");
+        assert!(pool.push("cover-a"), "下载结束后才能重新入队");
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
