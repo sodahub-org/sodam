@@ -617,6 +617,10 @@ impl Root {
         let limit = self.settings.audio_cache_limit_mb;
         let work = cx.background_spawn(async move {
             sodam_core::cache::trim_audio(limit);
+            // #217：同一趟后台维护顺手把封面压到 512 MiB 以内，不新增触发时机。
+            sodam_core::cache::trim_covers(
+                sodam_core::cache::COVER_LIMIT_MB.saturating_mul(1024 * 1024),
+            );
             sodam_core::audio::cache_stats()
         });
         cx.spawn(async move |this, cx| {

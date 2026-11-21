@@ -126,6 +126,79 @@ fn is_fresh_part(path: &Path, modified: SystemTime) -> bool {
         && modified.elapsed().unwrap_or_default() < PART_MAX_AGE
 }
 
+/// 封面分组键：文件名开头的 URL 哈希。缩略图 `{hash}-160.img`、原图 `{hash}.img`、
+/// 临时文件 `{hash}-160.img.*.part` 都以同一个哈希开头，这样整组能一起淘汰，
+/// 不会出现只剩缩略图或只剩原图的半套缓存。
+fn cover_group_key(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let hash: String = name
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hash.is_empty() {
+        name
+    } else {
+        hash
+    }
+}
+
+/// 封面缓存硬上限：缩略图加原图合计，固定 512 MiB，不做用户配置项。
+pub const COVER_LIMIT_MB: u64 = 512;
+
+/// 按组内最后访问时间淘汰封面缓存，返回淘汰后的剩余字节数。
+///
+/// 目录里所有普通文件都计入总量（含原图子目录和临时文件）；24 小时内的 `.part`
+/// 只统计不淘汰。同一张封面的缩略图与原图成组，组内取最新访问时间做 LRU 键，
+/// 从最久没看的组开始整组删，删到不超上限为止。删除成功才算释放，失败不中断。
+/// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
+fn trim_covers_with<F: Fn(&Path) -> bool>(dir: &Path, limit_bytes: u64, remove: F) -> u64 {
+    let mut files = Vec::new();
+    files_in(dir, &mut files);
+    let mut groups: HashMap<String, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
+    let mut total = 0u64;
+    for path in files {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let bytes = meta.len();
+        total = total.saturating_add(bytes);
+        let modified = meta.modified().unwrap_or(SystemTime::now());
+        if is_fresh_part(&path, modified) {
+            continue;
+        }
+        let group = groups
+            .entry(cover_group_key(&path))
+            .or_insert((modified, Vec::new()));
+        group.0 = group.0.max(modified);
+        group.1.push((path, bytes));
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|(_, (modified, _))| *modified);
+    for (_, (_, files)) in groups {
+        if total <= limit_bytes {
+            break;
+        }
+        for (path, bytes) in files {
+            if remove(&path) {
+                total = total.saturating_sub(bytes);
+            }
+        }
+    }
+    total
+}
+
+pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> u64 {
+    trim_covers_with(dir, limit_bytes, |path| std::fs::remove_file(path).is_ok())
+}
+
+/// 对封面缓存目录施加字节上限，返回剩余字节数。调用方必须在后台执行。
+pub fn trim_covers(limit_bytes: u64) -> u64 {
+    trim_covers_in(&crate::audio::cover_cache_dir(), limit_bytes)
+}
+
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
 pub fn clear_in(root: &Path) -> usize {
     let mut files = Vec::new();
@@ -864,6 +937,76 @@ mod tests {
         assert_eq!(trim_audio_in(dir.path(), 0), 20);
         drop(lease);
         assert_eq!(trim_audio_in(dir.path(), 0), 0);
+    }
+
+    /// #217：没超上限一个都不删，统计口径含原图子目录里的文件。
+    #[test]
+    fn trim_covers_below_limit_keeps_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let original = file(dir.path(), "covers/original/0000000000000001.img", 100);
+        assert_eq!(trim_covers_in(dir.path(), 1000), 20);
+        assert!(thumb.exists());
+        assert!(original.exists());
+    }
+
+    /// #217：超限时按组内最后访问时间排序，最旧那组的缩略图和原图一起删，不剩半套。
+    #[test]
+    fn trim_covers_evicts_oldest_group_as_a_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let old_original = file(dir.path(), "covers/original/0000000000000001.img", 100);
+        let new_thumb = file(dir.path(), "covers/0000000000000002-160.img", 0);
+        let new_original = file(dir.path(), "covers/original/0000000000000002.img", 0);
+
+        assert_eq!(trim_covers_in(dir.path(), 20), 20);
+        assert!(!old_thumb.exists(), "最旧的缩略图要删");
+        assert!(!old_original.exists(), "最旧的原图要一起删");
+        assert!(new_thumb.exists() && new_original.exists(), "最近看过的组要留住");
+    }
+
+    /// #217：24 小时内的临时文件计入总量但受保护；过期临时文件可以淘汰。
+    #[test]
+    fn trim_covers_protects_fresh_parts_and_evicts_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = file(dir.path(), "covers/0000000000000001-160.img.123-0.part", 0);
+        let stale = file(dir.path(), "covers/0000000000000002-160.img.456-0.part", 90_000);
+        let cover = file(dir.path(), "covers/0000000000000003-160.img", 50);
+
+        assert_eq!(trim_covers_in(dir.path(), 10), 10);
+        assert!(fresh.exists(), "24 小时内的临时文件不能删");
+        assert!(!stale.exists(), "过期临时文件可删");
+        assert!(!cover.exists(), "普通封面按顺序删");
+    }
+
+    /// #217：删除失败的文件不减统计，也不挡着后面的组继续淘汰。
+    #[test]
+    fn trim_covers_delete_failure_does_not_count_or_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let recent = file(dir.path(), "covers/0000000000000002-160.img", 0);
+        let attempts = std::cell::Cell::new(0);
+
+        let remaining = trim_covers_with(dir.path(), 10, |path| {
+            attempts.set(attempts.get() + 1);
+            if path == old.as_path() {
+                false // 模拟这个删不掉
+            } else {
+                std::fs::remove_file(path).is_ok()
+            }
+        });
+        assert_eq!(remaining, 10, "删失败的那 10 字节不能算释放");
+        assert!(old.exists(), "删失败的文件还在");
+        assert!(!recent.exists(), "不能因为一个删失败就中断后续淘汰");
+        assert_eq!(attempts.get(), 2, "两组都要尝试过");
+    }
+
+    /// #217：目录不存在或为空都返回 0，不 panic。
+    #[test]
+    fn trim_covers_missing_or_empty_dir_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(trim_covers_in(&dir.path().join("missing"), 0), 0);
+        assert_eq!(trim_covers_in(dir.path(), 0), 0);
     }
 
     #[test]
