@@ -738,6 +738,10 @@ impl Root {
                 if let Ok(mut tried) = root.original_cover_attempted.lock() {
                     tried.clear();
                 }
+                root.original_cover_pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
                 if let Ok(mut tried) = root.cache_upgrade_attempted.lock() {
                     tried.clear();
                 }
@@ -1300,6 +1304,8 @@ impl Root {
     /// 原图下载的在飞上限：单张解码最坏 64 MiB（16 位图翻倍），这条路没有
     /// CoverPool 的并发保护，用计数限流防快速切歌时瞬时内存失控。
     const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
+    /// 原图下载排队的上限：超过就丢最旧的（最新切进来的歌最有用）。
+    const MAX_ORIGINAL_COVER_PENDING: usize = 32;
 
     pub(crate) fn ensure_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
@@ -1308,27 +1314,31 @@ impl Root {
         if url.is_empty() || self.original_covers.contains_key(url) {
             return;
         }
-        let first_try = match self.original_cover_attempted.lock() {
-            Ok(mut attempted) => attempted.insert(url.to_string()),
-            Err(_) => false,
-        };
-        if !first_try {
-            return;
-        }
+        // 锁中毒自恢复：宁可拿旧数据继续，也别让整条队列停摆。
+        let mut attempted = self
+            .original_cover_attempted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_try = attempted.insert(url.to_string());
         // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
-        // 回调补上（照 CoverPool 的 pump 思路），排队的不许被丢掉。
+        // 回调补上（照 CoverPool 的 pump 思路），排队的不许被丢掉；
+        // 队列有界（丢最旧），且切歌时只留当前曲目（见 load_lyrics）。
         if self.original_cover_inflight.load(Ordering::SeqCst) >= Self::MAX_ORIGINAL_COVER_INFLIGHT
         {
-            if let Ok(mut attempted) = self.original_cover_attempted.lock() {
-                attempted.remove(url);
-            }
-            if let Ok(mut pending) = self.original_cover_pending.lock() {
-                if !pending.iter().any(|queued| queued == url) {
-                    pending.push(url.to_string());
+            attempted.remove(url);
+            let mut pending = self
+                .original_cover_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !pending.iter().any(|queued| queued == url) {
+                while pending.len() >= Self::MAX_ORIGINAL_COVER_PENDING {
+                    pending.remove(0);
                 }
+                pending.push(url.to_string());
             }
             return;
         }
+        drop(attempted);
         self.spawn_original_cover(url, cx);
     }
 
@@ -1368,10 +1378,10 @@ impl Root {
                     return;
                 }
                 let slots = max_inflight - inflight_now;
-                let mut pending = match root.original_cover_pending.lock() {
-                    Ok(pending) => pending,
-                    Err(_) => return,
-                };
+                let mut pending = root
+                    .original_cover_pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let take = slots.min(pending.len());
                 let queued: Vec<String> = pending.drain(..take).collect();
                 drop(pending);
@@ -1399,6 +1409,12 @@ impl Root {
         self.lyrics_artist = track.artist.clone();
         self.lyrics_cover = track.cover.clone();
         self.lyrics_track_id = track.id.clone();
+        // 切歌了：排队里的原图多半是已经划过去的歌，只留当前曲目的封面；
+        // 被剔掉的 URL 没记「已尝试」，那些歌下次播放时会自然重新请求。
+        self.original_cover_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|queued| queued == &track.cover);
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         self.ensure_original_cover(&track.cover, cx);
         self.set_status("正在读取「{}」歌词…", std::slice::from_ref(&track.title));
