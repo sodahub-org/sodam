@@ -1,10 +1,10 @@
-//! 有上界、**按显示尺寸解码**的封面缓存（照 sonora 的 `ArtworkCache` 移植）。
+//! 有预算下限、**按显示尺寸解码**的封面缓存（照 sonora 的 `ArtworkCache` 移植）。
 //!
 //! gpui 的默认图片加载是「原分辨率解码」：歌词页原图 960×960 解出来就是 ~3.7MB，
 //! 几十张就吃掉几百 MB 显存/堆。sonora 的做法是让缓存 key 带上**目标边长 `edge`**，
 //! 解码后先 `resize_exact` 到实际显示尺寸再交给 gpui，于是 48px 的缩略图只占 64×64。
 //!
-//! 预算也小得多：16MB 起步，并随「一个满屏像素」增长；再加 256 条的条数上限。
+//! 预算 64MiB 起步，并随一个满屏像素增长；再加 512 条的条数上限。
 //! （sonora 实测 footprint 67MB / IOAccelerator 8.4MB。）
 
 use std::collections::HashMap;
@@ -19,9 +19,9 @@ use image::{imageops, DynamicImage, Frame, ImageFormat, RgbaImage};
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 
 /// 缓存预算下限（超出后淘汰）；实际预算 = `max(这个, 一个满屏像素)`。
-const CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// 条数上限。
-const CACHE_ITEMS: usize = 256;
+const CACHE_ITEMS: usize = 512;
 /// 解码边长向上取整到 64 的倍数（2 的幂会让像素数最多翻 4 倍）。
 const EDGE_STEP: u32 = 64;
 /// 解码边长上限：只用来拦住几千像素的本地原图整张保留。
@@ -207,12 +207,17 @@ impl CoverImageCache {
         Some(value)
     }
 
+    /// 预算和条数都没超就不用淘汰；条数按含新插入的这一张算。
+    fn needs_eviction(bytes: usize, items: usize, budget: usize) -> bool {
+        bytes > budget || items > CACHE_ITEMS
+    }
+
     /// 超出预算就按 LRU 淘汰，并把纹理交还 gpui（`drop_image`）。
     ///
     /// 严格按预算淘汰：正在显示的封面每帧都会被 touch、排在队尾，自然最后被选中。
     fn evict(&mut self, window: &mut Window, cx: &mut App) {
         let budget = self.budget();
-        if self.bytes <= budget && self.items.len() <= CACHE_ITEMS {
+        if !Self::needs_eviction(self.bytes, self.items.len(), budget) {
             return;
         }
 
@@ -225,7 +230,7 @@ impl CoverImageCache {
         candidates.sort_unstable_by_key(|(_, used)| *used);
 
         for (key, _) in candidates {
-            if self.bytes <= budget && self.items.len() <= CACHE_ITEMS {
+            if !Self::needs_eviction(self.bytes, self.items.len(), budget) {
                 break;
             }
             // 至少留一张（正在显示的那个）。
@@ -273,6 +278,44 @@ impl ImageCache for CoverImageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_cache(screen: usize) -> CoverImageCache {
+        CoverImageCache {
+            items: HashMap::new(),
+            bytes: 0,
+            screen,
+        }
+    }
+
+    #[test]
+    fn budget_floor_is_64_mib() {
+        assert_eq!(empty_cache(0).budget(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn budget_still_follows_larger_screen() {
+        let full_screen = 100 * 1024 * 1024;
+        assert_eq!(empty_cache(full_screen).budget(), full_screen);
+    }
+
+    #[test]
+    fn item_limit_needs_eviction_at_513() {
+        // 这里只关心条数，预算直接用生产值；64MiB 本身由 budget_floor 测试锁住。
+        let budget = CACHE_BYTES;
+        // 512 放得下，513 就超；没到条数但超预算也要淘汰。
+        assert!(
+            !CoverImageCache::needs_eviction(0, 512, budget),
+            "512 条不淘汰"
+        );
+        assert!(
+            CoverImageCache::needs_eviction(0, 513, budget),
+            "第 513 条触发淘汰"
+        );
+        assert!(
+            CoverImageCache::needs_eviction(budget + 1, 1, budget),
+            "没到条数但超预算也要淘汰"
+        );
+    }
 
     #[test]
     fn sample_edge_rounds_up_to_step() {
