@@ -102,6 +102,18 @@ impl CoverPool {
             self.seen.remove(url);
         }
     }
+
+    /// 清空缓存后重置去重集合。还在排队/下载中的 URL 保留，否则同一张会下两遍；
+    /// 已经下完的放行，下次能重新请求。`forgotten` 只留仍在下载的那几个。
+    fn reset_seen_preserving_inflight(&mut self) {
+        self.seen = self
+            .queue
+            .iter()
+            .chain(self.inflight.iter())
+            .cloned()
+            .collect();
+        self.forgotten.retain(|url| self.inflight.contains(url));
+    }
 }
 
 /// 列表一次渲染的行数上限：GPUI 没有虚拟滚动，一次性布局几百行 + 解码封面
@@ -2281,6 +2293,25 @@ mod tests {
         assert!(!pool.inflight.contains("cover-a"));
         assert!(!pool.forgotten.contains("cover-a"));
         assert!(pool.push("cover-a"), "这次拿回的封面不可用，要能重新入队");
+    }
+
+    /// 清缓存时正在下载/排队的 URL 要留着去重，已经下完的才放行。
+    #[test]
+    fn cover_pool_reset_seen_keeps_active_urls() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("downloading"));
+        assert!(pool.push("queued"));
+        assert!(pool.push("done"));
+        assert_eq!(pool.next().as_deref(), Some("downloading"));
+        assert_eq!(pool.next().as_deref(), Some("queued"));
+        assert_eq!(pool.next().as_deref(), Some("done"));
+        pool.done("done");
+
+        pool.reset_seen_preserving_inflight();
+        assert!(pool.seen.contains("downloading"), "下载中的要留着去重");
+        assert!(pool.seen.contains("queued"), "另一个在飞的也要留着");
+        assert!(!pool.seen.contains("done"), "下完的放行，能重新请求");
+        assert!(!pool.push("downloading"), "下载中不能被再次入队");
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";

@@ -39,13 +39,15 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     covers: &HashMap<String, PathBuf>,
     original_covers: &HashMap<String, PathBuf>,
     removed: &[PathBuf],
-    still_gone: F,
+    is_still_missing: F,
 ) -> (HashSet<String>, HashSet<String>) {
     let removed_set: HashSet<&std::path::Path> =
         removed.iter().map(|path| path.as_path()).collect();
     let pick = |map: &HashMap<String, PathBuf>| {
         map.iter()
-            .filter(|(_, path)| removed_set.contains(path.as_path()) && still_gone(path.as_path()))
+            .filter(|(_, path)| {
+                removed_set.contains(path.as_path()) && is_still_missing(path.as_path())
+            })
             .map(|(url, _)| url.clone())
             .collect()
     };
@@ -740,7 +742,8 @@ impl Root {
                     tried.clear();
                 }
                 root.cache_upgrade_inflight.clear();
-                root.cover_pool.seen.clear();
+                // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
+                root.cover_pool.reset_seen_preserving_inflight();
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -5277,8 +5280,9 @@ mod tests {
         assert!(!thumbs.contains("alive-thumb"));
 
         // 被下载重建回来的路径不再算失效，映射要留住。
+        // 只有 full-only.img 已被下载重建回来（不算缺），其余路径仍是缺的。
         let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
-            p.to_string_lossy() != "covers/original/full-only.img"
+            p != std::path::Path::new("covers/original/full-only.img")
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
