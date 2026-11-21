@@ -16,12 +16,8 @@ const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
 /// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
 /// 体积随画面复杂度与源图分辨率浮动，不写死数字。
 const COVER_JPEG_QUALITY: u8 = 85;
-/// 下载字节解码的边长上限，也是解码内存的结构性上界：
-/// 4096×4096 RGBA 解码约 64 MiB，8 路并发下载最坏约 0.5 GiB 瞬时，可控。
-/// 边长超过它的图当解码失败，走占位图重试——实测 CDN 封面最长边
-/// 只有 512px，4096 是 8 倍余量。不另设 max_alloc：边长已经封顶，
-/// 再画一条分配线只会跟自己打架。
-/// Limits 是 non_exhaustive，只能 Default 后按字段赋值。
+/// 下载字节解码的边长上限：超限当解码失败，走占位图重试。
+/// 单张最坏解码内存约 64 MiB（4096×4096 RGBA）。
 const MAX_DECODE_EDGE: u32 = 4096;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
@@ -1248,6 +1244,25 @@ mod tests {
             (decoded.width(), decoded.height()),
             (1280, 960),
             "长边缩到 1280，等比"
+        );
+    }
+
+    /// 边界内的合法大封面必须能解码成功——防止以后调小边长或加回
+    /// 别的上限，把这类图重新挡成永久占位图。
+    #[test]
+    fn shrink_cover_accepts_large_covers_within_limit() {
+        let img =
+            image::RgbImage::from_pixel(MAX_DECODE_EDGE, MAX_DECODE_EDGE, image::Rgb([8, 16, 32]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        let shrunk = shrink_cover(&bytes.into_inner(), COVER_ORIGINAL_MAX_EDGE)
+            .expect("边界内的大图必须能缩");
+        let decoded = image::load_from_memory(&shrunk).expect("输出必须还能解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (COVER_ORIGINAL_MAX_EDGE, COVER_ORIGINAL_MAX_EDGE),
+            "4096² 源图要缩到原图目标边长"
         );
     }
 
