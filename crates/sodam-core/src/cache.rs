@@ -247,12 +247,14 @@ fn cover_group_key(path: &Path) -> String {
 /// 封面缓存硬上限：缩略图加原图合计，固定 512 MiB，不做用户配置项。
 pub const COVER_LIMIT_MB: u64 = 512;
 
-/// 按组内最后访问时间从旧到新淘汰，直到总量不超 `limit_bytes`。
+/// 按组内最后使用时间从旧到新淘汰，直到总量不超 `limit_bytes`。
 ///
-/// 音频与封面共用的那一份淘汰器：两者只在「怎么分组」和「怎么删」上不同。
-/// `group_key` 把同一份缓存的文件归到一组（音频是文件 + `.quality` sidecar，
-/// 封面是缩略图 + 原图），组内取最新访问时间当 LRU 键，整组一起删，
-/// 不会留下半套缓存。24 小时内的 `.part` 计入总量但不参与淘汰（还在下载）。
+/// 音频与封面共用的那一份淘汰器：两者只在「怎么分组」「怎么删」和「最后使用时间从哪来」
+/// 上不同。`group_key` 把同一份缓存的文件归到一组（音频是文件 + `.quality` sidecar，
+/// 封面是缩略图 + 原图），组内取最新使用时间当 LRU 键，整组一起删，不会留下半套缓存。
+/// 24 小时内的 `.part` 计入总量但不参与淘汰（还在下载）。
+///
+/// `last_seen` 是「文件路径 → 最近一次显示时间」；没有记录的路径按 mtime 排。
 ///
 /// 返回 `(淘汰后的字节数, 真正删掉的路径)`：删除成功才算释放空间，失败不中断，
 /// 失败的文件留在总量里等下轮再试。
@@ -260,6 +262,7 @@ fn evict_lru<K, G, R>(
     files: Vec<ScannedFile>,
     limit_bytes: u64,
     group_key: G,
+    last_seen: &HashMap<PathBuf, SystemTime>,
     mut remove: R,
 ) -> (u64, Vec<PathBuf>)
 where
@@ -274,14 +277,18 @@ where
         if is_fresh_part(&file.path, file.modified) {
             continue;
         }
+        let used_at = last_seen
+            .get(&file.path)
+            .copied()
+            .map_or(file.modified, |seen| file.modified.max(seen));
         let group = groups
             .entry(group_key(&file.path))
-            .or_insert((file.modified, Vec::new()));
-        group.0 = group.0.max(file.modified);
+            .or_insert((used_at, Vec::new()));
+        group.0 = group.0.max(used_at);
         group.1.push((file.path, file.bytes));
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by_key(|(_, (modified, _))| *modified);
+    groups.sort_by_key(|(_, (used_at, _))| *used_at);
     let mut removed = Vec::new();
     for (_, (_, group_files)) in groups {
         if total <= limit_bytes {
@@ -375,6 +382,7 @@ fn cover_alert_gate() -> &'static CoverAlertGate {
 fn trim_covers_scan<F, L>(
     scan: Scan,
     limit_bytes: u64,
+    last_seen: &HashMap<PathBuf, SystemTime>,
     gate: &CoverAlertGate,
     mut alert: L,
     remove: F,
@@ -385,7 +393,7 @@ where
 {
     if !scan.incomplete {
         gate.admit(None);
-        return evict_lru(scan.files, limit_bytes, cover_group_key, remove);
+        return evict_lru(scan.files, limit_bytes, cover_group_key, last_seen, remove);
     }
     let readable_bytes = scan.total_bytes();
     let action = if readable_bytes > limit_bytes {
@@ -403,18 +411,24 @@ where
     if action == CoverTrimAction::Skip {
         (readable_bytes, Vec::new())
     } else {
-        evict_lru(scan.files, limit_bytes, cover_group_key, remove)
+        evict_lru(scan.files, limit_bytes, cover_group_key, last_seen, remove)
     }
 }
 
 /// 按字节上限淘汰封面缓存目录，返回 `(剩余字节数, 实际删掉的路径)`。
 ///
+/// `last_seen` 是调用方采样的「路径 → 最近显示时间」；没有记录的路径退回文件 mtime。
 /// 扫描完整时剩余字节数就是目录真实占用；扫描不完整时它只是**可读部分**的字节数
 /// （读不到的子目录不计入），所以调用方不要拿它当磁盘占用的准确值。
-pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
+pub fn trim_covers_in(
+    dir: &Path,
+    limit_bytes: u64,
+    last_seen: &HashMap<PathBuf, SystemTime>,
+) -> (u64, Vec<PathBuf>) {
     trim_covers_scan(
         scan_files(dir),
         limit_bytes,
+        last_seen,
         cover_alert_gate(),
         |alert| alert.log(),
         |path| std::fs::remove_file(path).is_ok(),
@@ -423,11 +437,14 @@ pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
 
 /// 对封面缓存目录施加 MB 上限，返回这次实际删掉的文件路径。调用方必须在后台执行。
 ///
-/// 和 `trim_audio` 一样收 MB。返回删掉的路径，让界面只同步这几张封面的内存状态。
-pub fn trim_covers(limit_mb: u64) -> Vec<PathBuf> {
+/// 和 `trim_audio` 一样收 MB。`last_seen` 由调用方在渲染线程采样后传入，用来把最近
+/// 显示过的封面排到后面（与 mtime 取较晚者）；传空表则退回按 mtime 淘汰。
+/// 返回删掉的路径，让界面只同步这几张封面的内存状态。
+pub fn trim_covers(limit_mb: u64, last_seen: &HashMap<PathBuf, SystemTime>) -> Vec<PathBuf> {
     let (_, removed) = trim_covers_in(
         &crate::audio::cover_cache_dir(),
         limit_mb.saturating_mul(1024 * 1024),
+        last_seen,
     );
     removed
 }
@@ -452,7 +469,14 @@ pub fn trim_audio_in(dir: &Path, limit_bytes: u64) -> u64 {
 }
 
 fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
-    evict_lru(scan.files, limit_bytes, protection_key, remove_idle).0
+    evict_lru(
+        scan.files,
+        limit_bytes,
+        protection_key,
+        &HashMap::new(),
+        remove_idle,
+    )
+    .0
 }
 
 pub fn trim_audio(limit_mb: u64) -> u64 {
@@ -1149,7 +1173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
         let original = file(dir.path(), "covers/original/0000000000000001.img", 100);
-        let (remaining, removed) = trim_covers_in(dir.path(), 1000);
+        let (remaining, removed) = trim_covers_in(dir.path(), 1000, &HashMap::new());
         assert_eq!(remaining, 20);
         assert!(removed.is_empty(), "没超限不该报任何删除");
         assert!(thumb.exists());
@@ -1165,7 +1189,7 @@ mod tests {
         let new_thumb = file(dir.path(), "covers/0000000000000002-160.img", 0);
         let new_original = file(dir.path(), "covers/original/0000000000000002.img", 0);
 
-        let (remaining, removed) = trim_covers_in(dir.path(), 20);
+        let (remaining, removed) = trim_covers_in(dir.path(), 20, &HashMap::new());
         assert_eq!(remaining, 20);
         assert_eq!(removed.len(), 2, "整组两个文件都报出来");
         assert!(removed.contains(&old_thumb) && removed.contains(&old_original));
@@ -1175,6 +1199,55 @@ mod tests {
             new_thumb.exists() && new_original.exists(),
             "最近看过的组要留住"
         );
+    }
+
+    /// 最近显示过、但 mtime 很旧的封面，要排在从没显示过的较新封面之后，
+    /// 整组（缩略图 + 原图）一起保住。
+    #[test]
+    fn trim_covers_prefers_last_shown_over_stale_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let shown_thumb = file(dir.path(), "covers/0000000000000001-160.img", 3600);
+        let shown_original = file(dir.path(), "covers/original/0000000000000001.img", 3600);
+        let never_shown = file(dir.path(), "covers/0000000000000002-160.img", 30);
+
+        let mut last_seen = HashMap::new();
+        last_seen.insert(
+            shown_thumb.clone(),
+            SystemTime::now() - Duration::from_secs(1),
+        );
+
+        let (remaining, removed) = trim_covers_in(dir.path(), 20, &last_seen);
+        assert_eq!(remaining, 20);
+        assert_eq!(removed, vec![never_shown.clone()], "只淘汰从没显示过的那组");
+        assert!(
+            shown_thumb.exists() && shown_original.exists(),
+            "最近显示的组，缩略图和原图都要留"
+        );
+        assert!(!never_shown.exists());
+    }
+
+    /// 显示之后又重新下载过的封面，mtime 比显示时间新，排序键必须取较晚的 mtime。
+    /// 若实现退化成「有 last_seen 就只看 last_seen」，这张会被当成最旧的一组删掉。
+    #[test]
+    fn trim_covers_keeps_redownloaded_cover_over_older_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let redownloaded = file(dir.path(), "covers/0000000000000001-160.img", 60);
+        let stale = file(dir.path(), "covers/0000000000000002-160.img", 3600);
+
+        let mut last_seen = HashMap::new();
+        last_seen.insert(
+            redownloaded.clone(),
+            SystemTime::now() - Duration::from_secs(7200),
+        );
+
+        let (remaining, removed) = trim_covers_in(dir.path(), 10, &last_seen);
+        assert_eq!(remaining, 10);
+        assert_eq!(removed, vec![stale.clone()], "旧 mtime 的那组先淘汰");
+        assert!(
+            redownloaded.exists(),
+            "重新下载后的 mtime 要能压过旧显示时间"
+        );
+        assert!(!stale.exists());
     }
 
     /// #217：24 小时内的临时文件计入总量但受保护；过期临时文件可以淘汰。
@@ -1189,7 +1262,7 @@ mod tests {
         );
         let cover = file(dir.path(), "covers/0000000000000003-160.img", 50);
 
-        assert_eq!(trim_covers_in(dir.path(), 10).0, 10);
+        assert_eq!(trim_covers_in(dir.path(), 10, &HashMap::new()).0, 10);
         assert!(fresh.exists(), "24 小时内的临时文件不能删");
         assert!(!stale.exists(), "过期临时文件可删");
         assert!(!cover.exists(), "普通封面按顺序删");
@@ -1223,8 +1296,11 @@ mod tests {
     #[test]
     fn trim_covers_missing_or_empty_dir_returns_zero() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(trim_covers_in(&dir.path().join("missing"), 0).0, 0);
-        assert_eq!(trim_covers_in(dir.path(), 0).0, 0);
+        assert_eq!(
+            trim_covers_in(&dir.path().join("missing"), 0, &HashMap::new()).0,
+            0
+        );
+        assert_eq!(trim_covers_in(dir.path(), 0, &HashMap::new()).0, 0);
     }
 
     /// #225：「根目录不存在」是正常状态，不能算成扫描不完整，否则封面淘汰会永久停摆。
@@ -1260,6 +1336,7 @@ mod tests {
         trim_covers_scan(
             scan_files(dir),
             limit_bytes,
+            &HashMap::new(),
             &CoverAlertGate::default(),
             |_alert| {},
             remove,
@@ -1284,6 +1361,7 @@ mod tests {
         let (remaining, removed) = trim_covers_scan(
             scan,
             1000,
+            &HashMap::new(),
             &CoverAlertGate::default(),
             |alert| alerts.borrow_mut().push(alert),
             |_path| {
@@ -1322,6 +1400,7 @@ mod tests {
         let (remaining, removed) = trim_covers_scan(
             scan,
             10,
+            &HashMap::new(),
             &CoverAlertGate::default(),
             |_alert| {},
             |path| std::fs::remove_file(path).is_ok(),
@@ -1349,6 +1428,7 @@ mod tests {
             let _ = trim_covers_scan(
                 scan,
                 1000,
+                &HashMap::new(),
                 &gate,
                 |alert| alerts.borrow_mut().push(alert),
                 |_| false,
@@ -1361,6 +1441,7 @@ mod tests {
         let (remaining, removed) = trim_covers_scan(
             scan,
             0,
+            &HashMap::new(),
             &gate,
             |alert| alerts.borrow_mut().push(alert),
             |path| std::fs::remove_file(path).is_ok(),
@@ -1390,6 +1471,7 @@ mod tests {
         let _ = trim_covers_scan(
             scan,
             1000,
+            &HashMap::new(),
             &gate,
             |alert| alerts.borrow_mut().push(alert),
             |_| false,
@@ -1402,6 +1484,7 @@ mod tests {
         let _ = trim_covers_scan(
             scan,
             1000,
+            &HashMap::new(),
             &gate,
             |alert| alerts.borrow_mut().push(alert),
             |_| false,
@@ -1413,6 +1496,7 @@ mod tests {
         let _ = trim_covers_scan(
             scan,
             1000,
+            &HashMap::new(),
             &gate,
             |alert| alerts.borrow_mut().push(alert),
             |_| false,

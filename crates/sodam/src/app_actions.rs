@@ -640,9 +640,22 @@ impl Root {
         }
         self.cache_maintenance_running = true;
         let limit = self.settings.audio_cache_limit_mb;
+        // 在渲染线程采样「最近显示时间」：UI 命中内存缓存时不碰磁盘，mtime 只代表
+        // 最后下载/落盘，只有这份快照能说明用户最近还在看。后台只拿值，不持实体、不碰 UI。
+        let last_seen = crate::ui::cover_cache::shown_snapshot(cx);
+        if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+            let sampled = last_seen.len().to_string();
+            log_event(
+                LogLevel::Debug,
+                LogTopic::App,
+                "cover_last_seen_sample",
+                &[("paths", sampled.as_str())],
+            );
+        }
         let work = cx.background_spawn(async move {
             sodam_core::cache::trim_audio(limit);
-            let removed = sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB);
+            let removed =
+                sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB, &last_seen);
             let stats = sodam_core::audio::cache_stats();
             (removed, stats)
         });
