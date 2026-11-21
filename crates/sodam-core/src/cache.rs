@@ -134,10 +134,7 @@ fn cover_group_key(path: &Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let hash: String = name
-        .chars()
-        .take_while(|c| c.is_ascii_hexdigit())
-        .collect();
+    let hash: String = name.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if hash.is_empty() {
         name
     } else {
@@ -962,7 +959,10 @@ mod tests {
         assert_eq!(trim_covers_in(dir.path(), 20), 20);
         assert!(!old_thumb.exists(), "最旧的缩略图要删");
         assert!(!old_original.exists(), "最旧的原图要一起删");
-        assert!(new_thumb.exists() && new_original.exists(), "最近看过的组要留住");
+        assert!(
+            new_thumb.exists() && new_original.exists(),
+            "最近看过的组要留住"
+        );
     }
 
     /// #217：24 小时内的临时文件计入总量但受保护；过期临时文件可以淘汰。
@@ -970,7 +970,11 @@ mod tests {
     fn trim_covers_protects_fresh_parts_and_evicts_stale_ones() {
         let dir = tempfile::tempdir().unwrap();
         let fresh = file(dir.path(), "covers/0000000000000001-160.img.123-0.part", 0);
-        let stale = file(dir.path(), "covers/0000000000000002-160.img.456-0.part", 90_000);
+        let stale = file(
+            dir.path(),
+            "covers/0000000000000002-160.img.456-0.part",
+            90_000,
+        );
         let cover = file(dir.path(), "covers/0000000000000003-160.img", 50);
 
         assert_eq!(trim_covers_in(dir.path(), 10), 10);
