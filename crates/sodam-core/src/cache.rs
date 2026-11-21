@@ -305,7 +305,7 @@ where
 /// 返回删掉的路径，好让调用方只清理这些文件对应的内存映射，不必全表扫盘。
 /// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
 ///
-/// 扫描不完整时本轮一个都不删（见 `trim_covers_scan`）。
+/// 扫描不完整时只在「可读部分已超限」时按可读部分淘汰，否则本轮不删（见 `trim_covers_scan`）。
 fn trim_covers_with<F: FnMut(&Path) -> bool>(
     dir: &Path,
     limit_bytes: u64,
@@ -314,36 +314,56 @@ fn trim_covers_with<F: FnMut(&Path) -> bool>(
     trim_covers_scan(scan_files(dir), limit_bytes, remove)
 }
 
-/// 封面淘汰的决策层：只有扫描完整才动手。
+/// 封面淘汰的决策层：只在「总量一定超限」时才删。
 ///
-/// 读不到的子树会让总量偏小，而淘汰量正是按这个总量算出来的：删到「不超限」之后，
-/// 真实总量仍可能在上限之上——本轮看起来做完了，其实没有。所以这一轮干脆不删，
-/// 把不完整扫描当成一次异常上报（Debug 日志），等子树恢复可读再按完整统计淘汰；
-/// 代价是目录可能暂时超限，收益是不拿残缺总量做任何删除决定（#225 方案 A）。
-/// 这里只记日志，不弹提示、不改状态行。
+/// 读不到的子树会让总量偏小，所以可读部分的字节数只是一个**下界**：
+/// - 下界本身已经超限 → 真实占用必然也超限，按可读部分淘汰是对的，删掉的也确实是
+///   可读文件里最旧的那几组；一条长期读不到的条目只会让本轮少删，不会冻住整轮淘汰。
+/// - 下界还没超限 → 真实占用可能超、也可能不超，这一轮不删，并留一条 Warn 日志
+///   `cover_trim_incomplete`（`readable_bytes` / `readable_files` / `action`）。
+///
+/// 读不到的那部分有多大，任何淘汰策略都无从得知（删它也会失败），只能靠可见性上报和
+/// 权限恢复：所以这里不承诺「目录一定回到上限内」，只承诺「不拿残缺总量当完整视图」。
+/// 全程只写日志，不弹提示、不改状态行。
 fn trim_covers_scan<F: FnMut(&Path) -> bool>(
     scan: Scan,
     limit_bytes: u64,
     remove: F,
 ) -> (u64, Vec<PathBuf>) {
-    if scan.incomplete {
-        let total = scan.total_bytes();
-        let scanned_bytes = total.to_string();
-        let scanned_files = scan.files.len().to_string();
-        log_event(
-            LogLevel::Debug,
-            LogTopic::App,
-            "cover_trim_incomplete",
-            &[
-                ("scanned_bytes", scanned_bytes.as_str()),
-                ("scanned_files", scanned_files.as_str()),
-            ],
-        );
-        return (total, Vec::new());
+    if !scan.incomplete {
+        return evict_lru(scan.files, limit_bytes, cover_group_key, remove);
     }
-    evict_lru(scan.files, limit_bytes, cover_group_key, remove)
+    let readable_bytes = scan.total_bytes();
+    let over_readable = readable_bytes > limit_bytes;
+    log_cover_trim_incomplete(readable_bytes, scan.files.len(), over_readable);
+    if over_readable {
+        evict_lru(scan.files, limit_bytes, cover_group_key, remove)
+    } else {
+        (readable_bytes, Vec::new())
+    }
 }
 
+/// 扫描不完整时的留痕。Warn 而不是 Debug：Debug 默认不写盘，那就还是「静默跳过」。
+/// 持续存在时由日志出口的连续重复行折叠压成一条带计数的记录，不会刷屏。
+fn log_cover_trim_incomplete(readable_bytes: u64, readable_files: usize, evicting: bool) {
+    let bytes = readable_bytes.to_string();
+    let files = readable_files.to_string();
+    log_event(
+        LogLevel::Warn,
+        LogTopic::App,
+        "cover_trim_incomplete",
+        &[
+            ("readable_bytes", bytes.as_str()),
+            ("readable_files", files.as_str()),
+            ("action", if evicting { "evict_readable" } else { "skip" }),
+        ],
+    );
+}
+
+/// 按字节上限淘汰封面缓存目录，返回 `(剩余字节数, 实际删掉的路径)`。
+///
+/// 扫描完整时剩余字节数就是目录真实占用；扫描不完整时它只是**可读部分**的字节数
+/// （读不到的子目录不计入），所以调用方不要拿它当磁盘占用的准确值。
 pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
     trim_covers_with(dir, limit_bytes, |path| std::fs::remove_file(path).is_ok())
 }
@@ -372,8 +392,8 @@ pub fn clear_in(root: &Path) -> usize {
 /// sidecar 与音频成组淘汰；失败的删除不计入释放空间。调用方必须在后台执行。
 ///
 /// 扫描不完整时照旧只按可读部分淘汰：音频有租约保护、又是用户主动设定的额度，
-/// 少删（停在额度之上）比不删更接近预期。这条口径与封面相反，是 #217 刻意保留的
-/// 差异，改它要单独评估（#225 方案 C）。
+/// 少删（停在额度之上）比不删更接近预期。封面则在可读部分已超限时才这么做、否则本轮
+/// 不删——这点差异是有意保留的：音频额度是用户可见的硬需求，封面是「别无限涨」的软约束。
 pub fn trim_audio_in(dir: &Path, limit_bytes: u64) -> u64 {
     trim_audio_scan(scan_files(dir), limit_bytes)
 }
@@ -1178,11 +1198,13 @@ mod tests {
         })
     }
 
-    /// #225：子目录读不到时，本轮一个封面都不删，也不把可读部分当成完整总量。
+    /// 子目录读不到、可读部分也没超限：本轮不删。
+    ///
+    /// 可读部分只有一个 10 字节的文件，上限远大于它，所以「超没超限」根本判断不了；
+    /// 判定靠的是删除回调一次都没被调用，跟两边各多少字节无关。
     #[test]
     fn trim_covers_skips_eviction_when_scan_is_incomplete() {
         let dir = tempfile::tempdir().unwrap();
-        // 可读部分只有 10 字节；读不到的 original 子目录里另有 600 字节的「大头」。
         let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
         let hidden = file(dir.path(), "covers/original/0000000000000002.img", 500);
         let scan = scan_denying(dir.path(), &dir.path().join("covers/original"));
@@ -1190,20 +1212,40 @@ mod tests {
         assert_eq!(scan.total_bytes(), 10, "只统计到可读部分");
 
         let attempts = std::cell::Cell::new(0);
-        let (remaining, removed) = trim_covers_scan(scan, 0, |_path| {
+        let (remaining, removed) = trim_covers_scan(scan, 1000, |_path| {
             attempts.set(attempts.get() + 1);
             true
         });
 
-        assert_eq!(attempts.get(), 0, "扫描不完整时不能拿偏小的统计去删");
+        assert_eq!(attempts.get(), 0, "下界没超限时不能凭残缺总量去删");
         assert!(removed.is_empty());
         assert_eq!(remaining, 10);
         assert!(thumb.exists(), "可读的封面也不能删");
         assert!(hidden.exists(), "读不到的部分更没动过");
     }
 
-    /// #225：音频遇到同样的扫描缺口时保持既有口径（按可读部分淘汰），
-    /// 这条差异是刻意的：改音频行为要单独评估（方案 C）。
+    /// 子目录读不到、但可读部分自己就超限：照删不误，否则一条坏条目能把整轮淘汰冻住。
+    #[test]
+    fn trim_covers_still_evicts_when_readable_part_alone_overflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let recent = file(dir.path(), "covers/0000000000000002-160.img", 0);
+        let hidden = file(dir.path(), "covers/original/0000000000000003.img", 500);
+        let scan = scan_denying(dir.path(), &dir.path().join("covers/original"));
+        assert!(scan.incomplete);
+
+        // 可读 20 字节、上限 10：可读部分已经超限，真实占用必然也超限。
+        let (remaining, removed) =
+            trim_covers_scan(scan, 10, |path| std::fs::remove_file(path).is_ok());
+        assert_eq!(remaining, 10);
+        assert_eq!(removed, vec![old.clone()], "只删可读部分里最旧的那组");
+        assert!(!old.exists());
+        assert!(recent.exists(), "最近看过的要留住");
+        assert!(hidden.exists(), "读不到的部分不动");
+    }
+
+    /// 音频遇到同样的扫描缺口时保持既有口径（按可读部分淘汰），
+    /// 这条差异是刻意的：音频额度是用户设定、有租约保护，改它要单独评估。
     #[test]
     fn trim_audio_still_evicts_from_incomplete_scan() {
         let dir = tempfile::tempdir().unwrap();
