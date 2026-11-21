@@ -642,7 +642,7 @@ pub struct Root {
     /// 的并发上限，手动限流防止快速切歌时瞬时内存失控。
     pub(crate) original_cover_inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// 限流期间排队的原图 URL：在飞位空出来后由完成回调补上（照 CoverPool
-    /// 的 pump 思路），排队的不能被丢掉。
+    /// 的 pump 思路），队列有界（丢最旧），切歌时只留当前曲目。
     pub(crate) original_cover_pending: Mutex<Vec<String>>,
     /// “其他”里的贡献者图（contrib.rocks 组合 SVG）；独立缓存，不参与歌曲封面统计。
     pub contributors_image: Option<Arc<Image>>,

@@ -1321,7 +1321,8 @@ impl Root {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let first_try = attempted.insert(url.to_string());
         if !first_try {
-            // 已尝试过（在飞/失败/排队）：不重复拉起，等既有的出口走完。
+            // 在飞或已失败过的 URL 不再拉起：失败后由重试按钮清标记，
+            // 队列去重见下面的 pending 检查。
             return;
         }
         // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
