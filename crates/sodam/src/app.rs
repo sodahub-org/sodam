@@ -638,6 +638,12 @@ pub struct Root {
     pub covers: Arc<HashMap<String, PathBuf>>,
     pub original_covers: HashMap<String, PathBuf>,
     pub original_cover_attempted: Arc<Mutex<HashSet<String>>>,
+    /// 在飞的原图下载数：原图解码最坏 64 MiB/张，且这条路没有 CoverPool
+    /// 的并发上限，手动限流防止快速切歌时瞬时内存失控。
+    pub(crate) original_cover_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// 限流期间排队的原图 URL：在飞位空出来后由完成回调补上（照 CoverPool
+    /// 的 pump 思路），队列有界（丢最旧），切歌时只留当前曲目。
+    pub(crate) original_cover_pending: Mutex<Vec<String>>,
     /// “其他”里的贡献者图（contrib.rocks 组合 SVG）；独立缓存，不参与歌曲封面统计。
     pub contributors_image: Option<Arc<Image>>,
     pub(crate) contributors_fetching: bool,
@@ -998,6 +1004,8 @@ impl Root {
             covers: Arc::new(HashMap::new()),
             original_covers: HashMap::new(),
             original_cover_attempted: Arc::new(Mutex::new(HashSet::new())),
+            original_cover_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            original_cover_pending: Mutex::new(Vec::new()),
             contributors_image: None,
             contributors_fetching: false,
             contributors_failed: false,
