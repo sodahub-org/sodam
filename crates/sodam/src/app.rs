@@ -44,8 +44,10 @@ pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 /// 其余排队；渲染永远只读缓存。
 pub(crate) struct CoverPool {
     queue: VecDeque<String>,
-    inflight: usize,
+    inflight: HashSet<String>,
     seen: HashSet<String>,
+    /// 下载中被淘汰的 URL：这次下载完（成功或失败）要放行 seen，让封面能重排。
+    forgotten: HashSet<String>,
 }
 
 impl CoverPool {
@@ -55,8 +57,9 @@ impl CoverPool {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
-            inflight: 0,
+            inflight: HashSet::new(),
             seen: HashSet::new(),
+            forgotten: HashSet::new(),
         }
     }
 
@@ -72,16 +75,50 @@ impl CoverPool {
     }
 
     fn next(&mut self) -> Option<String> {
-        if self.inflight >= Self::MAX_CONCURRENCY {
+        if self.inflight.len() >= Self::MAX_CONCURRENCY {
             return None;
         }
         let url = self.queue.pop_front()?;
-        self.inflight += 1;
+        self.inflight.insert(url.clone());
         Some(url)
     }
 
-    fn done(&mut self) {
-        self.inflight = self.inflight.saturating_sub(1);
+    fn done(&mut self, url: &str) {
+        self.inflight.remove(url);
+        if self.forgotten.remove(url) {
+            // 下载中被淘汰过：这次拿回来的文件可能已经被删，也可能压根没下到，
+            // 放行去重标记，渲染发现缺图时才能重新排队。
+            self.seen.remove(url);
+        }
+    }
+
+    /// 封面被淘汰后想让一个 URL 重新入队：摘掉排队中的旧请求和去重标记。
+    /// 正在下载的那份先记下来，等 `done` 再放行——过早放行会和这次下载撞成两份。
+    fn forget(&mut self, url: &str) {
+        self.queue.retain(|queued| queued != url);
+        if self.inflight.contains(url) {
+            self.forgotten.insert(url.to_string());
+        } else {
+            self.seen.remove(url);
+        }
+    }
+
+    /// 解析成功但文件被淘汰删掉时放行去重标记，让这次封面能重新排队。
+    /// 只摘 seen——调用时 `done` 已经把 inflight 清掉了。
+    fn release_seen(&mut self, url: &str) {
+        self.seen.remove(url);
+    }
+
+    /// 清空缓存后重置去重集合。还在排队/下载中的 URL 保留 seen，否则同一张会下两遍；
+    /// 在飞的一律记进 forgotten，磁盘文件被清掉后 `done` 会放行 seen，让封面能重下。
+    fn reset_seen_preserving_inflight(&mut self) {
+        self.seen = self
+            .queue
+            .iter()
+            .chain(self.inflight.iter())
+            .cloned()
+            .collect();
+        self.forgotten.extend(self.inflight.iter().cloned());
     }
 }
 
@@ -2221,8 +2258,84 @@ impl Render for Root {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_verify_window_result, verify_window_step, VerifyWindowState, VerifyWindowStep,
+        apply_verify_window_result, verify_window_step, CoverPool, VerifyWindowState,
+        VerifyWindowStep,
     };
+
+    /// forget 要同时摘掉排队项和去重标记，重新入队才不会下两遍。
+    #[test]
+    fn cover_pool_forget_allows_exactly_one_requeue() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("cover-a"));
+        assert!(pool.push("cover-b"));
+        assert!(!pool.push("cover-a"), "没 forget 之前不能重复入队");
+        assert_eq!(pool.queue.len(), 2);
+
+        pool.forget("cover-a");
+        assert_eq!(pool.queue.len(), 1, "排队里的旧请求要被摘掉");
+        assert!(!pool.seen.contains("cover-a"), "去重标记也要放行");
+
+        assert!(pool.push("cover-a"), "forget 之后要能重新入队");
+        assert_eq!(pool.queue.iter().filter(|url| *url == "cover-a").count(), 1);
+    }
+
+    /// 正在下载的封面被淘汰时，forget 不能放行去重标记，否则同一张会同时下两遍。
+    #[test]
+    fn cover_pool_forget_keeps_seen_while_inflight() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("cover-a"));
+        assert_eq!(pool.next().as_deref(), Some("cover-a"), "取出后进入下载中");
+        assert!(pool.inflight.contains("cover-a"));
+
+        pool.forget("cover-a");
+        assert!(
+            !pool.push("cover-a"),
+            "下载中 forget 不能放行，否则同一张下两遍"
+        );
+
+        // 下载中这张被淘汰，文件很可能已删或没下到；这次结束后必须放行 seen，
+        // 渲染发现缺图时才能重新排队——不管这次下载成功还是失败。
+        pool.done("cover-a");
+        assert!(!pool.inflight.contains("cover-a"));
+        assert!(!pool.forgotten.contains("cover-a"));
+        assert!(pool.push("cover-a"), "这次拿回的封面不可用，要能重新入队");
+    }
+
+    /// 解析成功但文件被淘汰删掉的封面，发布前要放行 pool 的去重标记才能重排。
+    #[test]
+    fn cover_pool_release_seen_allows_retry() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("cover-a"));
+        pool.next();
+        pool.done("cover-a");
+        assert!(pool.seen.contains("cover-a"));
+        pool.release_seen("cover-a");
+        assert!(pool.push("cover-a"), "放行后要能重新入队");
+    }
+
+    /// 清缓存时正在下载/排队的 URL 要留着去重，已经下完的才放行。
+    #[test]
+    fn cover_pool_reset_seen_keeps_active_urls() {
+        let mut pool = CoverPool::new();
+        assert!(pool.push("downloading"));
+        assert!(pool.push("queued"));
+        assert!(pool.push("done"));
+        assert_eq!(pool.next().as_deref(), Some("downloading"));
+        assert_eq!(pool.next().as_deref(), Some("queued"));
+        assert_eq!(pool.next().as_deref(), Some("done"));
+        pool.done("done");
+
+        pool.reset_seen_preserving_inflight();
+        assert!(pool.seen.contains("downloading"), "下载中的要留着去重");
+        assert!(pool.seen.contains("queued"), "另一个在飞的也要留着");
+        assert!(!pool.seen.contains("done"), "下完的放行，能重新请求");
+        assert!(!pool.push("downloading"), "下载中不能被再次入队");
+
+        // 磁盘被清空的在飞封面：这次下载结束时必须放行 seen，否则一直占位图。
+        assert!(pool.forgotten.contains("downloading"));
+        pool.done("downloading");
+        assert!(pool.push("downloading"), "清缓存后在飞的也要能重新入队");
+    }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
     const OPENED_TEXT: &str = "验证窗口已打开；完成后这里会自动更新";

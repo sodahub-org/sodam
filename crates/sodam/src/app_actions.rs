@@ -29,6 +29,31 @@ use super::{
 };
 use sodam_core::queue::{PlayMode, Queue};
 
+/// 按「被淘汰的文件路径」反查对应的 URL，缩略图和原图分开返回。
+///
+/// `covers` / `original_covers` 的 value 就是磁盘路径，按 value 精确匹配即可，
+/// 只删了缩略图就不会连原图映射一起清掉。先拿哈希集合筛出内存中真命中删除列表的
+/// 那几条，再只对这几条做磁盘检查——被淘汰的路径成千上万，绝大多数根本不在内存表里，
+/// 不能在主线程上挨个 stat。已被下载重建回来的路径不算失效。
+fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
+    covers: &HashMap<String, PathBuf>,
+    original_covers: &HashMap<String, PathBuf>,
+    removed: &[PathBuf],
+    is_still_missing: F,
+) -> (HashSet<String>, HashSet<String>) {
+    let removed_set: HashSet<&std::path::Path> =
+        removed.iter().map(|path| path.as_path()).collect();
+    let pick = |map: &HashMap<String, PathBuf>| {
+        map.iter()
+            .filter(|(_, path)| {
+                removed_set.contains(path.as_path()) && is_still_missing(path.as_path())
+            })
+            .map(|(url, _)| url.clone())
+            .collect()
+    };
+    (pick(covers), pick(original_covers))
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -617,13 +642,17 @@ impl Root {
         let limit = self.settings.audio_cache_limit_mb;
         let work = cx.background_spawn(async move {
             sodam_core::cache::trim_audio(limit);
-            sodam_core::audio::cache_stats()
+            let removed = sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB);
+            let stats = sodam_core::audio::cache_stats();
+            (removed, stats)
         });
         cx.spawn(async move |this, cx| {
-            let stats = work.await;
+            let (removed, stats) = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
                 root.cache_summary = stats;
+                // 只同步这次真被淘汰的封面路径，不在主线程上全表扫盘。
+                root.drop_removed_covers(&removed, cx);
                 if root.settings.audio_cache_limit_mb != limit {
                     root.maintain_cache(cx);
                 }
@@ -631,6 +660,63 @@ impl Root {
             });
         })
         .detach();
+    }
+
+    /// 淘汰删了磁盘上的封面后，同步清掉内存里指向它们的路径映射。
+    ///
+    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各自独立，
+    /// 只删了缩略图就不动原图映射。清掉后解除对应的下载去重标记、剔掉请求池里的
+    /// 重复项，渲染才能把这几种封面重新排队下载。当前曲目的原图被删时直接补一次下载，
+    /// 歌词页没有原图的自动入队口子，不等它自己回来。
+    pub(crate) fn drop_removed_covers(&mut self, removed: &[PathBuf], cx: &mut Context<Self>) {
+        if removed.is_empty() {
+            return;
+        }
+        // 淘汰到回调之间下载可能把文件重建回来。还活着的路径不当成被删，
+        // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
+        let (thumb_urls, original_urls) =
+            urls_for_removed_paths(&self.covers, &self.original_covers, removed, |path| {
+                !path.exists()
+            });
+        if thumb_urls.is_empty() && original_urls.is_empty() {
+            return;
+        }
+        {
+            let covers = Arc::make_mut(&mut self.covers);
+            for url in &thumb_urls {
+                covers.remove(url);
+            }
+        }
+        for url in &original_urls {
+            self.original_covers.remove(url);
+        }
+        if let Ok(mut attempted) = self.cover_attempted.lock() {
+            for url in &thumb_urls {
+                attempted.remove(url);
+            }
+        }
+        if let Ok(mut attempted) = self.original_cover_attempted.lock() {
+            for url in &original_urls {
+                attempted.remove(url);
+            }
+        }
+        // 只动缩略图请求的去重状态：原图走独立的下载任务，踢这里的队列会把
+        // 排队中的缩略图请求一起干掉，却没清 cover_attempted，导致再也排不进去。
+        for url in &thumb_urls {
+            self.cover_pool.forget(url);
+        }
+        // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
+        // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
+        let current_cover = self
+            .pending_track
+            .as_ref()
+            .or_else(|| self.queue.current())
+            .map(|track| track.cover.clone());
+        if let Some(url) = current_cover {
+            if original_urls.contains(&url) {
+                self.ensure_original_cover(&url, cx);
+            }
+        }
     }
 
     pub(crate) fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -656,7 +742,8 @@ impl Root {
                     tried.clear();
                 }
                 root.cache_upgrade_inflight.clear();
-                root.cover_pool.seen.clear();
+                // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
+                root.cover_pool.reset_seen_preserving_inflight();
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -3043,7 +3130,7 @@ impl Root {
             cx.spawn(async move |this, cx| {
                 let (path, color) = task.await;
                 let _ = this.update(cx, |root, cx| {
-                    root.cover_pool.done();
+                    root.cover_pool.done(&url);
                     if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
                         let file = path
                             .as_ref()
@@ -3063,6 +3150,18 @@ impl Root {
                                 ("color", color.as_str()),
                             ],
                         );
+                    }
+                    // 下载期间这张封面可能刚好被后台淘汰删掉。解析到了路径但文件
+                    // 已经没了：不发布（否则 map 指向空文件），并放行 attempted 和
+                    // pool 的 seen，让渲染能重新排队。普通下载失败（压根没解析出
+                    // 路径）保持去重，否则会每帧空转重下。
+                    let was_resolved = path.is_some();
+                    let path = path.filter(|path| path.exists());
+                    if was_resolved && path.is_none() {
+                        if let Ok(mut attempted) = root.cover_attempted.lock() {
+                            attempted.remove(&url);
+                        }
+                        root.cover_pool.release_seen(&url);
                     }
                     let has_result = path.is_some() || color.is_some();
                     if let Some(path) = path {
@@ -5144,8 +5243,53 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
+        urls_for_removed_paths,
     };
     use sodam_core::models::{LyricLine, LyricWord};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// 只按被删的文件路径反查 URL，缩略图和原图分开；只删了一侧不能连另一侧一起清。
+    #[test]
+    fn removed_paths_map_to_the_right_side_only() {
+        let path = |name: &str| PathBuf::from(name);
+        let covers = HashMap::from([
+            ("gone-thumb".to_string(), path("covers/thumb-gone.img")),
+            ("alive-thumb".to_string(), path("covers/thumb-alive.img")),
+        ]);
+        let originals = HashMap::from([
+            (
+                "gone-thumb".to_string(),
+                path("covers/original/full-gone.img"),
+            ),
+            (
+                "original-only".to_string(),
+                path("covers/original/full-only.img"),
+            ),
+        ]);
+
+        let removed = [
+            path("covers/thumb-gone.img"),
+            path("covers/original/full-only.img"),
+        ];
+        let (thumbs, originals_gone) =
+            urls_for_removed_paths(&covers, &originals, &removed, |_| true);
+        assert_eq!(thumbs.len(), 1, "只有缩略图被删的那张要重下缩略图");
+        assert!(thumbs.contains("gone-thumb"));
+        assert_eq!(originals_gone.len(), 1, "只有原图被删的那张要重下原图");
+        assert!(originals_gone.contains("original-only"));
+        // gone-thumb 的原图没被删，不能因为缩略图没了就一起清掉。
+        assert!(!originals_gone.contains("gone-thumb"));
+        // alive-thumb 两侧都没被删，谁都不该动。
+        assert!(!thumbs.contains("alive-thumb"));
+
+        // 被下载重建回来的路径不算缺，映射要留住。
+        let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
+            p != std::path::Path::new("covers/original/full-only.img")
+        });
+        assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
+        assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
+    }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
         LyricLine {

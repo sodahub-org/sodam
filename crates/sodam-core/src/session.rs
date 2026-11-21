@@ -83,6 +83,15 @@ fn log_cover_decode_failed(path: &std::path::Path) {
     );
 }
 
+/// 命中缓存时把修改时间推到当前，作为封面淘汰的「最后访问时间」。
+/// 更新失败（只读、刚好被淘汰等）就算了，本次照样用这张图。
+fn touch_cover_file(path: &std::path::Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+}
+
 /// 封面落盘。写成功返回 true。
 ///
 /// 失败时记一条 warn 的 `cover_write_failed`（文件名 + 错误），然后看目标这会儿能不能用：
@@ -1071,6 +1080,7 @@ impl Session {
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{:016x}.img", hash_url(url)));
         if cover_file_usable(&path) {
+            touch_cover_file(&path);
             return Some(path);
         }
 
@@ -1125,6 +1135,7 @@ impl Session {
         // 文件名带目标边长：换尺寸/旧的全尺寸缓存不会混用
         let path = dir.join(format!("{:016x}-{COVER_MAX_EDGE}.img", hash_url(url)));
         if cover_file_usable(&path) {
+            touch_cover_file(&path);
             return Some(path);
         }
         let response = ureq::get(url)
@@ -1312,6 +1323,31 @@ mod tests {
             image::ColorType::Rgb8,
             "透明通道要被 JPEG 语义丢掉"
         );
+    }
+
+    /// #217：命中缓存把修改时间推到当前，给封面 LRU 当「最后访问时间」。
+    #[test]
+    fn touching_cover_refreshes_modified_time() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0000abcd-160.img");
+        std::fs::write(&path, b"cover").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        touch_cover_file(&path);
+
+        let refreshed = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(refreshed > old, "命中后修改时间要往前推");
+        // 路径已经不存在时也不能 panic（命中与淘汰并发时的竞态）。
+        std::fs::remove_file(&path).unwrap();
+        touch_cover_file(&path);
     }
 
     /// 写不进去就返回 false，目标位置上的东西一个都不许动，自己的临时文件也要清干净。
