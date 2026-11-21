@@ -36,12 +36,12 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     use image::ImageEncoder;
 
     // 解码带上限：CDN 字节不可全信，16 MiB 的下载体积拦不住解压后的内存（Review Fish）。
+    // Limits 是 non_exhaustive，只能 Default 后按字段赋值；default 自带 512 MiB 分配上限。
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
-    reader.set_limits(image::Limits {
-        max_image_width: Some(MAX_DECODE_EDGE),
-        max_image_height: Some(MAX_DECODE_EDGE),
-        ..Default::default()
-    });
+    reader.limits(limits);
     let decoded = reader.with_guessed_format().ok()?.decode().ok()?;
     let (width, height) = (decoded.width(), decoded.height());
     // 等比缩到长边 ≤ edge；比目标小的图原样保留，不放大。
