@@ -299,9 +299,9 @@ mod tests {
     }
 
     #[test]
-    fn item_limit_triggers_eviction_at_513() {
+    fn item_limit_needs_eviction_at_513() {
         let budget = 64 * 1024 * 1024;
-        // 数字写死：常量被改回 256 时，这两个断言会立刻失败。
+        // 512 放得下，513 就超；没到条数但超预算也要淘汰。
         assert!(
             !CoverImageCache::needs_eviction(0, 512, budget),
             "512 条不淘汰"
