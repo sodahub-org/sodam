@@ -32,25 +32,24 @@ use sodam_core::queue::{PlayMode, Queue};
 /// 按「被淘汰的文件路径」反查对应的 URL，缩略图和原图分开返回。
 ///
 /// `covers` / `original_covers` 的 value 就是磁盘路径，按 value 精确匹配即可，
-/// 只删了缩略图就不会连原图映射一起清掉；调用方据此解除下载去重标记。
-fn urls_for_removed_paths(
+/// 只删了缩略图就不会连原图映射一起清掉。先拿哈希集合筛出内存中真命中删除列表的
+/// 那几条，再只对这几条做磁盘检查——被淘汰的路径成千上万，绝大多数根本不在内存表里，
+/// 不能在主线程上挨个 stat。已被下载重建回来的路径不算失效。
+fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     covers: &HashMap<String, PathBuf>,
     original_covers: &HashMap<String, PathBuf>,
     removed: &[PathBuf],
+    still_gone: F,
 ) -> (HashSet<String>, HashSet<String>) {
     let removed_set: HashSet<&std::path::Path> =
         removed.iter().map(|path| path.as_path()).collect();
-    let thumb_urls = covers
-        .iter()
-        .filter(|(_, path)| removed_set.contains(path.as_path()))
-        .map(|(url, _)| url.clone())
-        .collect();
-    let original_urls = original_covers
-        .iter()
-        .filter(|(_, path)| removed_set.contains(path.as_path()))
-        .map(|(url, _)| url.clone())
-        .collect();
-    (thumb_urls, original_urls)
+    let pick = |map: &HashMap<String, PathBuf>| {
+        map.iter()
+            .filter(|(_, path)| removed_set.contains(path.as_path()) && still_gone(path.as_path()))
+            .map(|(url, _)| url.clone())
+            .collect()
+    };
+    (pick(covers), pick(original_covers))
 }
 
 impl Root {
@@ -668,18 +667,15 @@ impl Root {
     /// 重复项，渲染才能把这几种封面重新排队下载。当前曲目的原图被删时直接补一次下载，
     /// 歌词页没有原图的自动入队口子，不等它自己回来。
     pub(crate) fn drop_removed_covers(&mut self, removed: &[PathBuf], cx: &mut Context<Self>) {
-        // 淘汰到回调之间可能有下载把文件重建回来了。还活着的路径不能当成被删处理，
-        // 否则刚下好的封面会被误清、再下一遍。
-        let gone: Vec<PathBuf> = removed
-            .iter()
-            .filter(|path| !path.exists())
-            .cloned()
-            .collect();
-        if gone.is_empty() {
+        if removed.is_empty() {
             return;
         }
+        // 淘汰到回调之间下载可能把文件重建回来。还活着的路径不当成被删，
+        // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
         let (thumb_urls, original_urls) =
-            urls_for_removed_paths(&self.covers, &self.original_covers, &gone);
+            urls_for_removed_paths(&self.covers, &self.original_covers, removed, |path| {
+                !path.exists()
+            });
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
@@ -5265,14 +5261,12 @@ mod tests {
             ),
         ]);
 
-        let (thumbs, originals_gone) = urls_for_removed_paths(
-            &covers,
-            &originals,
-            &[
-                path("covers/thumb-gone.img"),
-                path("covers/original/full-only.img"),
-            ],
-        );
+        let removed = [
+            path("covers/thumb-gone.img"),
+            path("covers/original/full-only.img"),
+        ];
+        let (thumbs, originals_gone) =
+            urls_for_removed_paths(&covers, &originals, &removed, |_| true);
         assert_eq!(thumbs.len(), 1, "只有缩略图被删的那张要重下缩略图");
         assert!(thumbs.contains("gone-thumb"));
         assert_eq!(originals_gone.len(), 1, "只有原图被删的那张要重下原图");
@@ -5281,6 +5275,13 @@ mod tests {
         assert!(!originals_gone.contains("gone-thumb"));
         // alive-thumb 两侧都没被删，谁都不该动。
         assert!(!thumbs.contains("alive-thumb"));
+
+        // 被下载重建回来的路径不再算失效，映射要留住。
+        let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
+            p.to_string_lossy() == "covers/original/full-only.img"
+        });
+        assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
+        assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {

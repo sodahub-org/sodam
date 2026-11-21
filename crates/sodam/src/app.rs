@@ -46,6 +46,8 @@ pub(crate) struct CoverPool {
     queue: VecDeque<String>,
     inflight: HashSet<String>,
     seen: HashSet<String>,
+    /// 下载中被淘汰的 URL：这次下载完（成功或失败）要放行 seen，让封面能重排。
+    forgotten: HashSet<String>,
 }
 
 impl CoverPool {
@@ -57,6 +59,7 @@ impl CoverPool {
             queue: VecDeque::new(),
             inflight: HashSet::new(),
             seen: HashSet::new(),
+            forgotten: HashSet::new(),
         }
     }
 
@@ -82,13 +85,20 @@ impl CoverPool {
 
     fn done(&mut self, url: &str) {
         self.inflight.remove(url);
+        if self.forgotten.remove(url) {
+            // 下载中被淘汰过：这次拿回来的文件可能已经被删，也可能压根没下到，
+            // 放行去重标记，渲染发现缺图时才能重新排队。
+            self.seen.remove(url);
+        }
     }
 
     /// 封面被淘汰后想让一个 URL 重新入队：摘掉排队中的旧请求和去重标记。
-    /// 但正在下载的那份不能放行——它马上会写回文件，再 push 一次就是重复下载。
+    /// 正在下载的那份先记下来，等 `done` 再放行——过早放行会和这次下载撞成两份。
     fn forget(&mut self, url: &str) {
         self.queue.retain(|queued| queued != url);
-        if !self.inflight.contains(url) {
+        if self.inflight.contains(url) {
+            self.forgotten.insert(url.to_string());
+        } else {
             self.seen.remove(url);
         }
     }
@@ -2265,10 +2275,12 @@ mod tests {
             "下载中 forget 不能放行，否则同一张下两遍"
         );
 
-        // 下载完成会写回文件，这份请求已经拿到封面；seen 保持，不需要再排队。
+        // 下载中这张被淘汰，文件很可能已删或没下到；这次结束后必须放行 seen，
+        // 渲染发现缺图时才能重新排队——不管这次下载成功还是失败。
         pool.done("cover-a");
         assert!(!pool.inflight.contains("cover-a"));
-        assert!(!pool.push("cover-a"), "文件已下好，不该再排一次");
+        assert!(!pool.forgotten.contains("cover-a"));
+        assert!(pool.push("cover-a"), "这次拿回的封面不可用，要能重新入队");
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
