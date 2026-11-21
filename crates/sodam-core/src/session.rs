@@ -30,8 +30,9 @@ fn cover_file_usable(path: &std::path::Path) -> bool {
 /// 封面落盘前的纯处理：解码 → 等比缩小（只缩不放，长边 ≤ `edge`）→ 编码。
 ///
 /// 解码/编码失败返回 `None`，调用方不写缓存文件，界面继续显示占位图。
-/// 不透明图落 JPEG（专辑封面实际均为不透明）；带 alpha 的图落 PNG 保透明——
-/// 这个缓存也服务音乐人/用户头像（可能是不透明通道的 PNG），转 JPEG 会变黑底。
+/// 不透明图落 JPEG（专辑封面实际均为不透明）；真有透明像素的图落 PNG
+/// 保透明——这个缓存也服务音乐人/用户头像，转 JPEG 会变黑底。
+/// 只带 alpha 通道、像素全不透明的图（大量导出工具的默认形态）照旧 JPEG。
 fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     use image::codecs::jpeg::JpegEncoder;
     use image::ImageEncoder;
@@ -57,8 +58,12 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     };
     let resized = decoded.thumbnail(w, h);
     let mut encoded = std::io::Cursor::new(Vec::new());
-    if resized.color().has_alpha() {
-        // 头像等带透明的图：落 PNG，别把透明变黑底。
+    // 带 alpha 通道 ≠ 有透明像素：全不透明的 RGBA 源图照旧走 JPEG，
+    // 不然「带通道就落 PNG」会把无损 PNG 的体积又吐回去。
+    let transparent =
+        resized.color().has_alpha() && resized.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255);
+    if transparent {
+        // 头像等真带透明的图：落 PNG，别把透明变黑底。
         resized
             .write_to(&mut encoded, image::ImageFormat::Png)
             .ok()?;
@@ -1336,6 +1341,28 @@ mod tests {
             rgba.get_pixel(0, 0),
             &image::Rgba([10, 20, 30, 128]),
             "半透明像素原样保留"
+        );
+    }
+
+    /// 全不透明的 RGBA 源图（导出工具默认带 alpha 通道）照旧走 JPEG——
+    /// 别让「带通道就落 PNG」把无损 PNG 的体积又吐回去。
+    #[test]
+    fn shrink_cover_keeps_jpeg_for_opaque_rgba_source() {
+        let img = image::RgbaImage::from_pixel(320, 200, image::Rgba([8, 16, 32, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("测试 PNG 必须编得出来");
+        let shrunk = shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).expect("PNG 应该解得开");
+        assert_eq!(
+            image::guess_format(&shrunk).unwrap(),
+            image::ImageFormat::Jpeg,
+            "全不透明的源图要照旧走 JPEG"
+        );
+        let decoded = image::load_from_memory(&shrunk).expect("JPEG 必须能再解");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (160, 100),
+            "长边缩到 160，等比"
         );
     }
 

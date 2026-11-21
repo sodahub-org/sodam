@@ -1297,10 +1297,13 @@ impl Root {
         self.load_lyrics(track, false, cx);
     }
 
+    /// 原图下载的在飞上限：单张解码最坏 64 MiB（16 位图翻倍），这条路没有
+    /// CoverPool 的并发保护，用计数限流防快速切歌时瞬时内存失控。
+    const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
+
     pub(crate) fn ensure_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
 
-        const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
         let url = url.trim();
         if url.is_empty() || self.original_covers.contains_key(url) {
             return;
@@ -1312,15 +1315,28 @@ impl Root {
         if !first_try {
             return;
         }
-        // 原图这条路没有 CoverPool 的并发上限：解码一张最坏 64 MiB（16 位图
-        // 翻倍），快速切歌时几十张同时在飞会瞬时堆出几 GiB，手动限流。
-        // 排不上的 URL 不记「已尝试」，等在飞任务完成后自然再取。
-        if self.original_cover_inflight.load(Ordering::SeqCst) >= MAX_ORIGINAL_COVER_INFLIGHT {
+        // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
+        // 回调补上（照 CoverPool 的 pump 思路），排队的不许被丢掉。
+        if self.original_cover_inflight.load(Ordering::SeqCst) >= Self::MAX_ORIGINAL_COVER_INFLIGHT
+        {
             if let Ok(mut attempted) = self.original_cover_attempted.lock() {
                 attempted.remove(url);
             }
+            if let Ok(mut pending) = self.original_cover_pending.lock() {
+                if !pending.iter().any(|queued| queued == url) {
+                    pending.push(url.to_string());
+                }
+            }
             return;
         }
+        self.spawn_original_cover(url, cx);
+    }
+
+    /// 占一个在飞位并启动原图下载；完成回调里把排队中的补上。
+    fn spawn_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+
+        let max_inflight = Self::MAX_ORIGINAL_COVER_INFLIGHT;
         self.original_cover_inflight.fetch_add(1, Ordering::SeqCst);
         let inflight = Arc::clone(&self.original_cover_inflight);
         let settings = self.settings.clone();
@@ -1341,6 +1357,26 @@ impl Root {
                         Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
                     }
                     cx.notify();
+                }
+            });
+            // 在飞位空出来了：把限流期间排队的原图补上，不许被丢掉。
+            let _ = this.update(cx, |root, cx| {
+                let inflight_now = root
+                    .original_cover_inflight
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if inflight_now >= max_inflight {
+                    return;
+                }
+                let slots = max_inflight - inflight_now;
+                let mut pending = match root.original_cover_pending.lock() {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                };
+                let take = slots.min(pending.len());
+                let queued: Vec<String> = pending.drain(..take).collect();
+                drop(pending);
+                for queued_url in &queued {
+                    root.ensure_original_cover(queued_url, cx);
                 }
             });
         })
