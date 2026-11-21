@@ -1298,6 +1298,9 @@ impl Root {
     }
 
     pub(crate) fn ensure_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+
+        const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
         let url = url.trim();
         if url.is_empty() || self.original_covers.contains_key(url) {
             return;
@@ -1309,11 +1312,25 @@ impl Root {
         if !first_try {
             return;
         }
+        // 原图这条路没有 CoverPool 的并发上限：解码一张最坏 64 MiB（16 位图
+        // 翻倍），快速切歌时几十张同时在飞会瞬时堆出几 GiB，手动限流。
+        // 排不上的 URL 不记「已尝试」，等在飞任务完成后自然再取。
+        if self.original_cover_inflight.load(Ordering::SeqCst) >= MAX_ORIGINAL_COVER_INFLIGHT {
+            if let Ok(mut attempted) = self.original_cover_attempted.lock() {
+                attempted.remove(url);
+            }
+            return;
+        }
+        self.original_cover_inflight.fetch_add(1, Ordering::SeqCst);
+        let inflight = Arc::clone(&self.original_cover_inflight);
         let settings = self.settings.clone();
         let fetch_url = url.to_string();
         let work_url = fetch_url.clone();
-        let work = cx
-            .background_spawn(async move { Session::new(settings).original_cover_path(&work_url) });
+        let work = cx.background_spawn(async move {
+            let path = Session::new(settings).original_cover_path(&work_url);
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            path
+        });
         cx.spawn(async move |this, cx| {
             let path = work.await;
             let _ = this.update(cx, |root, cx| {

@@ -10,14 +10,14 @@ use std::sync::Arc;
 /// 封面 URL → 缓存文件名用的稳定哈希（FNV-1a 64）。
 /// 封面缓存的最大边长：列表缩略图 40px、卡片 156px，160 足够且解码开销极小。
 const COVER_MAX_EDGE: u32 = 160;
-/// 原图落盘目标边长：歌词页封面按窗口高度 40% 显示，4K + 高缩放下物理像素
-/// 约 900–1700，1280 覆盖常见场景且体积可控。
+/// 原图落盘目标边长：歌词页封面按窗口高度 40% 显示，1280 覆盖到约 2×
+/// 缩放的常见场景，更高缩放下会轻微放大（父票 #215 挂了 4K 真机复核假设）。
 const COVER_ORIGINAL_MAX_EDGE: u32 = 1280;
-/// 落盘统一编码的 JPEG 质量：85 在清晰度与体积之间取平衡。
-/// 体积随画面复杂度与源图分辨率浮动，不写死数字。
+/// 落盘编码质量：不透明的封面统一 JPEG，85 在清晰度与体积之间取平衡。
+/// 体积随画面复杂度与源图分辨率浮动，不写死数字。带透明的图落 PNG（见 shrink_cover）。
 const COVER_JPEG_QUALITY: u8 = 85;
 /// 下载字节解码的边长上限：超限当解码失败，走占位图重试。
-/// 单张最坏解码内存约 64 MiB（4096×4096 RGBA）。
+/// 单张最坏解码内存：8 位 RGBA 约 64 MiB，16 位图翻倍到约 128 MiB。
 const MAX_DECODE_EDGE: u32 = 4096;
 
 /// 缓存文件能不能用：是个普通文件，而且不是 0 字节（0 字节多半是上次写坏的）。
@@ -27,10 +27,11 @@ fn cover_file_usable(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 封面落盘前的纯处理：解码 → 等比缩小（只缩不放，长边 ≤ `edge`）→ 转 RGB 编码 JPEG。
+/// 封面落盘前的纯处理：解码 → 等比缩小（只缩不放，长边 ≤ `edge`）→ 编码。
 ///
-/// 解码/编码失败返回 `None`，调用方不写缓存文件，界面继续显示占位图，下次可重试。
-/// JPEG 没有 alpha：透明像素按 JPEG 语义丢弃（专辑封面实际均为不透明）。
+/// 解码/编码失败返回 `None`，调用方不写缓存文件，界面继续显示占位图。
+/// 不透明图落 JPEG（专辑封面实际均为不透明）；带 alpha 的图落 PNG 保透明——
+/// 这个缓存也服务音乐人/用户头像（可能是不透明通道的 PNG），转 JPEG 会变黑底。
 fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
     use image::codecs::jpeg::JpegEncoder;
     use image::ImageEncoder;
@@ -54,22 +55,30 @@ fn shrink_cover(bytes: &[u8], edge: u32) -> Option<Vec<u8>> {
         let short = (width as u64 * edge as u64 / height as u64).max(1) as u32;
         (short, edge)
     };
-    let rgb = decoded.thumbnail(w, h).to_rgb8();
+    let resized = decoded.thumbnail(w, h);
     let mut encoded = std::io::Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut encoded, COVER_JPEG_QUALITY)
-        .write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .ok()?;
+    if resized.color().has_alpha() {
+        // 头像等带透明的图：落 PNG，别把透明变黑底。
+        resized
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .ok()?;
+    } else {
+        let rgb = resized.to_rgb8();
+        JpegEncoder::new_with_quality(&mut encoded, COVER_JPEG_QUALITY)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .ok()?;
+    }
     Some(encoded.into_inner())
 }
 
 /// 缩放/编码失败记一条 warn：整会话只剩占位图，得留排查线索（对齐 `cover_write_failed`）。
 /// `shrink_cover` 本体保持纯函数，日志在调用方落；文件名从缓存路径取，避免拼法漂移。
-fn log_cover_decode_failed(path: &std::path::Path) {
+fn log_cover_shrink_failed(path: &std::path::Path) {
     use crate::log_outlet::{log_event, LogLevel, LogTopic};
     let file = path
         .file_name()
@@ -78,7 +87,7 @@ fn log_cover_decode_failed(path: &std::path::Path) {
     log_event(
         LogLevel::Warn,
         LogTopic::App,
-        "cover_decode_failed",
+        "cover_shrink_failed",
         &[("file", file.as_str())],
     );
 }
@@ -1098,9 +1107,9 @@ impl Session {
             return None;
         }
         // 按歌词页显示需要缩小再存 JPEG：原始字节直接落盘太占空间。
-        // 源图解不开就不落盘：界面显示占位图，下次可重试。
+        // 源图解不开就不落盘：界面显示占位图，本会话不自动重试（重试按钮/重启后再取）。
         let Some(shrunk) = shrink_cover(&bytes, COVER_ORIGINAL_MAX_EDGE) else {
-            log_cover_decode_failed(&path);
+            log_cover_shrink_failed(&path);
             return None;
         };
         // 先写临时文件再整体换上去：写到一半断了也不会留下半张图。
@@ -1152,9 +1161,10 @@ impl Session {
             return None;
         }
         // 缩到列表实际需要的尺寸再存 JPEG：40px 的缩略图不需要 500px 的原图。
-        // 源图解不开就不落盘：界面显示占位图，下次可重试，不再把原始字节当兜底缓存。
+        // 源图解不开就不落盘：界面显示占位图，本会话不自动重试（重试按钮/重启后再取），
+        // 不再把原始字节当兜底缓存。
         let Some(shrunk) = shrink_cover(&bytes, COVER_MAX_EDGE) else {
-            log_cover_decode_failed(&path);
+            log_cover_shrink_failed(&path);
             return None;
         };
         if !save_cover_file(&path, &shrunk) {
@@ -1260,10 +1270,11 @@ mod tests {
 
     /// 边界内的合法大封面必须能解码成功——防止以后调小边长或加回
     /// 别的上限，把这类图重新挡成永久占位图。
+    /// 源图边长写死 4096，故意不跟 `MAX_DECODE_EDGE` 走：常量调小后
+    /// 这条测试必须红，才算盯住了。
     #[test]
     fn shrink_cover_accepts_large_covers_within_limit() {
-        let img =
-            image::RgbImage::from_pixel(MAX_DECODE_EDGE, MAX_DECODE_EDGE, image::Rgb([8, 16, 32]));
+        let img = image::RgbImage::from_pixel(4096, 4096, image::Rgb([8, 16, 32]));
         let mut bytes = std::io::Cursor::new(Vec::new());
         img.write_to(&mut bytes, image::ImageFormat::Png)
             .expect("测试 PNG 必须编得出来");
@@ -1277,7 +1288,7 @@ mod tests {
         );
     }
 
-    /// 解不开的源图返回 `None`，调用方据此不落盘、下次可重试。
+    /// 解不开的源图返回 `None`，调用方据此不落盘、界面显示占位图。
     #[test]
     fn shrink_cover_rejects_undecodable_bytes() {
         assert!(shrink_cover(b"not-an-image", COVER_MAX_EDGE).is_none());
@@ -1298,9 +1309,9 @@ mod tests {
         );
     }
 
-    /// 带 alpha 的源图按 JPEG 语义丢掉透明通道，输出仍是可解码的 JPEG。
+    /// 带 alpha 的源图落 PNG 保透明（头像走这个缓存，转 JPEG 会变黑底）。
     #[test]
-    fn shrink_cover_drops_alpha_and_stays_decodable() {
+    fn shrink_cover_preserves_alpha_as_png() {
         let mut img = image::RgbaImage::new(80, 80);
         for pixel in img.pixels_mut() {
             *pixel = image::Rgba([10, 20, 30, 128]);
@@ -1311,17 +1322,18 @@ mod tests {
         let shrunk = shrink_cover(&bytes.into_inner(), COVER_MAX_EDGE).expect("PNG 应该解得开");
         assert_eq!(
             image::guess_format(&shrunk).unwrap(),
-            image::ImageFormat::Jpeg,
-            "落盘内容必须是 JPEG"
+            image::ImageFormat::Png,
+            "带透明的图要落 PNG"
         );
-        let decoded = image::load_from_memory(&shrunk).expect("JPEG 必须能再解");
+        let decoded = image::load_from_memory(&shrunk).expect("PNG 必须能再解");
         // 80×80 ≤ 160：原样保留，不放大。
         assert_eq!((decoded.width(), decoded.height()), (80, 80));
-        // alpha 被丢弃：解出来是 RGB 三通道（JPEG 不存 alpha）。
+        // PNG 无损：alpha 通道和值都原样保留。
+        assert_eq!(decoded.color(), image::ColorType::Rgba8, "透明通道要保留");
         assert_eq!(
-            decoded.color(),
-            image::ColorType::Rgb8,
-            "透明通道要被 JPEG 语义丢掉"
+            decoded.get_pixel(0, 0),
+            image::Rgba([10, 20, 30, 128]),
+            "半透明像素原样保留"
         );
     }
 
