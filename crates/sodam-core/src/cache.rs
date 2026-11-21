@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
+
 pub const DEFAULT_AUDIO_LIMIT_MB: u64 = 10 * 1024;
 const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -104,19 +106,119 @@ fn remove_idle(path: &Path) -> bool {
     std::fs::remove_file(path).is_ok()
 }
 
-fn files_in(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
+/// 目录扫描得到的一个缓存文件：路径、字节数、最后修改时间。
+pub(crate) struct ScannedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) modified: SystemTime,
+}
+
+/// 一次递归扫描的结果。
+///
+/// `incomplete` 记录「有地方没读到」：目录打不开、条目读错、元数据取不到。
+/// 这种情况下 `files` 只是可读部分的视图，总量偏小，不能当成完整统计。
+#[derive(Default)]
+pub(crate) struct Scan {
+    pub(crate) files: Vec<ScannedFile>,
+    pub(crate) incomplete: bool,
+}
+
+impl Scan {
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .fold(0u64, |sum, file| sum.saturating_add(file.bytes))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EntryKind {
+    Dir,
+    File,
+    /// 符号链接、套接字等：一律不碰，免得走到缓存目录外。
+    Other,
+}
+
+/// 一层目录的读取结果。
+struct Listing {
+    entries: Vec<(PathBuf, EntryKind)>,
+    /// 这一层有条目读不到：条目本身或它的类型取失败。
+    incomplete: bool,
+}
+
+type ListingResult = std::io::Result<Listing>;
+
+fn list_dir(dir: &Path) -> ListingResult {
+    let mut entries = Vec::new();
+    let mut incomplete = false;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else {
+            incomplete = true;
             continue;
         };
-        // 不沿符号链接走到缓存目录外。
-        if kind.is_dir() {
-            files_in(&entry.path(), files);
-        } else if kind.is_file() {
-            files.push(entry.path());
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => EntryKind::Dir,
+            Ok(kind) if kind.is_file() => EntryKind::File,
+            Ok(_) => EntryKind::Other,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        entries.push((entry.path(), kind));
+    }
+    Ok(Listing {
+        entries,
+        incomplete,
+    })
+}
+
+/// 递归扫描 `dir`，不跟随符号链接。所有维护入口共用这一份遍历。
+pub(crate) fn scan_files(dir: &Path) -> Scan {
+    scan_with(dir, list_dir)
+}
+
+/// 遍历实现，目录读取可注入：测试用它模拟「某个子目录读不到」，
+/// 不必依赖权限位（root 下无效、Windows 上不生效）。
+fn scan_with<L>(dir: &Path, list: L) -> Scan
+where
+    L: FnMut(&Path) -> ListingResult,
+{
+    let mut scan = Scan::default();
+    let mut list = list;
+    scan_into(dir, &mut scan, &mut list);
+    scan
+}
+
+fn scan_into<L>(dir: &Path, scan: &mut Scan, list: &mut L)
+where
+    L: FnMut(&Path) -> ListingResult,
+{
+    let listing = match list(dir) {
+        Ok(listing) => listing,
+        // 目录不存在是正常状态（首次启动、用户没看过封面、正在被并发删掉），
+        // 不算「扫描不完整」，也不该让封面淘汰在这一轮停摆。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            scan.incomplete = true;
+            return;
+        }
+    };
+    scan.incomplete |= listing.incomplete;
+    for (path, kind) in listing.entries {
+        match kind {
+            EntryKind::Dir => scan_into(&path, scan, list),
+            EntryKind::File => match std::fs::metadata(&path) {
+                Ok(meta) => scan.files.push(ScannedFile {
+                    path,
+                    bytes: meta.len(),
+                    modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
+                }),
+                // 扫描与取元数据之间被删掉：正常竞争，不算扫描缺口。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => scan.incomplete = true,
+            },
+            EntryKind::Other => {}
         }
     }
 }
@@ -145,46 +247,47 @@ fn cover_group_key(path: &Path) -> String {
 /// 封面缓存硬上限：缩略图加原图合计，固定 512 MiB，不做用户配置项。
 pub const COVER_LIMIT_MB: u64 = 512;
 
-/// 按组内最后访问时间淘汰封面缓存，返回 `(剩余字节数, 实际删掉的文件路径)`。
+/// 按组内最后访问时间从旧到新淘汰，直到总量不超 `limit_bytes`。
 ///
-/// 目录里所有普通文件都计入总量（含原图子目录和临时文件）；24 小时内的 `.part`
-/// 只统计不淘汰。同一张封面的缩略图与原图成组，组内取最新访问时间做 LRU 键，
-/// 从最久没看的组开始整组删，删到不超上限为止。删除成功才算释放，失败不中断。
-/// 返回删掉的路径，好让调用方只清理这些文件对应的内存映射，不必全表扫盘。
-/// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
-fn trim_covers_with<F: Fn(&Path) -> bool>(
-    dir: &Path,
+/// 音频与封面共用的那一份淘汰器：两者只在「怎么分组」和「怎么删」上不同。
+/// `group_key` 把同一份缓存的文件归到一组（音频是文件 + `.quality` sidecar，
+/// 封面是缩略图 + 原图），组内取最新访问时间当 LRU 键，整组一起删，
+/// 不会留下半套缓存。24 小时内的 `.part` 计入总量但不参与淘汰（还在下载）。
+///
+/// 返回 `(淘汰后的字节数, 真正删掉的路径)`：删除成功才算释放空间，失败不中断，
+/// 失败的文件留在总量里等下轮再试。
+fn evict_lru<K, G, R>(
+    files: Vec<ScannedFile>,
     limit_bytes: u64,
-    remove: F,
-) -> (u64, Vec<PathBuf>) {
-    let mut files = Vec::new();
-    files_in(dir, &mut files);
-    let mut groups: HashMap<String, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
+    group_key: G,
+    mut remove: R,
+) -> (u64, Vec<PathBuf>)
+where
+    K: Eq + std::hash::Hash,
+    G: Fn(&Path) -> K,
+    R: FnMut(&Path) -> bool,
+{
+    let mut groups: HashMap<K, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
     let mut total = 0u64;
-    for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let bytes = meta.len();
-        total = total.saturating_add(bytes);
-        let modified = meta.modified().unwrap_or(SystemTime::now());
-        if is_fresh_part(&path, modified) {
+    for file in files {
+        total = total.saturating_add(file.bytes);
+        if is_fresh_part(&file.path, file.modified) {
             continue;
         }
         let group = groups
-            .entry(cover_group_key(&path))
-            .or_insert((modified, Vec::new()));
-        group.0 = group.0.max(modified);
-        group.1.push((path, bytes));
+            .entry(group_key(&file.path))
+            .or_insert((file.modified, Vec::new()));
+        group.0 = group.0.max(file.modified);
+        group.1.push((file.path, file.bytes));
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by_key(|(_, (modified, _))| *modified);
     let mut removed = Vec::new();
-    for (_, (_, files)) in groups {
+    for (_, (_, group_files)) in groups {
         if total <= limit_bytes {
             break;
         }
-        for (path, bytes) in files {
+        for (path, bytes) in group_files {
             if remove(&path) {
                 total = total.saturating_sub(bytes);
                 removed.push(path);
@@ -192,6 +295,53 @@ fn trim_covers_with<F: Fn(&Path) -> bool>(
         }
     }
     (total, removed)
+}
+
+/// 按组内最后访问时间淘汰封面缓存，返回 `(剩余字节数, 实际删掉的文件路径)`。
+///
+/// 目录里所有普通文件都计入总量（含原图子目录和临时文件）；24 小时内的 `.part`
+/// 只统计不淘汰。同一张封面的缩略图与原图成组，组内取最新访问时间做 LRU 键，
+/// 从最久没看的组开始整组删，删到不超上限为止。删除成功才算释放，失败不中断。
+/// 返回删掉的路径，好让调用方只清理这些文件对应的内存映射，不必全表扫盘。
+/// 封面不建立租约，正在被读的文件若被系统拒绝删除，下次维护再试。
+///
+/// 扫描不完整时本轮一个都不删（见 `trim_covers_scan`）。
+fn trim_covers_with<F: FnMut(&Path) -> bool>(
+    dir: &Path,
+    limit_bytes: u64,
+    remove: F,
+) -> (u64, Vec<PathBuf>) {
+    trim_covers_scan(scan_files(dir), limit_bytes, remove)
+}
+
+/// 封面淘汰的决策层：只有扫描完整才动手。
+///
+/// 读不到的子树会让总量偏小，而淘汰量正是按这个总量算出来的：删到「不超限」之后，
+/// 真实总量仍可能在上限之上——本轮看起来做完了，其实没有。所以这一轮干脆不删，
+/// 把不完整扫描当成一次异常上报（Debug 日志），等子树恢复可读再按完整统计淘汰；
+/// 代价是目录可能暂时超限，收益是不拿残缺总量做任何删除决定（#225 方案 A）。
+/// 这里只记日志，不弹提示、不改状态行。
+fn trim_covers_scan<F: FnMut(&Path) -> bool>(
+    scan: Scan,
+    limit_bytes: u64,
+    remove: F,
+) -> (u64, Vec<PathBuf>) {
+    if scan.incomplete {
+        let total = scan.total_bytes();
+        let scanned_bytes = total.to_string();
+        let scanned_files = scan.files.len().to_string();
+        log_event(
+            LogLevel::Debug,
+            LogTopic::App,
+            "cover_trim_incomplete",
+            &[
+                ("scanned_bytes", scanned_bytes.as_str()),
+                ("scanned_files", scanned_files.as_str()),
+            ],
+        );
+        return (total, Vec::new());
+    }
+    evict_lru(scan.files, limit_bytes, cover_group_key, remove)
 }
 
 pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> (u64, Vec<PathBuf>) {
@@ -211,54 +361,25 @@ pub fn trim_covers(limit_mb: u64) -> Vec<PathBuf> {
 
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
 pub fn clear_in(root: &Path) -> usize {
-    let mut files = Vec::new();
-    files_in(root, &mut files);
-    files
+    scan_files(root)
+        .files
         .into_iter()
-        .filter(|path| {
-            let modified = std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .unwrap_or(SystemTime::now());
-            !is_fresh_part(path, modified) && remove_idle(path)
-        })
+        .filter(|file| !is_fresh_part(&file.path, file.modified) && remove_idle(&file.path))
         .count()
 }
 
 /// 按最后使用时间淘汰音频（命中缓存时更新 mtime）。租约文件可暂时超额。
 /// sidecar 与音频成组淘汰；失败的删除不计入释放空间。调用方必须在后台执行。
+///
+/// 扫描不完整时照旧只按可读部分淘汰：音频有租约保护、又是用户主动设定的额度，
+/// 少删（停在额度之上）比不删更接近预期。这条口径与封面相反，是 #217 刻意保留的
+/// 差异，改它要单独评估（#225 方案 C）。
 pub fn trim_audio_in(dir: &Path, limit_bytes: u64) -> u64 {
-    let mut files = Vec::new();
-    files_in(dir, &mut files);
-    let mut groups: HashMap<PathBuf, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
-    let mut total = 0u64;
-    for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let bytes = meta.len();
-        total = total.saturating_add(bytes);
-        let modified = meta.modified().unwrap_or(SystemTime::now());
-        if is_fresh_part(&path, modified) {
-            continue;
-        }
-        let key = protection_key(&path);
-        let group = groups.entry(key).or_insert((modified, Vec::new()));
-        group.0 = group.0.max(modified);
-        group.1.push((path, bytes));
-    }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by_key(|(_, (modified, _))| *modified);
-    for (_, (_, files)) in groups {
-        if total <= limit_bytes {
-            break;
-        }
-        for (path, bytes) in files {
-            if remove_idle(&path) {
-                total = total.saturating_sub(bytes);
-            }
-        }
-    }
-    total
+    trim_audio_scan(scan_files(dir), limit_bytes)
+}
+
+fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
+    evict_lru(scan.files, limit_bytes, protection_key, remove_idle).0
 }
 
 pub fn trim_audio(limit_mb: u64) -> u64 {
@@ -1031,6 +1152,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(trim_covers_in(&dir.path().join("missing"), 0).0, 0);
         assert_eq!(trim_covers_in(dir.path(), 0).0, 0);
+    }
+
+    /// #225：「根目录不存在」是正常状态，不能算成扫描不完整，否则封面淘汰会永久停摆。
+    #[test]
+    fn scan_treats_missing_root_as_complete_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let scan = scan_files(&dir.path().join("missing"));
+        assert!(scan.files.is_empty());
+        assert!(!scan.incomplete, "目录还不存在不等于扫描失败");
+    }
+
+    /// 模拟「某个子目录读不到」的扫描：权限位在 root 下无效、Windows 上不生效，
+    /// 所以直接替换目录读取，而不是去 chmod。
+    fn scan_denying(root: &Path, denied: &Path) -> Scan {
+        scan_with(root, |path| {
+            if path == denied {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            } else {
+                list_dir(path)
+            }
+        })
+    }
+
+    /// #225：子目录读不到时，本轮一个封面都不删，也不把可读部分当成完整总量。
+    #[test]
+    fn trim_covers_skips_eviction_when_scan_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        // 可读部分只有 10 字节；读不到的 original 子目录里另有 600 字节的「大头」。
+        let thumb = file(dir.path(), "covers/0000000000000001-160.img", 100);
+        let hidden = file(dir.path(), "covers/original/0000000000000002.img", 500);
+        let scan = scan_denying(dir.path(), &dir.path().join("covers/original"));
+        assert!(scan.incomplete, "读不到的子目录要标记出来");
+        assert_eq!(scan.total_bytes(), 10, "只统计到可读部分");
+
+        let attempts = std::cell::Cell::new(0);
+        let (remaining, removed) = trim_covers_scan(scan, 0, |_path| {
+            attempts.set(attempts.get() + 1);
+            true
+        });
+
+        assert_eq!(attempts.get(), 0, "扫描不完整时不能拿偏小的统计去删");
+        assert!(removed.is_empty());
+        assert_eq!(remaining, 10);
+        assert!(thumb.exists(), "可读的封面也不能删");
+        assert!(hidden.exists(), "读不到的部分更没动过");
+    }
+
+    /// #225：音频遇到同样的扫描缺口时保持既有口径（按可读部分淘汰），
+    /// 这条差异是刻意的：改音频行为要单独评估（方案 C）。
+    #[test]
+    fn trim_audio_still_evicts_from_incomplete_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = file(dir.path(), "old.m4a", 100);
+        file(dir.path(), "old.quality", 100);
+        let recent = file(dir.path(), "recent.m4a", 0);
+        file(dir.path(), "deep/unreadable.m4a", 100);
+
+        let scan = scan_denying(dir.path(), &dir.path().join("deep"));
+        assert!(scan.incomplete);
+        // 可读部分共 30 字节，上限 20：淘汰最旧那组（音频 + sidecar 20 字节），停在 10。
+        assert_eq!(trim_audio_scan(scan, 20), 10);
+        assert!(!old.exists(), "音频照旧淘汰可读部分里最旧的");
+        assert!(recent.exists());
     }
 
     #[test]
