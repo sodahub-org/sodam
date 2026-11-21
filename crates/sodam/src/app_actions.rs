@@ -29,6 +29,25 @@ use super::{
 };
 use sodam_core::queue::{PlayMode, Queue};
 
+/// 从封面路径映射里挑出磁盘上已经不存在（被淘汰或外部删掉）的 URL。
+///
+/// 缩略图和原图各查一遍，同一个 URL 只留一条。存在性判断由 `exists` 注入，
+/// 这样单测不用碰文件系统；调用方拿到结果后再去清 `covers` / `original_covers`
+/// 和下载去重标记。
+fn missing_cover_urls<F: Fn(&PathBuf) -> bool>(
+    covers: &HashMap<String, PathBuf>,
+    original_covers: &HashMap<String, PathBuf>,
+    exists: F,
+) -> HashSet<String> {
+    let mut missing = HashSet::new();
+    for (url, path) in covers.iter().chain(original_covers.iter()) {
+        if !exists(path) {
+            missing.insert(url.clone());
+        }
+    }
+    missing
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -617,10 +636,7 @@ impl Root {
         let limit = self.settings.audio_cache_limit_mb;
         let work = cx.background_spawn(async move {
             sodam_core::cache::trim_audio(limit);
-            // #217：同一趟后台维护顺手把封面压到 512 MiB 以内，不新增触发时机。
-            sodam_core::cache::trim_covers(
-                sodam_core::cache::COVER_LIMIT_MB.saturating_mul(1024 * 1024),
-            );
+            sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB);
             sodam_core::audio::cache_stats()
         });
         cx.spawn(async move |this, cx| {
@@ -628,6 +644,10 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
                 root.cache_summary = stats;
+                // #217：后台淘汰可能删掉界面正在显示的封面。清掉指向已不存在文件的
+                // 路径映射并解除去重标记，让渲染把这张封面重新入队下载，否则本会话
+                // 会一直停在占位图（Session 的按需重下路径被 map 命中挡住了）。
+                root.drop_missing_covers();
                 if root.settings.audio_cache_limit_mb != limit {
                     root.maintain_cache(cx);
                 }
@@ -635,6 +655,37 @@ impl Root {
             });
         })
         .detach();
+    }
+
+    /// 封面淘汰之后调用：把指向已不存在文件的内存路径清掉，并解除对应的下载去重标记。
+    ///
+    /// 只摘磁盘上真没有的那几条，不动还在用的封面；被清掉的 URL 会因为 `covers`
+    /// 不再命中而被渲染重新丢进请求池，`attempted` / `seen` 也得放行，否则重下不来。
+    pub(crate) fn drop_missing_covers(&mut self) {
+        let dropped = missing_cover_urls(&self.covers, &self.original_covers, |path| path.exists());
+        if dropped.is_empty() {
+            return;
+        }
+        {
+            let covers = Arc::make_mut(&mut self.covers);
+            for url in &dropped {
+                covers.remove(url);
+            }
+        }
+        self.original_covers.retain(|url, _| !dropped.contains(url));
+        if let Ok(mut attempted) = self.cover_attempted.lock() {
+            for url in &dropped {
+                attempted.remove(url);
+            }
+        }
+        if let Ok(mut attempted) = self.original_cover_attempted.lock() {
+            for url in &dropped {
+                attempted.remove(url);
+            }
+        }
+        for url in &dropped {
+            self.cover_pool.seen.remove(url);
+        }
     }
 
     pub(crate) fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -5148,8 +5199,32 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
+        missing_cover_urls,
     };
     use sodam_core::models::{LyricLine, LyricWord};
+
+    /// #217：封面被淘汰后，只挑出磁盘上真没了的 URL，还在的不能误清；
+    /// 同一个 URL 的缩略图和原图都被删时也只报一次。
+    #[test]
+    fn missing_cover_urls_picks_only_gone_files() {
+        let path = |name: &str| PathBuf::from(name);
+        let covers = HashMap::from([
+            ("alive".to_string(), path("alive")),
+            ("gone-thumb".to_string(), path("gone")),
+        ]);
+        let originals = HashMap::from([
+            ("alive".to_string(), path("alive")),
+            ("gone-original".to_string(), path("gone")),
+            ("gone-thumb".to_string(), path("never-existed")),
+        ]);
+        let exists = |p: &PathBuf| p.to_string_lossy() == "alive";
+
+        let missing = missing_cover_urls(&covers, &originals, exists);
+        assert_eq!(missing.len(), 2, "alive 要留住，两个 gone 各报一次");
+        assert!(missing.contains("gone-thumb"), "缩略图被删要报");
+        assert!(missing.contains("gone-original"), "原图被删要报");
+        assert!(!missing.contains("alive"), "还在的封面不能被误清");
+    }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
         LyricLine {

@@ -191,9 +191,15 @@ pub fn trim_covers_in(dir: &Path, limit_bytes: u64) -> u64 {
     trim_covers_with(dir, limit_bytes, |path| std::fs::remove_file(path).is_ok())
 }
 
-/// 对封面缓存目录施加字节上限，返回剩余字节数。调用方必须在后台执行。
-pub fn trim_covers(limit_bytes: u64) -> u64 {
-    trim_covers_in(&crate::audio::cover_cache_dir(), limit_bytes)
+/// 对封面缓存目录施加 MB 上限，返回剩余字节数。调用方必须在后台执行。
+///
+/// 和 `trim_audio` 一样收 MB：单位统一，调用方直接传 `COVER_LIMIT_MB`，
+/// 不用也不能在这里手写字节换算（漏写一次就会把上限当成 512 字节，清空整个目录）。
+pub fn trim_covers(limit_mb: u64) -> u64 {
+    trim_covers_in(
+        &crate::audio::cover_cache_dir(),
+        limit_mb.saturating_mul(1024 * 1024),
+    )
 }
 
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
