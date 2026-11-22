@@ -136,6 +136,41 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     }
 }
 
+/// 曲目 id 拼进缓存文件名前先过这一步。正常 id 是数字，原样返回；
+/// 带路径分隔符或别的怪字符时编码成 `_XX`（字节的十六进制），避免两件事：
+/// 一是把文件拼到缓存目录外面，二是 `a/b` 和 `a_b` 被压成同一个名字互相踩。
+///
+/// 连字符也编码：缓存文件名是 `{safe_id}-{档位}.m4a`，读回时按第一个 `-` 切出 id。
+/// safe id 里不能有 `-`，否则从文件名反推的 id 再编码一次就对不上了。
+fn safe_track_id(track_id: &str) -> String {
+    let bytes = track_id.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        // 已经是 `_XX` 转义的原样留下：从缓存文件名反推出的 id 还会再过一次这里，
+        // 幂等才能让「写入 → 反推 → 再写」落到同一个路径上。
+        if byte == b'_'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('_');
+            out.push(bytes[i + 1] as char);
+            out.push(bytes[i + 2] as char);
+            i += 3;
+            continue;
+        }
+        if byte.is_ascii_alphanumeric() {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("_{byte:02x}"));
+        }
+        i += 1;
+    }
+    out
+}
+
 /// 音频下载交给 libresoda 的暂存目标名（不含目录）。
 ///
 /// 名字只由曲目、档位标签和用途决定，不带进程号/序号：同一首歌反复下、重试多少次
@@ -146,22 +181,6 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
 ///
 /// 用途必须进名字：正常下载与升级会同时下同一首（升级刻意不和播放抢锁），
 /// 同名会让后启动那条被 libresoda 的目标锁顶回来。
-/// 曲目 id 拼进缓存文件名前先过这一步。正常 id 是数字，原样返回；
-/// 带路径分隔符或别的怪字符时编码成 `_XX`（字节的十六进制），避免两件事：
-/// 一是把文件拼到缓存目录外面，二是 `a/b` 和 `a_b` 被压成同一个名字互相踩。
-fn safe_track_id(track_id: &str) -> String {
-    let mut out = String::with_capacity(track_id.len());
-    for byte in track_id.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' {
-            out.push(byte as char);
-        } else {
-            // 连 `_` 也编码，免得跟编码序列本身撞车。
-            out.push_str(&format!("_{byte:02x}"));
-        }
-    }
-    out
-}
-
 fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
     format!(
         "{}-{}-{}.m4a",
@@ -266,6 +285,15 @@ mod part_tests {
             super::safe_track_id("a_b"),
             "a_5fb",
             "下划线也编码，免得跟编码序列撞"
+        );
+        // safe id 里不能有 `-`：从文件名反推时按第一个 `-` 切分，
+        // 反推出来的 id 再编码一次必须还是自己，否则缓存永远 miss。
+        let encoded = super::safe_track_id("a-b_c/d");
+        assert!(!encoded.contains('-'), "safe id 不能含分隔符: {encoded}");
+        assert_eq!(
+            super::safe_track_id(&encoded),
+            encoded,
+            "从文件名反推的 id 再编码要稳定"
         );
     }
 
