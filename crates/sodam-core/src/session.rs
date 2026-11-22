@@ -176,24 +176,26 @@ fn stage_path(
     track_id: &str,
     tag: &str,
     purpose: crate::cache::DownloadPurpose,
-) -> (std::path::PathBuf, crate::cache::CacheLease) {
+) -> Result<(std::path::PathBuf, crate::cache::CacheLease), crate::failure::PlaybackFailure> {
+    use crate::failure::{PlaybackFailure, RecoveryAction, Retryability, Stage};
+
     let stage = staging_dir(dir);
-    if let Err(err) = std::fs::create_dir_all(&stage) {
-        use crate::log_outlet::{log_event, LogLevel, LogTopic};
-        let error = err.to_string();
-        log_event(
-            LogLevel::Warn,
-            LogTopic::Audio,
-            "staging_dir_failed",
-            &[("error", error.as_str())],
-        );
-    }
+    // 建不出暂存目录就没法下载：直接报确定的失败，别拿着一条父目录都不存在的
+    // 路径往下走，最后被 classify 归因成传输错误。
+    std::fs::create_dir_all(&stage).map_err(|err| {
+        PlaybackFailure::new(
+            Stage::Unpack,
+            Retryability::Never,
+            RecoveryAction::FreeSpace,
+            err.to_string(),
+        )
+    })?;
     let name = part_file_name(track_id, tag, purpose);
     let part = stage.join(&name);
     // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
-    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。单实例锁降级时
-    // 可能还有第二个实例，删之前无法核出它是不是正在写；删不掉就记一条日志，
-    // 别静默吞掉——后面查「这首歌为什么一直下不对」要有线索。
+    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。
+    // 删不掉记日志，但日志不是护栏：Unix 上正在被写的同名文件也能 unlink 成功，
+    // 这时没有日志，靠的是调用方持有的那把锁保证没人在写。
     for stale in [
         part.clone(),
         stage.join(format!("{name}.part")),
@@ -220,7 +222,7 @@ fn stage_path(
         }
     }
     let lease = crate::cache::CacheLease::acquire(&part);
-    (part, lease)
+    Ok((part, lease))
 }
 
 #[cfg(test)]
@@ -306,7 +308,8 @@ mod part_tests {
             "123",
             "lossless",
             crate::cache::DownloadPurpose::Normal,
-        );
+        )
+        .expect("建暂存目录该成功");
 
         assert_eq!(part, stale, "暂存目标落在独立的 staging 子目录");
         assert!(!stale.exists(), "上次留下的交付目标必须清掉");
@@ -865,7 +868,7 @@ impl Session {
         // 两条路并发下同一首时互不撞锁。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
         let (part, _part_lease) =
-            stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal);
+            stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal)?;
         let info = self
             .pumpkin
             .download_with_info(&song, &part)
@@ -1035,7 +1038,7 @@ impl Session {
             &track.id,
             &tag,
             crate::cache::DownloadPurpose::Upgrade,
-        );
+        )?;
 
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
         let info = if let crate::quality::QualityIntent::Tier(tier) = intent {

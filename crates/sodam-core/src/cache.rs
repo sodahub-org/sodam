@@ -2361,10 +2361,10 @@ mod tests {
     /// 它的 .part / .part.lock 不会被维护线程当废弃文件删掉。
     #[test]
     fn audio_staging_files_share_the_target_lease() {
-        let target = Path::new("/cache/audio/123-lossless-normal.m4a");
+        let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
         for staged in [
-            "/cache/audio/123-lossless-normal.m4a.part",
-            "/cache/audio/123-lossless-normal.m4a.part.lock",
+            "/cache/audio/staging/123-lossless-normal.m4a.part",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
         }
