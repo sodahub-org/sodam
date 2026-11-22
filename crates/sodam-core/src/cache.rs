@@ -589,6 +589,11 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64, staging: &Path) -> u64 {
 /// 24 小时内的 `.part` 平时不参与淘汰（可能还在下载），但正式文件已经淘汰时
 /// 这首的暂存就是纯垃圾：租约挡得住真正在下的，挡不住的说明早没人下了，一起删。
 /// 返回实际释放的字节数。
+///
+/// 已知边界：收尾释放的字节不计入选组时的预算。`evict_lru` 只看正式文件组，
+/// 新鲜暂存的字节数要等收尾才知道，于是「旧曲目 + 大块无租约新鲜暂存」同时
+/// 命中时可能多淘汰一到两组——多删的按 LRU 序正好是下一顺位，下轮自愈。
+/// 要把字节数算进选组，得给与封面共用的 `evict_lru` 加每组钩子，不值得。
 fn remove_evicted_staging(removed: &[PathBuf], staging: &Path) -> u64 {
     let audio_root = match staging.parent() {
         Some(root) => root,
@@ -2687,9 +2692,9 @@ mod tests {
     /// `.m4a` 后面都能折回交付目标。加尾巴只改数组，这条测试守住保护键不漏。
     #[test]
     fn protection_key_maps_every_staging_tail_to_the_target() {
-        let target = Path::new("/cache/audio/123-lossless-normal.m4a");
+        let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
         for tail in STAGING_TAILS {
-            let staged = format!("123-lossless-normal.m4a{tail}");
+            let staged = format!("/cache/audio/staging/123-lossless-normal.m4a{tail}");
             assert_eq!(protection_key(Path::new(&staged)), target, "{staged}");
         }
         // 挂在别处（封面那类 `.img.*.part`）不进映射，保持原样。
