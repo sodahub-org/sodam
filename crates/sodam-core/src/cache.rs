@@ -514,14 +514,68 @@ pub fn trim_audio(limit_mb: u64) -> u64 {
     )
 }
 
+/// 曲目 id 写进缓存文件名前先过这一步：字母数字原样留着，其余字节写成 `_XX`
+/// （字节的十六进制，小写）。
+///
+/// 要挡住两件事：一是带 `/` 或 `..` 的 id 把文件拼到缓存目录外面；二是编码不能
+/// 把两个不同的 id 压成同一个名字——`a/` 和 `a_2f` 撞在一起的话，两首歌共用一个
+/// 缓存文件，播第二首会直接命中第一首的音频。
+///
+/// 和 [`decode_track_id`] 是严格的一对，谁改谁都得一起改：文件名读回来时靠它反解，
+/// 解不出原来那个 id，下次拼的路径就对不上，缓存永远 miss。
+pub(crate) fn encode_track_id(track_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(track_id.len());
+    for byte in track_id.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            out.push(byte as char);
+        } else {
+            // `_` 自己也编码，所以编码结果里出现的每个 `_` 都一定是转义序列的开头，
+            // 反解时不用猜「这串是不是已经编码过了」。
+            out.push('_');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// [`encode_track_id`] 的反函数，把缓存文件名里的 id 还原成原始值。
+///
+/// 非 ASCII 的 id 也是逐字节还原成原始字节，再按 UTF-8 拼回字符串。
+/// 遇到不成对的下划线（畸形文件名）就原样保留，不给坏数据瞎猜。
+pub(crate) fn decode_track_id(encoded: &str) -> String {
+    let src = encoded.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'_' && i + 2 < src.len() {
+            let hex = std::str::from_utf8(&src[i + 1..i + 3])
+                .ok()
+                .and_then(|text| u8::from_str_radix(text, 16).ok());
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(src[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| encoded.to_string())
+}
+
 /// 解析音频缓存主文件名 stem，分离出 `(track_id, quality_tag)`。
 /// 文件名格式形如 `{track_id}-{quality_tag}`（如 `7427204361343191057-auto`）。
+///
+/// id 一侧是转义过的，这里顺手反解，返回的 track_id 就是能直接拿去拼路径的原始 id。
+/// 转义后的 id 不含 `-`（连字符会写成 `_2d`），所以按第一个 `-` 切分不会切错位置。
 pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
     let (track_id, tag) = stem.split_once('-')?;
     if track_id.is_empty() || tag.is_empty() {
         return None;
     }
-    Some((track_id.to_string(), tag.to_string()))
+    Some((decode_track_id(track_id), tag.to_string()))
 }
 
 /// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}`，
@@ -1857,6 +1911,53 @@ mod tests {
             Some(("7427204361343191057".to_string(), "auto".to_string()))
         );
         assert_eq!(parse_audio_cache_stem("invalid"), None);
+    }
+
+    /// 编码必须单射：两个不同 id 压成同一个文件名，两首歌就共用一份缓存，
+    /// 播第二首会直接命中第一首的音频。
+    #[test]
+    fn track_id_encoding_keeps_distinct_ids_apart() {
+        assert_ne!(encode_track_id("a/"), encode_track_id("a_2f"));
+        assert_ne!(encode_track_id("a/b"), encode_track_id("a_b"));
+        assert_ne!(
+            encode_track_id("../../etc/passwd"),
+            encode_track_id("______etc_passwd")
+        );
+        assert_eq!(encode_track_id("123"), "123", "数字 id 原样保留");
+        let dashed = encode_track_id("a-b");
+        assert!(!dashed.contains('-'), "编码后不能含分隔符: {dashed}");
+    }
+
+    /// 编码要能反解：文件名读回来的 id 必须还是原来那个。解不回来，批量升级拿它
+    /// 拼出来的路径就找不到缓存，这首歌每轮白跑。
+    #[test]
+    fn track_id_encoding_round_trips() {
+        for id in [
+            "123",
+            "7427204361343191057",
+            "a_b",
+            "a/",
+            "a_2f",
+            "a-b",
+            "曲目",
+        ] {
+            let encoded = encode_track_id(id);
+            assert_eq!(decode_track_id(&encoded), id, "{id} 编码后反解不回原值");
+        }
+    }
+
+    /// 走一遍真实链路：写下去的文件名再解析回来，id 和档位都得对。
+    /// 这里特意用非数字 id，也就是以前会 miss 的那条路。
+    #[test]
+    fn cache_stem_round_trips_original_track_id() {
+        for id in ["a_b", "a/", "a_2f", "7427204361343191057"] {
+            let stem = format!("{}-hi-res", encode_track_id(id));
+            assert_eq!(
+                parse_audio_cache_stem(&stem),
+                Some((id.to_string(), "hi-res".to_string())),
+                "{stem}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! 会话层：把 [`Settings`] 变成可用的 libresoda 客户端。
 
+use crate::cache::encode_track_id;
 use crate::config::Settings;
 use anyhow::Context;
 use libresoda::soda::signature::HttpSignature;
@@ -136,28 +137,6 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     }
 }
 
-/// 曲目 id 拼进缓存文件名前先过这一步。正常 id 是数字，原样返回；
-/// 带路径分隔符或别的怪字符时编码成 `_XX`（字节的十六进制），避免两件事：
-/// 一是把文件拼到缓存目录外面，二是 `a/b` 和 `a_b` 被压成同一个名字互相踩。
-///
-/// 连字符也编码：缓存文件名是 `{safe_id}-{档位}.m4a`，读回时按第一个 `-` 切出 id。
-/// safe id 里不能有 `-`，否则从文件名反推的 id 再编码一次就对不上了。
-fn safe_track_id(track_id: &str) -> String {
-    let mut out = String::with_capacity(track_id.len());
-    for byte in track_id.bytes() {
-        // 数字 id 原样保留：线上 id 都是数字串，这样缓存文件名不变，
-        // 而且从文件名反推出来的 id 再编码一次还是自己。
-        // 其余字节一律编码成 `_XX`，不做「看着像转义就放过」的猜测——
-        // 那种猜法会让 `a_2f` 和 `a/` 撞成同一个名字，播错歌。
-        if byte.is_ascii_digit() {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("_{byte:02x}"));
-        }
-    }
-    out
-}
-
 /// 音频下载交给 libresoda 的暂存目标名（不含目录）。
 ///
 /// 名字只由曲目、档位标签和用途决定，不带进程号/序号：同一首歌反复下、重试多少次
@@ -171,7 +150,7 @@ fn safe_track_id(track_id: &str) -> String {
 fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
     format!(
         "{}-{}-{}.m4a",
-        safe_track_id(track_id),
+        encode_track_id(track_id),
         tag,
         purpose.suffix()
     )
@@ -258,31 +237,6 @@ mod part_tests {
         let dir = std::path::Path::new("/tmp/sodam-cache/audio");
         let joined = dir.join(&name);
         assert_eq!(joined.parent(), Some(dir), "拼出的路径必须仍在缓存目录里");
-    }
-
-    /// 净化必须是单射：两个不同 id 撞成同一个文件名会让两首歌共用一个缓存，
-    /// 播第二首时直接命中第一首的文件。review-fish 找到的洞是 `a_2f` 和 `a/`
-    /// 在「看着像 `_XX` 就放过」的猜法下会撞名。
-    #[test]
-    fn safe_track_id_keeps_distinct_ids_distinct() {
-        assert_ne!(
-            super::safe_track_id("a/"),
-            super::safe_track_id("a_2f"),
-            "转义序列不能被当成已编码的原文放过"
-        );
-        assert_ne!(
-            super::safe_track_id("a/b"),
-            super::safe_track_id("a_b"),
-            "不同 id 不能撞成同一个文件名"
-        );
-        assert_eq!(super::safe_track_id("123"), "123", "正常数字 id 原样保留");
-        let encoded = super::safe_track_id("a-b_c/d");
-        assert!(!encoded.contains('-'), "safe id 不能含分隔符: {encoded}");
-        // 数字 id 从文件名反推后仍是数字，再编码不变——真实场景走这条路。
-        assert_eq!(
-            super::safe_track_id("7427204361343191057"),
-            "7427204361343191057"
-        );
     }
 
     /// 同一曲目 + 档位 + 用途的暂存名必须每次一样。
@@ -440,7 +394,7 @@ impl Session {
     /// 第五、六个字段记录「没有更高档位」的结论，第七个记录试听补整曲的最近一次尝试。
     /// 后两者必须分开：试听不是「曲库没有更高档位」，权益一变就可能拿到整曲。
     fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
-        let safe_id = safe_track_id(track_id);
+        let safe_id = encode_track_id(track_id);
         let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
@@ -464,7 +418,7 @@ impl Session {
     }
 
     pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
-        let safe_id = safe_track_id(track_id);
+        let safe_id = encode_track_id(track_id);
         let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
         let info = self.cached_info(track_id)?;
@@ -903,7 +857,7 @@ impl Session {
         // 缓存文件名带音质档位：切换音质后自然 miss，重新拉对应档位的流
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
-        let safe_id = safe_track_id(&track.id);
+        let safe_id = encode_track_id(&track.id);
         let path = dir.join(format!("{safe_id}-{tag}.m4a"));
         // sidecar 记录「音质标签 + 实际字节数 + 是否试听」，用于命中时的大小校验。
         let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
@@ -1032,7 +986,7 @@ impl Session {
 
         let dir = crate::audio::cache_dir();
         let tag = self.quality_tag();
-        let safe_id = safe_track_id(&track.id);
+        let safe_id = encode_track_id(&track.id);
         let path = dir.join(format!("{safe_id}-{tag}.m4a"));
         let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
 
