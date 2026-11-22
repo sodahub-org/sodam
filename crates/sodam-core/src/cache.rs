@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime};
 use crate::log_outlet::{log_event, LogLevel, LogTopic};
 
 pub const DEFAULT_AUDIO_LIMIT_MB: u64 = 10 * 1024;
+/// 下载临时文件（含可续传暂存族）的保留窗口：窗口内不参与淘汰。
+/// 失败留下的暂存至少能在这段时间内被下一次播放接上（#243）。
 const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 「已确认没有更高档位」记录的有效期。
@@ -105,14 +107,22 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// 同一个暂存目标的 .part / .part.lock 与它的交付文件共享保护键：
-// 租约挂在暂存目标上时，这几个文件都不会被维护线程当废弃文件删掉。
+// 同一个暂存目标的一族文件与它的交付文件共享保护键。族里除交付目标外全部来自
+// libresoda 可续传路径的命名表（`part_record` 的 `staged_paths`）：`.part` 数据、
+// `.part.meta` 记录、`.part.meta.tmp` 记录临时、`.part.lock` 锁、`.dec.tmp` 解密临时。
+// 租约挂在暂存目标上时，这几个文件都不会被维护线程当废弃文件删掉；淘汰也按这一键
+// 整组走，不会出现删了记录只剩数据、续传对再也对不上的半套残骸。
 fn protection_key(path: &Path) -> PathBuf {
+    // 长后缀在前：`.part.meta.tmp` 必须先于 `.part.meta` 被摘掉。
+    const STAGED_SUFFIXES: [&str; 5] = [
+        ".m4a.part.meta.tmp",
+        ".m4a.part.meta",
+        ".m4a.part.lock",
+        ".m4a.part",
+        ".m4a.dec.tmp",
+    ];
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if let Some(stem) = name
-        .strip_suffix(".m4a.part.lock")
-        .or_else(|| name.strip_suffix(".m4a.part"))
-    {
+    if let Some(stem) = STAGED_SUFFIXES.iter().find_map(|s| name.strip_suffix(s)) {
         return path.with_file_name(format!("{stem}.m4a"));
     }
     if path.extension().is_some_and(|ext| ext == "quality") {
@@ -251,9 +261,28 @@ where
     }
 }
 
+/// 24 小时内的下载临时文件不参与淘汰（还在下载，或留着给下次续传）。
+///
+/// 覆盖两类：封面/音频共用的 `.part` 后缀，以及 libresoda 可续传路径在 staging
+/// 子目录写的整族名字（`.part` 数据、`.part.meta` 记录、`.part.meta.tmp`、`.dec.tmp`）。
+/// 数据和记录必须一起保护，删掉一边续传对就再也对不上了。
+/// 过了窗口的暂存由两条路清掉：配额淘汰按 [`protection_key`] 整组删；
+/// libresoda 每次下载开始也会清掉记录认得出的 7 天过期对（`purge_expired_parts`）。
 fn is_fresh_part(path: &Path, modified: SystemTime) -> bool {
+    if modified.elapsed().unwrap_or_default() >= PART_MAX_AGE {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.ends_with(".part.meta")
+        || name.ends_with(".part.meta.tmp")
+        || name.ends_with(".dec.tmp")
+    {
+        return true;
+    }
     path.extension().is_some_and(|ext| ext == "part")
-        && modified.elapsed().unwrap_or_default() < PART_MAX_AGE
 }
 
 /// 封面分组键：文件名开头的 URL 哈希。缩略图 `{hash}-160.img`、原图 `{hash}.img`、
@@ -2459,13 +2488,17 @@ mod tests {
     }
 
     /// 同一个暂存目标的文件共享保护键：租约挂在暂存目标上时，
-    /// 它的 .part / .part.lock 不会被维护线程当废弃文件删掉。
+    /// 可续传路径写下的整族文件（数据 / 记录 / 记录临时 / 锁 / 解密临时）
+    /// 都不会被维护线程当废弃文件删掉。
     #[test]
     fn audio_staging_files_share_the_target_lease() {
         let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
         for staged in [
             "/cache/audio/staging/123-lossless-normal.m4a.part",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.meta",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.meta.tmp",
             "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
+            "/cache/audio/staging/123-lossless-normal.m4a.dec.tmp",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
         }
@@ -2479,6 +2512,28 @@ mod tests {
             protection_key(Path::new("/cache/audio/abcd-160.img.123.part")),
             Path::new("/cache/audio/abcd-160.img.123.part")
         );
+    }
+
+    /// 可续传的暂存整族在 24 小时窗口内都算「还在用」：数据和记录少一边，
+    /// 下次就接不上上次那段字节了。
+    #[test]
+    fn resumable_staging_family_counts_as_fresh_within_the_window() {
+        let dir = "/cache/audio/staging/123-lossless-normal.m4a";
+        for staged in [
+            format!("{dir}.part"),
+            format!("{dir}.part.meta"),
+            format!("{dir}.part.meta.tmp"),
+            format!("{dir}.dec.tmp"),
+        ] {
+            assert!(
+                is_fresh_part(Path::new(&staged), SystemTime::now()),
+                "{staged} 在窗口内必须受保护"
+            );
+        }
+        // 过了 24 小时窗口就不再保护：残留交给配额淘汰与 libresoda 的 7 天清扫。
+        let old = SystemTime::now() - PART_MAX_AGE;
+        assert!(!is_fresh_part(Path::new(&format!("{dir}.part")), old));
+        assert!(!is_fresh_part(Path::new(&format!("{dir}.part.meta")), old));
     }
 
     /// 临时名每次都不一样：同一张封面的两个写者不会写到同一个文件里。

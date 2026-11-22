@@ -431,6 +431,19 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
+    // libresoda 暂存路径的锁文本（`acquire_lock` 的文档化错误）：撞锁说明这个目标
+    // 正被另一个下载占着（跨进程，或暂存名撞车）。这是「正在下载，稍后再来」，
+    // 不是这台机器坏了：按可重试交还给排队/逐曲退避，用户看到的是排队或
+    // 「正在下载」（#243），不是一次永久失败。
+    if detail.contains("being staged by another download") {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Transient,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
+
     // 下架 / 取不到 / 非 Cookie 参数错误仍走既有 PickAnother：它们与上面的
     // TrackUnavailable 同属按曲目不可播（由 `is_per_track` 统一判定），
     // 但给用户的成因文案是「这首当前取不到」。
@@ -487,6 +500,53 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
 
 /// `SodaError::Http` 只剩字符串，相位信息已经在上游丢失；这里只解析结构化的状态码。
 fn classify_http(detail: &str) -> PlaybackFailure {
+    // 暂存路径把「写盘失败」也包在传输中断的文本里带出来（`staged download
+    // interrupted: <io 文本>`），而 io 文本可能是本地化的——中文 Windows 报
+    // 「磁盘空间不足」，英文报 "not enough space on the disk"。磁盘满重试不会好，
+    // 先认出来交给 FreeSpace，让预取闸门按磁盘类挂起、状态行指向腾空间。
+    // 错误码兜底：ENOSPC=28、Windows ERROR_HANDLE_DISK_FULL=39 / ERROR_DISK_FULL=112。
+    let lower = detail.to_ascii_lowercase();
+    const DISK_FULL_MARKERS: [&str; 6] = [
+        "no space left",
+        "not enough space",
+        "disk full",
+        "空间不足",
+        "os error 28",
+        "os error 112",
+    ];
+    if DISK_FULL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Never,
+            RecoveryAction::FreeSpace,
+            detail,
+        );
+    }
+    // libresoda 暂存路径的文档化错误文本（#243 的口径）：
+    // * 传输中断 / 服务器把开放区间封顶——重试从缺口接着补，值得再试一次；
+    // * 字节与 Content-Range 不符——那批字节已被库内作废，重试是整份重来，
+    //   别在慢链路上白烧带宽，按不再自动重试处理。
+    if detail.contains("staged download interrupted")
+        || detail.contains("download did not complete")
+    {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Transient,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
+    if detail.contains("staged download disagrees") {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Never,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
     let status = detail
         .split("status ")
         .nth(1)
@@ -504,7 +564,6 @@ fn classify_http(detail: &str) -> PlaybackFailure {
             // 没有状态码的都是传输层。判据必须盖住真实的握手类文本——本机实测到的就是
             // `Connection Failed: tls connection init failed: unexpected end of file`；
             // 只认 "timeout" 会把这类抖动误判成永久错误，一次都不重试。
-            let lower = detail.to_ascii_lowercase();
             let transport = [
                 "timed out",
                 "timeout",
@@ -604,10 +663,11 @@ pub fn strip_urls_for_user(text: &str) -> String {
 /// 一次播放尝试的重试预算：**只有一层，且只按「这次失败值不值得再来一次」判**。
 ///
 /// 不设总墙钟时长：那等于把刚从 libresoda 拆掉的「整首下载总时限」从另一侧装回来，
-/// 慢但仍在推进的传输会被误杀。不设「无进展时长」也不是疏忽——阶段一 里根本没有可观测的
-/// 进展信号：`download_to_cache` 是一次阻塞调用，失败即删掉 `.part`，跨尝试零进度。
-/// 单次尝试内部的「卡住」由 libresoda 的空闲读超时（20s）负责；等阶段二有了
-/// 密文暂存 + `Range` 续传，字节偏移才第一次成为可读的进度，那时才谈得上无进展封顶。
+/// 慢但仍在推进的传输会被误杀。不设「无进展时长」暂不算疏忽：可续传路径落地后
+///（#243）失败不再删暂存，同一首歌的下一次尝试从缺口接着补，跨尝试的进度第一次
+/// 真实存在；但预算这一层拿不到「这次推进了多少」，无进展封顶仍没有直接的观测点，
+/// 等真有需要再把报告里的字节事实接进来。单次尝试内部的「卡住」仍由
+/// libresoda 的空闲读超时（20s）负责。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayBudget {
     pub max_attempts: u8,
@@ -704,6 +764,71 @@ mod tests {
             );
             assert_eq!(classified.action, action, "修复动作错位：{classified:?}");
         }
+    }
+
+    /// 可续传路径（#243）的错误形态按「这段字节还有没有用」分流：
+    /// 中断与封顶值得再试（重试从缺口接着补）；区间不符的暂存已被库内作废，
+    /// 重试是整份重来，按不自动重试处理；磁盘满交给 FreeSpace。
+    #[test]
+    fn staged_path_errors_split_by_whether_the_bytes_are_still_useful() {
+        // 传输中断 / 服务器封顶：可重试，重试接得上。
+        for error in [
+            SodaError::http("staged download interrupted: connection reset by peer"),
+            SodaError::http("download did not complete: 1048576 of 26214400 bytes on disk"),
+        ] {
+            let classified = failure(error);
+            assert_eq!(
+                classified.retryability,
+                Retryability::Transient,
+                "中断与封顶都该再试：{classified:?}"
+            );
+            assert_eq!(classified.stage, Stage::Transfer, "{classified:?}");
+            assert_eq!(classified.action, RecoveryAction::Nothing, "{classified:?}");
+        }
+
+        // 区间不符：字节被库内作废，重试是整份重来，不自动重试。
+        let mismatch = failure(SodaError::http(
+            "staged download disagrees with its Content-Range",
+        ));
+        assert_eq!(mismatch.retryability, Retryability::Never, "{mismatch:?}");
+        assert_eq!(mismatch.stage, Stage::Transfer, "{mismatch:?}");
+
+        // 磁盘满藏在传输中断文本里（io 文本可能是本地化的），必须认出来给 FreeSpace。
+        for error in [
+            SodaError::http("staged download interrupted: no space left on device"),
+            SodaError::http("staged download interrupted: 磁盘空间不足。 (os error 112)"),
+        ] {
+            let classified = failure(error);
+            assert_eq!(
+                classified.action,
+                RecoveryAction::FreeSpace,
+                "磁盘满要指向腾空间：{classified:?}"
+            );
+            assert_eq!(
+                classified.retryability,
+                Retryability::Never,
+                "磁盘满重试不会好：{classified:?}"
+            );
+        }
+    }
+
+    /// 撞暂存锁是「正在下载，稍后再来」：可重试，不指向磁盘，也不算按曲目不可播。
+    #[test]
+    fn staged_lock_contention_is_transient_not_a_disk_or_track_failure() {
+        let classified = failure(SodaError::Io(
+            "download target is being staged by another download".into(),
+        ));
+        assert_eq!(
+            classified.retryability,
+            Retryability::Transient,
+            "{classified:?}"
+        );
+        assert_eq!(classified.stage, Stage::Transfer, "{classified:?}");
+        assert_eq!(classified.action, RecoveryAction::Nothing, "{classified:?}");
+        assert!(
+            !classified.is_per_track(),
+            "撞锁与曲目无关，换一首也一样：{classified:?}"
+        );
     }
 
     /// 「结论是否关于单个曲目」只看结论对象，不看可重试性。
