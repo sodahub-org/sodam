@@ -2620,10 +2620,11 @@ mod tests {
         let expired_tmp = file(&staging, "123-lossless-normal.m4a.dec.tmp", old);
         let stale_lock = file(&staging, "123-lossless-normal.m4a.part.lock", old);
         let fresh_data = file(&staging, "456-high-normal.m4a.part", 0);
-        // 租约挂在暂存目标上时，它的整族过期文件也受保护。
+        // 租约挂在暂存目标上时，它的整族过期文件也受保护。`_lease` 只是为了
+        // 让租约活到断言结束：这里不需要读它。
         let leased_target = file(&staging, "789-lossless-normal.m4a", old);
         let leased_data = file(&staging, "789-lossless-normal.m4a.part", old);
-        let lease = CacheLease::acquire(&leased_target);
+        let _lease = CacheLease::acquire(&leased_target);
 
         let removed = purge_stale_staging_in(&staging, STALE_STAGING_MAX_AGE);
 
