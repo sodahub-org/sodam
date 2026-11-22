@@ -627,7 +627,7 @@ fn remove_evicted_staging(removed: &[PathBuf], staging: &Path) -> u64 {
     freed
 }
 
-/// 启动巡检：清掉音频目录里超过 [`PART_MAX_AGE`]、没被租约占用的暂存残留。
+/// 残留清扫：清掉指定目录里超过 [`PART_MAX_AGE`]、没被租约占用的暂存残留。
 ///
 /// 底层库从不删锁文件（进程退出靠内核解锁，一个下载目标留一把空锁是它写明的设计），
 /// 它自带的 7 天清扫也只认「数据 + 记录成对、两边都够老」的文件——只有 `.part`
@@ -665,9 +665,18 @@ pub fn sweep_stale_staging_in(dir: &Path) -> usize {
     removed
 }
 
-/// 对整个音频缓存目录跑一次启动巡检（含暂存子目录），返回删除的文件数。
-/// 调用方必须在后台执行。
+/// 对整个音频缓存目录（含暂存子目录）跑一轮残留清扫，返回删除的文件数。
+///
+/// 只在启动后的首轮维护实际执行：主心跳约 60 秒就调一轮维护，而残留的年龄门槛
+/// 是 24 小时，会话期间新产生的残留本来就不满 24 小时，每轮重扫几乎全是空跑；
+/// 音频目录可能上万文件，这个代价省得掉。会话期间攒下的残留留给下次启动清，
+/// 与「每次启动的缓存巡检顺手清掉」的口径一致。调用方必须在后台执行。
 pub fn sweep_stale_staging() -> usize {
+    static STALE_SWEEP_DONE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if STALE_SWEEP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
     sweep_stale_staging_in(&root_dir().join("audio"))
 }
 

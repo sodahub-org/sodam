@@ -653,8 +653,8 @@ impl Root {
             );
         }
         let work = cx.background_spawn(async move {
-            // 每轮缓存维护先清历史暂存残留（旧格式的锁、孤儿 .part；启动、改上限
-            // 都会走这里），再做超额淘汰与统计。
+            // 首轮维护先清历史暂存残留（旧格式的锁、孤儿 .part；进程内只跑一次，
+            // 心跳的每轮维护到这里都是空转），再做超额淘汰与统计。
             sodam_core::cache::sweep_stale_staging();
             sodam_core::cache::trim_audio(limit);
             let removed =
