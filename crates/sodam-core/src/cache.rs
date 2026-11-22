@@ -2727,9 +2727,11 @@ mod tests {
         let old_data = file(&staging, "123-lossless-normal.m4a.part", 90_000);
         let fresh_meta = file(&staging, "123-lossless-normal.m4a.part.meta", 0);
         let victim = file(&staging, "456-high-normal.m4a.part", 90_000);
-        // 两份各 10 字节，限 10 字节：必须淘汰一组。
+        // 三份各 10 字节，限 10 字节：唯一可淘汰的是全过期的 victim 那组。
+        // 受保护的族留在总量里，淘汰合法地停在额度之上——与租约文件
+        // 「可暂时超额」是同一条既有语义。
         let remaining = trim_audio_scan(scan_files(dir.path()), 10);
-        assert_eq!(remaining, 10);
+        assert_eq!(remaining, 20);
         assert!(!victim.exists(), "全过期的族照常按 LRU 淘汰");
         assert!(
             old_data.exists() && fresh_meta.exists(),
