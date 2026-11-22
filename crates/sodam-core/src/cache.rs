@@ -136,10 +136,9 @@ fn protection_key(path: &Path) -> PathBuf {
 
 /// 文件名是否落在可续传暂存族的命名表里（不含交付目标本身）。
 ///
-/// 与 [`protection_key`] 有一处刻意的宽严差：这里摘掉 `.m4a` 前缀再匹配，
-/// 封面的 `{hash}-160.img.*.part` 也会命中——它们共享同一条「24 小时内
-/// 不淘汰」的规则。保护键的映射（锁、记录还原到交付目标）仍要求 `.m4a`
-/// 前缀，否则封面临时文件会被错误地挂到某个音频暂存目标上。
+/// 这里摘掉 `.m4a` 前缀再匹配，所以封面的 `{hash}-160.img.*.part` 也算
+/// 暂存族、24 小时内不淘汰；[`protection_key`] 则必须要求 `.m4a` 前缀，
+/// 否则封面临时会挂到音频暂存目标上。两边判据不一样是刻意的。
 fn staged_family_member(name: &str) -> bool {
     STAGED_SUFFIXES
         .iter()
@@ -592,9 +591,8 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
 /// 维护把超过保留期的残留从这里清走。
 pub(crate) const STAGING_DIR_NAME: &str = "staging";
 
-/// 可续传暂存残留的保留期：与 libresoda 自己的 7 天过期清扫同一条口径。
-/// 配额不紧时，失败留下的暂存在这段时间内始终值得留——下一次播放就从它
-/// 接上；配额吃紧时 24 小时新鲜窗一过就按 LRU 先走（#243）。
+/// 暂存残留保留 7 天，和 libresoda 自己的过期清扫同一条口径（#243）；
+/// 配额吃紧时 24 小时新鲜窗一过就会被 LRU 淘汰。
 const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub fn trim_audio(limit_mb: u64) -> u64 {

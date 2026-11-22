@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// 失败发生的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// 取回可用流及其地址，含向签名服务请求签名（ libresoda 内部把两步
+    /// 取回可用流及其地址，含向签名服务请求签名（libresoda 内部把两步
     /// 串在一次调用里，本层无法把两者分开）。
     ResolveStream,
     /// 把音频体的字节从 CDN 搬到本地。
@@ -523,8 +523,12 @@ fn classify_http(detail: &str) -> PlaybackFailure {
     const ERRNO_DISK_FULL: [&str; 2] = ["os error 39", "os error 112"];
     #[cfg(not(windows))]
     const ERRNO_DISK_FULL: [&str; 2] = ["os error 28", "os error 122"];
-    let disk_full = DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
-        || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker));
+    // 判据只在暂存上下文里认：这段检查排在状态码解析之前，
+    // 放开上下文会把签名服务配额、限流回包里带 quota 字样的错误
+    // 一并吞成 FreeSpace，盖住它们本来的语义。
+    let disk_full = detail.contains("staged download")
+        && (DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
+            || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker)));
     if disk_full {
         return PlaybackFailure::new(
             Stage::Transfer,
