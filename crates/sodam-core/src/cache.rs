@@ -105,20 +105,22 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// 同一个暂存目标的全部暂存尾巴（.part / .part.lock / .part.meta / .part.meta.tmp /
-// .dec.tmp）与它的交付文件共享保护键：租约挂在暂存目标上时，这几个文件都不会被
-// 维护线程当废弃文件删掉。meta 与解密临时文件不带自己的租约，也必须跟着交付目标走，
-// 否则下载进行中被淘汰收尾删掉，断点续传信息就毁了。
+// 同一个暂存目标的全部暂存尾巴（见 [`STAGING_TAILS`]）与它的交付文件共享保护键：
+// 租约挂在暂存目标上时，这几个文件都不会被维护线程当废弃文件删掉。
+// meta 与解密临时文件不带自己的租约，也必须跟着交付目标走，否则下载进行中被
+// 淘汰收尾删掉，断点续传信息就毁了。名单从 [`STAGING_TAILS`] 单点派生，
+// 将来加尾巴不用记得来这里补。
 fn protection_key(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if let Some(stem) = name
-        .strip_suffix(".m4a.part.lock")
-        .or_else(|| name.strip_suffix(".m4a.part.meta.tmp"))
-        .or_else(|| name.strip_suffix(".m4a.part.meta"))
-        .or_else(|| name.strip_suffix(".m4a.part.dec.tmp"))
-        .or_else(|| name.strip_suffix(".m4a.dec.tmp"))
-        .or_else(|| name.strip_suffix(".m4a.part"))
-    {
+    // 尾巴必须长在交付目标的 `.m4a` 后面（`{交付目标}{尾巴}`）才算同一组：
+    // 先按尾巴剥一层，再看剩下的部分是否以 `.m4a` 收尾。封面那类 `.img.*.part`
+    // 的剩余部分不带 `.m4a`，不进映射，别误套音频租约。
+    let stem = STAGING_TAILS.iter().find_map(|tail| {
+        let rest = name.strip_suffix(tail)?;
+        rest.ends_with(".m4a")
+            .then(|| &rest[..rest.len() - ".m4a".len()])
+    });
+    if let Some(stem) = stem {
         return path.with_file_name(format!("{stem}.m4a"));
     }
     if path.extension().is_some_and(|ext| ext == "quality") {
@@ -149,15 +151,22 @@ pub(crate) fn staging_dir(audio_dir: &Path) -> PathBuf {
     audio_dir.join("staging")
 }
 
-/// 我们自己的暂存文件尾巴（最长在前）。
+/// 我们自己的暂存文件尾巴（最长在前），三处共用的单一出处：
+/// 启动巡检的白名单（[`is_staging_residue_name`]）、租约保护键的映射
+/// （[`protection_key`]，按「交付目标 + 尾巴」认）、淘汰收尾的名字反推
+/// （[`staging_committed_name`]，逐层剥尾巴）。加新尾巴只需改这里，
+/// 三条路同时生效；测试 `protection_key_maps_every_staging_tail_to_the_target`
+/// 会守住保护键这层。
 ///
 /// libresoda 以「交付目标 + 后缀」落暂存：数据 `.part`、锁 `.part.lock`、
-/// 断点元数据 `.part.meta`（含 `.tmp` 中间态）、解密中间文件 `.dec.tmp`。
-/// 历史版本把目标名带 `.part` 传下去，还留下过 `.part.part` / `.part.part.lock`。
-/// 清理只认这份名单：正式缓存（`.m4a`）、`.quality` 记录、封面和名字不相干的
-/// 文件一律不碰。一个名字最多匹配一条尾巴（后缀精确到结尾），顺序只影响可读性。
-const STAGING_TAILS: [&str; 5] = [
+/// 断点元数据 `.part.meta`（含 `.tmp` 中间态）、解密中间文件 `.dec.tmp`
+///（尾巴挂在交付目标或 `.part` 上都见过，两种拼法都收）。历史版本把目标名带
+/// `.part` 传下去，还留下过 `.part.part` / `.part.part.lock`。清理只认这份名单：
+/// 正式缓存（`.m4a`）、`.quality` 记录、封面和名字不相干的文件一律不碰。
+/// 一个名字最多匹配一条尾巴（后缀精确到结尾），顺序只影响可读性。
+const STAGING_TAILS: [&str; 6] = [
     ".part.meta.tmp",
+    ".part.dec.tmp",
     ".part.meta",
     ".part.lock",
     ".dec.tmp",
@@ -2671,6 +2680,22 @@ mod tests {
         assert!(
             is_fresh_part(Path::new(&name), SystemTime::now()),
             "写了一半的封面不能被维护任务顺手删掉"
+        );
+    }
+
+    /// 保护键的映射必须与 [`STAGING_TAILS`] 同源：名单里每条尾巴挂在交付目标
+    /// `.m4a` 后面都能折回交付目标。加尾巴只改数组，这条测试守住保护键不漏。
+    #[test]
+    fn protection_key_maps_every_staging_tail_to_the_target() {
+        let target = Path::new("/cache/audio/123-lossless-normal.m4a");
+        for tail in STAGING_TAILS {
+            let staged = format!("123-lossless-normal.m4a{tail}");
+            assert_eq!(protection_key(Path::new(&staged)), target, "{staged}");
+        }
+        // 挂在别处（封面那类 `.img.*.part`）不进映射，保持原样。
+        assert_eq!(
+            protection_key(Path::new("/cache/audio/abcd-160.img.123.part")),
+            Path::new("/cache/audio/abcd-160.img.123.part")
         );
     }
 
