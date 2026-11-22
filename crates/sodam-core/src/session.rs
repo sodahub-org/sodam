@@ -159,8 +159,9 @@ fn stage_path(
     purpose: crate::cache::DownloadPurpose,
 ) -> (std::path::PathBuf, crate::cache::CacheLease) {
     let part = dir.join(part_file_name(track_id, tag, purpose));
-    // Windows 的 rename 不覆盖既有文件：上次下载被杀时可能留下已交付的目标，
-    // 清掉它，重放同一首才不会被残留顶回来。调用方已持有对应用途的下载锁。
+    // 名字固定后，上次被杀留下的交付目标会占着同一个路径。libresoda 的 `.part`
+    // 系列它自己会清，但交付目标这一层不在它管内；这里清掉，重放同一首才不会被
+    // 残留顶回来。调用方已持有对应用途的下载锁。
     if part.exists() {
         let _ = std::fs::remove_file(&part);
     }
@@ -170,7 +171,7 @@ fn stage_path(
 
 #[cfg(test)]
 mod part_tests {
-    /// #241：同一曲目 + 档位 + 用途的暂存名必须每次一样。
+    /// 同一曲目 + 档位 + 用途的暂存名必须每次一样。
     /// 名字里不能再带进程号或序号，否则每下一次就在缓存目录留一把新锁。
     #[test]
     fn part_name_is_fixed_for_same_track_tag_and_purpose() {
@@ -181,7 +182,7 @@ mod part_tests {
         assert_eq!(first, "123-lossless-normal.m4a");
     }
 
-    /// #241：传给 libresoda 的目标名不能以 `.part` 结尾。
+    /// 传给 libresoda 的目标名不能以 `.part` 结尾。
     /// libresoda 自己会在目标名后拼 `.part` / `.part.lock`，目标名再带 `.part`
     /// 就会落盘成 `.part.part` / `.part.part.lock`。
     #[test]
@@ -195,7 +196,7 @@ mod part_tests {
         }
     }
 
-    /// #241：正常下载与升级补音质必须两个名字。
+    /// 正常下载与升级补音质必须两个名字。
     /// 升级刻意不抢播放的锁，两条路会同时下同一首；名字相同的话后启动那条会被
     /// libresoda 用「目标正被别的下载占着」顶回来。
     #[test]
@@ -207,6 +208,26 @@ mod part_tests {
         assert_ne!(normal, upgrade, "正常下载与升级必须落在不同暂存名上");
         assert_eq!(normal, "123-lossless-normal.m4a");
         assert_eq!(upgrade, "123-lossless-upgrade.m4a");
+    }
+
+    /// 名字固定后，上次被杀留下的交付目标会占着同一个路径。stage_path 要先清掉它，
+    /// 再拿租约挡住维护线程；返回的路径就是固定名。
+    #[test]
+    fn stage_path_discards_stale_target_and_holds_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("123-lossless-normal.m4a");
+        std::fs::write(&stale, b"leftover from a killed download").unwrap();
+
+        let (part, lease) = super::stage_path(
+            dir.path(),
+            "123",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        );
+
+        assert_eq!(part, stale, "暂存目标名固定，复用上次那一个");
+        assert!(!part.exists(), "上次留下的交付目标必须清掉");
+        assert_eq!(lease.0.as_path(), part.as_path(), "租约挂在暂存目标上");
     }
 }
 
@@ -750,7 +771,7 @@ impl Session {
             ..Default::default()
         };
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
-        // #241：暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
+        // 暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
         // 两条路并发下同一首时互不撞锁。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
         let (part, _part_lease) =
@@ -918,7 +939,7 @@ impl Session {
             ..Default::default()
         };
 
-        // #241：升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
+        // 升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
         let (part, _part_lease) = stage_path(
             &dir,
             &track.id,
