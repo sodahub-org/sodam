@@ -1,5 +1,6 @@
 //! 会话层：把 [`Settings`] 变成可用的 libresoda 客户端。
 
+use crate::cache::encode_track_id;
 use crate::config::Settings;
 use anyhow::Context;
 use libresoda::soda::signature::HttpSignature;
@@ -136,25 +137,210 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     }
 }
 
-/// 预取/播放两条路径可能**并发下载同一首**（预取进行中用户又手动点了它），
-/// 固定的 .part 名会让两个写者互相踩踏（remove + 交错写 + 错误的 rename 对象）。
-/// 用「进程号 + 进程内序号」保证每次下载写自己的临时文件。
-fn part_file_name(track_id: &str, tag: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{track_id}-{tag}-{}-{seq}.m4a.part", std::process::id())
+/// 音频下载交给 libresoda 的暂存目标名（不含目录）。
+///
+/// 名字只由曲目、档位标签和用途决定，不带进程号/序号：同一首歌反复下、重试多少次
+/// 都复用同一套名字，缓存目录里也就只留这一套 `.part` 与 `.part.lock`。
+///
+/// 不能带 `.part` 后缀：libresoda 拿到这个路径当下载目标，自己会在后面拼 `.part`
+/// （暂存数据）和 `.part.lock`（锁）。目标名再带 `.part` 就会落盘成 `.part.part`。
+///
+/// 用途必须进名字：正常下载与升级会同时下同一首（升级刻意不和播放抢锁），
+/// 同名会让后启动那条被 libresoda 的目标锁顶回来。
+fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
+    format!(
+        "{}-{}-{}.m4a",
+        encode_track_id(track_id),
+        tag,
+        purpose.suffix()
+    )
+}
+
+/// 暂存文件单独放一个子目录，别和正式缓存混在一起。
+/// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
+/// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
+fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
+    audio_dir.join("staging")
+}
+
+/// 准备这组暂存目标：清掉上次被杀留下的交付目标、`.part` 和 `.part.lock`，
+/// 再拿租约挡住缓存维护。正常下载与升级都要走这一步，差异只在用途。
+fn stage_path(
+    dir: &std::path::Path,
+    track_id: &str,
+    tag: &str,
+    purpose: crate::cache::DownloadPurpose,
+) -> Result<(std::path::PathBuf, crate::cache::CacheLease), crate::failure::PlaybackFailure> {
+    use crate::failure::{PlaybackFailure, RecoveryAction, Retryability, Stage};
+
+    let stage = staging_dir(dir);
+    // 建不出暂存目录就没法下载：直接报确定的失败，别拿着一条父目录都不存在的
+    // 路径往下走。错误里带上路径，报问题时不用回头猜是哪一层缓存目录。
+    std::fs::create_dir_all(&stage).map_err(|err| {
+        PlaybackFailure::new(
+            Stage::Unpack,
+            Retryability::Never,
+            RecoveryAction::FreeSpace,
+            format!("{}: {err}", stage.display()),
+        )
+    })?;
+    let name = part_file_name(track_id, tag, purpose);
+    let part = stage.join(&name);
+    // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
+    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。
+    // 删不掉记日志，但日志不是护栏：Unix 上正在被写的同名文件也能 unlink 成功，
+    // 这时没有日志，靠的是调用方持有的那把锁保证没人在写。
+    for stale in [
+        part.clone(),
+        stage.join(format!("{name}.part")),
+        stage.join(format!("{name}.part.lock")),
+    ] {
+        // 直接删，NotFound 是正常的（多半没留下残留）；别的错才记日志。
+        // 不用 exists() 先探再删：那两步之间文件可能被别的写者收尾删掉，
+        // 会冒出一条假的清理失败。
+        if let Err(err) = std::fs::remove_file(&stale) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                use crate::log_outlet::{log_event, LogLevel, LogTopic};
+                let file = stale
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let error = err.to_string();
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::Audio,
+                    "stage_cleanup_failed",
+                    &[("file", file.as_str()), ("error", error.as_str())],
+                );
+            }
+        }
+    }
+    let lease = crate::cache::CacheLease::acquire(&part);
+    Ok((part, lease))
 }
 
 #[cfg(test)]
 mod part_tests {
+    /// 曲目 id 拼进文件名后还要交给 remove_file。带 / 或 .. 的 id 必须被净化，
+    /// 不能让清理路径指到缓存目录外面。
     #[test]
-    fn part_names_are_unique_and_labeled() {
-        let first = super::part_file_name("123", "lossless");
-        let second = super::part_file_name("123", "lossless");
-        assert_ne!(first, second, "同一曲目两次下载的临时名必须不同");
-        assert!(first.starts_with("123-lossless-"), "{first}");
-        assert!(first.ends_with(".m4a.part"), "{first}");
+    fn part_name_neutralizes_path_characters_in_track_id() {
+        let name = super::part_file_name(
+            "../../etc/passwd",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        );
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert!(!name.contains(std::path::MAIN_SEPARATOR), "{name}");
+
+        let dir = std::path::Path::new("/tmp/sodam-cache/audio");
+        let joined = dir.join(&name);
+        assert_eq!(joined.parent(), Some(dir), "拼出的路径必须仍在缓存目录里");
+    }
+
+    /// 同一曲目 + 档位 + 用途的暂存名必须每次一样。
+    /// 名字里不能再带进程号或序号，否则每下一次就在缓存目录留一把新锁。
+    #[test]
+    fn part_name_is_fixed_for_same_track_tag_and_purpose() {
+        let first = super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        let second =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        assert_eq!(first, second, "同一曲目两次下载必须复用同一个暂存名");
+        assert_eq!(first, "123-lossless-normal.m4a");
+    }
+
+    /// 传给 libresoda 的目标名不能以 `.part` 结尾。
+    /// libresoda 自己会在目标名后拼 `.part` / `.part.lock`，目标名再带 `.part`
+    /// 就会落盘成 `.part.part` / `.part.part.lock`。
+    #[test]
+    fn part_name_has_no_part_suffix() {
+        for purpose in [
+            crate::cache::DownloadPurpose::Normal,
+            crate::cache::DownloadPurpose::Upgrade,
+        ] {
+            let name = super::part_file_name("123", "lossless", purpose);
+            assert!(!name.ends_with(".part"), "{name} 不能再带 .part 后缀");
+        }
+    }
+
+    /// 正常下载与升级补音质必须两个名字。
+    /// 升级刻意不抢播放的锁，两条路会同时下同一首；名字相同的话后启动那条会被
+    /// libresoda 用「目标正被别的下载占着」顶回来。
+    #[test]
+    fn part_name_separates_normal_download_from_upgrade() {
+        let normal =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        let upgrade =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Upgrade);
+        assert_ne!(normal, upgrade, "正常下载与升级必须落在不同暂存名上");
+        assert_eq!(normal, "123-lossless-normal.m4a");
+        assert_eq!(upgrade, "123-lossless-upgrade.m4a");
+    }
+
+    /// 名字固定后，上次被杀留下的整组暂存会挂在下次要用的同一组名字上。
+    /// stage_path 要把交付目标、`.part`、`.part.lock` 都清掉，再拿租约挡住维护线程。
+    #[test]
+    fn stage_path_discards_all_stale_staging_and_holds_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = super::staging_dir(dir.path());
+        std::fs::create_dir_all(&stage).unwrap();
+        let stale = stage.join("123-lossless-normal.m4a");
+        let stale_part = stage.join("123-lossless-normal.m4a.part");
+        let stale_lock = stage.join("123-lossless-normal.m4a.part.lock");
+        std::fs::write(&stale, b"leftover target").unwrap();
+        std::fs::write(&stale_part, b"leftover part data").unwrap();
+        std::fs::write(&stale_lock, b"").unwrap();
+
+        // 正式缓存里放一个同名文件：自定义档位 auto-normal 会撞上这个暂存名，
+        // 清理暂存绝不能删掉它。
+        let committed = dir.path().join("123-lossless-normal.m4a");
+        std::fs::write(&committed, b"committed cache").unwrap();
+
+        let (part, lease) = super::stage_path(
+            dir.path(),
+            "123",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        )
+        .expect("建暂存目录该成功");
+
+        assert_eq!(part, stale, "暂存目标落在独立的 staging 子目录");
+        assert!(!stale.exists(), "上次留下的交付目标必须清掉");
+        assert!(!stale_part.exists(), "半截的 .part 必须清掉");
+        assert!(!stale_lock.exists(), "旧的 .part.lock 必须清掉");
+        assert_eq!(
+            std::fs::read(&committed).unwrap(),
+            b"committed cache",
+            "同名正式缓存不能被清理误删"
+        );
+        assert_eq!(lease.0.as_path(), part.as_path(), "租约挂在暂存目标上");
+    }
+
+    /// 暂存目录建不出来时不能拿着写不进去的路径往下走，要给确定性的落盘失败。
+    #[test]
+    fn stage_path_reports_unpack_failure_when_staging_dir_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        // 用同名普通文件占住 staging，create_dir_all 必然失败。
+        std::fs::write(dir.path().join("staging"), b"occupied").unwrap();
+
+        let err = match super::stage_path(
+            dir.path(),
+            "123",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        ) {
+            Ok(_) => panic!("建不出目录该报错，不能继续"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.stage, crate::failure::Stage::Unpack);
+        assert_eq!(err.action, crate::failure::RecoveryAction::FreeSpace);
+        assert!(
+            err.detail.contains("staging"),
+            "错误里要带上路径: {}",
+            err.detail
+        );
     }
 }
 
@@ -208,13 +394,14 @@ impl Session {
     /// 第五、六个字段记录「没有更高档位」的结论，第七个记录试听补整曲的最近一次尝试。
     /// 后两者必须分开：试听不是「曲库没有更高档位」，权益一变就可能拿到整曲。
     fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
-        let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
+        let safe_id = encode_track_id(track_id);
+        let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
             return None;
         }
         let quality_path =
-            crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
+            crate::audio::cache_dir().join(format!("{safe_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
         let meta = crate::cache::parse_sidecar(&text, actual)?;
         let now = crate::cache::now_epoch_secs();
@@ -231,7 +418,8 @@ impl Session {
     }
 
     pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
-        let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
+        let safe_id = encode_track_id(track_id);
+        let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
         let info = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
@@ -663,15 +851,16 @@ impl Session {
                 Stage::Unpack,
                 Retryability::Never,
                 RecoveryAction::FreeSpace,
-                err.to_string(),
+                format!("{}: {err}", dir.display()),
             )
         })?;
         // 缓存文件名带音质档位：切换音质后自然 miss，重新拉对应档位的流
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
-        let path = dir.join(format!("{0}-{tag}.m4a", track.id));
+        let safe_id = encode_track_id(&track.id);
+        let path = dir.join(format!("{safe_id}-{tag}.m4a"));
         // sidecar 记录「音质标签 + 实际字节数 + 是否试听」，用于命中时的大小校验。
-        let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+        let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
         // 快速路径：若当前已有有效缓存命中，直接返回，无需排队等待锁
         if let Some(cached) = self.cached_track(&track.id) {
             return Ok(cached);
@@ -698,10 +887,11 @@ impl Session {
             ..Default::default()
         };
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
-        // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
+        // 暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
+        // 两条路并发下同一首时互不撞锁。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
-        let part = dir.join(part_file_name(&track.id, &tag));
-        let _part_lease = crate::cache::CacheLease::acquire(&part);
+        let (part, _part_lease) =
+            stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal)?;
         let info = self
             .pumpkin
             .download_with_info(&song, &part)
@@ -796,8 +986,9 @@ impl Session {
 
         let dir = crate::audio::cache_dir();
         let tag = self.quality_tag();
-        let path = dir.join(format!("{0}-{tag}.m4a", track.id));
-        let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+        let safe_id = encode_track_id(&track.id);
+        let path = dir.join(format!("{safe_id}-{tag}.m4a"));
+        let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
 
         // 若本地缓存原本就不存在，拒绝升级（升级只针对已有缓存曲目）
         let current = match self.cached_track(&track.id) {
@@ -865,8 +1056,13 @@ impl Session {
             ..Default::default()
         };
 
-        let part = dir.join(part_file_name(&track.id, &tag));
-        let _part_lease = crate::cache::CacheLease::acquire(&part);
+        // 升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
+        let (part, _part_lease) = stage_path(
+            &dir,
+            &track.id,
+            &tag,
+            crate::cache::DownloadPurpose::Upgrade,
+        )?;
 
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
         let info = if let crate::quality::QualityIntent::Tier(tier) = intent {
