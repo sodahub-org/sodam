@@ -147,11 +147,23 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
 /// 用途必须进名字：正常下载与升级会同时下同一首（升级刻意不和播放抢锁），
 /// 同名会让后启动那条被 libresoda 的目标锁顶回来。
 fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
-    format!("{track_id}-{tag}-{}.m4a", purpose.suffix())
+    // 曲目 id 会拼进文件名，并把文件交给 remove_file。只留字母数字、下划线和连字符，
+    // 别让带 / 或 .. 的 id 把清理路径指到缓存目录外面去。
+    let safe_id: String = track_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe_id}-{tag}-{}.m4a", purpose.suffix())
 }
 
-/// 准备暂存目标：清掉上次被杀留下的交付目标，再拿租约挡住缓存维护。
-/// 正常下载与升级都要走这一步，差异只在用途；收在这里免得两处各改一处漏一处。
+/// 准备这组暂存目标：清掉上次被杀留下的交付目标、`.part` 和 `.part.lock`，
+/// 再拿租约挡住缓存维护。正常下载与升级都要走这一步，差异只在用途。
 fn stage_path(
     dir: &std::path::Path,
     track_id: &str,
@@ -161,15 +173,29 @@ fn stage_path(
     let name = part_file_name(track_id, tag, purpose);
     let part = dir.join(&name);
     // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
-    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁，这几个必然是
-    // 上一轮留下的，顺手清掉，重放就从干净状态开始，不依赖上游怎么处理残留。
+    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。单实例锁降级时
+    // 可能还有第二个实例，删之前无法核出它是不是正在写；删不掉就记一条日志，
+    // 别静默吞掉——后面查「这首歌为什么一直下不对」要有线索。
     for stale in [
         part.clone(),
         dir.join(format!("{name}.part")),
         dir.join(format!("{name}.part.lock")),
     ] {
         if stale.exists() {
-            let _ = std::fs::remove_file(&stale);
+            if let Err(err) = std::fs::remove_file(&stale) {
+                use crate::log_outlet::{log_event, LogLevel, LogTopic};
+                let file = stale
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let error = err.to_string();
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::Audio,
+                    "stage_cleanup_failed",
+                    &[("file", file.as_str()), ("error", error.as_str())],
+                );
+            }
         }
     }
     let lease = crate::cache::CacheLease::acquire(&part);
@@ -178,6 +204,24 @@ fn stage_path(
 
 #[cfg(test)]
 mod part_tests {
+    /// 曲目 id 拼进文件名后还要交给 remove_file。带 / 或 .. 的 id 必须被净化，
+    /// 不能让清理路径指到缓存目录外面。
+    #[test]
+    fn part_name_neutralizes_path_characters_in_track_id() {
+        let name = super::part_file_name(
+            "../../etc/passwd",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        );
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert!(!name.contains(std::path::MAIN_SEPARATOR), "{name}");
+
+        let dir = std::path::Path::new("/tmp/sodam-cache/audio");
+        let joined = dir.join(&name);
+        assert_eq!(joined.parent(), Some(dir), "拼出的路径必须仍在缓存目录里");
+    }
+
     /// 同一曲目 + 档位 + 用途的暂存名必须每次一样。
     /// 名字里不能再带进程号或序号，否则每下一次就在缓存目录留一把新锁。
     #[test]

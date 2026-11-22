@@ -105,8 +105,16 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// .quality 与音频共享保护键，避免播放/下载时只删了 sidecar。
+// 音频的一组文件共享保护键：.quality 边车、以及下载中的 .part / .part.lock。
+// 这样租约挂在正式 .m4a 上时，同一首正在写的暂存不会被维护线程当废弃文件删掉。
 fn protection_key(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if let Some(stem) = name
+        .strip_suffix(".m4a.part.lock")
+        .or_else(|| name.strip_suffix(".m4a.part"))
+    {
+        return path.with_file_name(format!("{stem}.m4a"));
+    }
     if path.extension().is_some_and(|ext| ext == "quality") {
         path.with_extension("m4a")
     } else {
@@ -2347,6 +2355,25 @@ mod tests {
         let target = dir.path().join("nope").join("0000abcd-160.img");
         assert!(write_cache_file_atomic(&target, b"x").is_err());
         assert!(!target.exists());
+    }
+
+    /// 音频下载的一组文件共享保护键：租约挂在正式 .m4a 上时，
+    /// 边车和下载中的 .part / .part.lock 都不会被维护线程当废弃文件删掉。
+    #[test]
+    fn audio_staging_files_share_the_target_lease() {
+        let target = Path::new("/cache/audio/123-lossless.m4a");
+        for staged in [
+            "/cache/audio/123-lossless.quality",
+            "/cache/audio/123-lossless.m4a.part",
+            "/cache/audio/123-lossless.m4a.part.lock",
+        ] {
+            assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
+        }
+        // 封面那类 `.img.*.part` 不在映射范围内，保持原样，别误套音频租约。
+        assert_eq!(
+            protection_key(Path::new("/cache/audio/abcd-160.img.123.part")),
+            Path::new("/cache/audio/abcd-160.img.123.part")
+        );
     }
 
     /// 临时名每次都不一样：同一张封面的两个写者不会写到同一个文件里。
