@@ -199,8 +199,11 @@ fn stage_path(
         stage.join(format!("{name}.part")),
         stage.join(format!("{name}.part.lock")),
     ] {
-        if stale.exists() {
-            if let Err(err) = std::fs::remove_file(&stale) {
+        // 直接删，NotFound 是正常的（多半没留下残留）；别的错才记日志。
+        // 不用 exists() 先探再删：那两步之间文件可能被别的写者收尾删掉，
+        // 会冒出一条假的清理失败。
+        if let Err(err) = std::fs::remove_file(&stale) {
+            if err.kind() != std::io::ErrorKind::NotFound {
                 use crate::log_outlet::{log_event, LogLevel, LogTopic};
                 let file = stale
                     .file_name()
