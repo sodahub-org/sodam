@@ -431,10 +431,11 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
-    // libresoda 暂存路径的锁文本（`acquire_lock` 的文档化错误）：撞锁说明这个目标
-    // 正被另一个下载占着（跨进程，或暂存名撞车）。这是「正在下载，稍后再来」，
-    // 不是这台机器坏了：按可重试交还给排队/逐曲退避，用户看到的是排队或
-    // 「正在下载」（#243），不是一次永久失败。
+    // libresoda 暂存路径的锁文本（`acquire_lock` 的文档化错误）：撞锁说明这个
+    // 目标正被另一个下载占着。应用内同目标下载本来就由 download_lock 串行
+    // （那是字面意义的「排队」），能走到这里的只有跨进程或暂存名撞车的缝隙；
+    // 按可重试抖动交还，界面上落「暂时连不上」的兜底文案并跳下一首，绝不会
+    // 把半截文件当播放产物（#243）。
     if detail.contains("being staged by another download") {
         return PlaybackFailure::new(
             Stage::Transfer,
@@ -504,21 +505,19 @@ fn classify_http(detail: &str) -> PlaybackFailure {
     // interrupted: <io 文本>`），而 io 文本可能是本地化的——中文 Windows 报
     // 「磁盘空间不足」，英文报 "not enough space on the disk"。磁盘满重试不会好，
     // 先认出来交给 FreeSpace，让预取闸门按磁盘类挂起、状态行指向腾空间。
-    // 错误码兜底：ENOSPC=28、Windows ERROR_HANDLE_DISK_FULL=39 / ERROR_DISK_FULL=112。
+    // errno 兜底必须按平台认：ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux
+    // 是 ENOTEMPTY / EHOSTDOWN——断网时 libresoda 会把 `Host is down
+    // (os error 112)` 包进同一句文本里，跨平台硬认会把断网判成磁盘满。
     let lower = detail.to_ascii_lowercase();
-    const DISK_FULL_MARKERS: [&str; 7] = [
-        "no space left",
-        "not enough space",
-        "disk full",
-        "空间不足",
-        "os error 28",
-        "os error 39",
-        "os error 112",
-    ];
-    if DISK_FULL_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+    const DISK_FULL_TEXT: [&str; 4] =
+        ["no space left", "not enough space", "disk full", "空间不足"];
+    #[cfg(windows)]
+    const ERRNO_DISK_FULL: [&str; 2] = ["os error 39", "os error 112"];
+    #[cfg(not(windows))]
+    const ERRNO_DISK_FULL: [&str; 1] = ["os error 28"];
+    let disk_full = DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
+        || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker));
+    if disk_full {
         return PlaybackFailure::new(
             Stage::Transfer,
             Retryability::Never,
@@ -811,6 +810,27 @@ mod tests {
                 "磁盘满重试不会好：{classified:?}"
             );
         }
+
+        // errno 的含义随平台变：Linux 的 112 是 EHOSTDOWN，断网会包成
+        // `Host is down (os error 112)`，不能跨平台硬认成磁盘满。
+        let host_down = failure(SodaError::http(
+            "staged download interrupted: Host is down (os error 112)",
+        ));
+        #[cfg(windows)]
+        {
+            // Windows 上 112 恰好是 ERROR_DISK_FULL，这条在 Windows 仍是磁盘满。
+            assert_eq!(host_down.action, RecoveryAction::FreeSpace, "{host_down:?}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                host_down.retryability,
+                Retryability::Transient,
+                "断网是可重试的传输中断，不是磁盘满：{host_down:?}"
+            );
+            assert_eq!(host_down.action, RecoveryAction::Nothing, "{host_down:?}");
+            assert_eq!(host_down.stage, Stage::Transfer, "{host_down:?}");
+        }
     }
 
     /// 撞暂存锁是「正在下载，稍后再来」：可重试，不指向磁盘，也不算按曲目不可播。
@@ -1025,7 +1045,7 @@ mod tests {
         // 永久错误一次都不重试：再打只是打扰那台共享签名服务。
         assert_eq!(budget.next_delay(1, &permanent, 0.5), None);
         assert!(budget.next_delay(1, &transient, 0.5).is_some());
-        // 次数封顶是唯一的上限（阶段一 没有可观测的字节进度，见 PlayBudget 文档）。
+        // 次数封顶是唯一的上限（预算这一层拿不到字节进度，见 PlayBudget 文档）。
         assert_eq!(budget.next_delay(3, &transient, 0.5), None);
         // full jitter：等待时长受抖动系数缩放，且不超过上限。
         let ceiling = budget.next_delay(1, &transient, 0.999).unwrap();

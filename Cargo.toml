@@ -22,6 +22,6 @@ sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 
-# c8a9f54 = 上游 main：`download_resumable` 的 `DownloadReport` 带上本次实际使用的
-# 流信息（libresoda#55 / PR #56），续传路径不用再二次解析补档位。
+# c8a9f54 = 上游 main：`download_resumable` 交回的 `DownloadReport` 带上本次
+# 实际使用的流信息，续传路径不用再二次解析补档位。
 libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "c8a9f54" }

@@ -584,8 +584,9 @@ fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
 }
 
-/// 续传发生时留一条日志：transferred 明显小于 total_len 就证明这次补的是缺口，
-/// 不是整份重来。点播与升级两条路共用——预取/升级的续传同样要能取证（#243）。
+/// 续传发生时把传输事实记进日志（resumed_from / transferred / total_len）：
+/// 「transferred 是否明显小于 total_len」由看日志的人判断——有值就说明这次
+/// 是接在上次那段字节后面补的。点播与升级两条路共用（#243）。
 fn log_resumed_download(report: &libresoda::soda::download::DownloadReport) {
     let Some(from) = report.resumed_from else {
         return;
