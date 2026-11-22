@@ -617,8 +617,9 @@ pub(crate) fn purge_stale_staging_in(dir: &Path, max_age: Duration) -> usize {
             continue;
         }
         // mtime 在未来（时钟回拨）也算拿不到年龄，按「还没过期」处理。
-        let expired = match meta.modified().and_then(|m| now.duration_since(m)) {
-            Ok(age) => age >= max_age,
+        // modified() 与 duration_since() 错误类型不同，只能分两步取。
+        let expired = match meta.modified() {
+            Ok(modified) => now.duration_since(modified).is_ok_and(|age| age >= max_age),
             Err(_) => false,
         };
         if staged_family_member(name) {
