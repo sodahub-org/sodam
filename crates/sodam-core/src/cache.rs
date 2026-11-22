@@ -684,24 +684,45 @@ fn sweep_scan(scan: Scan) -> usize {
     removed
 }
 
-/// 首轮巡检的门：扫描完整才执行清扫；不完整这轮跳过并留痕，不算完成。
+/// 首轮巡检的连续不完整轮数上限：到顶就放弃，进程内不再重试。
+/// 5 轮 ≈ 5 分钟，子树长期读不到（权限不对、目录一直被占）时不至于每 60 秒
+/// 一次全量扫盘永不停止——那正是进程级一次性门要省的开销。
+const SWEEP_MAX_INCOMPLETE_ROUNDS: usize = 5;
+
+/// 首轮巡检的门：扫描完整才执行清扫；不完整这轮跳过、计数加一，到上限就放弃。
 ///
 /// 与封面淘汰同一条教训（#225）：子树临时读不到（权限抖动、盘忙、被锁）会让
-/// 扫描标成不完整，可读部分里的残留这轮不清，留给下轮维护重试——一次性开关
-/// 绝不能在不完整的扫描上落位。拆成纯函数是为了让这套语义能被测试固定。
-/// 返回 (删除数, 本轮是否算完成)。
-fn sweep_first_run(scan: Scan) -> (usize, bool) {
+/// 扫描标成不完整，可读部分里的残留这轮不清，留给下轮维护重试；但重试必须有界，
+/// 否则长期读不到时每轮维护都在空扫。日志也有界：首轮一条 `stale_staging_sweep_incomplete`，
+/// 放弃时一条 `stale_staging_sweep_gave_up`，中间轮次静默。拆成纯函数是为了让
+/// 这套语义能被测试固定。返回 (删除数, 是否结束巡检, 不完整轮数)。
+fn sweep_first_run(incomplete_rounds: usize, scan: Scan) -> (usize, bool, usize) {
     if scan.incomplete {
+        let rounds = incomplete_rounds + 1;
         let readable_files = scan.files.len().to_string();
-        log_event(
-            LogLevel::Warn,
-            LogTopic::App,
-            "stale_staging_sweep_incomplete",
-            &[("readable_files", readable_files.as_str())],
-        );
-        return (0, false);
+        if rounds == 1 {
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "stale_staging_sweep_incomplete",
+                &[("readable_files", readable_files.as_str())],
+            );
+        } else if rounds == SWEEP_MAX_INCOMPLETE_ROUNDS {
+            let rounds_text = rounds.to_string();
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "stale_staging_sweep_gave_up",
+                &[
+                    ("rounds", rounds_text.as_str()),
+                    ("readable_files", readable_files.as_str()),
+                ],
+            );
+        }
+        let done = rounds >= SWEEP_MAX_INCOMPLETE_ROUNDS;
+        return (0, done, rounds);
     }
-    (sweep_scan(scan), true)
+    (sweep_scan(scan), true, incomplete_rounds)
 }
 
 /// 对整个音频缓存目录（含暂存子目录）跑一轮残留清扫，返回删除的文件数。
@@ -709,17 +730,22 @@ fn sweep_first_run(scan: Scan) -> (usize, bool) {
 /// 只在启动后的首轮维护实际执行：主心跳约 60 秒就调一轮维护，而残留的年龄门槛
 /// 是 24 小时，会话期间新产生的残留本来就不满 24 小时，每轮重扫几乎全是空跑；
 /// 音频目录可能上万文件，这个代价省得掉。会话期间攒下的残留留给下次启动清，
-/// 与「每次启动的缓存巡检顺手清掉」的口径一致。扫描完整才置「已巡检」：
-/// 首轮赶上子树读不到时这轮跳过、下轮重试（Warn 留痕）。调用方必须在后台执行。
+/// 与「每次启动的缓存巡检顺手清掉」的口径一致。扫描完整或连续不完整到
+/// [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮才置「已巡检」。调用方必须在后台执行。
 pub fn sweep_stale_staging() -> usize {
     static STALE_SWEEP_DONE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static STALE_SWEEP_INCOMPLETE_ROUNDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     if STALE_SWEEP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
-    let (removed, complete) = sweep_first_run(scan_files(&root_dir().join("audio")));
-    if complete {
+    let rounds = STALE_SWEEP_INCOMPLETE_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
+    let (removed, done, rounds) = sweep_first_run(rounds, scan_files(&root_dir().join("audio")));
+    if done {
         STALE_SWEEP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        STALE_SWEEP_INCOMPLETE_ROUNDS.store(rounds, std::sync::atomic::Ordering::Relaxed);
     }
     removed
 }
@@ -2858,19 +2884,50 @@ mod tests {
         let scan = scan_denying(dir.path(), &dir.path().join("unreadable"));
         assert!(scan.incomplete);
 
-        let (removed, complete) = sweep_first_run(scan);
-        assert_eq!((removed, complete), (0, false), "不完整的扫描这轮不清");
+        let (removed, done, rounds) = sweep_first_run(0, scan);
+        assert_eq!(
+            (removed, done, rounds),
+            (0, false, 1),
+            "不完整的扫描这轮不清"
+        );
         assert!(stale.exists(), "可读部分的残留也要等完整扫描再清");
 
         // 下轮扫描恢复完整：上轮看漏的那条也一起清掉，一次性开关这才落位。
-        let (removed, complete) = sweep_first_run(scan_files(dir.path()));
-        assert_eq!((removed, complete), (2, true));
+        let (removed, done, rounds) = sweep_first_run(1, scan_files(dir.path()));
+        assert_eq!((removed, done, rounds), (2, true, 1));
         assert!(!stale.exists());
         assert!(!dir
             .path()
             .join("unreadable")
             .join("222-auto.m4a.part")
             .exists());
+    }
+
+    /// #242：连续多轮扫描不完整就放弃重试，扫盘和 Warn 都有上界。
+    ///
+    /// 「长期读不到」不该让每 60 秒一次的全量扫描永不停止。
+    #[test]
+    fn sweep_first_run_gives_up_after_repeated_incomplete_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = file(dir.path(), "111-auto.m4a.part", 90_000);
+        file(dir.path(), "unreadable/222-auto.m4a.part", 90_000);
+        let denied = dir.path().join("unreadable");
+
+        let mut rounds = 0;
+        let mut done = false;
+        for _ in 0..SWEEP_MAX_INCOMPLETE_ROUNDS {
+            let (removed, d, r) = sweep_first_run(rounds, scan_denying(dir.path(), &denied));
+            assert_eq!(removed, 0, "放弃之前不清任何文件");
+            rounds = r;
+            done = d;
+        }
+        assert_eq!(rounds, SWEEP_MAX_INCOMPLETE_ROUNDS);
+        assert!(done, "到上限就放弃，不再空扫");
+
+        // 已达上限后再喂一轮不完整扫描，结果同样是结束：重试有界，不无限续期。
+        let (_removed, done, _rounds) = sweep_first_run(rounds, scan_denying(dir.path(), &denied));
+        assert!(done);
+        assert!(stale.exists(), "放弃后残留留待下次启动");
     }
 
     /// #242：超额淘汰正式音频时，它的暂存整组同批消失，别曲目的不沾。
