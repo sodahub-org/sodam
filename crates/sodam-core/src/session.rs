@@ -162,6 +162,13 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
     format!("{safe_id}-{tag}-{}.m4a", purpose.suffix())
 }
 
+/// 暂存文件单独放一个子目录，别和正式缓存混在一起。
+/// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
+/// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
+fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
+    audio_dir.join("staging")
+}
+
 /// 准备这组暂存目标：清掉上次被杀留下的交付目标、`.part` 和 `.part.lock`，
 /// 再拿租约挡住缓存维护。正常下载与升级都要走这一步，差异只在用途。
 fn stage_path(
@@ -170,16 +177,27 @@ fn stage_path(
     tag: &str,
     purpose: crate::cache::DownloadPurpose,
 ) -> (std::path::PathBuf, crate::cache::CacheLease) {
+    let stage = staging_dir(dir);
+    if let Err(err) = std::fs::create_dir_all(&stage) {
+        use crate::log_outlet::{log_event, LogLevel, LogTopic};
+        let error = err.to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::Audio,
+            "staging_dir_failed",
+            &[("error", error.as_str())],
+        );
+    }
     let name = part_file_name(track_id, tag, purpose);
-    let part = dir.join(&name);
+    let part = stage.join(&name);
     // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
     // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。单实例锁降级时
     // 可能还有第二个实例，删之前无法核出它是不是正在写；删不掉就记一条日志，
     // 别静默吞掉——后面查「这首歌为什么一直下不对」要有线索。
     for stale in [
         part.clone(),
-        dir.join(format!("{name}.part")),
-        dir.join(format!("{name}.part.lock")),
+        stage.join(format!("{name}.part")),
+        stage.join(format!("{name}.part.lock")),
     ] {
         if stale.exists() {
             if let Err(err) = std::fs::remove_file(&stale) {
@@ -266,12 +284,19 @@ mod part_tests {
     #[test]
     fn stage_path_discards_all_stale_staging_and_holds_lease() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("123-lossless-normal.m4a");
-        let stale_part = dir.path().join("123-lossless-normal.m4a.part");
-        let stale_lock = dir.path().join("123-lossless-normal.m4a.part.lock");
+        let stage = super::staging_dir(dir.path());
+        std::fs::create_dir_all(&stage).unwrap();
+        let stale = stage.join("123-lossless-normal.m4a");
+        let stale_part = stage.join("123-lossless-normal.m4a.part");
+        let stale_lock = stage.join("123-lossless-normal.m4a.part.lock");
         std::fs::write(&stale, b"leftover target").unwrap();
         std::fs::write(&stale_part, b"leftover part data").unwrap();
         std::fs::write(&stale_lock, b"").unwrap();
+
+        // 正式缓存里放一个同名文件：自定义档位 auto-normal 会撞上这个暂存名，
+        // 清理暂存绝不能删掉它。
+        let committed = dir.path().join("123-lossless-normal.m4a");
+        std::fs::write(&committed, b"committed cache").unwrap();
 
         let (part, lease) = super::stage_path(
             dir.path(),
@@ -280,10 +305,15 @@ mod part_tests {
             crate::cache::DownloadPurpose::Normal,
         );
 
-        assert_eq!(part, stale, "暂存目标名固定，复用上次那一个");
+        assert_eq!(part, stale, "暂存目标落在独立的 staging 子目录");
         assert!(!stale.exists(), "上次留下的交付目标必须清掉");
         assert!(!stale_part.exists(), "半截的 .part 必须清掉");
         assert!(!stale_lock.exists(), "旧的 .part.lock 必须清掉");
+        assert_eq!(
+            std::fs::read(&committed).unwrap(),
+            b"committed cache",
+            "同名正式缓存不能被清理误删"
+        );
         assert_eq!(lease.0.as_path(), part.as_path(), "租约挂在暂存目标上");
     }
 }
