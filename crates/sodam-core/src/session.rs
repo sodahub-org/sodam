@@ -150,6 +150,24 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
     format!("{track_id}-{tag}-{}.m4a", purpose.suffix())
 }
 
+/// 准备暂存目标：清掉上次被杀留下的交付目标，再拿租约挡住缓存维护。
+/// 正常下载与升级都要走这一步，差异只在用途；收在这里免得两处各改一处漏一处。
+fn stage_path(
+    dir: &std::path::Path,
+    track_id: &str,
+    tag: &str,
+    purpose: crate::cache::DownloadPurpose,
+) -> (std::path::PathBuf, crate::cache::CacheLease) {
+    let part = dir.join(part_file_name(track_id, tag, purpose));
+    // Windows 的 rename 不覆盖既有文件：上次下载被杀时可能留下已交付的目标，
+    // 清掉它，重放同一首才不会被残留顶回来。调用方已持有对应用途的下载锁。
+    if part.exists() {
+        let _ = std::fs::remove_file(&part);
+    }
+    let lease = crate::cache::CacheLease::acquire(&part);
+    (part, lease)
+}
+
 #[cfg(test)]
 mod part_tests {
     /// #241：同一曲目 + 档位 + 用途的暂存名必须每次一样。
@@ -734,18 +752,9 @@ impl Session {
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
         // #241：暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
         // 两条路并发下同一首时互不撞锁。
-        // 上次下载被杀时可能留下已交付的目标文件；Windows 的 rename 不覆盖既有文件，
-        // 这里在锁内先清掉它，重放同一首才不会被残留顶回来。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
-        let part = dir.join(part_file_name(
-            &track.id,
-            &tag,
-            crate::cache::DownloadPurpose::Normal,
-        ));
-        if part.exists() {
-            let _ = std::fs::remove_file(&part);
-        }
-        let _part_lease = crate::cache::CacheLease::acquire(&part);
+        let (part, _part_lease) =
+            stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal);
         let info = self
             .pumpkin
             .download_with_info(&song, &part)
@@ -910,16 +919,12 @@ impl Session {
         };
 
         // #241：升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
-        // 上次升级被杀时留下的已交付目标先清掉，Windows 的 rename 不覆盖，重放才不会被顶回来。
-        let part = dir.join(part_file_name(
+        let (part, _part_lease) = stage_path(
+            &dir,
             &track.id,
             &tag,
             crate::cache::DownloadPurpose::Upgrade,
-        ));
-        if part.exists() {
-            let _ = std::fs::remove_file(&part);
-        }
-        let _part_lease = crate::cache::CacheLease::acquire(&part);
+        );
 
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
         let info = if let crate::quality::QualityIntent::Tier(tier) = intent {
