@@ -156,13 +156,6 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
     )
 }
 
-/// 暂存文件单独放一个子目录，别和正式缓存混在一起。
-/// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
-/// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
-fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
-    audio_dir.join("staging")
-}
-
 /// 准备这组暂存目标：清掉上次被杀留下的交付目标、`.part` 和 `.part.lock`，
 /// 再拿租约挡住缓存维护。正常下载与升级都要走这一步，差异只在用途。
 fn stage_path(
@@ -173,7 +166,7 @@ fn stage_path(
 ) -> Result<(std::path::PathBuf, crate::cache::CacheLease), crate::failure::PlaybackFailure> {
     use crate::failure::{PlaybackFailure, RecoveryAction, Retryability, Stage};
 
-    let stage = staging_dir(dir);
+    let stage = crate::cache::staging_dir(dir);
     // 建不出暂存目录就没法下载：直接报确定的失败，别拿着一条父目录都不存在的
     // 路径往下走。错误里带上路径，报问题时不用回头猜是哪一层缓存目录。
     std::fs::create_dir_all(&stage).map_err(|err| {
@@ -283,7 +276,7 @@ mod part_tests {
     #[test]
     fn stage_path_discards_all_stale_staging_and_holds_lease() {
         let dir = tempfile::tempdir().unwrap();
-        let stage = super::staging_dir(dir.path());
+        let stage = crate::cache::staging_dir(dir.path());
         std::fs::create_dir_all(&stage).unwrap();
         let stale = stage.join("123-lossless-normal.m4a");
         let stale_part = stage.join("123-lossless-normal.m4a.part");
