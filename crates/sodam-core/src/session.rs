@@ -136,25 +136,59 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
     }
 }
 
-/// 预取/播放两条路径可能**并发下载同一首**（预取进行中用户又手动点了它），
-/// 固定的 .part 名会让两个写者互相踩踏（remove + 交错写 + 错误的 rename 对象）。
-/// 用「进程号 + 进程内序号」保证每次下载写自己的临时文件。
-fn part_file_name(track_id: &str, tag: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{track_id}-{tag}-{}-{seq}.m4a.part", std::process::id())
+/// 音频下载交给 libresoda 的暂存目标名（不含目录）。
+///
+/// 名字只由曲目、档位标签和用途决定，不带进程号/序号：同一首歌反复下、重试多少次
+/// 都复用同一套名字，缓存目录里也就只留这一套 `.part` 与 `.part.lock`。
+///
+/// 不能带 `.part` 后缀：libresoda 拿到这个路径当下载目标，自己会在后面拼 `.part`
+/// （暂存数据）和 `.part.lock`（锁）。目标名再带 `.part` 就会落盘成 `.part.part`。
+///
+/// 用途必须进名字：正常下载与升级会同时下同一首（升级刻意不和播放抢锁），
+/// 同名会让后启动那条被 libresoda 的目标锁顶回来。
+fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
+    format!("{track_id}-{tag}-{}.m4a", purpose.suffix())
 }
 
 #[cfg(test)]
 mod part_tests {
+    /// #241：同一曲目 + 档位 + 用途的暂存名必须每次一样。
+    /// 名字里不能再带进程号或序号，否则每下一次就在缓存目录留一把新锁。
     #[test]
-    fn part_names_are_unique_and_labeled() {
-        let first = super::part_file_name("123", "lossless");
-        let second = super::part_file_name("123", "lossless");
-        assert_ne!(first, second, "同一曲目两次下载的临时名必须不同");
-        assert!(first.starts_with("123-lossless-"), "{first}");
-        assert!(first.ends_with(".m4a.part"), "{first}");
+    fn part_name_is_fixed_for_same_track_tag_and_purpose() {
+        let first = super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        let second =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        assert_eq!(first, second, "同一曲目两次下载必须复用同一个暂存名");
+        assert_eq!(first, "123-lossless-normal.m4a");
+    }
+
+    /// #241：传给 libresoda 的目标名不能以 `.part` 结尾。
+    /// libresoda 自己会在目标名后拼 `.part` / `.part.lock`，目标名再带 `.part`
+    /// 就会落盘成 `.part.part` / `.part.part.lock`。
+    #[test]
+    fn part_name_has_no_part_suffix() {
+        for purpose in [
+            crate::cache::DownloadPurpose::Normal,
+            crate::cache::DownloadPurpose::Upgrade,
+        ] {
+            let name = super::part_file_name("123", "lossless", purpose);
+            assert!(!name.ends_with(".part"), "{name} 不能再带 .part 后缀");
+        }
+    }
+
+    /// #241：正常下载与升级补音质必须两个名字。
+    /// 升级刻意不抢播放的锁，两条路会同时下同一首；名字相同的话后启动那条会被
+    /// libresoda 用「目标正被别的下载占着」顶回来。
+    #[test]
+    fn part_name_separates_normal_download_from_upgrade() {
+        let normal =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Normal);
+        let upgrade =
+            super::part_file_name("123", "lossless", crate::cache::DownloadPurpose::Upgrade);
+        assert_ne!(normal, upgrade, "正常下载与升级必须落在不同暂存名上");
+        assert_eq!(normal, "123-lossless-normal.m4a");
+        assert_eq!(upgrade, "123-lossless-upgrade.m4a");
     }
 }
 
@@ -698,9 +732,19 @@ impl Session {
             ..Default::default()
         };
         // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
-        // 临时名带进程号+序号：预取与手动播放并发下同一首时互不踩踏。
+        // #241：暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
+        // 两条路并发下同一首时互不撞锁。
+        // 上次下载被杀时可能留下已交付的目标文件；Windows 的 rename 不覆盖既有文件，
+        // 这里在锁内先清掉它，重放同一首才不会被残留顶回来。
         // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
-        let part = dir.join(part_file_name(&track.id, &tag));
+        let part = dir.join(part_file_name(
+            &track.id,
+            &tag,
+            crate::cache::DownloadPurpose::Normal,
+        ));
+        if part.exists() {
+            let _ = std::fs::remove_file(&part);
+        }
         let _part_lease = crate::cache::CacheLease::acquire(&part);
         let info = self
             .pumpkin
@@ -865,7 +909,16 @@ impl Session {
             ..Default::default()
         };
 
-        let part = dir.join(part_file_name(&track.id, &tag));
+        // #241：升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
+        // 上次升级被杀时留下的已交付目标先清掉，Windows 的 rename 不覆盖，重放才不会被顶回来。
+        let part = dir.join(part_file_name(
+            &track.id,
+            &tag,
+            crate::cache::DownloadPurpose::Upgrade,
+        ));
+        if part.exists() {
+            let _ = std::fs::remove_file(&part);
+        }
         let _part_lease = crate::cache::CacheLease::acquire(&part);
 
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位

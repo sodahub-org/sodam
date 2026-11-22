@@ -23,6 +23,26 @@ pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 把整曲下一遍再丢掉；六小时后自动再试，用户买了会员不必等到第二天。
 pub const PREVIEW_RETRY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// 音频下载的用途。正常下载与升级补音质要落到不同的暂存名上：
+/// 升级刻意不抢播放的锁，两条路会并发下同一首，同名会让后启动那条被
+/// libresoda 的「目标正被别的下载占着」顶回来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DownloadPurpose {
+    /// 点播、预取的正常下载。
+    Normal,
+    /// 后台补音质升级。
+    Upgrade,
+}
+
+impl DownloadPurpose {
+    pub(crate) fn suffix(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Upgrade => "upgrade",
+        }
+    }
+}
+
 type Leases = HashMap<PathBuf, std::sync::Weak<PathBuf>>;
 fn leases() -> &'static Mutex<Leases> {
     static LEASES: OnceLock<Mutex<Leases>> = OnceLock::new();
