@@ -146,20 +146,29 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
 ///
 /// 用途必须进名字：正常下载与升级会同时下同一首（升级刻意不和播放抢锁），
 /// 同名会让后启动那条被 libresoda 的目标锁顶回来。
+/// 曲目 id 拼进缓存文件名前先过这一步。正常 id 是数字，原样返回；
+/// 带路径分隔符或别的怪字符时编码成 `_XX`（字节的十六进制），避免两件事：
+/// 一是把文件拼到缓存目录外面，二是 `a/b` 和 `a_b` 被压成同一个名字互相踩。
+fn safe_track_id(track_id: &str) -> String {
+    let mut out = String::with_capacity(track_id.len());
+    for byte in track_id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' {
+            out.push(byte as char);
+        } else {
+            // 连 `_` 也编码，免得跟编码序列本身撞车。
+            out.push_str(&format!("_{byte:02x}"));
+        }
+    }
+    out
+}
+
 fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurpose) -> String {
-    // 曲目 id 会拼进文件名，并把文件交给 remove_file。只留字母数字、下划线和连字符，
-    // 别让带 / 或 .. 的 id 把清理路径指到缓存目录外面去。
-    let safe_id: String = track_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{safe_id}-{tag}-{}.m4a", purpose.suffix())
+    format!(
+        "{}-{}-{}.m4a",
+        safe_track_id(track_id),
+        tag,
+        purpose.suffix()
+    )
 }
 
 /// 暂存文件单独放一个子目录，别和正式缓存混在一起。
@@ -243,6 +252,21 @@ mod part_tests {
         let dir = std::path::Path::new("/tmp/sodam-cache/audio");
         let joined = dir.join(&name);
         assert_eq!(joined.parent(), Some(dir), "拼出的路径必须仍在缓存目录里");
+    }
+
+    /// 净化要可逆到「不同 id 不撞名」：把怪字符压成同一个 `_` 会让两首歌
+    /// 共用一个暂存文件，而下载锁按原始 id 分，拦不住。
+    #[test]
+    fn safe_track_id_keeps_distinct_ids_distinct() {
+        let slash = super::safe_track_id("a/b");
+        let underscore = super::safe_track_id("a_b");
+        assert_ne!(slash, underscore, "不同 id 不能撞成同一个文件名");
+        assert_eq!(super::safe_track_id("123"), "123", "正常数字 id 原样保留");
+        assert_eq!(
+            super::safe_track_id("a_b"),
+            "a_5fb",
+            "下划线也编码，免得跟编码序列撞"
+        );
     }
 
     /// 同一曲目 + 档位 + 用途的暂存名必须每次一样。
@@ -400,13 +424,14 @@ impl Session {
     /// 第五、六个字段记录「没有更高档位」的结论，第七个记录试听补整曲的最近一次尝试。
     /// 后两者必须分开：试听不是「曲库没有更高档位」，权益一变就可能拿到整曲。
     fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
-        let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
+        let safe_id = safe_track_id(track_id);
+        let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let actual = std::fs::metadata(&path).ok()?.len();
         if actual == 0 {
             return None;
         }
         let quality_path =
-            crate::audio::cache_dir().join(format!("{track_id}-{}.quality", self.quality_tag()));
+            crate::audio::cache_dir().join(format!("{safe_id}-{}.quality", self.quality_tag()));
         let text = std::fs::read_to_string(&quality_path).ok()?;
         let meta = crate::cache::parse_sidecar(&text, actual)?;
         let now = crate::cache::now_epoch_secs();
@@ -423,7 +448,8 @@ impl Session {
     }
 
     pub fn cached_track(&self, track_id: &str) -> Option<CachedTrack> {
-        let path = crate::audio::cache_dir().join(format!("{track_id}-{}.m4a", self.quality_tag()));
+        let safe_id = safe_track_id(track_id);
+        let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
         let lease = crate::cache::CacheLease::acquire(&path);
         let info = self.cached_info(track_id)?;
         let _ = std::fs::OpenOptions::new()
@@ -855,15 +881,16 @@ impl Session {
                 Stage::Unpack,
                 Retryability::Never,
                 RecoveryAction::FreeSpace,
-                err.to_string(),
+                format!("{}: {err}", dir.display()),
             )
         })?;
         // 缓存文件名带音质档位：切换音质后自然 miss，重新拉对应档位的流
         //（正在播放的那首不受影响，因为它已经装载进引擎了）。
         let tag = self.quality_tag();
-        let path = dir.join(format!("{0}-{tag}.m4a", track.id));
+        let safe_id = safe_track_id(&track.id);
+        let path = dir.join(format!("{safe_id}-{tag}.m4a"));
         // sidecar 记录「音质标签 + 实际字节数 + 是否试听」，用于命中时的大小校验。
-        let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+        let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
         // 快速路径：若当前已有有效缓存命中，直接返回，无需排队等待锁
         if let Some(cached) = self.cached_track(&track.id) {
             return Ok(cached);
@@ -989,8 +1016,9 @@ impl Session {
 
         let dir = crate::audio::cache_dir();
         let tag = self.quality_tag();
-        let path = dir.join(format!("{0}-{tag}.m4a", track.id));
-        let quality_path = dir.join(format!("{0}-{tag}.quality", track.id));
+        let safe_id = safe_track_id(&track.id);
+        let path = dir.join(format!("{safe_id}-{tag}.m4a"));
+        let quality_path = dir.join(format!("{safe_id}-{tag}.quality"));
 
         // 若本地缓存原本就不存在，拒绝升级（升级只针对已有缓存曲目）
         let current = match self.cached_track(&track.id) {
