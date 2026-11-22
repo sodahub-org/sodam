@@ -502,18 +502,41 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
 
 /// `SodaError::Http` 只剩字符串，相位信息已经在上游丢失；这里只解析结构化的状态码。
 fn classify_http(detail: &str) -> PlaybackFailure {
-    // 磁盘满判据只认暂存上下文：`staged download interrupted:` 是 libresoda
-    // 暂存路径包写盘/读体失败的统一前缀（对上游拼法的核对只能到这，
-    // 其它包装的磁盘满会落进下面的传输中断分支，按可重试处理）。
-    // 这段检查排在状态码解析之前，放开上下文会把带 quota 字样的限流
-    // 回包吞成 FreeSpace。不带前缀的 io 失败走 `classify` 的 Io 分支，
-    // 同样按 FreeSpace 处理。io 文本可能是本地化的（中文 Windows 报
-    // 「磁盘空间不足」，英文报 "not enough space on the disk"）。
-    // errno 兜底必须按平台认：ENOSPC=28 是 POSIX 通用，但 39 / 112 在
-    // Linux 是 ENOTEMPTY / EHOSTDOWN（断网的 `Host is down
-    // (os error 112)`），122 在 Linux 是 EDQUOT 而在 Windows 是
-    // ERROR_INSUFFICIENT_BUFFER——跨平台硬认会把断网判成磁盘满。
     let lower = detail.to_ascii_lowercase();
+    // 状态码先行：429/401/403/404/5xx 各有语义，不能被后面的文本判据盖掉。
+    // 状态错误文本只含状态码与地址、不含磁盘字样，所以先解析不会漏判；
+    // 磁盘满的文本无论上游怎么包装都不带状态码，放在它后面才接得住。
+    let status = detail
+        .split("status ")
+        .nth(1)
+        .and_then(|rest| rest.chars().take(3).collect::<String>().parse::<u16>().ok());
+    if let Some(code) = status {
+        let (retryability, action) = match code {
+            429 => (Retryability::Throttled, RecoveryAction::Nothing),
+            401 => (Retryability::Never, RecoveryAction::Relogin),
+            // 403 既可能是 Cookie 权益，也可能是签名 URL 过期：后者换一次地址就能好，
+            // 所以按可重试处理，让它走一次「重新解析」而不是永久失败。
+            403 => (Retryability::Transient, RecoveryAction::Nothing),
+            404 => (Retryability::Never, RecoveryAction::PickAnother),
+            500..=599 => (Retryability::Transient, RecoveryAction::Nothing),
+            _ => (Retryability::Never, RecoveryAction::Nothing),
+        };
+        let stage = if detail.contains("http request failed") {
+            // 这个前缀是 `get_full` / `get_reader` 在**拿到状态码**时产出的，归地址解析；
+            Stage::ResolveStream
+        } else {
+            // 有状态码但没有这个前缀：分不清相位，别装作知道。
+            Stage::Network
+        };
+        return PlaybackFailure::new(stage, retryability, action, detail);
+    }
+    // 磁盘满：写盘失败经暂存路径或裸 io 冒出来，任何包装都认，重试不会好，
+    // 交给 FreeSpace——预取按磁盘类挂起、状态行指向腾空间。io 文本可能
+    // 本地化（中文 Windows「磁盘空间不足」）。errno 必须按平台认：
+    // ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux 是 ENOTEMPTY /
+    // EHOSTDOWN（断网的 `Host is down (os error 112)`），122 在 Linux
+    // 是 EDQUOT 而在 Windows 是 ERROR_INSUFFICIENT_BUFFER——跨平台
+    // 硬认会把断网判成磁盘满。
     const DISK_FULL_TEXT: [&str; 5] = [
         "no space left",
         "not enough space",
@@ -525,9 +548,8 @@ fn classify_http(detail: &str) -> PlaybackFailure {
     const ERRNO_DISK_FULL: [&str; 2] = ["os error 39", "os error 112"];
     #[cfg(not(windows))]
     const ERRNO_DISK_FULL: [&str; 2] = ["os error 28", "os error 122"];
-    let disk_full = detail.contains("staged download")
-        && (DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
-            || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker)));
+    let disk_full = DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
+        || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker));
     if disk_full {
         return PlaybackFailure::new(
             Stage::Transfer,
@@ -558,47 +580,29 @@ fn classify_http(detail: &str) -> PlaybackFailure {
             detail,
         );
     }
-    let status = detail
-        .split("status ")
-        .nth(1)
-        .and_then(|rest| rest.chars().take(3).collect::<String>().parse::<u16>().ok());
-    let (retryability, action) = match status {
-        Some(429) => (Retryability::Throttled, RecoveryAction::Nothing),
-        Some(401) => (Retryability::Never, RecoveryAction::Relogin),
-        // 403 既可能是 Cookie 权益，也可能是签名 URL 过期：后者换一次地址就能好，
-        // 所以按可重试处理，让它走一次「重新解析」而不是永久失败。
-        Some(403) => (Retryability::Transient, RecoveryAction::Nothing),
-        Some(404) => (Retryability::Never, RecoveryAction::PickAnother),
-        Some(500..=599) => (Retryability::Transient, RecoveryAction::Nothing),
-        Some(_) => (Retryability::Never, RecoveryAction::Nothing),
-        None => {
-            // 没有状态码的都是传输层。判据必须盖住真实的握手类文本——本机实测到的就是
-            // `Connection Failed: tls connection init failed: unexpected end of file`；
-            // 只认 "timeout" 会把这类抖动误判成永久错误，一次都不重试。
-            let transport = [
-                "timed out",
-                "timeout",
-                "tls",
-                "connection",
-                "dns",
-                "failed to lookup address",
-                "end of file",
-                "broken pipe",
-                "reset by peer",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
-            if transport {
-                (Retryability::Transient, RecoveryAction::Nothing)
-            } else {
-                (Retryability::Never, RecoveryAction::Nothing)
-            }
-        }
+    // 没有状态码、也不是上述契约形态的，都是传输层或兜底。判据必须盖住真实的
+    // 握手类文本——本机实测到的就是 `Connection Failed: tls connection init
+    // failed: unexpected end of file`；只认 "timeout" 会把这类抖动误判成
+    // 永久错误，一次都不重试。
+    let transport = [
+        "timed out",
+        "timeout",
+        "tls",
+        "connection",
+        "dns",
+        "failed to lookup address",
+        "end of file",
+        "broken pipe",
+        "reset by peer",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let (retryability, action) = if transport {
+        (Retryability::Transient, RecoveryAction::Nothing)
+    } else {
+        (Retryability::Never, RecoveryAction::Nothing)
     };
-    let stage = if detail.contains("http request failed") {
-        // 这个前缀是 `get_full` / `get_reader` 在**拿到状态码**时产出的，归地址解析；
-        Stage::ResolveStream
-    } else if detail.contains("reading response") || detail.contains("reading body") {
+    let stage = if detail.contains("reading response") || detail.contains("reading body") {
         // 已经在读响应体：明确的音频体传输故障。
         Stage::Transfer
     } else {
@@ -871,6 +875,29 @@ mod tests {
             RecoveryAction::FreeSpace,
             "Windows 的 122 不是磁盘含义：{errno_only:?}"
         );
+    }
+
+    /// 状态码先行：带 quota 字样的限流回包先落自己的语义，不被磁盘文本
+    /// 判据盖掉；磁盘满不带任何暂存上下文（上游换包装）也接得住。
+    #[test]
+    fn status_codes_win_over_text_markers_and_disk_full_needs_no_context() {
+        let throttled = failure(SodaError::http(
+            "http request failed: status 429 (https://x.test quota exceeded)",
+        ));
+        assert_eq!(
+            throttled.retryability,
+            Retryability::Throttled,
+            "429 先落限流语义：{throttled:?}"
+        );
+        assert_eq!(throttled.stage, Stage::ResolveStream, "{throttled:?}");
+
+        let plain = failure(SodaError::http("no space left on device"));
+        assert_eq!(
+            plain.action,
+            RecoveryAction::FreeSpace,
+            "裸磁盘满文本也要指向腾空间：{plain:?}"
+        );
+        assert_eq!(plain.retryability, Retryability::Never, "{plain:?}");
     }
 
     /// 撞暂存锁是「正在下载，稍后再来」：可重试，不指向磁盘，也不算按曲目不可播。
