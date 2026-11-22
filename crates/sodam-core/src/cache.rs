@@ -589,10 +589,11 @@ pub(crate) fn purge_stale_staging_in(dir: &Path, max_age: Duration) -> usize {
         if !meta.is_file() {
             continue;
         }
-        let Ok(age) = meta
-            .modified()
-            .and_then(|modified| now.duration_since(modified))
-        else {
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        // mtime 在未来（时钟回拨）也算拿不到年龄，交给下一轮。
+        let Ok(age) = now.duration_since(modified) else {
             continue;
         };
         if age < max_age {
