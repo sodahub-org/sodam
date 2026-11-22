@@ -143,30 +143,17 @@ fn save_cover_file(path: &std::path::Path, bytes: &[u8]) -> bool {
 /// 连字符也编码：缓存文件名是 `{safe_id}-{档位}.m4a`，读回时按第一个 `-` 切出 id。
 /// safe id 里不能有 `-`，否则从文件名反推的 id 再编码一次就对不上了。
 fn safe_track_id(track_id: &str) -> String {
-    let bytes = track_id.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        // 已经是 `_XX` 转义的原样留下：从缓存文件名反推出的 id 还会再过一次这里，
-        // 幂等才能让「写入 → 反推 → 再写」落到同一个路径上。
-        if byte == b'_'
-            && i + 2 < bytes.len()
-            && bytes[i + 1].is_ascii_hexdigit()
-            && bytes[i + 2].is_ascii_hexdigit()
-        {
-            out.push('_');
-            out.push(bytes[i + 1] as char);
-            out.push(bytes[i + 2] as char);
-            i += 3;
-            continue;
-        }
-        if byte.is_ascii_alphanumeric() {
+    let mut out = String::with_capacity(track_id.len());
+    for byte in track_id.bytes() {
+        // 数字 id 原样保留：线上 id 都是数字串，这样缓存文件名不变，
+        // 而且从文件名反推出来的 id 再编码一次还是自己。
+        // 其余字节一律编码成 `_XX`，不做「看着像转义就放过」的猜测——
+        // 那种猜法会让 `a_2f` 和 `a/` 撞成同一个名字，播错歌。
+        if byte.is_ascii_digit() {
             out.push(byte as char);
         } else {
             out.push_str(&format!("_{byte:02x}"));
         }
-        i += 1;
     }
     out
 }
@@ -273,27 +260,28 @@ mod part_tests {
         assert_eq!(joined.parent(), Some(dir), "拼出的路径必须仍在缓存目录里");
     }
 
-    /// 净化要可逆到「不同 id 不撞名」：把怪字符压成同一个 `_` 会让两首歌
-    /// 共用一个暂存文件，而下载锁按原始 id 分，拦不住。
+    /// 净化必须是单射：两个不同 id 撞成同一个文件名会让两首歌共用一个缓存，
+    /// 播第二首时直接命中第一首的文件。review-fish 找到的洞是 `a_2f` 和 `a/`
+    /// 在「看着像 `_XX` 就放过」的猜法下会撞名。
     #[test]
     fn safe_track_id_keeps_distinct_ids_distinct() {
-        let slash = super::safe_track_id("a/b");
-        let underscore = super::safe_track_id("a_b");
-        assert_ne!(slash, underscore, "不同 id 不能撞成同一个文件名");
-        assert_eq!(super::safe_track_id("123"), "123", "正常数字 id 原样保留");
-        assert_eq!(
-            super::safe_track_id("a_b"),
-            "a_5fb",
-            "下划线也编码，免得跟编码序列撞"
+        assert_ne!(
+            super::safe_track_id("a/"),
+            super::safe_track_id("a_2f"),
+            "转义序列不能被当成已编码的原文放过"
         );
-        // safe id 里不能有 `-`：从文件名反推时按第一个 `-` 切分，
-        // 反推出来的 id 再编码一次必须还是自己，否则缓存永远 miss。
+        assert_ne!(
+            super::safe_track_id("a/b"),
+            super::safe_track_id("a_b"),
+            "不同 id 不能撞成同一个文件名"
+        );
+        assert_eq!(super::safe_track_id("123"), "123", "正常数字 id 原样保留");
         let encoded = super::safe_track_id("a-b_c/d");
         assert!(!encoded.contains('-'), "safe id 不能含分隔符: {encoded}");
+        // 数字 id 从文件名反推后仍是数字，再编码不变——真实场景走这条路。
         assert_eq!(
-            super::safe_track_id(&encoded),
-            encoded,
-            "从文件名反推的 id 再编码要稳定"
+            super::safe_track_id("7427204361343191057"),
+            "7427204361343191057"
         );
     }
 
