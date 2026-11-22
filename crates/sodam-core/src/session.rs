@@ -159,8 +159,9 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
 /// 暂存文件单独放一个子目录，别和正式缓存混在一起。
 /// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
 /// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
+/// 目录名与维护侧（`cache::STAGING_DIR_NAME`）共用一份。
 fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
-    audio_dir.join("staging")
+    audio_dir.join(crate::cache::STAGING_DIR_NAME)
 }
 
 /// 准备这组暂存目标：清掉上次被杀留下的交付目标，再拿租约挡住缓存维护。
@@ -583,6 +584,28 @@ fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
 }
 
+/// 续传发生时留一条日志：transferred 明显小于 total_len 就证明这次补的是缺口，
+/// 不是整份重来。点播与升级两条路共用——预取/升级的续传同样要能取证（#243）。
+fn log_resumed_download(report: &libresoda::soda::download::DownloadReport) {
+    let Some(from) = report.resumed_from else {
+        return;
+    };
+    use crate::log_outlet::{log_event, LogLevel, LogTopic};
+    let from = from.to_string();
+    let transferred = report.transferred.to_string();
+    let total = report.total_len.to_string();
+    log_event(
+        LogLevel::Info,
+        LogTopic::Audio,
+        "download_resumed",
+        &[
+            ("resumed_from", from.as_str()),
+            ("transferred", transferred.as_str()),
+            ("total_len", total.as_str()),
+        ],
+    );
+}
+
 /// 把「确认没有更高档位」写回 sidecar；失败不影响播放，下次再探。
 fn record_upgrade_check(
     quality_path: &std::path::Path,
@@ -913,24 +936,7 @@ impl Session {
             .pumpkin
             .download_resumable(&song, &part)
             .map_err(|err| classify(&err))?;
-        // 续传发生时留一条日志：transferred 明显小于 total_len 就证明这次
-        // 补的是缺口，不是整份重来（真机窄带宽验证靠它取证）。
-        if let Some(from) = report.resumed_from {
-            use crate::log_outlet::{log_event, LogLevel, LogTopic};
-            let from = from.to_string();
-            let transferred = report.transferred.to_string();
-            let total = report.total_len.to_string();
-            log_event(
-                LogLevel::Info,
-                LogTopic::Audio,
-                "download_resumed",
-                &[
-                    ("resumed_from", from.as_str()),
-                    ("transferred", transferred.as_str()),
-                    ("total_len", total.as_str()),
-                ],
-            );
-        }
+        log_resumed_download(&report);
         // 档位 / 试听标记取自这次传输自己的 `stream_info`：它跟落盘字节来自
         // 同一次取流，不会出现「整曲文件 + 试听标记」的错配（libresoda#55）。
         let info = report.stream_info;
@@ -1119,6 +1125,7 @@ impl Session {
             }
             classify(&err)
         })?;
+        log_resumed_download(&report);
         // 与点播同一条口径：档位 / 试听标记用这次传输自己的 stream_info。
         let info = report.stream_info;
 

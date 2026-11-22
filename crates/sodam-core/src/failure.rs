@@ -506,12 +506,13 @@ fn classify_http(detail: &str) -> PlaybackFailure {
     // 先认出来交给 FreeSpace，让预取闸门按磁盘类挂起、状态行指向腾空间。
     // 错误码兜底：ENOSPC=28、Windows ERROR_HANDLE_DISK_FULL=39 / ERROR_DISK_FULL=112。
     let lower = detail.to_ascii_lowercase();
-    const DISK_FULL_MARKERS: [&str; 6] = [
+    const DISK_FULL_MARKERS: [&str; 7] = [
         "no space left",
         "not enough space",
         "disk full",
         "空间不足",
         "os error 28",
+        "os error 39",
         "os error 112",
     ];
     if DISK_FULL_MARKERS
