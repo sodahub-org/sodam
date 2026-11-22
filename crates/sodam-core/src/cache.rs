@@ -135,7 +135,11 @@ fn protection_key(path: &Path) -> PathBuf {
 }
 
 /// 文件名是否落在可续传暂存族的命名表里（不含交付目标本身）。
-/// 后缀表每项带 `.m4a` 前缀，摘掉就是文件名里的实际后缀。
+///
+/// 与 [`protection_key`] 有一处刻意的宽严差：这里摘掉 `.m4a` 前缀再匹配，
+/// 封面的 `{hash}-160.img.*.part` 也会命中——它们共享同一条「24 小时内
+/// 不淘汰」的规则。保护键的映射（锁、记录还原到交付目标）仍要求 `.m4a`
+/// 前缀，否则封面临时文件会被错误地挂到某个音频暂存目标上。
 fn staged_family_member(name: &str) -> bool {
     STAGED_SUFFIXES
         .iter()
@@ -284,9 +288,10 @@ where
 
 /// 24 小时内的下载临时文件不参与淘汰（还在下载，或留着给下次续传）。
 ///
-/// 覆盖封面的 `.part` 临时名和 libresoda 暂存族的整族名字；调用方（淘汰、
-/// 清缓存）再按保护键把族聚合，保证数据和记录一起保护。过了窗口的暂存
-/// 由配额淘汰与保留期清扫处理，libresoda 下载时也会清掉 7 天过期对。
+/// 覆盖封面的 `.part` 临时名和 libresoda 暂存族的整族名字；调用方再按各自
+/// 的分组键（音频 `protection_key`、封面 `cover_group_key`）把族聚合，
+/// 保证数据和记录一起保护。过了窗口的暂存由配额淘汰与保留期清扫处理，
+/// libresoda 下载时也会清掉 7 天过期对。
 fn is_fresh_part(path: &Path, modified: SystemTime) -> bool {
     if modified.elapsed().unwrap_or_default() >= PART_MAX_AGE {
         return false;
