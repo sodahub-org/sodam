@@ -105,12 +105,18 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// 同一个暂存目标的 .part / .part.lock 与它的交付文件共享保护键：
-// 租约挂在暂存目标上时，这几个文件都不会被维护线程当废弃文件删掉。
+// 同一个暂存目标的全部暂存尾巴（.part / .part.lock / .part.meta / .part.meta.tmp /
+// .dec.tmp）与它的交付文件共享保护键：租约挂在暂存目标上时，这几个文件都不会被
+// 维护线程当废弃文件删掉。meta 与解密临时文件不带自己的租约，也必须跟着交付目标走，
+// 否则下载进行中被淘汰收尾删掉，断点续传信息就毁了。
 fn protection_key(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if let Some(stem) = name
         .strip_suffix(".m4a.part.lock")
+        .or_else(|| name.strip_suffix(".m4a.part.meta.tmp"))
+        .or_else(|| name.strip_suffix(".m4a.part.meta"))
+        .or_else(|| name.strip_suffix(".m4a.part.dec.tmp"))
+        .or_else(|| name.strip_suffix(".m4a.dec.tmp"))
         .or_else(|| name.strip_suffix(".m4a.part"))
     {
         return path.with_file_name(format!("{stem}.m4a"));
@@ -2617,14 +2623,19 @@ mod tests {
         assert!(!target.exists());
     }
 
-    /// 同一个暂存目标的文件共享保护键：租约挂在暂存目标上时，
-    /// 它的 .part / .part.lock 不会被维护线程当废弃文件删掉。
+    /// 同一个缓存目标的文件共享保护键：租约挂在暂存目标上时，
+    /// 它的全部暂存尾巴（.part / .part.lock / .part.meta / .part.meta.tmp / .dec.tmp）
+    /// 不会被维护线程当废弃文件删掉。
     #[test]
     fn audio_staging_files_share_the_target_lease() {
         let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
         for staged in [
             "/cache/audio/staging/123-lossless-normal.m4a.part",
             "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.meta",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.meta.tmp",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.dec.tmp",
+            "/cache/audio/staging/123-lossless-normal.m4a.dec.tmp",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
         }
@@ -2743,21 +2754,27 @@ mod tests {
     }
 
     /// #242：巡检的租约保护。租约挂在交付目标上（与 stage_path 同一处）时，
-    /// 同一组暂存的 `.part` / `.part.lock` 过期也不删；租约放开后下一轮清走。
+    /// 同一组暂存的所有尾巴过期也不删；租约放开后下一轮清走。
     #[test]
     fn sweep_respects_download_leases() {
         let dir = tempfile::tempdir().unwrap();
         let stage = staging_dir(dir.path());
         let part = file(&stage, "777-auto-normal.m4a.part", 90_000);
         let lock = file(&stage, "777-auto-normal.m4a.part.lock", 90_000);
+        let meta = file(&stage, "777-auto-normal.m4a.part.meta", 90_000);
+        let dec_tmp = file(&stage, "777-auto-normal.m4a.dec.tmp", 90_000);
         let lease = CacheLease::acquire(&stage.join("777-auto-normal.m4a"));
 
         assert_eq!(sweep_stale_staging_in(dir.path()), 0);
-        assert!(part.exists() && lock.exists(), "正在下载的暂存不能被清");
+        assert!(
+            part.exists() && lock.exists() && meta.exists() && dec_tmp.exists(),
+            "正在下载的暂存不能被清"
+        );
 
         drop(lease);
-        assert_eq!(sweep_stale_staging_in(dir.path()), 2);
+        assert_eq!(sweep_stale_staging_in(dir.path()), 4);
         assert!(!part.exists() && !lock.exists());
+        assert!(!meta.exists() && !dec_tmp.exists());
     }
 
     /// #242：超额淘汰正式音频时，该曲目在暂存子目录的整组残余同批消失，
@@ -2785,8 +2802,8 @@ mod tests {
         // 别的曲目的暂存：正式文件没被淘汰，它的锁必须留着。
         let others = file(&stage, "300-other-auto-normal.m4a.part.lock", 0);
 
-        // 全部文件各 10 字节、共 120。过期组只有三组（正式对 20、交付目标+part+锁 30、
-        // 元数据 10），上限 60 让淘汰正好停在过期组收完的那一刻；升级锁过期和新锁
+        // 全部文件各 10 字节、共 120。过期组只有两组（正式对 20、交付目标+part+锁+
+        // 元数据 40），上限 60 让淘汰正好停在过期组收完的那一刻；升级锁过期和新锁
         // 同组，组的使用时间取较新的，落进新鲜段不动，只能靠收尾按名字带走。
         // 新鲜的升级 `.part` 不参与分组淘汰，同样靠收尾。收尾共带走 30 字节，剩 30。
         assert_eq!(trim_audio_in(dir.path(), 60), 30);
@@ -2808,20 +2825,24 @@ mod tests {
         let stage = staging_dir(dir.path());
         let part = file(&stage, "500-old-auto-normal.m4a.part", 90_000);
         let lock = file(&stage, "500-old-auto-normal.m4a.part.lock", 90_000);
-        // 与 stage_path 一致：租约挂在交付目标上。
+        let meta = file(&stage, "500-old-auto-normal.m4a.part.meta", 90_000);
+        let dec_tmp = file(&stage, "500-old-auto-normal.m4a.dec.tmp", 90_000);
+        // 与 stage_path 一致：租约挂在交付目标上。meta 与 dec.tmp 没有自己的租约，
+        // 也必须跟着交付目标走，否则下载进行中被收尾删掉，断点续传信息就毁了。
         let lease = CacheLease::acquire(&stage.join("500-old-auto-normal.m4a"));
 
-        // 正式文件 + sidecar（20 字节）被淘汰；租约挡着的 `.part` + 锁留在统计里。
-        assert_eq!(trim_audio_in(dir.path(), 0), 20);
+        // 正式文件 + sidecar（20 字节）被淘汰；租约挡着的 40 字节暂存留在统计里。
+        assert_eq!(trim_audio_in(dir.path(), 0), 40);
         assert!(!committed.exists(), "正式缓存没租约，照常淘汰");
         assert!(
-            part.exists() && lock.exists(),
+            part.exists() && lock.exists() && meta.exists() && dec_tmp.exists(),
             "正在下载的暂存不能被淘汰收尾删掉"
         );
 
         drop(lease);
         assert_eq!(trim_audio_in(dir.path(), 0), 0);
         assert!(!part.exists() && !lock.exists());
+        assert!(!meta.exists() && !dec_tmp.exists());
     }
 
     #[cfg(unix)]
