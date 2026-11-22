@@ -646,8 +646,8 @@ fn remove_evicted_staging(removed: &[PathBuf], staging: &Path) -> u64 {
 /// 底层库从不删锁文件（进程退出靠内核解锁，一个下载目标留一把空锁是它写明的设计），
 /// 它自带的 7 天清扫也只认「数据 + 记录成对、两边都够老」的文件——只有 `.part`
 /// 没有记录的孤儿它认不出，锁文件更是完全不认。历史残留只能在这里按后缀白名单补刀：
-/// `.part` / `.part.meta` / `.part.meta.tmp` / `.dec.tmp` / `.part.lock`，超过 24 小时
-/// 且租约放行的才删；清完之后锁文件数量就降到「最近 24 小时内下载过的曲目数」的量级。
+/// 名单见 [`STAGING_TAILS`]，超过 24 小时且租约放行的才删；清完之后锁文件数量就降到
+/// 「最近 24 小时内下载过的曲目数」的量级。
 ///
 /// 正式缓存、`.quality` 记录、封面和名字不相干的文件一律不碰；正在下载的暂存由
 /// 租约挡住（检查与 unlink 在同一临界区），24 小时的年龄门槛再兜一层底。
@@ -655,7 +655,12 @@ fn remove_evicted_staging(removed: &[PathBuf], staging: &Path) -> u64 {
 /// `stage_path` 或淘汰收尾负责，巡检不凭后缀判断 `.m4a` 的归属。
 /// 返回删除的文件数。调用方必须在后台执行。
 pub fn sweep_stale_staging_in(dir: &Path) -> usize {
-    let removed = scan_files(dir)
+    sweep_scan(scan_files(dir))
+}
+
+/// 白名单清扫的执行核心：过期的暂存尾巴按租约放行逐个删除并记日志。
+fn sweep_scan(scan: Scan) -> usize {
+    let removed = scan
         .files
         .into_iter()
         .filter(|file| {
@@ -679,19 +684,44 @@ pub fn sweep_stale_staging_in(dir: &Path) -> usize {
     removed
 }
 
+/// 首轮巡检的门：扫描完整才执行清扫；不完整这轮跳过并留痕，不算完成。
+///
+/// 与封面淘汰同一条教训（#225）：子树临时读不到（权限抖动、盘忙、被锁）会让
+/// 扫描标成不完整，可读部分里的残留这轮不清，留给下轮维护重试——一次性开关
+/// 绝不能在不完整的扫描上落位。拆成纯函数是为了让这套语义能被测试固定。
+/// 返回 (删除数, 本轮是否算完成)。
+fn sweep_first_run(scan: Scan) -> (usize, bool) {
+    if scan.incomplete {
+        let readable_files = scan.files.len().to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "stale_staging_sweep_incomplete",
+            &[("readable_files", readable_files.as_str())],
+        );
+        return (0, false);
+    }
+    (sweep_scan(scan), true)
+}
+
 /// 对整个音频缓存目录（含暂存子目录）跑一轮残留清扫，返回删除的文件数。
 ///
 /// 只在启动后的首轮维护实际执行：主心跳约 60 秒就调一轮维护，而残留的年龄门槛
 /// 是 24 小时，会话期间新产生的残留本来就不满 24 小时，每轮重扫几乎全是空跑；
 /// 音频目录可能上万文件，这个代价省得掉。会话期间攒下的残留留给下次启动清，
-/// 与「每次启动的缓存巡检顺手清掉」的口径一致。调用方必须在后台执行。
+/// 与「每次启动的缓存巡检顺手清掉」的口径一致。扫描完整才置「已巡检」：
+/// 首轮赶上子树读不到时这轮跳过、下轮重试（Warn 留痕）。调用方必须在后台执行。
 pub fn sweep_stale_staging() -> usize {
     static STALE_SWEEP_DONE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    if STALE_SWEEP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if STALE_SWEEP_DONE.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
-    sweep_stale_staging_in(&root_dir().join("audio"))
+    let (removed, complete) = sweep_first_run(scan_files(&root_dir().join("audio")));
+    if complete {
+        STALE_SWEEP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    removed
 }
 
 pub fn trim_audio(limit_mb: u64) -> u64 {
@@ -2715,6 +2745,7 @@ mod tests {
             "100-old-auto-normal.m4a.part.meta",
             "100-old-auto-normal.m4a.part.meta.tmp",
             "100-old-auto-normal.m4a.dec.tmp",
+            "100-old-auto-normal.m4a.part.dec.tmp",
             "100-old-auto-upgrade.m4a.part.lock",
         ] {
             assert_eq!(
@@ -2743,20 +2774,18 @@ mod tests {
     }
 
     /// #242：过期的暂存残留按白名单清掉，其余一个不碰。
-    ///
-    /// 清的：五种暂存尾巴 + 历史格式的 `.part.part` / `.part.part.lock`。
-    /// 留的：正式缓存、sidecar、封面式名字、不相干文件（过期也留）、
-    /// 暂存里的交付目标（`.m4a` 不在白名单）、以及 24 小时内的残留。
     #[test]
     fn sweep_removes_only_stale_whitelisted_residue() {
         let dir = tempfile::tempdir().unwrap();
-        // 过期残留：五种后缀各一个，外加历史格式的孤儿数据和锁、新暂存子目录里的锁。
+        // 过期残留：六种尾巴各一个（dec.tmp 的两种拼法都算），外加历史格式的
+        // 孤儿数据和锁、新暂存子目录里的锁。
         let stale = [
             "111-auto.m4a.part",
             "111-auto.m4a.part.lock",
             "111-auto.m4a.part.meta",
             "111-auto.m4a.part.meta.tmp",
             "111-auto.m4a.dec.tmp",
+            "111-auto.m4a.part.dec.tmp",
             "222-low-4242-7.m4a.part.part",
             "222-low-4242-7.m4a.part.part.lock",
             "staging/333-auto-normal.m4a.part.lock",
@@ -2795,9 +2824,6 @@ mod tests {
     }
 
     /// #242：巡检不删租约还在的暂存，放开后下一轮清走。
-    ///
-    /// 租约挂在交付目标上（与 stage_path 同一处）；同组的所有尾巴——包括没有
-    /// 自己租约的 `.part.meta` / `.dec.tmp`——过期也不删。
     #[test]
     fn sweep_respects_download_leases() {
         let dir = tempfile::tempdir().unwrap();
@@ -2820,9 +2846,34 @@ mod tests {
         assert!(!meta.exists() && !dec_tmp.exists());
     }
 
-    /// #242：超额淘汰正式音频时，它的暂存整组同批消失，别曲目的不沾。
+    /// #242：首轮巡检赶上扫描不完整就跳过本轮、留给下轮重试。
     ///
-    /// 24 小时内不参与分组淘汰的 `.part` 也由收尾带走（租约挡住的除外）。
+    /// 一次性开关绝不能在不完整的扫描上落位（#225 同款教训）：
+    /// 可读部分的残留也要等完整扫描再清。
+    #[test]
+    fn sweep_first_run_skips_incomplete_scan_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = file(dir.path(), "111-auto.m4a.part", 90_000);
+        file(dir.path(), "unreadable/222-auto.m4a.part", 90_000);
+        let scan = scan_denying(dir.path(), &dir.path().join("unreadable"));
+        assert!(scan.incomplete);
+
+        let (removed, complete) = sweep_first_run(scan);
+        assert_eq!((removed, complete), (0, false), "不完整的扫描这轮不清");
+        assert!(stale.exists(), "可读部分的残留也要等完整扫描再清");
+
+        // 下轮扫描恢复完整：上轮看漏的那条也一起清掉，一次性开关这才落位。
+        let (removed, complete) = sweep_first_run(scan_files(dir.path()));
+        assert_eq!((removed, complete), (2, true));
+        assert!(!stale.exists());
+        assert!(!dir
+            .path()
+            .join("unreadable")
+            .join("222-auto.m4a.part")
+            .exists());
+    }
+
+    /// #242：超额淘汰正式音频时，它的暂存整组同批消失，别曲目的不沾。
     #[test]
     fn evicted_audio_takes_its_staging_group_along() {
         let dir = tempfile::tempdir().unwrap();
@@ -2858,8 +2909,6 @@ mod tests {
     }
 
     /// #242：下载进行中的暂存不被淘汰收尾删，正式缓存照常淘汰。
-    ///
-    /// 租约放开后（下载完成或失败）残留下轮清走。
     #[test]
     fn eviction_spares_staging_of_running_download() {
         let dir = tempfile::tempdir().unwrap();
