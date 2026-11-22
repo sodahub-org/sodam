@@ -2742,9 +2742,11 @@ mod tests {
         assert_eq!(staging_committed_name("222-low-4242-7.m4a.part.part"), None);
     }
 
-    /// #242：启动巡检按「后缀白名单 + 24 小时 + 租约」清暂存残留。
-    /// 过期的各种后缀（含历史 `.part.part` / `.part.part.lock`）全清；
-    /// 正式缓存、sidecar、不相干文件、24 小时内的残留、暂存里的交付目标一律保留。
+    /// #242：过期的暂存残留按白名单清掉，其余一个不碰。
+    ///
+    /// 清的：五种暂存尾巴 + 历史格式的 `.part.part` / `.part.part.lock`。
+    /// 留的：正式缓存、sidecar、封面式名字、不相干文件（过期也留）、
+    /// 暂存里的交付目标（`.m4a` 不在白名单）、以及 24 小时内的残留。
     #[test]
     fn sweep_removes_only_stale_whitelisted_residue() {
         let dir = tempfile::tempdir().unwrap();
@@ -2792,8 +2794,10 @@ mod tests {
         }
     }
 
-    /// #242：巡检的租约保护。租约挂在交付目标上（与 stage_path 同一处）时，
-    /// 同一组暂存的所有尾巴过期也不删；租约放开后下一轮清走。
+    /// #242：巡检不删租约还在的暂存，放开后下一轮清走。
+    ///
+    /// 租约挂在交付目标上（与 stage_path 同一处）；同组的所有尾巴——包括没有
+    /// 自己租约的 `.part.meta` / `.dec.tmp`——过期也不删。
     #[test]
     fn sweep_respects_download_leases() {
         let dir = tempfile::tempdir().unwrap();
@@ -2816,9 +2820,9 @@ mod tests {
         assert!(!meta.exists() && !dec_tmp.exists());
     }
 
-    /// #242：超额淘汰正式音频时，该曲目在暂存子目录的整组残余同批消失，
-    /// 包括 24 小时内、本来不参与淘汰的 `.part`（租约挡得住的除外）；
-    /// 别的曲目、别的用途的暂存一概不沾。
+    /// #242：超额淘汰正式音频时，它的暂存整组同批消失，别曲目的不沾。
+    ///
+    /// 24 小时内不参与分组淘汰的 `.part` 也由收尾带走（租约挡住的除外）。
     #[test]
     fn evicted_audio_takes_its_staging_group_along() {
         let dir = tempfile::tempdir().unwrap();
@@ -2841,10 +2845,9 @@ mod tests {
         // 别的曲目的暂存：正式文件没被淘汰，它的锁必须留着。
         let others = file(&stage, "300-other-auto-normal.m4a.part.lock", 0);
 
-        // 全部文件各 10 字节、共 120。过期组只有两组（正式对 20、交付目标+part+锁+
-        // 元数据 40），上限 60 让淘汰正好停在过期组收完的那一刻；升级锁过期和新锁
-        // 同组，组的使用时间取较新的，落进新鲜段不动，只能靠收尾按名字带走。
-        // 新鲜的升级 `.part` 不参与分组淘汰，同样靠收尾。收尾共带走 30 字节，剩 30。
+        // 断言 30 的算法：全部文件各 10 字节共 120，上限 60 正好在过期组收完时停
+        // （正式对 20 + 交付目标组 40）。升级锁过期和新锁同组、使用时间取较新的，
+        // 落进新鲜段不动；新鲜升级 `.part` 不参与分组——这 30 字节全靠收尾带走。
         assert_eq!(trim_audio_in(dir.path(), 60), 30);
         assert!(!old.exists() && !old.with_extension("quality").exists());
         for path in gone_with_it {
@@ -2854,8 +2857,9 @@ mod tests {
         assert!(others.exists(), "别的曲目的暂存不属于这批淘汰，不能顺手删");
     }
 
-    /// #242：淘汰时正在进行的下载仍受租约保护——正式文件可以被淘汰，
-    /// 它名下的暂存要留到下载收尾（完成即交付、失败下轮再清）。
+    /// #242：下载进行中的暂存不被淘汰收尾删，正式缓存照常淘汰。
+    ///
+    /// 租约放开后（下载完成或失败）残留下轮清走。
     #[test]
     fn eviction_spares_staging_of_running_download() {
         let dir = tempfile::tempdir().unwrap();
