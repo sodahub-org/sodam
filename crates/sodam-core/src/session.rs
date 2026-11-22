@@ -158,12 +158,19 @@ fn stage_path(
     tag: &str,
     purpose: crate::cache::DownloadPurpose,
 ) -> (std::path::PathBuf, crate::cache::CacheLease) {
-    let part = dir.join(part_file_name(track_id, tag, purpose));
-    // 名字固定后，上次被杀留下的交付目标会占着同一个路径。libresoda 的 `.part`
-    // 系列它自己会清，但交付目标这一层不在它管内；这里清掉，重放同一首才不会被
-    // 残留顶回来。调用方已持有对应用途的下载锁。
-    if part.exists() {
-        let _ = std::fs::remove_file(&part);
+    let name = part_file_name(track_id, tag, purpose);
+    let part = dir.join(&name);
+    // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
+    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁，这几个必然是
+    // 上一轮留下的，顺手清掉，重放就从干净状态开始，不依赖上游怎么处理残留。
+    for stale in [
+        part.clone(),
+        dir.join(format!("{name}.part")),
+        dir.join(format!("{name}.part.lock")),
+    ] {
+        if stale.exists() {
+            let _ = std::fs::remove_file(&stale);
+        }
     }
     let lease = crate::cache::CacheLease::acquire(&part);
     (part, lease)
@@ -210,13 +217,17 @@ mod part_tests {
         assert_eq!(upgrade, "123-lossless-upgrade.m4a");
     }
 
-    /// 名字固定后，上次被杀留下的交付目标会占着同一个路径。stage_path 要先清掉它，
-    /// 再拿租约挡住维护线程；返回的路径就是固定名。
+    /// 名字固定后，上次被杀留下的整组暂存会挂在下次要用的同一组名字上。
+    /// stage_path 要把交付目标、`.part`、`.part.lock` 都清掉，再拿租约挡住维护线程。
     #[test]
-    fn stage_path_discards_stale_target_and_holds_lease() {
+    fn stage_path_discards_all_stale_staging_and_holds_lease() {
         let dir = tempfile::tempdir().unwrap();
         let stale = dir.path().join("123-lossless-normal.m4a");
-        std::fs::write(&stale, b"leftover from a killed download").unwrap();
+        let stale_part = dir.path().join("123-lossless-normal.m4a.part");
+        let stale_lock = dir.path().join("123-lossless-normal.m4a.part.lock");
+        std::fs::write(&stale, b"leftover target").unwrap();
+        std::fs::write(&stale_part, b"leftover part data").unwrap();
+        std::fs::write(&stale_lock, b"").unwrap();
 
         let (part, lease) = super::stage_path(
             dir.path(),
@@ -226,7 +237,9 @@ mod part_tests {
         );
 
         assert_eq!(part, stale, "暂存目标名固定，复用上次那一个");
-        assert!(!part.exists(), "上次留下的交付目标必须清掉");
+        assert!(!stale.exists(), "上次留下的交付目标必须清掉");
+        assert!(!stale_part.exists(), "半截的 .part 必须清掉");
+        assert!(!stale_lock.exists(), "旧的 .part.lock 必须清掉");
         assert_eq!(lease.0.as_path(), part.as_path(), "租约挂在暂存目标上");
     }
 }
