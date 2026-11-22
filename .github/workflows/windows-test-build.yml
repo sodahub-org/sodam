@@ -1,0 +1,55 @@
+name: windows test build
+
+# 临时：给「gpui 基线换到 d9a82ba」那个 PR 出一个 Windows 安装包，方便真机试。
+# 产物版本号带 -test.<运行号>，不会顶掉同版本号的正式包。
+# 只活在 ci/gpui-d9a82ba-windows 这条分支上，不要合并。
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: win-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    name: Windows x64 installer (test)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows runner 自带 VS Build Tools，托盘（tray-icon）与 DirectX 后端无需额外系统依赖。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --package sodam
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+        shell: pwsh
+
+      - name: Create test installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          $testVersion = "$version-test.${{ github.run_number }}"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$testVersion" `
+            packaging/windows/sodam.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "release/sodam-$testVersion-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "installer not found: $setup" }
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "$setup.sha256" -Encoding ascii
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodam-windows-x64-test
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
