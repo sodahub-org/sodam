@@ -502,15 +502,17 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
 
 /// `SodaError::Http` 只剩字符串，相位信息已经在上游丢失；这里只解析结构化的状态码。
 fn classify_http(detail: &str) -> PlaybackFailure {
-    // 暂存路径把「写盘失败」也包在传输中断的文本里带出来（`staged download
-    // interrupted: <io 文本>`），而 io 文本可能是本地化的——中文 Windows 报
-    // 「磁盘空间不足」，英文报 "not enough space on the disk"。磁盘满重试不会好，
-    // 先认出来交给 FreeSpace，让预取闸门按磁盘类挂起、状态行指向腾空间。
-    // errno 兜底必须按平台认：ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux
-    // 是 ENOTEMPTY / EHOSTDOWN——断网时 libresoda 会把 `Host is down
-    // (os error 112)` 包进同一句文本里，跨平台硬认会把断网判成磁盘满。
-    // 磁盘配额是另一路：Linux EDQUOT=122（容器/网络盘配额打满），
-    // Windows 的 122 却是 ERROR_INSUFFICIENT_BUFFER，同样不能跨平台认。
+    // 磁盘满判据只挂在暂存上下文（`staged download interrupted:` 是
+    // libresoda 暂存路径包写盘/读体失败的统一前缀）——这段检查排在
+    // 状态码解析之前，放开上下文会把带 quota 字样的限流回包吞成
+    // FreeSpace。进得来 `classify_http` 的磁盘满必然带这个前缀；
+    // 不带前缀的 io 失败走 `classify` 的 Io 分支，同样按 FreeSpace 处理。
+    // io 文本可能是本地化的（中文 Windows 报「磁盘空间不足」，英文报
+    // "not enough space on the disk"）。errno 兜底必须按平台认：
+    // ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux 是 ENOTEMPTY /
+    // EHOSTDOWN（断网的 `Host is down (os error 112)`），122 在 Linux
+    // 是 EDQUOT 而在 Windows 是 ERROR_INSUFFICIENT_BUFFER——跨平台
+    // 硬认会把断网判成磁盘满。
     let lower = detail.to_ascii_lowercase();
     const DISK_FULL_TEXT: [&str; 5] = [
         "no space left",
