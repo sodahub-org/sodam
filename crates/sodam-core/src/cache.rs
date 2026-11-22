@@ -749,13 +749,17 @@ fn sweep_first_run(state: &SweepState, scan: Scan) -> (usize, SweepState) {
 /// 是 24 小时，会话期间新产生的残留本来就不满 24 小时，每轮重扫几乎全是空跑；
 /// 音频目录可能上万文件，这个代价省得掉。会话期间攒下的残留留给下次启动清，
 /// 与「每次启动的缓存巡检顺手清掉」的口径一致。整个状态机（查状态 → 扫描 →
-/// 落位）由一把互斥锁串行化：并发调用按先后排队，后到的看到已结束就空转返回，
-/// 轮数也不会丢更新——这是 pub 函数，正确性不押在调用方恰好单飞上。
-/// 扫描完整或连续不完整到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮才算结束。
-/// 调用方必须在后台执行。
+/// 落位）由一把互斥锁串行化，用 [`std::sync::Mutex::try_lock`] 而不是阻塞等锁：
+/// 拿不到锁说明另一轮巡检正在进行，本轮直接空转返回——后到者不为一次全量
+/// 扫盘干等，同一时刻也不会有两个调用各烧一个不完整轮数名额。这是 pub 函数，
+/// 正确性不押在调用方恰好单飞上。扫描完整或连续不完整到
+/// [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮才算结束。调用方必须在后台执行。
 pub fn sweep_stale_staging() -> usize {
     static SWEEP_STATE: Mutex<SweepState> = Mutex::new(SweepState::NotRun);
-    let mut state = SWEEP_STATE.lock().unwrap_or_else(|err| err.into_inner());
+    // 拿不到锁说明另一轮巡检正在扫：它做完这件事就结束，这轮无事可做。
+    let Ok(mut state) = SWEEP_STATE.try_lock() else {
+        return 0;
+    };
     if matches!(*state, SweepState::Finished) {
         return 0;
     }
