@@ -181,13 +181,13 @@ fn stage_path(
 
     let stage = staging_dir(dir);
     // 建不出暂存目录就没法下载：直接报确定的失败，别拿着一条父目录都不存在的
-    // 路径往下走，最后被 classify 归因成传输错误。
+    // 路径往下走。错误里带上路径，报问题时不用回头猜是哪一层缓存目录。
     std::fs::create_dir_all(&stage).map_err(|err| {
         PlaybackFailure::new(
             Stage::Unpack,
             Retryability::Never,
             RecoveryAction::FreeSpace,
-            err.to_string(),
+            format!("{}: {err}", stage.display()),
         )
     })?;
     let name = part_file_name(track_id, tag, purpose);
@@ -321,6 +321,31 @@ mod part_tests {
             "同名正式缓存不能被清理误删"
         );
         assert_eq!(lease.0.as_path(), part.as_path(), "租约挂在暂存目标上");
+    }
+
+    /// 暂存目录建不出来时不能拿着写不进去的路径往下走，要给确定性的落盘失败。
+    #[test]
+    fn stage_path_reports_unpack_failure_when_staging_dir_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        // 用同名普通文件占住 staging，create_dir_all 必然失败。
+        std::fs::write(dir.path().join("staging"), b"occupied").unwrap();
+
+        let err = super::stage_path(
+            dir.path(),
+            "123",
+            "lossless",
+            crate::cache::DownloadPurpose::Normal,
+        )
+        .err()
+        .expect("建不出目录该报错，不能继续");
+
+        assert_eq!(err.stage, crate::failure::Stage::Unpack);
+        assert_eq!(err.action, crate::failure::RecoveryAction::FreeSpace);
+        assert!(
+            err.detail.contains("staging"),
+            "错误里要带上路径: {}",
+            err.detail
+        );
     }
 }
 
