@@ -330,14 +330,15 @@ mod part_tests {
         // 用同名普通文件占住 staging，create_dir_all 必然失败。
         std::fs::write(dir.path().join("staging"), b"occupied").unwrap();
 
-        let err = super::stage_path(
+        let err = match super::stage_path(
             dir.path(),
             "123",
             "lossless",
             crate::cache::DownloadPurpose::Normal,
-        )
-        .err()
-        .expect("建不出目录该报错，不能继续");
+        ) {
+            Ok(_) => panic!("建不出目录该报错，不能继续"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.stage, crate::failure::Stage::Unpack);
         assert_eq!(err.action, crate::failure::RecoveryAction::FreeSpace);
