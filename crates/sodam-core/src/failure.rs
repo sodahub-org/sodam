@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 /// 失败发生的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// 取回可用流及其地址，含向签名服务请求签名（阶段一 无法把两者分开）。
+    /// 取回可用流及其地址，含向签名服务请求签名（ libresoda 内部把两步
+    /// 串在一次调用里，本层无法把两者分开）。
     ResolveStream,
     /// 把音频体的字节从 CDN 搬到本地。
     Transfer,
@@ -508,13 +509,20 @@ fn classify_http(detail: &str) -> PlaybackFailure {
     // errno 兜底必须按平台认：ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux
     // 是 ENOTEMPTY / EHOSTDOWN——断网时 libresoda 会把 `Host is down
     // (os error 112)` 包进同一句文本里，跨平台硬认会把断网判成磁盘满。
+    // 磁盘配额是另一路：Linux EDQUOT=122（容器/网络盘配额打满），
+    // Windows 的 122 却是 ERROR_INSUFFICIENT_BUFFER，同样不能跨平台认。
     let lower = detail.to_ascii_lowercase();
-    const DISK_FULL_TEXT: [&str; 4] =
-        ["no space left", "not enough space", "disk full", "空间不足"];
+    const DISK_FULL_TEXT: [&str; 5] = [
+        "no space left",
+        "not enough space",
+        "disk full",
+        "quota exceeded",
+        "空间不足",
+    ];
     #[cfg(windows)]
     const ERRNO_DISK_FULL: [&str; 2] = ["os error 39", "os error 112"];
     #[cfg(not(windows))]
-    const ERRNO_DISK_FULL: [&str; 1] = ["os error 28"];
+    const ERRNO_DISK_FULL: [&str; 2] = ["os error 28", "os error 122"];
     let disk_full = DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
         || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker));
     if disk_full {
@@ -831,6 +839,35 @@ mod tests {
             assert_eq!(host_down.action, RecoveryAction::Nothing, "{host_down:?}");
             assert_eq!(host_down.stage, Stage::Transfer, "{host_down:?}");
         }
+
+        // 磁盘配额是另一路：文本在所有平台都指磁盘，errno 只在 POSIX 侧认
+        // （Linux EDQUOT=122；Windows 的 122 是 ERROR_INSUFFICIENT_BUFFER）。
+        let quota_text = failure(SodaError::http(
+            "staged download interrupted: Disk quota exceeded (os error 122)",
+        ));
+        assert_eq!(
+            quota_text.action,
+            RecoveryAction::FreeSpace,
+            "{quota_text:?}"
+        );
+        assert_eq!(
+            quota_text.retryability,
+            Retryability::Never,
+            "{quota_text:?}"
+        );
+        let errno_only = failure(SodaError::http("staged download interrupted: os error 122"));
+        #[cfg(not(windows))]
+        assert_eq!(
+            errno_only.action,
+            RecoveryAction::FreeSpace,
+            "POSIX 侧 122 是 EDQUOT：{errno_only:?}"
+        );
+        #[cfg(windows)]
+        assert_ne!(
+            errno_only.action,
+            RecoveryAction::FreeSpace,
+            "Windows 的 122 不是磁盘含义：{errno_only:?}"
+        );
     }
 
     /// 撞暂存锁是「正在下载，稍后再来」：可重试，不指向磁盘，也不算按曲目不可播。

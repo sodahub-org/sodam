@@ -593,7 +593,8 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
 pub(crate) const STAGING_DIR_NAME: &str = "staging";
 
 /// 可续传暂存残留的保留期：与 libresoda 自己的 7 天过期清扫同一条口径。
-/// 失败留下的暂存在这段时间内始终值得留——下一次播放就从它接上（#243）。
+/// 配额不紧时，失败留下的暂存在这段时间内始终值得留——下一次播放就从它
+/// 接上；配额吃紧时 24 小时新鲜窗一过就按 LRU 先走（#243）。
 const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub fn trim_audio(limit_mb: u64) -> u64 {
