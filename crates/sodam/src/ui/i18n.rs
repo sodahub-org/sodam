@@ -536,6 +536,7 @@ impl Language {
             "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
             "批量升级" => "Batch Upgrade",
             "正在停止批量升级…" => "Stopping batch upgrade…",
+            "正在停止…" => "Stopping…",
             "账号已变更，批量已停止 ({} / {})" => {
                 "Account changed; batch upgrade stopped ({} / {})"
             }
@@ -546,8 +547,8 @@ impl Language {
             "正在退出登录，批量已停止 ({} / {})" => {
                 "Signing out; batch upgrade stopped ({} / {})"
             }
-            "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位" => {
-                "Cache upgrade complete: upgraded {} songs, {} failed, {} with no higher quality"
+            "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲" => {
+                "Cache upgrade complete: upgraded {} songs, {} failed, {} without a better full track"
             }
             "正在整理缓存，请稍后再试" => "Cache maintenance is running; try again in a moment",
             "正在退出登录，请稍后再试" => "Signing out; try again in a moment",

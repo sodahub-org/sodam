@@ -1208,7 +1208,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .rounded(px(theme::radius::ROW))
                                 .text_size(theme::Text::Small.size());
 
-                            if root.batch_upgrading {
+                            if root.batch_upgrading && root.batch_upgrade_cancel {
+                                // 已经点过取消，等正在下的那一首跑完：按钮不再响应，
+                                // 文案说清在等什么，别让第二下点了没反应。
+                                btn = btn
+                                    .bg(theme::surface_elevated())
+                                    .text_color(theme::text_faint());
+                            } else if root.batch_upgrading {
                                 // 升级中变「取消」：只停在下一首之前，正在下的那一首不打断。
                                 btn = btn
                                     .bg(theme::surface_elevated())
@@ -1238,7 +1244,11 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                             }
 
                             btn.child(if root.batch_upgrading {
-                                root.tr("取消")
+                                if root.batch_upgrade_cancel {
+                                    root.tr("正在停止…")
+                                } else {
+                                    root.tr("取消")
+                                }
                             } else {
                                 root.tr("批量升级")
                             })
