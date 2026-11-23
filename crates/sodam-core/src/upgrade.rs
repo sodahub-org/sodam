@@ -49,6 +49,16 @@ pub struct StreamShape {
     pub preview: bool,
 }
 
+impl StreamShape {
+    /// 读一份已缓存流的样子。升级前后各取一次，判定只看这两份。
+    pub fn of(cached: &crate::session::CachedTrack) -> Self {
+        Self {
+            rank: cached.quality_rank,
+            preview: cached.preview,
+        }
+    }
+}
+
 /// 一首跑完落在哪一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -107,6 +117,9 @@ impl Tally {
 ///
 /// 表跟着身份走：换号 / 登出后整份作废，同一首同一档位在新账号下重新可试（#254）。
 /// 身份代数由调用方在 [`UpgradeAttempts::observe_epoch`] 里喂进来，这里不自己数。
+///
+/// 一条记号记下就一直留着：网络抖一下、或者这首确实没有更高档位，都不该让它在每次播放时
+/// 重跑一遍。作废只有两个来源——换了身份，或者盘上那份缓存被清掉。
 #[derive(Debug, Default)]
 pub struct UpgradeAttempts {
     epoch: u64,
@@ -117,16 +130,6 @@ impl UpgradeAttempts {
     /// 记一次尝试；已经记过返回 `false`，这次不用再跑。
     pub fn begin(&mut self, key: String) -> bool {
         self.keys.insert(key)
-    }
-
-    /// 这次没真升级：撤掉记号，同一首下次还能再试。
-    ///
-    /// 只在身份没变时撤。换号之后整张表已经作废，这时撤掉的很可能是新号刚记下的
-    /// 那一条，撤了就成了「新号多跑一遍」。
-    pub fn abandon(&mut self, key: &str, epoch: u64) {
-        if epoch == self.epoch {
-            self.keys.remove(key);
-        }
     }
 
     /// 身份代数变了就整份作废；返回这次到底清没清。
@@ -241,35 +244,16 @@ mod tests {
         assert!(!attempts.begin(key.clone()));
     }
 
-    /// 没真升级的记号可以撤；但旧身份回来的结果撤不掉新身份刚记下的那一条。
+    /// 清缓存把记号一起作废：文件没了，同一首当然要能重新跑。
     #[test]
-    fn abandoning_only_works_for_the_same_identity() {
+    fn clearing_drops_the_marks() {
         let mut attempts = UpgradeAttempts::default();
         let key = "8801:lossless".to_string();
-
         assert!(attempts.begin(key.clone()));
-        attempts.abandon(&key, 0);
-        assert!(attempts.begin(key.clone()), "没真升级的可以再试");
-
-        // 换了号，新号记下同一条；旧号在途的结果回来时不能把它撤掉。
-        attempts.observe_epoch(1);
-        assert!(attempts.begin(key.clone()));
-        attempts.abandon(&key, 0);
         assert!(!attempts.begin(key.clone()));
-    }
-
-    /// 清缓存把记号一起作废，但不算换身份。
-    #[test]
-    fn clearing_drops_the_marks_without_touching_the_epoch() {
-        let mut attempts = UpgradeAttempts::default();
-        let key = "8801:lossless".to_string();
-        assert!(attempts.begin(key.clone()));
 
         attempts.clear();
-        assert!(attempts.begin(key.clone()));
-        // 代数没动过，旧身份的在途结果照样能撤。
-        attempts.abandon(&key, 0);
-        assert!(attempts.begin(key));
+        assert!(attempts.begin(key), "清掉缓存后同一首要能重新试");
     }
 
     /// 收尾的三个数分开记，总数只算真跑过的。

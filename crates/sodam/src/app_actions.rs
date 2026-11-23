@@ -2948,20 +2948,13 @@ impl Root {
         let session = Session::new(settings);
         // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
         // 返回旧文件，只有前后对比才分得清「提升了」和「跑了但没变化」。
-        let before = session.cached_track(&track.id).map(|cached| StreamShape {
-            rank: cached.quality_rank,
-            preview: cached.preview,
-        });
+        let before = session
+            .cached_track(&track.id)
+            .map(|cached| StreamShape::of(&cached));
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(cached) => {
                 let outcome = before.map_or(Outcome::NoHigherTier, |before| {
-                    Outcome::of_shapes(
-                        before,
-                        StreamShape {
-                            rank: cached.quality_rank,
-                            preview: cached.preview,
-                        },
-                    )
+                    Outcome::of_shapes(before, StreamShape::of(&cached))
                 });
                 if outcome == Outcome::Upgraded {
                     log_outlet::log_event(
@@ -3013,21 +3006,16 @@ impl Root {
 
         self.cache_upgrade_inflight.insert(key.clone());
 
-        // 结果回来时对一下身份代数：换号之后这张表已经作废，别拿旧号的结果去撤新号的记号。
-        let epoch = self.auth_epoch;
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
             Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
         let key_clone = key;
         cx.spawn(async move |this, cx| {
-            let outcome = work.await;
+            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定（#254）。
+            let _ = work.await;
             let _ = this.update(cx, |root, _cx| {
                 root.cache_upgrade_inflight.remove(&key_clone);
-                // 没真升级：撤掉记号，下次切回来还能再试一次（#254）。
-                if outcome != Outcome::Upgraded {
-                    root.cache_upgrade_attempted.abandon(&key_clone, epoch);
-                }
             });
         })
         .detach();
@@ -3068,6 +3056,9 @@ impl Root {
             }
         };
 
+        // 点下去那一刻的身份代数：扫盘也要几百毫秒，期间登出/换号的话这一批一个都不该发（#254）。
+        let start_epoch = self.auth_epoch;
+
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
             let dir = sodam_core::audio::cache_dir();
@@ -3082,15 +3073,13 @@ impl Root {
             let upgradeables = scan_work.await;
             let total = upgradeables.len();
 
-            // 开跑那一下的身份代数：之后每一首之前都拿它跟当前值比。
-            let start_epoch = match this.update(cx, |root, cx| {
+            let update_res = this.update(cx, |root, cx| {
                 root.batch_upgrade_progress = BatchUpgradeProgress { done: 0, total };
                 cx.notify();
-                root.auth_epoch
-            }) {
-                Ok(epoch) => epoch,
-                Err(_) => return,
-            };
+            });
+            if update_res.is_err() {
+                return;
+            }
 
             let total_text = total.to_string();
             log_event(
