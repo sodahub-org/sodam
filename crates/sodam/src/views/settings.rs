@@ -1120,9 +1120,9 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .children(batch_tier_rows),
                         )
                         .child({
-                            // 档位未知的旧缓存另起一行（#89）：这几首不是「已知比目标低」，是旧版本
+                            // 档位未知的旧缓存另起一行：这几首不是「已知比目标低」，是旧版本
                             // 没记档位。被权益挡住、或这一轮全都抑制掉了，也要照样报出来——
-                            // 「没有可升级的缓存歌曲」在这种存量下就不是实话（P5 的原话）。
+                            // 「没有可升级的歌曲」在这种存量下就不是实话：这几首会被当成不存在。
                             // 只报事实、不写「需重下」：这一轮到底会不会重下已经由上一行的可升级数说过。
                             let legacy_note = if root.batch_upgrading {
                                 None
@@ -1153,7 +1153,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                             } else if let Some(estimate) = &root.batch_upgrade_estimate {
                                 if estimate.upgradeable_count == 0 {
                                     root.tr(
-                                        "没有可升级的缓存歌曲：已达目标、无更高档位或当前缓存条件不支持升级",
+                                        "没有可升级的歌曲：已达目标、30 天后会自动重探该档位，或当前缓存条件不支持升级",
                                     )
                                     .to_string()
                                 } else {

@@ -52,6 +52,25 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
         .collect()
 }
 
+/// 单首 / 批量两条路各自的日志级别。
+///
+/// 用带名字的字段而不是两个挨着的 `LogLevel`：同一个类型相邻，调用点写反了照样编译过，
+/// 只会变成「成功记 WARN、失败记 INFO」这种测不出来的错。
+#[derive(Clone, Copy)]
+struct UpgradeLogLevels {
+    success: LogLevel,
+    failure: LogLevel,
+}
+
+/// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
+///
+/// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
+/// 还没进队列的那首歌也显示它。缓存清理后补原图必须同口径，否则那首歌的大图
+/// 补不回来。两处补偿共用这个函数，避免一边改了口径另一边漏掉。
+fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) -> Option<String> {
+    pending.or(queued).map(|track| track.cover.clone())
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -639,6 +658,8 @@ impl Root {
             return;
         }
         self.cache_maintenance_running = true;
+        self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
+        let stats_seq = self.cache_summary_request_seq;
         let limit = self.settings.audio_cache_limit_mb;
         // 在渲染线程采样「最近显示时间」：UI 命中内存缓存时不碰磁盘，mtime 只代表
         // 最后下载/落盘，只有这份快照能说明用户最近还在看。后台只拿值，不持实体、不碰 UI。
@@ -666,7 +687,18 @@ impl Root {
             let (removed, stats) = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
-                root.cache_summary = stats;
+                // 旧扫描晚到不能把新数字盖回旧值（#248）。统计落了再顺手补设置页的预估：
+                // 未登录启动直接停在设置页，不走 `on_nav_changed`，这条是它唯一的算预估机会。
+                if root.cache_summary_request_seq == stats_seq {
+                    root.cache_summary = stats;
+                    if root.nav == Nav::Settings {
+                        root.refresh_upgrade_estimate(cx);
+                    }
+                } else {
+                    // 这次统计被更新的扫描抢先作废，但这轮维护已经删过文件；
+                    // 那个更新的扫描可能是在删之前读的盘，重扫一次，别等下一拍。
+                    root.refresh_cache_stats(cx);
+                }
                 // 只同步这次真被淘汰的封面路径，不在主线程上全表扫盘。
                 root.drop_removed_covers(&removed, cx);
                 if root.settings.audio_cache_limit_mb != limit {
@@ -712,16 +744,43 @@ impl Root {
             .forget(thumb_urls.iter().map(String::as_str));
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
-        let current_cover = self
-            .pending_track
-            .as_ref()
-            .or_else(|| self.queue.current())
-            .map(|track| track.cover.clone());
+        let current_cover = current_cover_url(self.pending_track.as_ref(), self.queue.current());
         if let Some(url) = current_cover {
             if original_urls.contains(&url) {
                 self.ensure_original_cover(&url, cx);
             }
         }
+    }
+
+    /// 清缓存后补下当前曲目的原图。
+    ///
+    /// 清掉原图去重状态和补下载收在一个方法里，调用方拿不到「清完但没 ensure」的
+    /// 中间态，顺序写不反。缩略图靠渲染每帧重新 want 自愈，原图没有这个口子，
+    /// 清完缓存必须显式补一次，否则歌词页大图停在占位图。口径跟歌词页一致：
+    /// `pending_track.or(queue.current())`。
+    pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
+        self.original_covers.clear();
+        // 清状态放在块里：锁跟着块结束自动释放。ensure_original_cover 里还会锁
+        // original_cover_attempted，同一线程重入 std::sync::Mutex 会卡住，而这里
+        // 跑在 UI 更新回调上，卡住就是挂界面。别把 ensure 挪进这个块。
+        {
+            // 中毒也接着用，否则 attempted 清不掉，接着的 ensure 会早退，原图补不回来。
+            let mut attempted = self
+                .original_cover_attempted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pending = self
+                .original_cover_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attempted.clear();
+            pending.clear();
+        }
+        let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
+            return;
+        };
+        // 这张原图若此刻正在下载，会多下一次同一 URL（attempted 清了、inflight 没动）。
+        self.ensure_original_cover(&url, cx);
     }
 
     pub(crate) fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -743,18 +802,14 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.cache_clearing = false;
                 // 文件已清理，已完成的结果作废；排队 / 在飞保留，免得同一张下两遍
-                //（#250 的结论）。
+                //（这是 #250 定下的清缓存语义）。
                 root.cover_store.clear_completed();
-                root.original_covers.clear();
-                if let Ok(mut tried) = root.original_cover_attempted.lock() {
-                    tried.clear();
-                }
-                root.original_cover_pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clear();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
+                // 原图没有渲染期自动入队口子，显式补一次当前曲目原图。
+                // 清去重状态和补下载都在 restore_current_original_cover 里完成，
+                // 这里拿不到中间态，顺序写不反。
+                root.restore_current_original_cover(cx);
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -2848,9 +2903,6 @@ impl Root {
             self.nav_history.remove(0);
         }
         self.nav = nav;
-        if matches!(nav, Nav::Settings) {
-            self.refresh_cache_stats(cx);
-        }
         self.on_nav_changed(cx);
         cx.notify();
     }
@@ -2858,13 +2910,18 @@ impl Root {
     /// 后台刷新缓存统计（同步扫盘不能进渲染路径：设置页每次重绘都扫
     /// 目录会把 UI 卡出顿挫，预取/心跳的高频 notify 会放大这个问题）。
     pub(crate) fn refresh_cache_stats(&mut self, cx: &mut Context<Self>) {
+        self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
+        let seq = self.cache_summary_request_seq;
         let work = cx.background_spawn(async { sodam_core::audio::cache_stats() });
         cx.spawn(async move |this, cx| {
             let stats = work.await;
             let _ = this.update(cx, |root, cx| {
-                root.cache_summary = stats;
-                root.refresh_upgrade_estimate(cx);
-                cx.notify();
+                // 旧扫描晚到不能把新数字盖回旧值（#248）。只有最新那次落回并接着刷预估。
+                if root.cache_summary_request_seq == seq {
+                    root.cache_summary = stats;
+                    root.refresh_upgrade_estimate(cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -2872,6 +2929,9 @@ impl Root {
 
     /// 刷新缓存批量升级预估信息（后台扫盘，不阻塞 UI）。
     pub(crate) fn refresh_upgrade_estimate(&mut self, cx: &mut Context<Self>) {
+        self.batch_upgrade_estimate_request_seq =
+            self.batch_upgrade_estimate_request_seq.wrapping_add(1);
+        let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
@@ -2890,7 +2950,12 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let estimate = work.await;
             let _ = this.update(cx, |root, cx| {
-                if root.batch_upgrade_target == target_intent {
+                if estimate_result_is_current(
+                    &root.batch_upgrade_target,
+                    root.batch_upgrade_estimate_request_seq,
+                    &target_intent,
+                    seq,
+                ) {
                     root.batch_upgrade_estimate = Some(estimate);
                     cx.notify();
                 }
@@ -2915,14 +2980,17 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
-    /// 批量几百首逐个记 Info 会刷屏，规格只要求开跑、收尾各一行，所以批量降到 Debug。
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
+    /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// 所以这几种逐首日志都降到 DEBUG。
+    ///
+    /// 升级前读不到、升级后却有结果这一档按失败算（批量会进失败数），但不写日志。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
-        success_level: LogLevel,
+        levels: UpgradeLogLevels,
     ) -> Outcome {
         let session = Session::new(settings);
         // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
@@ -2937,11 +3005,18 @@ impl Root {
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
-                if outcome == Outcome::Upgraded {
+                let event = match outcome {
+                    Outcome::Upgraded => Some("cache_upgraded"),
+                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
+                    Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
+                    // 没有可靠的失败原因可写，所以不落日志。
+                    Outcome::Failed => None,
+                };
+                if let Some(event) = event {
                     log_outlet::log_event(
-                        success_level,
+                        levels.success,
                         LogTopic::Player,
-                        "cache_upgraded",
+                        event,
                         &[
                             ("track_id", track.id.as_str()),
                             ("quality", cached.quality.as_str()),
@@ -2951,8 +3026,10 @@ impl Root {
                 outcome
             }
             Err(failure) => {
+                // 级别由调用方定：单首失败要用 WARN 进默认日志；批量几百首逐首记会刷屏，
+                // 用 DEBUG 只在详细模式留痕，默认日志只看收尾汇总。
                 log_outlet::log_event(
-                    LogLevel::Debug,
+                    levels.failure,
                     LogTopic::Player,
                     "cache_upgrade_failed",
                     &[
@@ -2991,13 +3068,30 @@ impl Root {
 
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
-            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
+            Self::upgrade_one_cached_track(
+                settings,
+                track,
+                intent,
+                account_is_vip,
+                UpgradeLogLevels {
+                    success: LogLevel::Info,
+                    failure: LogLevel::Warn,
+                },
+            )
         });
         cx.spawn(async move |this, cx| {
-            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
-            let _ = work.await;
-            let _ = this.update(cx, |root, _cx| {
+            // 单首这条路不按结果改去重记号：记号留着，档位结论由 sidecar 与下次命中判定。
+            let outcome = work.await;
+            let _ = this.update(cx, |root, cx| {
                 root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
+                // 单首升级跑完了，盘上文件或记录可能变了，设置页正开着就不能还拿打开那一刻的数字说话（#248）。
+                // `Upgraded` 一定换了文件；`NoHigherTier` 可能只写了 sidecar 探测记录，也可能什么都没写。
+                // 统计也一起刷：字节数可能变，同一屏不能一新一旧。
+                // `Failed` 不动正式缓存；批量跑着时卡片显示的是进度，收尾那条路自己会重算，这里不白扫一遍。
+                if outcome != Outcome::Failed && root.nav == Nav::Settings && !root.batch_upgrading
+                {
+                    root.refresh_cache_stats(cx);
+                }
             });
         })
         .detach();
@@ -3126,7 +3220,10 @@ impl Root {
                             track,
                             target_clone,
                             is_vip,
-                            LogLevel::Debug,
+                            UpgradeLogLevels {
+                                success: LogLevel::Debug,
+                                failure: LogLevel::Debug,
+                            },
                         )
                     })
                     .await;
@@ -3273,6 +3370,11 @@ impl Root {
     ///
     /// 未登录时其他页面一律进不去（登录入口在设置 → 账户）。
     pub fn on_nav_changed(&mut self, cx: &mut Context<Self>) {
+        // 进设置页要重扫缓存统计和升级预估。`set_nav` 和 `go_back` 都走这里；
+        // 只挂在 `set_nav` 上会让「从详情页返回」那条路继续显示旧数字（#248）。
+        if matches!(self.nav, Nav::Settings) {
+            self.refresh_cache_stats(cx);
+        }
         // 状态行是全局反馈，不属于某一页：切页就收走，否则「正在搜索…」会跟着
         // 用户跑到设置页上。本页自己的加载提示在这之后写入，不受影响。
         self.status_line.clear();
@@ -4142,7 +4244,7 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
-                        // 命中缓存但档位低于目标，且没有确认过该目标无更高流时，后台升级。
+                        // 命中缓存但档位低于目标，且没有探测过该目标档位时，后台升级。
                         if needs_upgrade {
                             root.spawn_background_cache_upgrade(
                                 track.clone(),
@@ -4845,6 +4947,19 @@ fn finished_event_is_current(
     current
 }
 
+/// 这次扫盘的结果还能不能落回状态：档位没变，而且它是最新发起的那次。
+///
+/// 进设置页、切档位、升级成功都会各发一次后台扫盘。先发的慢扫描晚到，
+/// 不能把升级后的新数字盖回旧值，否则又变回「停在打开那一刻」（#248）。
+fn estimate_result_is_current(
+    current_intent: &sodam_core::quality::QualityIntent,
+    current_seq: u64,
+    result_intent: &sodam_core::quality::QualityIntent,
+    result_seq: u64,
+) -> bool {
+    current_intent == result_intent && current_seq == result_seq
+}
+
 /// 预取并发上限：环境变量 `SODAM_PREFETCH_CONCURRENCY`（默认 2）。
 fn prefetch_concurrency() -> usize {
     std::env::var("SODAM_PREFETCH_CONCURRENCY")
@@ -4852,6 +4967,23 @@ fn prefetch_concurrency() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|count| *count > 0)
         .unwrap_or(2)
+}
+
+#[cfg(test)]
+mod upgrade_estimate_tests {
+    use super::estimate_result_is_current;
+    use sodam_core::quality::QualityIntent;
+
+    /// 只有最新一次扫盘能落回状态：慢扫描晚到、切档位后的旧结果、A→B→A 都要丢掉。
+    #[test]
+    fn only_newest_estimate_scan_lands() {
+        let lossless = QualityIntent::Tier("lossless".into());
+        let highest = QualityIntent::Tier("highest".into());
+        assert!(estimate_result_is_current(&lossless, 2, &lossless, 2));
+        assert!(!estimate_result_is_current(&lossless, 2, &lossless, 1));
+        assert!(!estimate_result_is_current(&highest, 2, &lossless, 2));
+        assert!(!estimate_result_is_current(&lossless, 3, &lossless, 1));
+    }
 }
 
 #[cfg(test)]
@@ -5437,10 +5569,10 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
-        urls_for_removed_paths,
+        current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
+        lyrics_scroll_ease, urls_for_removed_paths,
     };
-    use sodam_core::models::{LyricLine, LyricWord};
+    use sodam_core::models::{LyricLine, LyricWord, TrackItem};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -5485,6 +5617,32 @@ mod tests {
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
+    }
+
+    /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
+    /// 取错口径会让正在装载、还没进队列那首歌的大图补不回来。
+    #[test]
+    fn cover_restore_url_follows_lyrics_page_track_precedence() {
+        let make = |id: &str, cover: &str| TrackItem {
+            id: id.to_string(),
+            cover: cover.to_string(),
+            ..Default::default()
+        };
+        let pending = make("pending", "url/pending");
+        let queued = make("queued", "url/queued");
+
+        // pending 在场时歌词页显示它，补下载也得用它。
+        assert_eq!(
+            current_cover_url(Some(&pending), Some(&queued)).as_deref(),
+            Some("url/pending")
+        );
+        // 没有 pending 才退回队列当前曲目。
+        assert_eq!(
+            current_cover_url(None, Some(&queued)).as_deref(),
+            Some("url/queued")
+        );
+        // 两个都没有就没有可补的封面。
+        assert_eq!(current_cover_url(None, None), None);
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {

@@ -560,10 +560,14 @@ pub struct Root {
     /// 缓存统计快照（音频字节, 歌曲数, 封面字节, 封面张数）：
     /// 后台扫盘后回填，设置页只读它（渲染路径不做同步 IO）。
     pub(crate) cache_summary: (u64, usize, u64, usize),
+    /// 缓存统计重算的发起序号：只让最新一次扫盘的结果落回状态。
+    pub(crate) cache_summary_request_seq: u64,
     pub(crate) cache_maintenance_running: bool,
     pub(crate) cache_clearing: bool,
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
     pub(crate) batch_upgrade_estimate: Option<sodam_core::cache::UpgradeEstimate>,
+    /// 预估重算的发起序号：只让最新一次扫盘的结果落回状态。
+    pub(crate) batch_upgrade_estimate_request_seq: u64,
     pub(crate) batch_upgrading: bool,
     /// 用户点了「取消」：批量只停在下一首之前，正在下的那一首不打断。
     pub(crate) batch_upgrade_cancel: bool,
@@ -940,10 +944,12 @@ impl Root {
             logout_save_task: None,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
+            cache_summary_request_seq: 0,
             cache_maintenance_running: false,
             cache_clearing: false,
             batch_upgrade_target: sodam_core::quality::QualityIntent::Tier("lossless".into()),
             batch_upgrade_estimate: None,
+            batch_upgrade_estimate_request_seq: 0,
             batch_upgrading: false,
             batch_upgrade_cancel: false,
             batch_upgrade_progress: BatchUpgradeProgress::default(),
