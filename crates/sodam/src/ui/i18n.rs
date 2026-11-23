@@ -536,6 +536,7 @@ impl Language {
             "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
             "批量升级" => "Batch Upgrade",
             "正在停止批量升级…" => "Stopping batch upgrade…",
+            "正在停止…" => "Stopping…",
             "账号已变更，批量已停止 ({} / {})" => {
                 "Account changed; batch upgrade stopped ({} / {})"
             }
