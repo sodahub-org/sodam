@@ -311,9 +311,9 @@ pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> 
 
 /// 无损档位分，直接取自 libresoda 的意图刻度。
 ///
-/// 旧三字段缓存的标签不以「无损」开头，就能断定旧流不是无损；新流够到这个分数才算
-/// 真提升（用在 `session::is_better_stream`）。和 [`legacy_label_floor_rank`] 共用
-/// 同一个出处，改刻度时两边一起变。
+/// 旧三字段缓存的标签不以「无损」开头，就能断定旧流不是无损。`session::is_better_stream`
+/// 用它判定「新流升到无损也算提升」；同一条路上，码率严格更高也算提升。和
+/// [`legacy_label_floor_rank`] 共用同一个出处，改刻度时两边一起变。
 pub(crate) fn lossless_rank() -> Option<i64> {
     preference_rank("lossless")
 }

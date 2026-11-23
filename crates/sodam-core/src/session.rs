@@ -738,30 +738,22 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
 
 /// 拼出 sidecar 内容。
 ///
-/// 前四字段始终写；有探测结论时补第 5、6 字段；试听补整曲的尝试时间写第 7
-/// 字段——即使第 5、6 字段为空也要留出位置，否则读回来会错位。
+/// 前四字段始终写；有探测结论时补第 5、6 字段。第 7 字段（试听补整曲的尝试时间）
+/// 由 [`crate::cache::record_preview_attempt`] 单独维护，这个函数不写它、也不留空位。
 fn encode_sidecar(
     quality: &str,
     written: u64,
     preview: bool,
     actual_rank: i64,
     checked_rank: Option<i64>,
-    preview_attempt_at: Option<u64>,
 ) -> String {
     let flag = u8::from(preview);
-    match (checked_rank, preview_attempt_at) {
-        (Some(rank), None) => format!(
+    match checked_rank {
+        Some(rank) => format!(
             "{quality}\t{written}\t{flag}\t{actual_rank}\t{rank}\t{}",
             crate::cache::now_epoch_secs(),
         ),
-        (Some(rank), Some(attempted_at)) => format!(
-            "{quality}\t{written}\t{flag}\t{actual_rank}\t{rank}\t{}\t{attempted_at}",
-            crate::cache::now_epoch_secs(),
-        ),
-        (None, Some(attempted_at)) => {
-            format!("{quality}\t{written}\t{flag}\t{actual_rank}\t\t\t{attempted_at}")
-        }
-        (None, None) => format!("{quality}\t{written}\t{flag}\t{actual_rank}"),
+        None => format!("{quality}\t{written}\t{flag}\t{actual_rank}"),
     }
 }
 
@@ -1021,7 +1013,7 @@ impl Session {
         // 首次下载拿到试听时不写退避：下一次播放命中应该立刻再试一次，
         // 用户可能刚补上权益或签名服务刚恢复。退避从「后台升级仍拿回试听」才开始记。
         let sidecar_content =
-            encode_sidecar(&quality, written, preview, quality_rank, checked_rank, None);
+            encode_sidecar(&quality, written, preview, quality_rank, checked_rank);
         std::fs::write(&quality_path, sidecar_content).map_err(|err| {
             PlaybackFailure::new(
                 Stage::Unpack,
@@ -1227,9 +1219,8 @@ impl Session {
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
-        // 试听已经在上面被挡住：走到这里只可能是整曲替换，第 7 字段不写补整曲的退避时间。
-        let sidecar_content =
-            encode_sidecar(&quality, written, preview, new_rank, checked_rank, None);
+        // 试听已经在上面被挡住：走到这里只可能是整曲替换，第 7 字段由退避写入方单独维护。
+        let sidecar_content = encode_sidecar(&quality, written, preview, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -1258,7 +1249,7 @@ impl Session {
                 quality_rank: Some(new_rank),
                 checked_rank,
                 // 走到这里只可能是整曲替换，没有试听退避要记。
-                preview_retry_blocked: preview,
+                preview_retry_blocked: false,
                 lease: target_lease,
             },
             improved: true,
@@ -1944,26 +1935,25 @@ mod tests {
     /// 写出与解析必须用同一套字段布局，避免两边各改一处后错位。
     #[test]
     fn encode_sidecar_round_trips_through_parser() {
-        let plain = encode_sidecar("极高 320k", 2000, false, 80, None, None);
+        let plain = encode_sidecar("极高 320k", 2000, false, 80, None);
         assert_eq!(plain, "极高 320k\t2000\t0\t80");
         let plain_checked = crate::cache::parse_sidecar(&plain, 2000).unwrap();
         assert_eq!(plain_checked.checked_rank, None);
         assert_eq!(plain_checked.preview_attempt_at, None);
 
-        let checked = encode_sidecar("极高 320k", 2000, false, 80, Some(100), None);
+        let checked = encode_sidecar("极高 320k", 2000, false, 80, Some(100));
         let parsed = crate::cache::parse_sidecar(&checked, 2000).unwrap();
         assert_eq!(parsed.actual_rank, Some(80));
         assert_eq!(parsed.checked_rank, Some(100));
         assert!(parsed.checked_at.is_some());
 
-        // 试听补整曲的尝试时间要占到第 7 字段，中间两个空字段不能省。
-        let preview = encode_sidecar("未知 128k", 2000, true, 0, None, Some(1_700_000_000));
-        assert_eq!(preview, "未知 128k\t2000\t1\t0\t\t\t1700000000");
+        // 试听只写第 3 字段的标记；第 7 字段（补整曲退避时间）由 `record_preview_attempt` 维护。
+        let preview = encode_sidecar("未知 128k", 2000, true, 0, None);
+        assert_eq!(preview, "未知 128k\t2000\t1\t0");
         let parsed = crate::cache::parse_sidecar(&preview, 2000).unwrap();
         assert!(parsed.preview);
         assert_eq!(parsed.actual_rank, Some(0));
-        assert_eq!(parsed.checked_rank, None);
-        assert_eq!(parsed.preview_attempt_at, Some(1_700_000_000));
+        assert_eq!(parsed.preview_attempt_at, None);
     }
 
     /// 一条档位已知、没有额外标记的整曲缓存，供命中/升级判定用。
