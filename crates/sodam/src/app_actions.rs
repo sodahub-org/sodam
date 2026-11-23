@@ -2961,10 +2961,12 @@ impl Root {
         let session = Session::new(settings);
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(run) => {
-                // 换没换文件由升级那条路自己判定；这里只把它翻成对外结论。
-                let (outcome, event) = match Outcome::from_improved(run.improved) {
-                    Outcome::Upgraded => (Outcome::Upgraded, "cache_upgraded"),
-                    _ => (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier"),
+                // 换没换文件由升级那条路自己判定；事件名和对外结论都只认 improved。
+                let outcome = Outcome::from_improved(run.improved);
+                let event = if run.improved {
+                    "cache_upgraded"
+                } else {
+                    "cache_upgrade_no_higher_tier"
                 };
                 log_outlet::log_event(
                     levels.success,

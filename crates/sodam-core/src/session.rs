@@ -1227,16 +1227,9 @@ impl Session {
 
         let quality = describe_quality(&info);
         let preview = info.is_preview;
-        // 替换成一整曲时不需要第 7 字段；换成另一条试听时也要从这一刻重新退避。
-        let preview_attempt_at = preview.then(crate::cache::now_epoch_secs);
-        let sidecar_content = encode_sidecar(
-            &quality,
-            written,
-            preview,
-            new_rank,
-            checked_rank,
-            preview_attempt_at,
-        );
+        // 试听已经在上面被挡住：走到这里只可能是整曲替换，第 7 字段不写补整曲的退避时间。
+        let sidecar_content =
+            encode_sidecar(&quality, written, preview, new_rank, checked_rank, None);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -1264,7 +1257,7 @@ impl Session {
                 preview,
                 quality_rank: Some(new_rank),
                 checked_rank,
-                // 换成另一条试听时 sidecar 已经写了退避时间；换成整曲则不需要。
+                // 走到这里只可能是整曲替换，没有试听退避要记。
                 preview_retry_blocked: preview,
                 lease: target_lease,
             },
