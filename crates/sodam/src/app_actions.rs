@@ -5597,6 +5597,34 @@ mod tests {
         );
     }
 
+    /// 应用层链路：原图第一次失败后不用再点按钮，当前曲目自动排第二次并落账。
+    #[test]
+    fn current_original_retry_chain_needs_no_user_action() {
+        use sodam_core::cover::{CoverOutcome, CoverStore};
+
+        let mut store = CoverStore::default();
+        let url = "url/current";
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+
+        store.complete_original(url, CoverOutcome::Failed);
+        assert!(
+            retry_current_original_cover(false, Some(url), url),
+            "第一次失败后当前曲目要自动补排"
+        );
+        assert!(store.want_original(url), "补排真的进队列");
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+
+        store.complete_original(
+            url,
+            CoverOutcome::Ready {
+                path: PathBuf::from("/tmp/current.img"),
+                color: None,
+            },
+        );
+        assert!(store.original_path(url).is_some(), "第二次成功就落账");
+    }
+
     /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
     /// 取错口径会让正在装载、还没进队列那首歌的大图补不回来。
     #[test]
