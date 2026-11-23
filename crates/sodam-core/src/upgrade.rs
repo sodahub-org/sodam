@@ -70,6 +70,8 @@ pub struct StreamShape {
     pub rank: Option<i64>,
     /// 旧标签能证明的档位下限（见 [`crate::quality::legacy_label_floor_rank`]）；证不出为 `None`。
     pub label_floor_rank: Option<i64>,
+    /// 旧标签里写的档名（`极高` / `无损` 等）；新流和认不出的标签为 `None`。
+    pub label_tier: Option<&'static str>,
     /// 码率（kbps）；不知道为 `None`。新流总有，旧缓存看标签里有没有写。
     pub bitrate_kbps: Option<i64>,
     /// 是不是试听片段。
@@ -81,6 +83,10 @@ impl From<&crate::session::CachedTrack> for StreamShape {
         Self {
             rank: cached.quality_rank,
             label_floor_rank: crate::quality::legacy_label_floor_rank(&cached.quality),
+            label_tier: crate::quality::TIER_LABELS
+                .iter()
+                .copied()
+                .find(|tier| cached.quality.trim().starts_with(tier)),
             bitrate_kbps: crate::quality::legacy_label_bitrate_kbps(&cached.quality),
             preview: cached.preview,
         }
@@ -93,6 +99,7 @@ impl StreamShape {
         Self {
             rank: Some(crate::quality::stream_rank(info)),
             label_floor_rank: None,
+            label_tier: None,
             bitrate_kbps: Some(libresoda::soda::quality::normalize_bitrate(
                 info.bitrate.max(0),
             )),
@@ -119,7 +126,13 @@ pub fn stream_is_better(before: StreamShape, after: StreamShape, target_rank: Op
     }
     let reached_target = target_rank.is_some_and(|target| after_rank >= target);
     match (before.bitrate_kbps, after.bitrate_kbps) {
-        (Some(old), Some(new)) => new > old || (new < old && reached_target),
+        (Some(old), Some(new)) if new > old => true,
+        // 用码率换档位：只有新流够到目标、且档名确实和旧标签不同才算
+        // （无损的 300k 换掉有损的 320k）；同名档位的低码率流只是更差。
+        (Some(_), Some(_)) if reached_target => before
+            .label_tier
+            .is_some_and(|tier| tier != crate::quality::tier_label(after_rank)),
+        // 同码率，或旧标签没写码率：证明不了更好。
         _ => false,
     }
 }
@@ -301,9 +314,15 @@ mod tests {
         StreamShape {
             rank,
             label_floor_rank: floor,
+            label_tier: None,
             bitrate_kbps: bitrate,
             preview,
         }
+    }
+
+    fn with_label_tier(mut stream: StreamShape, tier: &'static str) -> StreamShape {
+        stream.label_tier = Some(tier);
+        stream
     }
 
     /// 档位没真提升不算成功。
@@ -385,22 +404,28 @@ mod tests {
     /// 换文件比算升级宽一档：同码率也换一次把档位量出来，但不算升级。
     #[test]
     fn an_equal_bitrate_stream_is_replaced_only_to_measure_the_tier() {
-        let legacy = shape(None, None, Some(320), false);
+        let legacy_high = with_label_tier(shape(None, None, Some(320), false), "极高");
         let same = shape(Some(80), None, Some(320), false);
-        assert!(!stream_is_better(legacy, same, Some(80)));
-        assert!(should_replace_stream(legacy, same, Some(80)));
+        assert!(!stream_is_better(legacy_high, same, Some(80)));
+        assert!(should_replace_stream(legacy_high, same, Some(80)));
 
-        let worse = shape(Some(80), None, Some(192), false);
-        assert!(!should_replace_stream(legacy, worse, Some(80)));
+        // 同档位、更低码率：目标档位也够到了，但只是把 320k 换成 192k，不换。
+        let worse_same_tier = shape(Some(80), None, Some(192), false);
+        assert!(!stream_is_better(legacy_high, worse_same_tier, Some(80)));
+        assert!(!should_replace_stream(
+            legacy_high,
+            worse_same_tier,
+            Some(80)
+        ));
 
         let lossless_at_lower_bitrate = shape(Some(100), None, Some(300), false);
         assert!(stream_is_better(
-            legacy,
+            legacy_high,
             lossless_at_lower_bitrate,
             Some(100)
         ));
         assert!(should_replace_stream(
-            legacy,
+            legacy_high,
             lossless_at_lower_bitrate,
             Some(100)
         ));
