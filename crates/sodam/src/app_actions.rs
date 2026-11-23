@@ -2949,12 +2949,13 @@ impl Root {
         // 返回旧文件，只有前后对比才分得清「提升了」和「跑了但没变化」。
         let before = session
             .cached_track(&track.id)
-            .map(|cached| StreamShape::of(&cached));
+            .map(|cached| StreamShape::from(&cached));
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(cached) => {
-                // 读不到升级前那份（并发被清掉的极端情形）就按「没真提升」算：宁可少报一次成功。
-                let outcome = before.map_or(Outcome::NoHigherTier, |before| {
-                    Outcome::of_shapes(before, StreamShape::of(&cached))
+                // 升级前读不到、升级后却有结果，只能是这一首在中间被重新缓存进来了。
+                // 这种判不出有没有真提升，按失败算，别谎报成「没有更高档位」。
+                let outcome = before.map_or(Outcome::Failed, |before| {
+                    Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
                 if outcome == Outcome::Upgraded {
                     log_outlet::log_event(
@@ -3107,7 +3108,7 @@ impl Root {
                 // 旧 Cookie 就是从这里漏出去的（#254）。
                 let step = this.update(cx, |root, _cx| {
                     (
-                        stop_reason(start_epoch, root.auth_epoch, root.batch_upgrade_cancel),
+                        root.batch_upgrade_stop(start_epoch),
                         root.settings.clone(),
                         root.account.as_ref().map(|a| a.vip),
                     )
@@ -3159,9 +3160,7 @@ impl Root {
             // 免得同一个窗口里两套口径给出两种答案。
             if stopped.is_none() {
                 stopped = this
-                    .update(cx, |root, _cx| {
-                        stop_reason(start_epoch, root.auth_epoch, root.batch_upgrade_cancel)
-                    })
+                    .update(cx, |root, _cx| root.batch_upgrade_stop(start_epoch))
                     .unwrap_or(None);
             }
 
@@ -3227,6 +3226,17 @@ impl Root {
             });
         })
         .detach();
+    }
+
+    /// 这一轮批量现在该不该停。
+    ///
+    /// 正在登出也算：`logout()` 要等落盘成功才推进身份代数，慢盘上那一等就是几秒，
+    /// 这期间批量还能拿旧 Cookie 再发一首——那正是本票要堵的洞，所以不等落盘。
+    fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
+        if self.logout_in_flight {
+            return Some(StopReason::IdentityChanged);
+        }
+        stop_reason(start_epoch, self.auth_epoch, self.batch_upgrade_cancel)
     }
 
     /// 取消批量升级：只停在下一首之前，正在下的那一首不打断（底层没有取消句柄）。

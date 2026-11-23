@@ -1,11 +1,11 @@
-//! 缓存音质升级：批量什么时候停、一首跑完算不算成功、去重表跟着谁走（#254）。
+//! 缓存音质升级要的纯逻辑：这一轮该不该接着跑、一首跑完算不算成功、试过的记账。
 //!
-//! 单首升级和批量升级在应用层共用同一段「跑一首」；这里只放批量那条循环需要的纯逻辑：
-//! 「下一首之前该不该停」和「一首跑完落在哪一档」。身份代数与取消标志由界面线程读出来
-//! 再喂进来——后台任务碰不到 `Root`。
+//! 应用层单首与批量共用同一段「跑一首」，两条路都从这里取判断：
+//! [`stop_reason`]（下一首之前要不要停）、[`Outcome`]（这一首落在哪一档）、
+//! [`Tally`]（批量收尾的三个数）、[`UpgradeAttempts`]（本会话试过哪几首，单首那条用）。
+//! 身份代数与取消标志由界面线程读出来再喂进来——后台任务碰不到 `Root`。
 //!
-//! 停机的三条理由各管一件事：身份变了、用户取消、档位没真提升不算成功。身份变了
-//! **不**自动拿新号接着跑：目标档位是按旧号定的，新号权益可能撑不住，替人花流量不合适。
+//! 身份变了**不**自动拿新号接着跑：目标档位是按旧号定的，新号权益可能撑不住，替人花流量不合适。
 
 use std::collections::HashSet;
 
@@ -49,9 +49,8 @@ pub struct StreamShape {
     pub preview: bool,
 }
 
-impl StreamShape {
-    /// 读一份已缓存流的样子。升级前后各取一次，判定只看这两份。
-    pub fn of(cached: &crate::session::CachedTrack) -> Self {
+impl From<&crate::session::CachedTrack> for StreamShape {
+    fn from(cached: &crate::session::CachedTrack) -> Self {
         Self {
             rank: cached.quality_rank,
             preview: cached.preview,
@@ -64,9 +63,9 @@ impl StreamShape {
 pub enum Outcome {
     /// 盘上那份确实变好了。
     Upgraded,
-    /// 跑完了，但服务端能给的最高就这些：不算成功，也不留在「试过了」表里。
+    /// 跑完了，但服务端能给的最高就这些：不算成功。
     NoHigherTier,
-    /// 这次没跑成（网络、磁盘、权益……），下次还能再试。
+    /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
     Failed,
 }
 

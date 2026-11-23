@@ -609,17 +609,14 @@ pub struct Root {
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
     pub(crate) batch_upgrade_estimate: Option<sodam_core::cache::UpgradeEstimate>,
     pub(crate) batch_upgrading: bool,
-    /// 用户点了「取消」：批量只停在下一首之前，正在下的那一首不打断（#254）。
+    /// 用户点了「取消」：批量只停在下一首之前，正在下的那一首不打断。
     pub(crate) batch_upgrade_cancel: bool,
     pub(crate) batch_upgrade_progress: BatchUpgradeProgress,
     /// 单曲后台缓存升级尝试记录（避免同一首低档曲目在切歌或重播时反复拉取升级）。
     ///
-    /// 跟着身份走：换号后整份作废，同一首同一档位在新账号下重新可试（#254）。
+    /// 跟着身份走：换号后整份作废，同一首同一档位在新账号下重新可试。
     pub(crate) cache_upgrade_attempted: sodam_core::upgrade::UpgradeAttempts,
-    /// 正在跑的单曲后台缓存升级任务数（限制并发，避免连续切歌时打满网络与签名服务）。
-    ///
-    /// 数任务而不是记「哪几首」：同一首在换号或清缓存之后会重新发起，两个任务并存时
-    /// 按 key 记只会共用一个槽位，上限就守不住了（#254）。
+    /// 正在跑的单曲后台缓存升级任务数，卡并发用（默认上限见 `prefetch_concurrency`）。
     pub(crate) cache_upgrade_running: usize,
     /// 正在删除诊断日志；只用于禁用重复点击，与缓存清理互不影响。
     pub(crate) log_clearing: bool,
