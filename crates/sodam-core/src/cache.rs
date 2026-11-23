@@ -12,10 +12,11 @@ pub const DEFAULT_AUDIO_LIMIT_MB: u64 = 10 * 1024;
 /// 失败留下的暂存至少能在这段时间内被下一次播放接上（#243）。
 const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// 「已确认没有更高档位」记录的有效期。
+/// 探测记录的有效期：记的是「用当时账号向服务端要过这个档位、没拿到更高的流」。
 ///
 /// 曲库补档与会员权益变化都没有推送通知，永久保留一次探测结论会让那些曲目
-/// 再也不参与升级；30 天后重新问一次，代价最多是一次请求。
+/// 再也不参与升级；30 天后重新问一次，代价最多是一次请求。杜比 / Hi-Res 也一样：
+/// 权益变了最多等 30 天，不能每轮批量都整首重下一遍（#247）。
 pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// 「上次为补整曲重新取流」记录的有效期。
@@ -921,7 +922,7 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
 /// 不影响前三字段的命中判定。第 4 字段也可能是空串——档位未知的旧缓存
 /// 记下「已探测」结论之后就是这个样子，读回来仍然是「档位未知」。
 /// 第 7 字段只对试听片段有意义：它记的是「上次为补整曲重新取流的时间」，
-/// 与第 5 字段「已确认没有更高档位」是两件事，不能互相冒充。
+/// 与第 5 字段「已探测过目标档位」是两件事，不能互相冒充。
 /// 旧缓存把 50 分档写作「标准」，这里按记录里的实际分数洗成当前显示名
 ///（50 分档是「流畅」、更低分是「省流」），只换档位前缀、保留码率，旧文件不必重下。
 pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
@@ -970,7 +971,7 @@ fn strip_preview_marker(quality: &str) -> String {
 }
 
 /// 一条 sidecar 记录。前四个字段是旧格式，后三个记录升级探测结果：
-/// 曾经向服务端要过哪个目标档位、什么时候确认没有更高流，以及上次为补整曲
+/// 曾经向服务端要过哪个目标档位、什么时候要的，以及上次为补整曲
 /// 重新取流的时间（只对试听片段）。后两件事不能混：试听不是曲库结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarMeta {
@@ -989,7 +990,7 @@ pub struct SidecarMeta {
 }
 
 impl SidecarMeta {
-    /// 仍然有效的「已确认没有更高档位」分数；没记录、过期或时钟回拨时返回 `None`。
+    /// 仍然有效的「已探测过该目标档位」分数；没记录、过期或时钟回拨时返回 `None`。
     ///
     /// 过期后重新探测，避免服务端补档或会员权益变化后客户端永久不再尝试升级。
     pub fn fresh_checked_rank(&self, now: u64) -> Option<i64> {
@@ -1022,7 +1023,7 @@ pub(crate) fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 已确认的记录是否覆盖本轮目标档位：记录的目标不低于本次目标，就不必再问。
+/// 已经问过的记录是否覆盖本轮目标档位：记录的目标不低于本次目标，就不必再问。
 ///
 /// 只问过较低档位、现在想升到更高档位时仍应探测——那次结论并不能代表更高档位。
 pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>) -> bool {
@@ -1211,7 +1212,7 @@ pub struct CachedAudioRecord {
     pub preview: bool,
     /// 实际档位分数（旧缓存缺失时为 `None`；记了 0 分表示认不出档位，两者都算未知）
     pub actual_rank: Option<i64>,
-    /// 仍在有效期内、已确认没有更高档位的目标分数；过期记录不入此字段
+    /// 仍在有效期内、已探测过的目标档位分数；过期记录不入此字段
     pub checked_rank: Option<i64>,
     /// 本地文件字节数
     pub file_size: u64,
@@ -1238,7 +1239,7 @@ impl CachedAudioRecord {
 
     /// 当前记录是否允许批量升级至目标档位。
     ///
-    /// 排除试听片段、已达到或超过目标的记录，以及最近已经确认过「没有更高档位」的目标：
+    /// 排除试听片段、已达到或超过目标的记录，以及最近已经探测过该目标档位的记录：
     /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
     /// 试听片段仍不纳入批量升级（#130）：补整曲由播放命中时的自动路径负责，
     /// 并有自己的退避记录；批量升级纳入与否是单独的产品决定，不能在这里悄悄扩大流量。
@@ -1364,7 +1365,7 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
         if record.actual_rank.is_none() && !record.preview {
             unknown_rank_count += 1;
         }
-        // 试听片段、超出意图上限、以及已确认无更高档位的记录都不计入升级。
+        // 试听片段、超出意图上限、以及最近已探测过该目标档位的记录都不计入升级。
         if record.is_upgradeable_to(target_rank) {
             count += 1;
             current_bytes = current_bytes.saturating_add(record.file_size);
@@ -2428,7 +2429,7 @@ mod tests {
         assert!(lossless_downgraded.is_upgradeable_to(100));
     }
 
-    /// #90：确认过「没有更高档位」的目标不再计入升级与预估，但更高目标仍可探测。
+    /// #90：探测过「该目标没有更高流」的档位不再计入升级与预估，但更高目标仍可探测。
     #[test]
     fn checked_target_is_skipped_until_the_target_rises() {
         let confirmed = CachedAudioRecord {
@@ -2441,7 +2442,7 @@ mod tests {
             checked_rank: Some(100),
             file_size: 10 * 1024 * 1024,
         };
-        // 已经问过无损、确认没有更高流：同一个目标不再计入
+        // 已经问过无损、没拿到更高流：同一个目标不再计入
         assert!(!confirmed.is_upgradeable_to(100));
         // 更高目标还没问过，仍要允许探测：历史结论不能代表更高档位
         assert!(confirmed.is_upgradeable_to(110));
@@ -2462,6 +2463,32 @@ mod tests {
         assert!(!upgrade_check_covers(Some(70), Some(80)));
         assert!(!upgrade_check_covers(None, Some(80)));
         assert!(!upgrade_check_covers(Some(80), None));
+    }
+
+    /// #247：杜比 / Hi-Res 的探测结论也要挡住批量与预估，不能再整首重下一遍。
+    #[test]
+    fn high_tier_check_skips_upgrade_and_estimate() {
+        let confirmed = CachedAudioRecord {
+            track_id: "1".into(),
+            quality_tag: "hires".into(),
+            path: PathBuf::from("1-hires.m4a"),
+            quality_label: "无损 871k".into(),
+            preview: false,
+            actual_rank: Some(100),
+            checked_rank: Some(110),
+            file_size: 10 * 1024 * 1024,
+        };
+        assert!(!confirmed.is_upgradeable_to(110));
+        let estimate = estimate_upgrade(&[confirmed.clone()], 110);
+        assert_eq!(estimate.upgradeable_count, 0);
+
+        // 记录到期后（`fresh_checked_rank` 返回 None）重新算作可升级。
+        let expired = CachedAudioRecord {
+            checked_rank: None,
+            ..confirmed
+        };
+        assert!(expired.is_upgradeable_to(110));
+        assert_eq!(estimate_upgrade(&[expired], 110).upgradeable_count, 1);
     }
 
     /// 探测结论只在 30 天内有效，过期后重新探测。

@@ -4037,7 +4037,7 @@ impl Root {
                                 root.played_history.drain(0..overflow);
                             }
                         }
-                        // 命中缓存但档位低于目标，且没有确认过该目标无更高流时，后台升级。
+                        // 命中缓存但档位低于目标，且没有探测过该目标档位时，后台升级。
                         if needs_upgrade {
                             root.spawn_background_cache_upgrade(
                                 track.clone(),
