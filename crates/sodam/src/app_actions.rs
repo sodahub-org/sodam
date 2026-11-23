@@ -17,7 +17,10 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::upgrade::{stop_reason, Outcome, StopConditions, StopReason, StreamShape, Tally};
+use sodam_core::upgrade::{
+    identity_change, stop_reason, IdentityChange, Outcome, StopConditions, StopReason, StreamShape,
+    Tally,
+};
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -3248,19 +3251,19 @@ impl Root {
                     let counts = [tally.total().to_string(), total.to_string()];
                     match stopped {
                         Some(StopReason::IdentityChanged) => {
-                            // 会员状态刷新也会推进代数：只有账号 id 真的换了才说「账号已变更」。
-                            let account_changed = matches!(
-                                (
-                                    start_user_id.as_deref(),
-                                    root.account.as_ref().map(|account| account.user_id.as_str()),
-                                ),
-                                (Some(before), Some(now)) if before != now
-                            );
-                            let message = if account_changed {
-                                root.localized("账号已变更，批量已停止 ({} / {})", &counts)
-                            } else {
-                                root.localized("登录状态已变化，批量已停止 ({} / {})", &counts)
-                            };
+                            // 会员状态刷新也会推进代数：只有真换了号才说「账号已变更」。
+                            let current_user_id = root
+                                .account
+                                .as_ref()
+                                .map(|account| account.user_id.as_str());
+                            let message =
+                                match identity_change(start_user_id.as_deref(), current_user_id) {
+                                    IdentityChange::AccountChanged => {
+                                        root.localized("账号已变更，批量已停止 ({} / {})", &counts)
+                                    }
+                                    IdentityChange::LoginStateChanged => root
+                                        .localized("登录状态已变化，批量已停止 ({} / {})", &counts),
+                                };
                             root.notify_warning_once("batch-upgrade-stopped", message);
                         }
                         Some(StopReason::LoggingOut) => {
