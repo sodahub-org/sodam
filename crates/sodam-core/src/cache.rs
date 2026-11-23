@@ -597,6 +597,10 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
 /// 不递归进 `staging/` 子目录：那里归 [`purge_stale_staging_in`] 的 7 天
 /// 保留期按整族清扫，这里按成员年龄动手会把续传对拆开。
 ///
+/// 旧格式文件名（如 `*.part.part`）在 [`protection_key`] 里还原不出交付目标，
+/// 保护键就是文件自己——但产生它们的旧进程早已不在，不会有租约指向它们；
+/// 租约保护由 #243 的新暂存族（`staging/` 子目录）负责。
+///
 /// 返回 `Some(删除数)`；`None` 表示这轮目录没读全（条目、类型或元数据
 /// 读不到），交给下轮重试，别让一次抖动就把这次机会用掉。
 fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
@@ -682,17 +686,17 @@ impl SweepGate {
         }
     }
 
-    /// 门是否已结束（完成或放弃）。只给测试用：生产路径由 [`Self::advance`]
-    /// 内部的已结束分支兜住，不需要外部再问一次。
-    #[cfg(test)]
+    /// 门是否已结束（完成或放弃）。
+    ///
+    /// 调用方先问一句再扫：门关了就别再列目录，省掉每秒每轮的心跳空扫。
     fn is_finished(&self) -> bool {
         self.finished
     }
 
-    /// 喂一轮结果：`Some(删除数)` 这轮收工；`None` 目录没读全就跳过本轮、
-    /// 计数加一并留痕，连续到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮就放弃
-    /// （带日志）并结束。日志有界：首轮一条 `legacy_residue_sweep_incomplete`，
-    /// 放弃时一条 `legacy_residue_sweep_gave_up`，中间轮次静默。
+    /// 喂一轮结果：`Some(删除数)` 就收工关门；`None` 就跳过本轮、计数加一。
+    /// 连续到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮放弃并关门。
+    /// 日志只写两条：首轮一条 `legacy_residue_sweep_incomplete`，
+    /// 放弃时一条 `legacy_residue_sweep_gave_up`，中间静默。
     /// 返回删除的文件数。
     fn advance(&mut self, outcome: Option<usize>) -> usize {
         if self.finished {
@@ -744,6 +748,11 @@ pub fn sweep_legacy_residue() -> usize {
         Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return 0,
     };
+    // 先问门再列目录：门关了就别每分钟白付一次 read_dir + 每文件 metadata。
+    // 参数立即求值的话，扫完进 advance 才发现已结束，门等于只省了删除不省扫描。
+    if gate.is_finished() {
+        return 0;
+    }
     gate.advance(sweep_legacy_residue_once(&root_dir().join("audio")))
 }
 
