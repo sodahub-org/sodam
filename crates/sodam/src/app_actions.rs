@@ -2975,8 +2975,7 @@ impl Root {
                     Outcome::Upgraded => Some("cache_upgraded"),
                     // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
                     Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
-                    // 升级前读不到、升级后却有结果，只能是中途重新缓存进来的；判不出有没有
-                    // 真提升，也没有可靠的失败原因可写。
+                    // 判不出有没有真提升，没有可靠的失败原因可写。
                     Outcome::Failed => None,
                 };
                 if let Some(event) = event {
