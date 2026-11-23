@@ -682,7 +682,9 @@ impl SweepGate {
         }
     }
 
-    /// 门是否已结束（完成或放弃）。
+    /// 门是否已结束（完成或放弃）。只给测试用：生产路径由 [`Self::advance`]
+    /// 内部的已结束分支兜住，不需要外部再问一次。
+    #[cfg(test)]
     fn is_finished(&self) -> bool {
         self.finished
     }
