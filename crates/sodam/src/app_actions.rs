@@ -778,18 +778,17 @@ impl Root {
         // original_cover_attempted，同一线程重入 std::sync::Mutex 会卡住，而这里
         // 跑在 UI 更新回调上，卡住就是挂界面。别把 ensure 挪进这个块。
         {
-            // 锁中毒自恢复，跟 ensure_original_cover / load_lyrics 对同两把锁一致；
-            // 静默跳过的话 attempted 没清，ensure 早退，原图就补不回来。
+            // 中毒也接着用，否则 attempted 清不掉，接着的 ensure 会早退，原图补不回来。
             let mut attempted = self
                 .original_cover_attempted
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut wait_list = self
+            let mut pending = self
                 .original_cover_pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             attempted.clear();
-            wait_list.clear();
+            pending.clear();
         }
         let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
             return;
