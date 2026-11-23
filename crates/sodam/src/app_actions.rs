@@ -90,34 +90,6 @@ fn settle_original_cover(
     }
 }
 
-/// 文件在下载期间被删掉后，这次回调要不要放行记号、要不要马上重排。
-///
-/// 清缓存后的补下载、用户点重试、淘汰补偿都可能已经为同一 URL 起了更新的一次
-/// 尝试。记号属于更新的那次，这里不能删，也不能再排一份，否则同一 URL 会下好
-/// 几份。只有没有更新的尝试、而且这张图还在当前歌词页时，才顺手补一次。
-#[derive(Debug, PartialEq, Eq)]
-struct OriginalCoverRetry {
-    release_attempted: bool,
-    re_request: bool,
-}
-
-fn retry_vanished_original_cover(
-    has_newer_attempt: bool,
-    is_displayed: bool,
-) -> OriginalCoverRetry {
-    if has_newer_attempt {
-        OriginalCoverRetry {
-            release_attempted: false,
-            re_request: false,
-        }
-    } else {
-        OriginalCoverRetry {
-            release_attempted: true,
-            re_request: is_displayed,
-        }
-    }
-}
-
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -1459,28 +1431,23 @@ impl Root {
                 if settlement.release_attempted {
                     // 下载期间文件被清缓存或淘汰删掉了：别把死路径记进表，
                     // 否则 ensure_original_cover 会一直当成命中，本会话再也
-                    // 排不进来。已经有更新的一次尝试时，记号留给它；没有，
-                    // 而且这张图还在歌词页时，顺手补一次。
+                    // 排不进来。这里无条件放行记号；同一个 URL 可能因此多下
+                    // 一份，重复下载是已知代价，后续单独收。
+                    {
+                        let mut attempted = root
+                            .original_cover_attempted
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        attempted.remove(&fetch_url);
+                    }
+                    // 这张图还是歌词页当前曲目的封面时，顺手补一次，
+                    // 不然停在歌词页只能等用户自己点重试。
                     let displayed_cover = root
                         .pending_track
                         .as_ref()
                         .or_else(|| root.queue.current())
                         .map(|track| track.cover.clone());
-                    let retry = {
-                        let mut attempted = root
-                            .original_cover_attempted
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let retry = retry_vanished_original_cover(
-                            attempted.contains(&fetch_url),
-                            displayed_cover.as_deref() == Some(fetch_url.as_str()),
-                        );
-                        if retry.release_attempted {
-                            attempted.remove(&fetch_url);
-                        }
-                        retry
-                    };
-                    if retry.re_request {
+                    if displayed_cover.as_deref() == Some(fetch_url.as_str()) {
                         root.ensure_original_cover(&fetch_url, cx);
                     }
                     cx.notify();
@@ -5577,8 +5544,7 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
-        retry_vanished_original_cover, settle_original_cover, urls_for_removed_paths,
-        OriginalCoverRetry,
+        settle_original_cover, urls_for_removed_paths,
     };
     use sodam_core::models::{LyricLine, LyricWord};
     use std::collections::HashMap;
@@ -5643,35 +5609,6 @@ mod tests {
         let failed = settle_original_cover(None, |_| true);
         assert_eq!(failed.publish, None, "下载失败没有图可发布");
         assert!(!failed.release_attempted, "下载失败保留记号，避免每帧空转");
-    }
-
-    /// 文件没了时，只有「没有更新的尝试」才放行记号；还在歌词页就顺手补一次。
-    #[test]
-    fn vanished_original_cover_retries_only_without_a_newer_attempt() {
-        assert_eq!(
-            retry_vanished_original_cover(false, true),
-            OriginalCoverRetry {
-                release_attempted: true,
-                re_request: true,
-            },
-            "没有更新的尝试、还在歌词页：放行并重排"
-        );
-        assert_eq!(
-            retry_vanished_original_cover(false, false),
-            OriginalCoverRetry {
-                release_attempted: true,
-                re_request: false,
-            },
-            "没有更新的尝试、已经切走：只放行，不抢着下"
-        );
-        assert_eq!(
-            retry_vanished_original_cover(true, true),
-            OriginalCoverRetry {
-                release_attempted: false,
-                re_request: false,
-            },
-            "已经有更新的一次尝试：记号留它，别再下一份"
-        );
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
