@@ -3038,7 +3038,7 @@ impl Root {
             cx.notify();
             return;
         }
-        // 正在退出登录：这一批一首都发不出去（每首之前都会因为身份要变停住），别白扫一遍全盘。
+        // 正在退出登录：每首之前都会按 `LoggingOut` 停住，扫了也是白扫一遍全盘。
         if self.logout_in_flight {
             let message = self.tr("正在退出登录，请稍后再试");
             self.notify_warning_once("batch-upgrade-blocked", message);
@@ -3209,8 +3209,6 @@ impl Root {
                             root.notify_warning_once("batch-upgrade-stopped", message);
                         }
                         Some(StopReason::LoggingOut) => {
-                            // 登出还没落盘就停了批量：这时候说「账号已变更」是撒谎，
-                            // 落盘失败账号还在。说清是「正在退出登录」就够了。
                             let message =
                                 root.localized("正在退出登录，批量已停止 ({} / {})", &counts);
                             root.notify_warning_once("batch-upgrade-stopped", message);
