@@ -2252,11 +2252,7 @@ mod tests {
         let mailbox = CoverMailbox::new(wake);
 
         mailbox.request("cover-a".to_string());
-        assert_eq!(
-            rx.try_next().expect("wake channel still open"),
-            Some(()),
-            "有需求要叫醒消费循环"
-        );
+        assert!(rx.try_recv().is_ok(), "有需求要叫醒消费循环");
         assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
         assert!(mailbox.take().is_empty());
     }
