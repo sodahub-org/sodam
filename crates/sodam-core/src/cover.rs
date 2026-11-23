@@ -463,9 +463,15 @@ impl CoverStore {
                 }
             }
             CoverOutcome::Vanished => {
-                if let Some(record) = self.records.get_mut(url) {
-                    record.thumbnail.state = State::Idle;
-                }
+                // 文件在下载落盘和回调之间被删掉，也算一次尝试：渲染每帧 want
+                // 会立刻重排，两次后先放弃，避免同一张反复走完整 HTTP 下载。
+                let record = self.records.entry(url.to_string()).or_default();
+                record.thumbnail.failures = record.thumbnail.failures.saturating_add(1);
+                record.thumbnail.state = if record.thumbnail.failures >= MAX_FAILURES {
+                    State::Failed
+                } else {
+                    State::Idle
+                };
                 // 不抹已发布路径：原图先回来时可能已经兜过底，文件还在。
             }
             CoverOutcome::Failed => {
@@ -955,15 +961,23 @@ mod tests {
         assert!(store.want(&urls(&["cover-a"])).is_empty());
     }
 
-    /// 文件解析出来后又被删：退回可重排。
+    /// 文件解析出来后又被删：第一次退回可重排，两次后先放弃，作废再下。
     #[test]
-    fn vanished_allows_requeue() {
+    fn vanished_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
-        assert_eq!(store.want(&url).len(), 1);
+        assert_eq!(store.want(&url).len(), 1, "第一次还能重排");
+
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(store.want(&url).is_empty(), "两次后先放弃");
+        assert!(store.drain().is_empty());
+
+        store.forget(["cover-a"]);
+        assert_eq!(store.want(&url).len(), 1, "作废之后能重新下");
     }
 
     /// 验收：查路径 / 查颜色 / 取快照只读，不改状态、不消费排队项。
