@@ -186,8 +186,7 @@ impl QualityIntent {
 ///
 /// `quality_rank` 在档位标签与码率都对不上时给 0：那不是「比谁都低」，是「没认出来」。
 /// 拿它当分数比大小，就是向用户断言一件查不到的事（#96）。负数同样不在这套刻度上。
-/// 本模块里判不符与判重下的地方共用这一道闸，免得对同一个文件给出不同结论；
-/// 升级那条路判「这一首算不算真升上去了」也走它（见 [`crate::upgrade::Outcome::of_shapes`]）。
+/// 本模块里判不符与判重下的地方共用这一道闸，免得对同一个文件给出不同结论。
 /// 档位显示名走 [`tier_label`]：它共用的是刻度，不是这个函数——0 分照样命名成「未知」。
 pub(crate) fn readable_rank(actual: Option<i64>) -> Option<i64> {
     actual.filter(|rank| *rank > 0)
@@ -310,6 +309,15 @@ pub fn target_rank(intent: &QualityIntent, is_vip: Option<bool>) -> Option<i64> 
     }
 }
 
+/// 无损档位分，直接取自 libresoda 的意图刻度。
+///
+/// 旧三字段缓存的标签不以「无损」开头，就能断定旧流不是无损。`session::is_better_stream`
+/// 用它判定「新流升到无损也算提升」；同一条路上，码率严格更高也算提升。和
+/// [`legacy_label_floor_rank`] 共用同一个出处，改刻度时两边一起变。
+pub(crate) fn lossless_rank() -> Option<i64> {
+    preference_rank("lossless")
+}
+
 /// 旧三字段缓存的档位**下限**：标签能证明「至少无损」时给出无损的分数，否则给 `None`。
 ///
 /// 只有这一条证得起来。两代旧写入者写「无损」的条件分别是
@@ -328,7 +336,7 @@ pub fn legacy_label_floor_rank(label: &str) -> Option<i64> {
     if !label.trim().starts_with(tier_label(100)) {
         return None;
     }
-    preference_rank("lossless")
+    lossless_rank()
 }
 
 /// 旧 sidecar 的档位文本里记着的码率（kbps），如「极高 320k」→ 320；没写码率则 `None`。
