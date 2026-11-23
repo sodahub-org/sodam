@@ -572,8 +572,8 @@ impl CachedTrack {
 /// 还是「没有更高档位」，不在事后拿升级前后的两份缓存自己比分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完后内存里的那份缓存；没换文件时就是原来那份。`checked_rank` 等字段可能比
-    /// sidecar 旧——结论有没有落盘以 sidecar 为准，这里不假装它已同步。
+    /// 跑完那一刻的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
+    /// sidecar，要准的值去读 sidecar。
     pub track: CachedTrack,
     /// 盘上文件有没有换成更好的流。`false` = 跑完了，但服务端没给更好的。
     pub improved: bool,
@@ -1217,8 +1217,9 @@ impl Session {
             });
         }
 
+        // 试听在上面已经被挡住：走到这里一定是整曲替换。
+        debug_assert!(!info.is_preview, "试听流不该走到整曲替换");
         let quality = describe_quality(&info);
-        // 试听已经在上面被挡住：走到这里只可能是整曲替换，第 7 字段由退避写入方单独维护。
         let sidecar_content = encode_sidecar(&quality, written, false, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
@@ -1244,7 +1245,6 @@ impl Session {
             track: CachedTrack {
                 path,
                 quality,
-                // 走到这里只可能是整曲替换：试听早被挡住，没有试听退避要记。
                 preview: false,
                 quality_rank: Some(new_rank),
                 checked_rank,
