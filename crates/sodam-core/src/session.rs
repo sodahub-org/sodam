@@ -683,7 +683,8 @@ fn confirmed_miss_rank(
 ///
 /// 这种情况文件证不出更好、不会换（#272），但「问过这个目标」仍要记下来（第 4 字段留空），
 /// 否则每轮都整曲重下一遍（#89 / #90）。档位已知或拿回试听时不适用——那些走
-/// [`confirmed_miss_rank`]。参数用真实类型而不是一串布尔，调用点写反顺序编译不过。
+/// [`confirmed_miss_rank`]。判据全部从缓存与流本身读（有没有可比档位、是不是试听），
+/// 只有「结论能不能落盘」由调用方传进来。
 fn legacy_probe_covers_target(
     current: &CachedTrack,
     info: &libresoda::soda::types::DownloadInfo,
