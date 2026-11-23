@@ -642,6 +642,8 @@ impl Root {
             return;
         }
         self.cache_maintenance_running = true;
+        self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
+        let stats_seq = self.cache_summary_request_seq;
         let limit = self.settings.audio_cache_limit_mb;
         // 在渲染线程采样「最近显示时间」：UI 命中内存缓存时不碰磁盘，mtime 只代表
         // 最后下载/落盘，只有这份快照能说明用户最近还在看。后台只拿值，不持实体、不碰 UI。
@@ -669,7 +671,18 @@ impl Root {
             let (removed, stats) = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
-                root.cache_summary = stats;
+                // 旧扫描晚到不能把新数字盖回旧值（#248）。统计落了再顺手补设置页的预估：
+                // 未登录启动直接停在设置页，不走 `on_nav_changed`，这条是它唯一的算预估机会。
+                if root.cache_summary_request_seq == stats_seq {
+                    root.cache_summary = stats;
+                    if root.nav == Nav::Settings {
+                        root.refresh_upgrade_estimate(cx);
+                    }
+                } else {
+                    // 这次统计被更新的扫描抢先作废，但这轮维护已经删过文件；
+                    // 那个更新的扫描可能是在删之前读的盘，重扫一次，别等下一拍。
+                    root.refresh_cache_stats(cx);
+                }
                 // 只同步这次真被淘汰的封面路径，不在主线程上全表扫盘。
                 root.drop_removed_covers(&removed, cx);
                 if root.settings.audio_cache_limit_mb != limit {
@@ -2871,9 +2884,6 @@ impl Root {
             self.nav_history.remove(0);
         }
         self.nav = nav;
-        if matches!(nav, Nav::Settings) {
-            self.refresh_cache_stats(cx);
-        }
         self.on_nav_changed(cx);
         cx.notify();
     }
@@ -2881,13 +2891,18 @@ impl Root {
     /// 后台刷新缓存统计（同步扫盘不能进渲染路径：设置页每次重绘都扫
     /// 目录会把 UI 卡出顿挫，预取/心跳的高频 notify 会放大这个问题）。
     pub(crate) fn refresh_cache_stats(&mut self, cx: &mut Context<Self>) {
+        self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
+        let seq = self.cache_summary_request_seq;
         let work = cx.background_spawn(async { sodam_core::audio::cache_stats() });
         cx.spawn(async move |this, cx| {
             let stats = work.await;
             let _ = this.update(cx, |root, cx| {
-                root.cache_summary = stats;
-                root.refresh_upgrade_estimate(cx);
-                cx.notify();
+                // 旧扫描晚到不能把新数字盖回旧值（#248）。只有最新那次落回并接着刷预估。
+                if root.cache_summary_request_seq == seq {
+                    root.cache_summary = stats;
+                    root.refresh_upgrade_estimate(cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -2895,6 +2910,9 @@ impl Root {
 
     /// 刷新缓存批量升级预估信息（后台扫盘，不阻塞 UI）。
     pub(crate) fn refresh_upgrade_estimate(&mut self, cx: &mut Context<Self>) {
+        self.batch_upgrade_estimate_request_seq =
+            self.batch_upgrade_estimate_request_seq.wrapping_add(1);
+        let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
@@ -2913,7 +2931,12 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let estimate = work.await;
             let _ = this.update(cx, |root, cx| {
-                if root.batch_upgrade_target == target_intent {
+                if estimate_result_is_current(
+                    &root.batch_upgrade_target,
+                    root.batch_upgrade_estimate_request_seq,
+                    &target_intent,
+                    seq,
+                ) {
                     root.batch_upgrade_estimate = Some(estimate);
                     cx.notify();
                 }
@@ -3017,10 +3040,18 @@ impl Root {
             Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
         cx.spawn(async move |this, cx| {
-            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
-            let _ = work.await;
-            let _ = this.update(cx, |root, _cx| {
+            // 单首这条路不按结果改去重记号：记号留着，档位结论由 sidecar 与下次命中判定。
+            let outcome = work.await;
+            let _ = this.update(cx, |root, cx| {
                 root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
+                // 单首升级跑完了，盘上文件或记录可能变了，设置页正开着就不能还拿打开那一刻的数字说话（#248）。
+                // `Upgraded` 一定换了文件；`NoHigherTier` 可能只写了 sidecar 探测记录，也可能什么都没写。
+                // 统计也一起刷：字节数可能变，同一屏不能一新一旧。
+                // `Failed` 不动正式缓存；批量跑着时卡片显示的是进度，收尾那条路自己会重算，这里不白扫一遍。
+                if outcome != Outcome::Failed && root.nav == Nav::Settings && !root.batch_upgrading
+                {
+                    root.refresh_cache_stats(cx);
+                }
             });
         })
         .detach();
@@ -3296,6 +3327,11 @@ impl Root {
     ///
     /// 未登录时其他页面一律进不去（登录入口在设置 → 账户）。
     pub fn on_nav_changed(&mut self, cx: &mut Context<Self>) {
+        // 进设置页要重扫缓存统计和升级预估。`set_nav` 和 `go_back` 都走这里；
+        // 只挂在 `set_nav` 上会让「从详情页返回」那条路继续显示旧数字（#248）。
+        if matches!(self.nav, Nav::Settings) {
+            self.refresh_cache_stats(cx);
+        }
         // 状态行是全局反馈，不属于某一页：切页就收走，否则「正在搜索…」会跟着
         // 用户跑到设置页上。本页自己的加载提示在这之后写入，不受影响。
         self.status_line.clear();
@@ -4889,6 +4925,19 @@ fn finished_event_is_current(
     current
 }
 
+/// 这次扫盘的结果还能不能落回状态：档位没变，而且它是最新发起的那次。
+///
+/// 进设置页、切档位、升级成功都会各发一次后台扫盘。先发的慢扫描晚到，
+/// 不能把升级后的新数字盖回旧值，否则又变回「停在打开那一刻」（#248）。
+fn estimate_result_is_current(
+    current_intent: &sodam_core::quality::QualityIntent,
+    current_seq: u64,
+    result_intent: &sodam_core::quality::QualityIntent,
+    result_seq: u64,
+) -> bool {
+    current_intent == result_intent && current_seq == result_seq
+}
+
 /// 预取并发上限：环境变量 `SODAM_PREFETCH_CONCURRENCY`（默认 2）。
 fn prefetch_concurrency() -> usize {
     std::env::var("SODAM_PREFETCH_CONCURRENCY")
@@ -4896,6 +4945,23 @@ fn prefetch_concurrency() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|count| *count > 0)
         .unwrap_or(2)
+}
+
+#[cfg(test)]
+mod upgrade_estimate_tests {
+    use super::estimate_result_is_current;
+    use sodam_core::quality::QualityIntent;
+
+    /// 只有最新一次扫盘能落回状态：慢扫描晚到、切档位后的旧结果、A→B→A 都要丢掉。
+    #[test]
+    fn only_newest_estimate_scan_lands() {
+        let lossless = QualityIntent::Tier("lossless".into());
+        let highest = QualityIntent::Tier("highest".into());
+        assert!(estimate_result_is_current(&lossless, 2, &lossless, 2));
+        assert!(!estimate_result_is_current(&lossless, 2, &lossless, 1));
+        assert!(!estimate_result_is_current(&highest, 2, &lossless, 2));
+        assert!(!estimate_result_is_current(&lossless, 3, &lossless, 1));
+    }
 }
 
 #[cfg(test)]
