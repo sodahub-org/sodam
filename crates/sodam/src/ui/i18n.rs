@@ -540,9 +540,10 @@ impl Language {
                 "Account changed; batch upgrade stopped ({} / {})"
             }
             "已取消 ({} / {})" => "Cancelled ({} / {})",
-            "缓存升级完成：成功升级 {} 首，{} 首网络失败，{} 首无更高档位" => {
-                "Cache upgrade complete: upgraded {} songs, {} network failures, {} with no higher quality"
+            "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位" => {
+                "Cache upgrade complete: upgraded {} songs, {} failed, {} with no higher quality"
             }
+            "正在整理缓存，请稍后再试" => "Cache maintenance is running; try again in a moment",
             "批量升级进行中，请先取消再清空缓存" => {
                 "Batch upgrade is running; cancel it before clearing the cache"
             }

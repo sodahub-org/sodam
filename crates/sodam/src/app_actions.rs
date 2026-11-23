@@ -768,7 +768,6 @@ impl Root {
                     .clear();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
-                root.cache_upgrade_inflight.clear();
                 // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
                 root.cover_pool.reset_seen_preserving_inflight();
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
@@ -2996,27 +2995,28 @@ impl Root {
         let max_inflight = prefetch_concurrency().max(1);
         let key = format!("{}:{}", track.id, intent.as_setting());
 
-        // N2 并发上限保护（复用 prefetch_concurrency，避免连续切歌并发冲垮签名服务）
-        if self.cache_upgrade_inflight.len() >= max_inflight {
+        // N2 并发上限保护（复用 prefetch_concurrency，避免连续切歌并发冲垮签名服务）。
+        // 数的是**在跑的任务**，不是「哪几首」：同一首在换号或清缓存之后会重新发起，
+        // 按 key 记的话两次发起会共用一个槽位，上限就守不住了（#254）。
+        if self.cache_upgrade_running >= max_inflight {
             return;
         }
         // 本次会话已试过升级该曲目到此档位，避免反复重试
-        if !self.cache_upgrade_attempted.begin(key.clone()) {
+        if !self.cache_upgrade_attempted.begin(key) {
             return;
         }
 
-        self.cache_upgrade_inflight.insert(key.clone());
+        self.cache_upgrade_running += 1;
 
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
             Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
-        let key_clone = key;
         cx.spawn(async move |this, cx| {
             // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定（#254）。
             let _ = work.await;
             let _ = this.update(cx, |root, _cx| {
-                root.cache_upgrade_inflight.remove(&key_clone);
+                root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
             });
         })
         .detach();
@@ -3027,6 +3027,14 @@ impl Root {
     /// 循环只跟单首共用「跑一首」；循环本身、状态和文案留在应用层（#254）。
     pub(crate) fn start_batch_upgrade(&mut self, cx: &mut Context<Self>) {
         if self.batch_upgrading {
+            return;
+        }
+        // 正在清缓存或收缩缓存时不开跑：扫完盘到真跑之间那几首会被删掉，剩下的一首首都以
+        // 「文件已被删」失败（#254）。和 `clear_cache` / `maintain_cache` 那两道拦的是同一件事。
+        if self.cache_clearing || self.cache_maintenance_running {
+            let message = self.tr("正在整理缓存，请稍后再试");
+            self.notify_warning_once("batch-upgrade-cache-busy", message);
+            cx.notify();
             return;
         }
 
@@ -3199,7 +3207,7 @@ impl Root {
                         }
                         None => {
                             let message = root.localized(
-                                "缓存升级完成：成功升级 {} 首，{} 首网络失败，{} 首无更高档位",
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位",
                                 &[
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),

@@ -616,8 +616,11 @@ pub struct Root {
     ///
     /// 跟着身份走：换号后整份作废，同一首同一档位在新账号下重新可试（#254）。
     pub(crate) cache_upgrade_attempted: sodam_core::upgrade::UpgradeAttempts,
-    /// 单曲后台缓存升级当前在飞集合（限制并发，避免连续切歌时打满网络与签名服务）。
-    pub(crate) cache_upgrade_inflight: HashSet<String>,
+    /// 正在跑的单曲后台缓存升级任务数（限制并发，避免连续切歌时打满网络与签名服务）。
+    ///
+    /// 数任务而不是记「哪几首」：同一首在换号或清缓存之后会重新发起，两个任务并存时
+    /// 按 key 记只会共用一个槽位，上限就守不住了（#254）。
+    pub(crate) cache_upgrade_running: usize,
     /// 正在删除诊断日志；只用于禁用重复点击，与缓存清理互不影响。
     pub(crate) log_clearing: bool,
     /// 下载完成后交给音频线程的装载序号；避免同一曲目重载/失败时永久 loading。
@@ -994,7 +997,7 @@ impl Root {
             batch_upgrade_cancel: false,
             batch_upgrade_progress: BatchUpgradeProgress::default(),
             cache_upgrade_attempted: sodam_core::upgrade::UpgradeAttempts::default(),
-            cache_upgrade_inflight: HashSet::new(),
+            cache_upgrade_running: 0,
             log_clearing: false,
             pending_engine_load: None,
             pending_track: None,
