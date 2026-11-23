@@ -1218,9 +1218,8 @@ impl Session {
         }
 
         let quality = describe_quality(&info);
-        let preview = info.is_preview;
         // 试听已经在上面被挡住：走到这里只可能是整曲替换，第 7 字段由退避写入方单独维护。
-        let sidecar_content = encode_sidecar(&quality, written, preview, new_rank, checked_rank);
+        let sidecar_content = encode_sidecar(&quality, written, false, new_rank, checked_rank);
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -1245,10 +1244,10 @@ impl Session {
             track: CachedTrack {
                 path,
                 quality,
-                preview,
+                // 走到这里只可能是整曲替换：试听早被挡住，没有试听退避要记。
+                preview: false,
                 quality_rank: Some(new_rank),
                 checked_rank,
-                // 走到这里只可能是整曲替换，没有试听退避要记。
                 preview_retry_blocked: false,
                 lease: target_lease,
             },
