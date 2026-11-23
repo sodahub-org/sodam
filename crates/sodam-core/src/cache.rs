@@ -2479,7 +2479,7 @@ mod tests {
             file_size: 10 * 1024 * 1024,
         };
         assert!(!confirmed.is_upgradeable_to(110));
-        let estimate = estimate_upgrade(&[confirmed.clone()], 110);
+        let estimate = estimate_upgrade(std::slice::from_ref(&confirmed), 110);
         assert_eq!(estimate.upgradeable_count, 0);
 
         // 记录到期后（`fresh_checked_rank` 返回 None）重新算作可升级。
