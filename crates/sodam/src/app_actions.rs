@@ -17,7 +17,7 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::upgrade::{stop_reason, Outcome, StopReason, StreamShape, Tally};
+use sodam_core::upgrade::{stop_reason, Outcome, StopReason, Tally};
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2943,7 +2943,7 @@ impl Root {
         cx.notify();
     }
 
-    /// 跑一首：建会话 → 调升级 → 按前后两份流判定结果。
+    /// 跑一首：建会话 → 调升级 → 直接取升级路径给的「换没换文件」判定结果。
     ///
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
@@ -2951,8 +2951,6 @@ impl Root {
     /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
     /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
-    ///
-    /// 升级前读不到、升级后却有结果这一档按失败算（批量会进失败数），但不写日志。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
@@ -2961,36 +2959,25 @@ impl Root {
         levels: UpgradeLogLevels,
     ) -> Outcome {
         let session = Session::new(settings);
-        // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
-        // 返回旧文件，只有前后对比才分得清「提升了」和「跑了但没变化」。
-        let before = session
-            .cached_track(&track.id)
-            .map(|cached| StreamShape::from(&cached));
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
-            Ok(cached) => {
-                // 升级前读不到、升级后却有结果，只能是这一首在中间被重新缓存进来了。
-                // 这种判不出有没有真提升，按失败算，别谎报成「没有更高档位」。
-                let outcome = before.map_or(Outcome::Failed, |before| {
-                    Outcome::of_shapes(before, StreamShape::from(&cached))
-                });
-                let event = match outcome {
-                    Outcome::Upgraded => Some("cache_upgraded"),
-                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
-                    Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
-                    // 没有可靠的失败原因可写，所以不落日志。
-                    Outcome::Failed => None,
+            Ok(run) => {
+                // 换没换文件由升级那条路自己判定（`is_better_stream`）：它说换了，盘上那份
+                // 就确实变好了；没换就是「跑完但服务端没给更好的」。不在这里拿前后两份
+                // 缓存比分数——档位未知的旧缓存会把「量出一个正分」误当成升了一档（#272）。
+                let (outcome, event) = if run.improved {
+                    (Outcome::Upgraded, "cache_upgraded")
+                } else {
+                    (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier")
                 };
-                if let Some(event) = event {
-                    log_outlet::log_event(
-                        levels.success,
-                        LogTopic::Player,
-                        event,
-                        &[
-                            ("track_id", track.id.as_str()),
-                            ("quality", cached.quality.as_str()),
-                        ],
-                    );
-                }
+                log_outlet::log_event(
+                    levels.success,
+                    LogTopic::Player,
+                    event,
+                    &[
+                        ("track_id", track.id.as_str()),
+                        ("quality", run.track.quality.as_str()),
+                    ],
+                );
                 outcome
             }
             Err(failure) => {
