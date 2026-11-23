@@ -636,7 +636,9 @@ impl Root {
     }
 
     pub(crate) fn maintain_cache(&mut self, cx: &mut Context<Self>) {
-        if self.cache_maintenance_running || self.cache_clearing {
+        // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
+        // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收（#254）。
+        if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
             return;
         }
         self.cache_maintenance_running = true;
@@ -2925,8 +2927,6 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         self.batch_upgrade_target = intent;
-        // 上一轮停在哪儿是旧目标的事，换了目标就不再挂着。
-        self.batch_upgrade_stopped = None;
         self.refresh_upgrade_estimate(cx);
         cx.notify();
     }
@@ -2935,11 +2935,15 @@ impl Root {
     ///
     /// 单首升级和批量升级共用这一段，改一处两边同时生效（#254）。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
+    ///
+    /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
+    /// 批量几百首逐个记 Info 会刷屏，规格只要求开跑、收尾各一行，所以批量降到 Debug。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
+        success_level: LogLevel,
     ) -> Outcome {
         let session = Session::new(settings);
         // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
@@ -2961,7 +2965,7 @@ impl Root {
                 });
                 if outcome == Outcome::Upgraded {
                     log_outlet::log_event(
-                        LogLevel::Info,
+                        success_level,
                         LogTopic::Player,
                         "cache_upgraded",
                         &[
@@ -3013,7 +3017,7 @@ impl Root {
         let epoch = self.auth_epoch;
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
-            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip)
+            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
         let key_clone = key;
         cx.spawn(async move |this, cx| {
@@ -3052,7 +3056,6 @@ impl Root {
 
         self.batch_upgrading = true;
         self.batch_upgrade_cancel = false;
-        self.batch_upgrade_stopped = None;
         self.batch_upgrade_progress = BatchUpgradeProgress::default();
         cx.notify();
 
@@ -3132,7 +3135,13 @@ impl Root {
                 let target_clone = target_intent.clone();
                 let outcome = cx
                     .background_spawn(async move {
-                        Self::upgrade_one_cached_track(settings, track, target_clone, is_vip)
+                        Self::upgrade_one_cached_track(
+                            settings,
+                            track,
+                            target_clone,
+                            is_vip,
+                            LogLevel::Debug,
+                        )
                     })
                     .await;
                 tally.record(outcome);
@@ -3169,7 +3178,6 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.batch_upgrading = false;
                 root.batch_upgrade_cancel = false;
-                root.batch_upgrade_stopped = stopped;
                 root.batch_upgrade_progress = BatchUpgradeProgress {
                     done: tally.total(),
                     total,
@@ -3179,7 +3187,7 @@ impl Root {
                     let counts = [tally.total().to_string(), total.to_string()];
                     match stopped {
                         Some(StopReason::IdentityChanged) => {
-                            // 状态行与按钮下面那句都要说清：剩下的不再拿旧号跑。
+                            // 状态行说清：剩下的不再拿旧号跑。
                             let message =
                                 root.localized("账号已变更，批量已停止 ({} / {})", &counts);
                             root.notify_warning_once("batch-upgrade-stopped", message);

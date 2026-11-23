@@ -62,11 +62,15 @@ pub enum Outcome {
 
 impl Outcome {
     /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
+    ///
+    /// 档位分走 [`crate::quality::readable_rank`] 那一道闸：0 分是「量过但认不出」，
+    /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
+    /// 会被当成一次升级。
     pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
         if before.preview && !after.preview {
             return Self::Upgraded;
         }
-        if after.rank > before.rank {
+        if crate::quality::readable_rank(after.rank) > crate::quality::readable_rank(before.rank) {
             Self::Upgraded
         } else {
             Self::NoHigherTier
@@ -193,6 +197,20 @@ mod tests {
                 highest
             ),
             Outcome::Upgraded
+        );
+        // 旧缓存没记分数、这次量出来 0 分（认不出）：不算已知档位，也不算升级。
+        assert_eq!(
+            Outcome::of_shapes(
+                StreamShape {
+                    rank: None,
+                    preview: false
+                },
+                StreamShape {
+                    rank: Some(0),
+                    preview: false
+                }
+            ),
+            Outcome::NoHigherTier
         );
         // 试听换整曲：同档位也算，盘上那份文件确实变完整了。
         let preview = StreamShape {

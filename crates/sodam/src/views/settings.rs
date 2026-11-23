@@ -1150,20 +1150,6 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                         root.batch_upgrade_progress.total.to_string(),
                                     ],
                                 )
-                            } else if let Some(stop) = root.batch_upgrade_stopped {
-                                // 停在哪儿要说清：按钮下面这句就是用户看结果的地方。
-                                let counts = [
-                                    root.batch_upgrade_progress.done.to_string(),
-                                    root.batch_upgrade_progress.total.to_string(),
-                                ];
-                                match stop {
-                                    sodam_core::upgrade::StopReason::IdentityChanged => {
-                                        root.localized("账号已变更，批量已停止 ({} / {})", &counts)
-                                    }
-                                    sodam_core::upgrade::StopReason::Cancelled => {
-                                        root.localized("已取消 ({} / {})", &counts)
-                                    }
-                                }
                             } else if let Some(estimate) = &root.batch_upgrade_estimate {
                                 if estimate.upgradeable_count == 0 {
                                     root.tr(
