@@ -672,23 +672,34 @@ fn would_downgrade_to_preview(
 
 /// 这次取到的新流是否值得换掉本地已有的那一份缓存。
 ///
-/// 档位/码率的比法来自 [`crate::upgrade::stream_is_better`]：档位已知只认档位提升；
-/// 档位未知的旧三字段缓存（#89）先看标签能证明的下限，再比标签里记着的码率；
-/// 试听片段换成整曲永远是提升。
-///
-/// 换文件比「算不算升级」宽一档（见 [`crate::upgrade::should_replace_stream`]）：
-/// 同样码率的流也换一次，把旧缓存没记的档位量进 sidecar，否则这一首每轮批量都会
-/// 重下再丢掉。那次换文件在批量小结里不算成功。
+/// * 档位已知（sidecar 第 4 字段有分数）：新流档位更高才算提升；
+/// * 档位未知的旧三字段缓存（#89）只剩标签可用：旧「无损」标签给得出下限就按下限比，
+///   给不出就用标签里记着的码率兜底——新流码率更低说明这次是拿差货换好货（权益过期、
+///   曲库退档都会走到这里），不换；但新流已经够到用户要的目标档位时照样换，
+///   无损 FLAC 的码率本来就可能低于有损的高码率流，不能被这道闸误挡；
+/// * 试听片段换成整曲永远是提升。
 fn is_better_stream(
     info: &libresoda::soda::types::DownloadInfo,
     current: &CachedTrack,
     target_rank: Option<i64>,
 ) -> bool {
-    crate::upgrade::should_replace_stream(
-        crate::upgrade::StreamShape::from(current),
-        crate::upgrade::StreamShape::from_download_info(info),
-        target_rank,
-    )
+    let new_rank = crate::quality::stream_rank(info);
+    if current.preview && !info.is_preview {
+        return true;
+    }
+    let Some(old_rank) = current
+        .quality_rank
+        .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
+    else {
+        if new_rank <= 0 {
+            return false;
+        }
+        let bitrate = libresoda::soda::quality::normalize_bitrate(info.bitrate.max(0));
+        return crate::quality::legacy_label_bitrate_kbps(&current.quality)
+            .is_none_or(|old_bitrate| bitrate >= old_bitrate)
+            || target_rank.is_some_and(|target| new_rank >= target);
+    };
+    new_rank > old_rank
 }
 
 /// 拼出 sidecar 内容。
@@ -2069,15 +2080,8 @@ mod tests {
             &legacy,
             Some(100)
         ));
-        // 同样 320k 的「极高」流：换一次把档位量进 sidecar，否则每轮批量都会重下；
-        // 但 `Outcome::of_shapes` 不会把这次换文件算成升级。
         assert!(is_better_stream(
             &info("higher", "m4a", 320_000, false),
-            &legacy,
-            Some(80)
-        ));
-        assert!(is_better_stream(
-            &info("lossless", "flac", 871_000, false),
             &legacy,
             Some(100)
         ));

@@ -2971,13 +2971,12 @@ impl Root {
         let before = session
             .cached_track(&track.id)
             .map(|cached| StreamShape::from(&cached));
-        let target_rank = sodam_core::quality::target_rank(&target_intent, account_is_vip);
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(cached) => {
                 // 升级前读不到、升级后却有结果，只能是这一首在中间被重新缓存进来了。
                 // 这种判不出有没有真提升，按失败算，别谎报成「没有更高档位」。
                 let outcome = before.map_or(Outcome::Failed, |before| {
-                    Outcome::of_shapes(before, StreamShape::from(&cached), target_rank)
+                    Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
                 let event = match outcome {
                     Outcome::Upgraded => Some("cache_upgraded"),

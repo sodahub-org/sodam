@@ -59,21 +59,13 @@ pub fn stop_reason(conditions: StopConditions) -> Option<StopReason> {
     conditions.cancelled.then_some(StopReason::Cancelled)
 }
 
-/// 一份缓存流的样子：档位分 + 标签能证明的档位下限 + 码率 + 是不是试听。
+/// 一份缓存流的样子：档位分 + 是不是试听片段。
 ///
-/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了；
-/// 旧三字段缓存的档位分是 `None`，得靠标签下限和码率兜底，否则「重新量了一次」
-/// 会被当成升级。
+/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamShape {
     /// 这条流的档位分；`None` = 旧缓存没记。
     pub rank: Option<i64>,
-    /// 旧标签能证明的档位下限（见 [`crate::quality::legacy_label_floor_rank`]）；证不出为 `None`。
-    pub label_floor_rank: Option<i64>,
-    /// 旧标签里写的档名（`极高` / `无损` 等）；新流和认不出的标签为 `None`。
-    pub label_tier: Option<&'static str>,
-    /// 码率（kbps）；不知道为 `None`。新流总有，旧缓存看标签里有没有写。
-    pub bitrate_kbps: Option<i64>,
     /// 是不是试听片段。
     pub preview: bool,
 }
@@ -82,85 +74,8 @@ impl From<&crate::session::CachedTrack> for StreamShape {
     fn from(cached: &crate::session::CachedTrack) -> Self {
         Self {
             rank: cached.quality_rank,
-            label_floor_rank: crate::quality::legacy_label_floor_rank(&cached.quality),
-            label_tier: crate::quality::TIER_LABELS
-                .iter()
-                .copied()
-                .find(|tier| cached.quality.trim().starts_with(tier)),
-            bitrate_kbps: crate::quality::legacy_label_bitrate_kbps(&cached.quality),
             preview: cached.preview,
         }
-    }
-}
-
-impl StreamShape {
-    /// 刚从服务端取到、还没落盘的一条流。
-    pub fn from_download_info(info: &libresoda::soda::types::DownloadInfo) -> Self {
-        Self {
-            rank: Some(crate::quality::stream_rank(info)),
-            label_floor_rank: None,
-            label_tier: None,
-            bitrate_kbps: Some(libresoda::soda::quality::normalize_bitrate(
-                info.bitrate.max(0),
-            )),
-            preview: info.is_preview,
-        }
-    }
-}
-
-/// 新流是不是真的比本地这份好。只回答「算不算一次升级」，不回答「要不要换文件」。
-///
-/// 档位已知就只认档位提升；档位未知的旧缓存先看标签能证明的下限，再比码率——
-/// 同样码率只是把档位重新量了一遍，不算更好；码率变低时只有新流已经够到用户要的
-/// 目标档位才算（无损的 300k 换掉有损的 320k）。旧标签没写码率时证明不了新流更好，
-/// 不算升级。
-pub fn stream_is_better(before: StreamShape, after: StreamShape, target_rank: Option<i64>) -> bool {
-    if before.preview && !after.preview {
-        return true;
-    }
-    let Some(after_rank) = crate::quality::readable_rank(after.rank) else {
-        return false;
-    };
-    if let Some(old_rank) = crate::quality::readable_rank(before.rank).or(before.label_floor_rank) {
-        return after_rank > old_rank;
-    }
-    let reached_target = target_rank.is_some_and(|target| after_rank >= target);
-    match (before.bitrate_kbps, after.bitrate_kbps) {
-        (Some(old), Some(new)) if new > old => true,
-        // 用码率换档位：只有新流码率更低、已经够到目标、且档名确实和旧标签不同才算
-        // （无损的 300k 换掉有损的 320k）。同码率只是同一条流换了叫法，同名档位的
-        // 低码率流只是更差，都不算。
-        (Some(old), Some(new)) if new < old && reached_target => before
-            .label_tier
-            .is_some_and(|tier| tier != crate::quality::tier_label(after_rank)),
-        // 同码率，或旧标签没写码率：证明不了更好。
-        _ => false,
-    }
-}
-
-/// 新流值不值得写回缓存。换文件和「算不算升级」是两个问题：
-///
-/// 同样码率的流也会换一次，把旧缓存没记下来的档位量进 sidecar；不换的话这一首
-/// 每轮批量都会重下一次再丢掉（档位一直补不上）。换完由 [`stream_is_better`] 判定，
-/// 这种「重新量了一遍」不算升级。
-pub fn should_replace_stream(
-    before: StreamShape,
-    after: StreamShape,
-    target_rank: Option<i64>,
-) -> bool {
-    if stream_is_better(before, after, target_rank) {
-        return true;
-    }
-    if before.rank.is_some() || before.label_floor_rank.is_some() || after.preview {
-        return false;
-    }
-    let Some(after_rank) = crate::quality::readable_rank(after.rank) else {
-        return false;
-    };
-    // 旧缓存没记档位、标签也证不出下限：新流不比标签里写的码率差就换，把档位补进 sidecar。
-    match (before.bitrate_kbps, after.bitrate_kbps) {
-        (Some(old), Some(new)) => new >= old,
-        _ => target_rank.is_some_and(|target| after_rank >= target),
     }
 }
 
@@ -176,12 +91,16 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位真变高算提升，其余不算。
+    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
     ///
-    /// 判定和 `session::is_better_stream` 共用 [`stream_is_better`]：旧三字段缓存
-    /// （`rank = None`）不能再因为「量出了分数」就报成功，同码率只是把档位重新量了一遍。
-    pub fn of_shapes(before: StreamShape, after: StreamShape, target_rank: Option<i64>) -> Self {
-        if stream_is_better(before, after, target_rank) {
+    /// 档位分走 [`crate::quality::readable_rank`] 那一道闸：0 分是「量过但认不出」，
+    /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
+    /// 会被当成一次升级。
+    pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
+        if before.preview && !after.preview {
+            return Self::Upgraded;
+        }
+        if crate::quality::readable_rank(after.rank) > crate::quality::readable_rank(before.rank) {
             Self::Upgraded
         } else {
             Self::NoHigherTier
@@ -306,154 +225,65 @@ mod tests {
         );
     }
 
-    fn shape(
-        rank: Option<i64>,
-        floor: Option<i64>,
-        bitrate: Option<i64>,
-        preview: bool,
-    ) -> StreamShape {
-        StreamShape {
-            rank,
-            label_floor_rank: floor,
-            label_tier: None,
-            bitrate_kbps: bitrate,
-            preview,
-        }
-    }
-
-    fn with_label_tier(mut stream: StreamShape, tier: &'static str) -> StreamShape {
-        stream.label_tier = Some(tier);
-        stream
-    }
-
     /// 档位没真提升不算成功。
     #[test]
     fn an_equal_or_lower_tier_is_not_an_upgrade() {
-        let lossless = shape(Some(100), None, Some(871), false);
-        let highest = shape(Some(80), None, Some(320), false);
+        let lossless = StreamShape {
+            rank: Some(100),
+            preview: false,
+        };
+        let highest = StreamShape {
+            rank: Some(80),
+            preview: false,
+        };
+        assert_eq!(Outcome::of_shapes(highest, lossless), Outcome::Upgraded);
         assert_eq!(
-            Outcome::of_shapes(highest, lossless, None),
-            Outcome::Upgraded
-        );
-        assert_eq!(
-            Outcome::of_shapes(lossless, lossless, None),
+            Outcome::of_shapes(lossless, lossless),
             Outcome::NoHigherTier,
             "同一条流拿回来两次不算升级"
         );
         assert_eq!(
-            Outcome::of_shapes(lossless, highest, None),
+            Outcome::of_shapes(lossless, highest),
             Outcome::NoHigherTier,
             "拿回更差的流不算升级"
         );
-        // 旧缓存没记分数、码率确实变高：实打实的提升。
+        // 旧缓存没记分数：这次量出来一个分数，就是实打实的提升。
         assert_eq!(
             Outcome::of_shapes(
-                shape(None, None, Some(192), false),
-                shape(Some(80), None, Some(320), false),
-                None
+                StreamShape {
+                    rank: None,
+                    preview: false
+                },
+                highest
             ),
             Outcome::Upgraded
-        );
-        // 旧缓存没记分数、换成同样 320k 的「极高」流：只是重新量了一遍档位，不算成功。
-        assert_eq!(
-            Outcome::of_shapes(
-                shape(None, None, Some(320), false),
-                shape(Some(80), None, Some(320), false),
-                Some(80)
-            ),
-            Outcome::NoHigherTier,
-            "同码率重写一遍文件不是升级"
-        );
-        // 旧标签是无损：按下限比，同档位的新流不算升级，哪怕码率更高。
-        assert_eq!(
-            Outcome::of_shapes(
-                shape(None, Some(100), Some(300), false),
-                shape(Some(100), None, Some(871), false),
-                Some(100)
-            ),
-            Outcome::NoHigherTier
-        );
-        // 旧标签没写码率：证明不了新流更好，不算升级（换文件补档位另算）。
-        assert_eq!(
-            Outcome::of_shapes(
-                shape(None, None, None, false),
-                shape(Some(100), None, None, false),
-                Some(100)
-            ),
-            Outcome::NoHigherTier
         );
         // 旧缓存没记分数、这次量出来 0 分（认不出）：不算已知档位，也不算升级。
         assert_eq!(
             Outcome::of_shapes(
-                shape(None, None, Some(320), false),
-                shape(Some(0), None, Some(320), false),
-                None
+                StreamShape {
+                    rank: None,
+                    preview: false
+                },
+                StreamShape {
+                    rank: Some(0),
+                    preview: false
+                }
             ),
             Outcome::NoHigherTier
         );
         // 试听换整曲：同档位也算，盘上那份文件确实变完整了。
-        let preview = shape(Some(80), None, Some(320), true);
-        let full = shape(Some(80), None, Some(320), false);
-        assert_eq!(Outcome::of_shapes(preview, full, None), Outcome::Upgraded);
+        let preview = StreamShape {
+            rank: Some(80),
+            preview: true,
+        };
+        let full = StreamShape {
+            rank: Some(80),
+            preview: false,
+        };
+        assert_eq!(Outcome::of_shapes(preview, full), Outcome::Upgraded);
         // 整曲换成试听什么时候都不算升级（这条路本来就另有护栏挡着）。
-        assert_eq!(
-            Outcome::of_shapes(full, preview, None),
-            Outcome::NoHigherTier
-        );
-    }
-
-    /// 换文件比算升级宽一档：同码率也换一次把档位量出来，但不算升级。
-    #[test]
-    fn an_equal_bitrate_stream_is_replaced_only_to_measure_the_tier() {
-        let legacy_high = with_label_tier(shape(None, None, Some(320), false), "极高");
-        let same = shape(Some(80), None, Some(320), false);
-        assert!(!stream_is_better(legacy_high, same, Some(80)));
-        assert!(should_replace_stream(legacy_high, same, Some(80)));
-
-        // 历史标签「极高 320k」按当前刻度只算「较高」：同一条 320k 流取回来，
-        // 只是档名从「极高」变成「较高」，码率没变，不算升级。
-        let remeasured = shape(Some(70), None, Some(320), false);
-        assert!(!stream_is_better(legacy_high, remeasured, Some(70)));
-        assert!(should_replace_stream(legacy_high, remeasured, Some(70)));
-
-        // 同档位、更低码率：目标档位也够到了，但只是把 320k 换成 192k，不换。
-        let worse_same_tier = shape(Some(80), None, Some(192), false);
-        assert!(!stream_is_better(legacy_high, worse_same_tier, Some(80)));
-        assert!(!should_replace_stream(
-            legacy_high,
-            worse_same_tier,
-            Some(80)
-        ));
-
-        let lossless_at_lower_bitrate = shape(Some(100), None, Some(300), false);
-        assert!(stream_is_better(
-            legacy_high,
-            lossless_at_lower_bitrate,
-            Some(100)
-        ));
-        assert!(should_replace_stream(
-            legacy_high,
-            lossless_at_lower_bitrate,
-            Some(100)
-        ));
-
-        // 已经记过档位的不再为了补测量而重写：只有真提升才换。
-        let known = shape(Some(80), None, Some(320), false);
-        assert!(!should_replace_stream(known, same, Some(80)));
-
-        // 标签能证明无损下限时，同档无损流也不换：下限管着，不靠补测。
-        let legacy_lossless = with_label_tier(shape(None, Some(100), Some(871), false), "无损");
-        let lossless_again = shape(Some(100), None, Some(871), false);
-        assert!(!stream_is_better(
-            legacy_lossless,
-            lossless_again,
-            Some(110)
-        ));
-        assert!(!should_replace_stream(
-            legacy_lossless,
-            lossless_again,
-            Some(110)
-        ));
+        assert_eq!(Outcome::of_shapes(full, preview), Outcome::NoHigherTier);
     }
 
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
