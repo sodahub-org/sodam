@@ -2974,11 +2974,11 @@ impl Root {
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
-                // 升级前读不到、升级后却有结果：没有可靠的失败原因可写。
                 let event = match outcome {
                     Outcome::Upgraded => Some("cache_upgraded"),
                     // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
                     Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
+                    // 这一档来自缓存中途被清掉的竞态，没有可靠的失败原因可写。
                     Outcome::Failed => None,
                 };
                 if let Some(event) = event {
