@@ -2974,28 +2974,23 @@ impl Root {
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
-                match outcome {
-                    Outcome::Upgraded => log_outlet::log_event(
+                // 升级前读不到、升级后却有结果：没有可靠的失败原因可写。
+                let event = match outcome {
+                    Outcome::Upgraded => Some("cache_upgraded"),
+                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
+                    Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
+                    Outcome::Failed => None,
+                };
+                if let Some(event) = event {
+                    log_outlet::log_event(
                         levels.success,
                         LogTopic::Player,
-                        "cache_upgraded",
+                        event,
                         &[
                             ("track_id", track.id.as_str()),
                             ("quality", cached.quality.as_str()),
                         ],
-                    ),
-                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，
-                    // 别让它一声不响。
-                    Outcome::NoHigherTier => log_outlet::log_event(
-                        levels.success,
-                        LogTopic::Player,
-                        "cache_upgrade_no_higher_tier",
-                        &[
-                            ("track_id", track.id.as_str()),
-                            ("quality", cached.quality.as_str()),
-                        ],
-                    ),
-                    Outcome::Failed => {}
+                    );
                 }
                 outcome
             }
