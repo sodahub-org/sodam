@@ -123,8 +123,10 @@ TrackItem + cache path
   释放后由下一轮维护淘汰。音频下载暂存（`staging/` 子目录，libresoda 的 `.part` /
   `.part.lock` / `.part.meta` / `.dec.tmp`）有两道收尾：启动后的首轮维护按后缀白名单
   清掉超过 24 小时、无租约占用的残留（进程内只跑一次，历史锁与孤儿 `.part` 靠它清；
-  `stale_staging_swept` 日志记删除数）；超额淘汰正式音频时，该曲目在暂存子目录的整组
-  残余（含 24 小时内的 `.part`）同批带走，进行中的下载由交付目标上的租约挡住。
+  `stale_staging_swept` 日志记删除数；扫描不完整时跳过本轮重试，连续 5 轮不完整就
+  放弃，`stale_staging_sweep_incomplete` / `stale_staging_sweep_gave_up` 两条 Warn
+  留痕）；超额淘汰正式音频时，该曲目在暂存子目录的整组残余（含 24 小时内的 `.part`）
+  同批带走，进行中的下载由交付目标上的租约挡住。
 - 音频与封面共用同一份递归扫描（`cache::scan_files`）和同一个按组 LRU 淘汰器，两者只在
   分组键（`{track}-{tag}` vs. 封面 URL 哈希）和删除方式（租约检查 vs. 直接删）上不同。
   扫描区分「目录不存在」和「子树读不到」：前者按空目录正常处理，后者把扫描标成不完整，
