@@ -637,7 +637,7 @@ impl Root {
 
     pub(crate) fn maintain_cache(&mut self, cx: &mut Context<Self>) {
         // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
-        // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收（#254）。
+        // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
         if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
             return;
         }
@@ -739,7 +739,7 @@ impl Root {
         if self.cache_clearing {
             return;
         }
-        // 批量升级期间清缓存，剩下的每一首都会以「文件已被删」失败，结尾还报成功（#254）。
+        // 批量升级期间清缓存，剩下的每一首都会以「文件已被删」失败，结尾还报成功。
         // 直接拦住：先取消批量，或者等它跑完再清。
         if self.batch_upgrading {
             let message = self.tr("批量升级进行中，请先取消再清空缓存");
@@ -2468,7 +2468,7 @@ impl Root {
         self.unplayable.clear();
         self.prefetch_cooldown_since.clear();
         self.clear_round_exhaustion();
-        // 升级去重表跟着身份走：换号后同一首同一档位在新账号下要能再试一次（#254）。
+        // 升级去重表跟着身份走：换号后同一首同一档位在新账号下要能再试一次。
         // 正在跑的批量下一首之前会看到代数变了，自己停。
         self.cache_upgrade_attempted.observe_epoch(self.auth_epoch);
     }
@@ -2932,7 +2932,7 @@ impl Root {
 
     /// 跑一首：建会话 → 调升级 → 按前后两份流判定结果。
     ///
-    /// 单首升级和批量升级共用这一段，改一处两边同时生效（#254）。同步函数：调用方自己
+    /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
     /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
@@ -2998,7 +2998,7 @@ impl Root {
 
         // N2 并发上限保护（复用 prefetch_concurrency，避免连续切歌并发冲垮签名服务）。
         // 数的是**在跑的任务**，不是「哪几首」：同一首在换号或清缓存之后会重新发起，
-        // 按 key 记的话两次发起会共用一个槽位，上限就守不住了（#254）。
+        // 按 key 记的话两次发起会共用一个槽位，上限就守不住了。
         if self.cache_upgrade_running >= max_inflight {
             return;
         }
@@ -3014,7 +3014,7 @@ impl Root {
             Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
         cx.spawn(async move |this, cx| {
-            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定（#254）。
+            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
             let _ = work.await;
             let _ = this.update(cx, |root, _cx| {
                 root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
@@ -3025,16 +3025,23 @@ impl Root {
 
     /// 执行已有缓存的批量升级任务。
     ///
-    /// 循环只跟单首共用「跑一首」；循环本身、状态和文案留在应用层（#254）。
+    /// 循环只跟单首共用「跑一首」；循环本身、状态和文案留在应用层。
     pub(crate) fn start_batch_upgrade(&mut self, cx: &mut Context<Self>) {
         if self.batch_upgrading {
             return;
         }
         // 正在清缓存或收缩缓存时不开跑：扫完盘到真跑之间那几首会被删掉，剩下的一首首都以
-        // 「文件已被删」失败（#254）。和 `clear_cache` / `maintain_cache` 那两道拦的是同一件事。
+        // 「文件已被删」失败。和 `clear_cache` / `maintain_cache` 那两道拦的是同一件事。
         if self.cache_clearing || self.cache_maintenance_running {
             let message = self.tr("正在整理缓存，请稍后再试");
             self.notify_warning_once("batch-upgrade-cache-busy", message);
+            cx.notify();
+            return;
+        }
+        // 正在退出登录：这一批一首都发不出去（每首之前都会因为身份要变停住），别白扫一遍全盘。
+        if self.logout_in_flight {
+            let message = self.tr("正在退出登录，请稍后再试");
+            self.notify_warning_once("batch-upgrade-blocked", message);
             cx.notify();
             return;
         }
@@ -3066,7 +3073,7 @@ impl Root {
             }
         };
 
-        // 点下去那一刻的身份代数：扫盘也要几百毫秒，期间登出/换号的话这一批一个都不该发（#254）。
+        // 点下去那一刻的身份代数：扫盘也要几百毫秒，期间登出/换号的话这一批一个都不该发。
         let start_epoch = self.auth_epoch;
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
@@ -3156,7 +3163,7 @@ impl Root {
             }
 
             // 取消和换号都可能落在最后一首下载期间：那时循环已经没有「下一首」可停，这两件事
-            // 照样要说出来，不能被一句「完成」盖掉（#254）。判据还是那一个 `stop_reason`，
+            // 照样要说出来，不能被一句「完成」盖掉。判据还是那一个 `stop_reason`，
             // 免得同一个窗口里两套口径给出两种答案。
             if stopped.is_none() {
                 stopped = this
@@ -3235,16 +3242,14 @@ impl Root {
         .detach();
     }
 
-    /// 这一轮批量现在该不该停。
-    ///
-    /// 正在退出登录也算：`logout()` 要等落盘成功才推进身份代数，慢盘上那一等就是几秒，
-    /// 这期间批量还能拿旧 Cookie 再发一首——那正是要堵的洞，所以不等落盘。但落盘可能失败
-    /// （账号还在），所以这里报的是「正在退出登录」，不冒充「账号已变更」。
+    /// 这一轮批量现在该不该停。判据全在 [`stop_reason`] 里，这里只负责把状态喂进去。
     fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
-        if self.logout_in_flight {
-            return Some(StopReason::LoggingOut);
-        }
-        stop_reason(start_epoch, self.auth_epoch, self.batch_upgrade_cancel)
+        stop_reason(
+            start_epoch,
+            self.auth_epoch,
+            self.batch_upgrade_cancel,
+            self.logout_in_flight,
+        )
     }
 
     /// 取消批量升级：只停在下一首之前，正在下的那一首不打断（底层没有取消句柄）。

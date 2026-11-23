@@ -33,8 +33,21 @@ impl StopReason {
 
 /// 下一首之前该不该停。
 ///
-/// 两件事同时到达时报身份那次：用户要处理的是「换号了」，取消已经不重要。
-pub fn stop_reason(start_epoch: u64, current_epoch: u64, cancelled: bool) -> Option<StopReason> {
+/// 优先级：正在退出登录 > 身份变了 > 用户取消。
+///
+/// * 正在退出登录压过身份：`logout()` 要等落盘成功才推进身份代数，慢盘上那几秒里批量还能
+///   拿旧 Cookie 再发一首，所以不等落盘就停；但落盘可能失败、账号还在，那句话说「账号已
+///   变更」就是撒谎，只能说「正在退出登录」。
+/// * 身份压过取消：两件事同时到达时，用户要处理的是「换号了」。
+pub fn stop_reason(
+    start_epoch: u64,
+    current_epoch: u64,
+    cancelled: bool,
+    logging_out: bool,
+) -> Option<StopReason> {
+    if logging_out {
+        return Some(StopReason::LoggingOut);
+    }
     if current_epoch != start_epoch {
         return Some(StopReason::IdentityChanged);
     }
@@ -159,17 +172,31 @@ mod tests {
     /// 换号之后，下一首之前就停；报的是身份变了。
     #[test]
     fn identity_change_stops_before_the_next_track() {
-        assert_eq!(stop_reason(7, 7, false), None);
-        assert_eq!(stop_reason(7, 8, false), Some(StopReason::IdentityChanged));
+        assert_eq!(stop_reason(7, 7, false, false), None);
+        assert_eq!(
+            stop_reason(7, 8, false, false),
+            Some(StopReason::IdentityChanged)
+        );
         // 取消和换号同时到：报身份那次，那才是用户要处理的事。
-        assert_eq!(stop_reason(7, 8, true), Some(StopReason::IdentityChanged));
+        assert_eq!(
+            stop_reason(7, 8, true, false),
+            Some(StopReason::IdentityChanged)
+        );
     }
 
     /// 取消之后不再发下一首。
     #[test]
     fn cancel_stops_before_the_next_track() {
-        assert_eq!(stop_reason(3, 3, true), Some(StopReason::Cancelled));
-        assert_eq!(stop_reason(3, 3, false), None);
+        assert_eq!(stop_reason(3, 3, true, false), Some(StopReason::Cancelled));
+        assert_eq!(stop_reason(3, 3, false, false), None);
+    }
+
+    /// 正在退出登录压过另外两条：落盘可能失败、账号还在，这时候说「账号已变更」没把握。
+    #[test]
+    fn logging_out_wins_over_identity_and_cancel() {
+        assert_eq!(stop_reason(7, 7, false, true), Some(StopReason::LoggingOut));
+        assert_eq!(stop_reason(7, 8, false, true), Some(StopReason::LoggingOut));
+        assert_eq!(stop_reason(7, 8, true, true), Some(StopReason::LoggingOut));
     }
 
     /// 档位没真提升不算成功。

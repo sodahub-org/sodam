@@ -547,6 +547,7 @@ impl Language {
                 "Cache upgrade complete: upgraded {} songs, {} failed, {} with no higher quality"
             }
             "正在整理缓存，请稍后再试" => "Cache maintenance is running; try again in a moment",
+            "正在退出登录，请稍后再试" => "Signing out; try again in a moment",
             "批量升级进行中，请先取消再清空缓存" => {
                 "Batch upgrade is running; cancel it before clearing the cache"
             }
