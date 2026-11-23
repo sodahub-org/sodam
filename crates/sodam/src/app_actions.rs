@@ -807,9 +807,8 @@ impl Root {
                 root.cover_store.clear_completed();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
-                // 原图没有渲染期自动入队口子，显式补一次当前曲目原图。
-                // 作废和补下载都在 restore_current_original_cover 里完成，
-                // 这里拿不到中间态，顺序写不反。
+                // 已完成结果的作废由上面的 `clear_completed()` 完成；
+                // 原图没有渲染期自动入队口子，这里只补排当前曲目。
                 root.restore_current_original_cover(cx);
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);

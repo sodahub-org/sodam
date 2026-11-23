@@ -170,8 +170,9 @@ struct Lane {
     inflight: HashSet<String>,
     /// 在飞期间被 `forget` 的 URL：这次结果作废，结束后退回 `Idle`。
     abandoned: HashSet<String>,
-    /// 作废期间又有人在等这张图：结果回来放行后要立刻重排，
-    /// 否则重试按钮要等下一次渲染才生效。
+    /// 作废期间又有人在等这张图，或清缓存时当前曲目的原图还在下载：
+    /// 结果落完要立刻补排，否则重试按钮 / 歌词页大图要等下一次请求才生效。
+    /// 切歌时 `retain_only` 会把非当前曲目的需求裁掉。
     requeue_after_release: HashSet<String>,
     max_queue: usize,
     max_inflight: usize,
@@ -269,12 +270,23 @@ impl Lane {
                 slot.failures = 0;
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
-            if self.requeue_after_release.remove(url) {
-                self.enqueue(url, ready, records, select);
-            }
+            self.requeue_if_demanded(url, ready, records, select);
             return true;
         }
         false
+    }
+
+    /// 有人在这张图在飞期间留了需求：结果落完立刻补排。
+    fn requeue_if_demanded(
+        &mut self,
+        url: &str,
+        ready: &CoverPaths,
+        records: &mut HashMap<String, Record>,
+        select: SelectSlot,
+    ) {
+        if self.requeue_after_release.remove(url) {
+            self.enqueue(url, ready, records, select);
+        }
     }
 
     /// 作废一张：清队列位置、记号、失败次数；在飞的那张等结果回来再放行。
@@ -296,12 +308,15 @@ impl Lane {
     }
 
     /// 切歌时只留一张在排队：别的排队项退回可重排，不删失败次数。
+    ///
+    /// 已经记下的「在飞结果回来要补排」也一起丢掉，否则切走的歌下载完还会再排一次。
     fn retain_only(
         &mut self,
         keep: &str,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
     ) {
+        self.requeue_after_release.retain(|url| url == keep);
         let mut dropped = Vec::new();
         self.queue.retain(|queued| {
             if queued.as_str() == keep {
@@ -496,10 +511,12 @@ impl CoverStore {
             }
         }
         // 清缓存时当前曲目的原图还在下载：这次按文件在不在落账，落完还缺就补排。
-        if self.originals.requeue_after_release.remove(url) {
-            self.originals
-                .enqueue(url, &self.original_paths, &mut self.records, original_slot);
-        }
+        self.originals.requeue_if_demanded(
+            url,
+            &self.original_paths,
+            &mut self.records,
+            original_slot,
+        );
     }
 
     /// 清缓存后当前曲目的原图还在下载：这次结果照常落账，落账后还缺再补排。
@@ -580,7 +597,8 @@ impl CoverStore {
         }
     }
 
-    /// 切歌时原图排队只留当前曲目；被剔掉的退回可重排，下次播放会重新请求。
+    /// 切歌时原图排队只留当前曲目；被剔掉的退回可重排，下次播放会重新请求，
+    /// 已经记下的「在飞结果回来要补排」也一起丢掉。
     pub fn retain_original_only(&mut self, url: &str) {
         self.originals
             .retain_only(url.trim(), &mut self.records, original_slot);
@@ -1137,6 +1155,28 @@ mod tests {
         assert!(store.original_path("cover-a").is_none());
         assert_eq!(store.want(&urls(&["cover-a"])).len(), 1, "两格都能重新下");
         assert!(store.want_original("cover-a"));
+    }
+
+    /// 切歌后旧歌的「落完补排」需求也要丢掉，不能等它下载完再排回来。
+    #[test]
+    fn switching_song_drops_old_retry_demand() {
+        let mut store = CoverStore::default();
+        assert!(store.want_original("original-old"));
+        assert!(store.want_original("original-current"));
+        assert_eq!(store.drain_original().len(), 2, "两张都在飞");
+
+        store.retry_original_after_release("original-old");
+        store.retry_original_after_release("original-current");
+        store.retain_original_only("original-current");
+        store.complete_original("original-old", CoverOutcome::Vanished);
+
+        assert!(store.drain_original().is_empty(), "切歌后旧歌不再补排");
+        store.complete_original("original-current", CoverOutcome::Vanished);
+        assert_eq!(
+            store.drain_original(),
+            vec!["original-current".to_string()],
+            "当前曲目的补排需求要留着"
+        );
     }
 
     /// 清缓存后当前曲目的原图还在下载：先按文件在不在落账，缺了才补排。
