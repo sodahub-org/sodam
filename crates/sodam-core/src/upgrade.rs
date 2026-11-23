@@ -127,9 +127,10 @@ pub fn stream_is_better(before: StreamShape, after: StreamShape, target_rank: Op
     let reached_target = target_rank.is_some_and(|target| after_rank >= target);
     match (before.bitrate_kbps, after.bitrate_kbps) {
         (Some(old), Some(new)) if new > old => true,
-        // 用码率换档位：只有新流够到目标、且档名确实和旧标签不同才算
-        // （无损的 300k 换掉有损的 320k）；同名档位的低码率流只是更差。
-        (Some(_), Some(_)) if reached_target => before
+        // 用码率换档位：只有新流码率更低、已经够到目标、且档名确实和旧标签不同才算
+        // （无损的 300k 换掉有损的 320k）。同码率只是同一条流换了叫法，同名档位的
+        // 低码率流只是更差，都不算。
+        (Some(old), Some(new)) if new < old && reached_target => before
             .label_tier
             .is_some_and(|tier| tier != crate::quality::tier_label(after_rank)),
         // 同码率，或旧标签没写码率：证明不了更好。
@@ -408,6 +409,12 @@ mod tests {
         let same = shape(Some(80), None, Some(320), false);
         assert!(!stream_is_better(legacy_high, same, Some(80)));
         assert!(should_replace_stream(legacy_high, same, Some(80)));
+
+        // 历史标签「极高 320k」按当前刻度只算「较高」：同一条 320k 流取回来，
+        // 只是档名从「极高」变成「较高」，码率没变，不算升级。
+        let remeasured = shape(Some(70), None, Some(320), false);
+        assert!(!stream_is_better(legacy_high, remeasured, Some(70)));
+        assert!(should_replace_stream(legacy_high, remeasured, Some(70)));
 
         // 同档位、更低码率：目标档位也够到了，但只是把 320k 换成 192k，不换。
         let worse_same_tier = shape(Some(80), None, Some(192), false);
