@@ -5695,11 +5695,14 @@ mod tests {
         assert_eq!(current_cover_url(None, None), None);
     }
 
-    /// 清缓存补原图：必须先把去重状态清干净，再交出 URL 去 ensure。
-    /// 顺序写反（先 ensure 后清）时 attempted 里还留着 URL，ensure 直接跳过，
-    /// 大图静默补不回来——这是 #265 的原 bug，必须有测试挡住回归。
+    /// 清缓存补原图：交出 URL 前必须把去重状态清干净，否则 ensure 会早退。
+    ///
+    /// `ensure_original_cover` 有两道早退关卡：命中 `original_covers`、或
+    /// `attempted` 里记过这个 URL，就直接返回。清状态和取 URL 绑在同一函数里，
+    /// 调用方拿到的 URL 一定已经过了这两关。测试按这两关逐一断言，锁住顺序契约。
+    /// （这里测的是纯函数这一半；调用方必须拿它的返回值去 ensure，不得从别处另取 URL。）
     #[test]
-    fn clear_state_is_dropped_before_original_cover_is_restored() {
+    fn cleared_dedup_state_lets_original_cover_ensure_through() {
         let make = |cover: &str| TrackItem {
             cover: cover.to_string(),
             ..Default::default()
@@ -5720,13 +5723,19 @@ mod tests {
         );
 
         // 交出去的 URL 跟歌词页同口径。
-        assert_eq!(picked.as_deref(), Some("url/pending"));
-        // 更要紧的是：交出去之前三张去重表都已清空，ensure 不会再被跳过。
-        assert!(originals.is_empty(), "原图映射必须先清");
+        let url = picked.as_deref().expect("应给出当前曲目封面");
+        assert_eq!(url, "url/pending");
+        // ensure 的第一道早退：original_covers 命中就不再下载。
         assert!(
-            attempted.is_empty(),
-            "attempted 必须先清，否则 ensure 直接返回"
+            !originals.contains_key(url),
+            "原图映射必须先清，否则 ensure 早退"
         );
+        // ensure 的第二道早退：attempted 记过就不再下载。
+        assert!(
+            !attempted.contains(url),
+            "attempted 必须先清，否则 ensure 早退"
+        );
+        // 排队表清干净，旧的在飞 URL 不会被补上。
         assert!(wait_list.is_empty(), "排队表必须先清");
     }
 
