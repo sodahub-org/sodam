@@ -1,6 +1,6 @@
 //! 磁盘缓存维护。所有扫描/删除由后台调用；租约保护下载、待装载和正在播放的音频。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime};
 use crate::log_outlet::{log_event, LogLevel, LogTopic};
 
 pub const DEFAULT_AUDIO_LIMIT_MB: u64 = 10 * 1024;
+/// 下载临时文件（含可续传暂存族）的保留窗口：窗口内不参与淘汰。
+/// 失败留下的暂存至少能在这段时间内被下一次播放接上（#243）。
 const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 「已确认没有更高档位」记录的有效期。
@@ -105,22 +107,24 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// 同一个暂存目标的全部暂存尾巴（见 [`STAGING_TAILS`]）与它的交付文件共享保护键：
-// 租约挂在暂存目标上时，这几个文件都不会被维护线程当废弃文件删掉。
-// meta 与解密临时文件不带自己的租约，也必须跟着交付目标走，否则下载进行中被
-// 淘汰收尾删掉，断点续传信息就毁了。名单从 [`STAGING_TAILS`] 单点派生，
-// 将来加尾巴不用记得来这里补。
+// libresoda 可续传路径在暂存目标旁落盘的一族文件后缀（`part_record` 的
+// `staged_paths` 命名表）。保护键与 24 小时新鲜窗共用这一份，上游改命名表
+// 时只改这里。每项带 `.m4a` 前缀：保护键摘掉整个后缀就能还原出交付目标，
+// 也把封面那类没有 `.m4a` 前缀的 `{hash}-160.img.*.part` 挡在映射之外。
+const STAGED_SUFFIXES: [&str; 5] = [
+    ".m4a.part.meta.tmp",
+    ".m4a.part.meta",
+    ".m4a.part.lock",
+    ".m4a.part",
+    ".m4a.dec.tmp",
+];
+
+// 同一个暂存目标的一族文件与它的交付文件共享保护键：
+// 租约挂在暂存目标上时，这几个文件都不会被维护线程删掉，淘汰也按这一键整组走。
 fn protection_key(path: &Path) -> PathBuf {
+    // 长后缀在前：`.part.meta.tmp` 必须先于 `.part.meta` 被摘掉。
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    // 尾巴必须长在交付目标的 `.m4a` 后面（`{交付目标}{尾巴}`）才算同一组：
-    // 先按尾巴剥一层，再看剩下的部分是否以 `.m4a` 收尾。封面那类 `.img.*.part`
-    // 的剩余部分不带 `.m4a`，不进映射，别误套音频租约。
-    let stem = STAGING_TAILS.iter().find_map(|tail| {
-        let rest = name.strip_suffix(tail)?;
-        rest.ends_with(".m4a")
-            .then(|| &rest[..rest.len() - ".m4a".len()])
-    });
-    if let Some(stem) = stem {
+    if let Some(stem) = STAGED_SUFFIXES.iter().find_map(|s| name.strip_suffix(s)) {
         return path.with_file_name(format!("{stem}.m4a"));
     }
     if path.extension().is_some_and(|ext| ext == "quality") {
@@ -130,7 +134,29 @@ fn protection_key(path: &Path) -> PathBuf {
     }
 }
 
+/// 文件名是否落在可续传暂存族的命名表里（不含交付目标本身）。
+///
+/// 这里摘掉 `.m4a` 前缀再匹配，所以封面的 `{hash}-160.img.*.part` 也算
+/// 暂存族、24 小时内不淘汰；[`protection_key`] 则必须要求 `.m4a` 前缀，
+/// 否则封面临时会挂到音频暂存目标上。两边判据不一样是刻意的。
+fn staged_family_member(name: &str) -> bool {
+    STAGED_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix.strip_prefix(".m4a").unwrap_or(suffix)))
+}
+
 fn remove_idle(path: &Path) -> bool {
+    // `.part.lock` 不走任何删除路径：它的 mtime 停在首次下载那一刻，
+    // 按龄判定会把「复用中的锁」误判成残留；跨进程时租约又看不见内核锁，
+    // 删掉正被挂着的锁文件，后到的下载者会在同名位置另立新锁，两把锁
+    // 罩同一个目标，互斥就破了。锁是 0 字节，留着没有任何代价。
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.ends_with(".part.lock") {
+        return false;
+    }
     let active = leases().lock().unwrap_or_else(|err| err.into_inner());
     if active
         .get(&protection_key(path))
@@ -140,67 +166,6 @@ fn remove_idle(path: &Path) -> bool {
     }
     // 检查和 unlink 在同一临界区，避免租约在二者之间建立。
     std::fs::remove_file(path).is_ok()
-}
-
-/// 音频下载暂存子目录（session.rs 的下载暂存都落在这里，与正式缓存分开）。
-///
-/// 单独放子目录是必须的：档位标签可以是用户自定义值，`auto-normal` 这种恰好会
-/// 撞上正常下载的暂存名；分开之后，清理暂存绝不会删掉已经下好的正式缓存。
-/// 淘汰收尾按这个名字找暂存文件；启动巡检扫整个音频目录时自然覆盖它。
-pub(crate) fn staging_dir(audio_dir: &Path) -> PathBuf {
-    audio_dir.join("staging")
-}
-
-/// 我们自己的暂存文件尾巴（最长在前），三处共用的单一出处：
-/// 启动巡检的白名单（[`is_staging_residue_name`]）、租约保护键的映射
-/// （[`protection_key`]，按「交付目标 + 尾巴」认）、淘汰收尾的名字反推
-/// （[`staging_committed_name`]，逐层剥尾巴）。加新尾巴只需改这里，
-/// 三条路同时生效；测试 `protection_key_maps_every_staging_tail_to_the_target`
-/// 会守住保护键这层。
-///
-/// libresoda 以「交付目标 + 后缀」落暂存：数据 `.part`、锁 `.part.lock`、
-/// 断点元数据 `.part.meta`（含 `.tmp` 中间态）、解密中间文件 `.dec.tmp`
-///（尾巴挂在交付目标或 `.part` 上都见过，两种拼法都收）。历史版本把目标名带
-/// `.part` 传下去，还留下过 `.part.part` / `.part.part.lock`。清理只认这份名单：
-/// 正式缓存（`.m4a`）、`.quality` 记录、封面和名字不相干的文件一律不碰。
-/// 一个名字最多匹配一条尾巴（后缀精确到结尾），顺序只影响可读性。
-const STAGING_TAILS: [&str; 6] = [
-    ".part.meta.tmp",
-    ".part.dec.tmp",
-    ".part.meta",
-    ".part.lock",
-    ".dec.tmp",
-    ".part",
-];
-
-/// 文件名是否落在我们自己的暂存尾巴上。只看后缀：历史残留（`*.part.part`、
-/// `*.part.part.lock`，在音频目录根下）和新暂存（staging 子目录）都靠它认出来。
-/// 缓存目录里除 libresoda 暂存外没有别的写者会用这些后缀。
-fn is_staging_residue_name(name: &str) -> bool {
-    STAGING_TAILS.iter().any(|tail| name.ends_with(tail))
-}
-
-/// 暂存子目录里的文件名 → 它归属的正式缓存文件名（`{id}-{tag}.m4a`）。
-///
-/// 先剥掉所有暂存尾巴得到交付目标名（`{id}-{tag}-{用途}.m4a`），再剥掉用途后缀。
-/// 名字对不上这套命名的（没有用途尾巴、或剥完不是 `.m4a`）一律 `None`：
-/// 不是我们命名的暂存，绝不碰。曲目 id 编码后不含 `-`，按结尾剥用途不会剥错位置；
-/// 自定义档位里带 `-normal` 时，交付名末尾是「标签-用途」两层，剥掉最后一层正好回到正式名。
-fn staging_committed_name(name: &str) -> Option<String> {
-    let mut rest = name;
-    while let Some(tail) = STAGING_TAILS.iter().find(|tail| rest.ends_with(*tail)) {
-        rest = &rest[..rest.len() - tail.len()];
-    }
-    if !rest.ends_with(".m4a") {
-        return None;
-    }
-    for purpose in [DownloadPurpose::Normal, DownloadPurpose::Upgrade] {
-        let tail = format!("-{}.m4a", purpose.suffix());
-        if let Some(base) = rest.strip_suffix(&tail) {
-            return Some(format!("{base}.m4a"));
-        }
-    }
-    None
 }
 
 /// 目录扫描得到的一个缓存文件：路径、字节数、最后修改时间。
@@ -320,9 +285,28 @@ where
     }
 }
 
+/// 24 小时内的下载临时文件不参与淘汰（还在下载，或留着给下次续传）。
+///
+/// 覆盖封面的 `.part` 临时名和 libresoda 暂存族的整族名字；调用方再按各自
+/// 的分组键（音频 `protection_key`、封面 `cover_group_key`）把族聚合，
+/// 保证数据和记录一起保护。过了窗口的暂存由配额淘汰与保留期清扫处理，
+/// libresoda 下载时也会清掉 7 天过期对。
 fn is_fresh_part(path: &Path, modified: SystemTime) -> bool {
+    if modified.elapsed().unwrap_or_default() >= PART_MAX_AGE {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    // 暂存族按与 [`protection_key`] 共用的那份后缀表认领：
+    // 数据和记录必须一起保护，删掉一边续传对就再也对不上了。
+    if staged_family_member(name) {
+        return true;
+    }
+    // 兜底：非 UTF-8 文件名读不出名字，写了一半的封面/音频临时照样按
+    // `.part` 后缀护住。
     path.extension().is_some_and(|ext| ext == "part")
-        && modified.elapsed().unwrap_or_default() < PART_MAX_AGE
 }
 
 /// 封面分组键：文件名开头的 URL 哈希。缩略图 `{hash}-160.img`、原图 `{hash}.img`、
@@ -349,7 +333,8 @@ pub const COVER_LIMIT_MB: u64 = 512;
 /// 音频与封面共用的那一份淘汰器：两者只在「怎么分组」「怎么删」和「最后使用时间从哪来」
 /// 上不同。`group_key` 把同一份缓存的文件归到一组（音频是文件 + `.quality` sidecar，
 /// 封面是缩略图 + 原图），组内取最新使用时间当 LRU 键，整组一起删，不会留下半套缓存。
-/// 24 小时内的 `.part` 计入总量但不参与淘汰（还在下载）。
+/// 组里任一成员是 24 小时内的临时文件，**整组**计入总量但不参与淘汰（还在下载）：
+/// 中断重写的记录 mtime 比数据新，按文件各自判新鲜会在配额超额时把续传对拆成半套。
 ///
 /// `last_seen` 是「文件路径 → 最近一次显示时间」；没有记录的路径按 mtime 排。
 ///
@@ -363,33 +348,37 @@ fn evict_lru<K, G, R>(
     mut remove: R,
 ) -> (u64, Vec<PathBuf>)
 where
-    K: Eq + std::hash::Hash,
+    K: Clone + Eq + std::hash::Hash,
     G: Fn(&Path) -> K,
     R: FnMut(&Path) -> bool,
 {
     let mut groups: HashMap<K, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
+    let mut protected: HashSet<K> = HashSet::new();
     let mut total = 0u64;
     for file in files {
         total = total.saturating_add(file.bytes);
+        let key = group_key(&file.path);
+        // 新鲜成员照常进组（排序键随它变新），只是把整组标记为受保护。
         if is_fresh_part(&file.path, file.modified) {
-            continue;
+            protected.insert(key.clone());
         }
         let used_at = last_seen
             .get(&file.path)
             .copied()
             .map_or(file.modified, |seen| file.modified.max(seen));
-        let group = groups
-            .entry(group_key(&file.path))
-            .or_insert((used_at, Vec::new()));
+        let group = groups.entry(key).or_insert((used_at, Vec::new()));
         group.0 = group.0.max(used_at);
         group.1.push((file.path, file.bytes));
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by_key(|(_, (used_at, _))| *used_at);
     let mut removed = Vec::new();
-    for (_, (_, group_files)) in groups {
+    for (key, (_, group_files)) in groups {
         if total <= limit_bytes {
             break;
+        }
+        if protected.contains(&key) {
+            continue;
         }
         for (path, bytes) in group_files {
             if remove(&path) {
@@ -547,11 +536,33 @@ pub fn trim_covers(limit_mb: u64, last_seen: &HashMap<PathBuf, SystemTime>) -> V
 }
 
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
+///
+/// 可续传暂存族的新鲜度按整族聚合（任一成员还年轻就整族留给下次续传），
+/// 其余文件仍按各自的新鲜度判；租约保护与 `remove_idle` 同一临界区。
 pub fn clear_in(root: &Path) -> usize {
-    scan_files(root)
-        .files
+    let files = scan_files(root).files;
+    let mut protected: HashSet<PathBuf> = HashSet::new();
+    for file in &files {
+        if is_fresh_part(&file.path, file.modified) {
+            protected.insert(protection_key(&file.path));
+        }
+    }
+    files
         .into_iter()
-        .filter(|file| !is_fresh_part(&file.path, file.modified) && remove_idle(&file.path))
+        .filter(|file| {
+            let name = file
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            // 暂存族看整族结论；其余文件（正式缓存、sidecar、封面）看自己。
+            let fresh = if staged_family_member(name) {
+                protected.contains(&protection_key(&file.path))
+            } else {
+                is_fresh_part(&file.path, file.modified)
+            };
+            !fresh && remove_idle(&file.path)
+        })
         .count()
 }
 
@@ -562,137 +573,102 @@ pub fn clear_in(root: &Path) -> usize {
 /// 少删（停在额度之上）比不删更接近预期。封面则在可读部分已超限时才这么做、否则本轮
 /// 不删——这点差异是有意保留的：音频额度是用户可见的硬需求，封面是「别无限涨」的软约束。
 pub fn trim_audio_in(dir: &Path, limit_bytes: u64) -> u64 {
-    trim_audio_scan(scan_files(dir), limit_bytes, &staging_dir(dir))
+    trim_audio_scan(scan_files(dir), limit_bytes)
 }
 
-fn trim_audio_scan(scan: Scan, limit_bytes: u64, staging: &Path) -> u64 {
-    let (total, removed) = evict_lru(
+fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
+    evict_lru(
         scan.files,
         limit_bytes,
         protection_key,
         &HashMap::new(),
         remove_idle,
-    );
-    // 扫描与收尾之间暂存文件可能新出现或长大，收尾释放的字节可能不在 total 里，
-    // 用饱和减法兜底，绝不让统计下溢。
-    total.saturating_sub(remove_evicted_staging(&removed, staging))
+    )
+    .0
 }
 
-/// 被淘汰的正式音频，把它留在暂存子目录的整组残余一并拿走。
+/// 音频根下旧格式（#241 之前）暂存残留的清扫核心：只列顶层、不递归。
 ///
-/// 暂存与正式缓存分居两个目录，扫描里各自成组：超额淘汰删掉正式文件时，
-/// 那首的锁和半截 `.part` 不会跟着走，会在目录里单独立着。这里按名字把被淘汰
-/// 曲目的交付目标、`.part`、`.part.lock`、`.part.meta`、`.dec.tmp` 一次收齐。
-/// 正在进行的下载仍由租约挡住（remove_idle 的检查与 unlink 在同一临界区），
-/// 暂存目录不存在（从来没有过下载）就是没有残余，正常返回 0 字节。
+/// #241 之前暂存直接落在音频目录根下，改到 `staging/` 子目录后，这些
+/// `{曲目}-{档位}-{pid}-{seq}.m4a.part(.part)` 之类的老文件就再也没人管了。
+/// 这里按与 [`STAGED_SUFFIXES`] 同源的族名认领，超过 [`PART_MAX_AGE`] 的
+/// 交给 [`remove_idle`]——租约与 `.part.lock` 的例外都在那儿。
 ///
-/// 24 小时内的 `.part` 平时不参与淘汰（可能还在下载），但正式文件已经淘汰时
-/// 这首的暂存就是纯垃圾：租约挡得住真正在下的，挡不住的说明早没人下了，一起删。
-/// 返回实际释放的字节数。
+/// 不递归进 `staging/` 子目录：那里归 [`purge_stale_staging_in`] 的 7 天
+/// 保留期按整族清扫，这里按成员年龄动手会把续传对拆开。
 ///
-/// 已知边界：收尾释放的字节不计入选组时的预算。`evict_lru` 只看正式文件组，
-/// 新鲜暂存的字节数要等收尾才知道，于是「旧曲目 + 大块无租约新鲜暂存」同时
-/// 命中时可能多淘汰一到两组——多删的按 LRU 序正好是下一顺位，下轮自愈。
-/// 要把字节数算进选组，得给与封面共用的 `evict_lru` 加每组钩子，不值得。
-fn remove_evicted_staging(removed: &[PathBuf], staging: &Path) -> u64 {
-    let audio_root = match staging.parent() {
-        Some(root) => root,
-        None => return 0,
+/// 返回 `Some(删除数)`；`None` 表示这轮目录没读全（条目、类型或元数据
+/// 读不到），交给下轮重试，别让一次抖动就把这次机会用掉。
+fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
+    let entries = match std::fs::read_dir(audio_root) {
+        Ok(entries) => entries,
+        // 目录不存在是正常状态（首次启动、从没下载过）：按空目录处理，别当缺口，
+        // 否则全新机器会白跑满重试轮次再留一条放弃 Warn。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
     };
-    let evicted: std::collections::HashSet<String> = removed
-        .iter()
-        .filter(|path| {
-            path.parent() == Some(audio_root) && path.extension().is_some_and(|ext| ext == "m4a")
-        })
-        .filter_map(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .collect();
-    if evicted.is_empty() {
-        return 0;
-    }
-    let Ok(entries) = std::fs::read_dir(staging) else {
-        return 0;
-    };
-    let mut freed = 0u64;
-    for entry in entries.flatten() {
+    let mut complete = true;
+    let mut removed = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         let path = entry.path();
-        if !path.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            complete = false;
+            continue;
+        };
+        // 只动顶层普通文件；目录（含 staging 子目录）与符号链接一律不碰。
+        if !file_type.is_file() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(committed) = staging_committed_name(name) else {
-            continue;
-        };
-        if !evicted.contains(&committed) {
+        // 锁永不删（#243）：mtime 停在首次下载，删掉正被内核锁挂着的锁
+        // 会让后到的下载者另立新锁，同一目标出现两把锁，互斥就破了。
+        if name.ends_with(".part.lock") {
             continue;
         }
-        // 先量后删：删成功就没了，量不出字节的删了也不计入释放空间。
+        if !staged_family_member(name) {
+            continue;
+        }
         let Ok(meta) = std::fs::metadata(&path) else {
+            // 扫描与取元数据之间被删掉是正常竞争；还在却读不到才算缺口。
+            if path.exists() {
+                complete = false;
+            }
             continue;
         };
+        let modified = meta.modified().unwrap_or_else(|_| SystemTime::now());
+        if is_fresh_part(&path, modified) {
+            continue;
+        }
         if remove_idle(&path) {
-            freed = freed.saturating_add(meta.len());
+            removed += 1;
         }
     }
-    freed
-}
-
-/// 残留清扫：清掉指定目录里超过 [`PART_MAX_AGE`]、没被租约占用的暂存残留。
-///
-/// 底层库从不删锁文件（进程退出靠内核解锁，一个下载目标留一把空锁是它写明的设计），
-/// 它自带的 7 天清扫也只认「数据 + 记录成对、两边都够老」的文件——只有 `.part`
-/// 没有记录的孤儿它认不出，锁文件更是完全不认。历史残留只能在这里按后缀白名单补刀：
-/// 名单见 [`STAGING_TAILS`]，超过 24 小时且租约放行的才删；清完之后锁文件数量就降到
-/// 「最近 24 小时内下载过的曲目数」的量级。
-///
-/// 正式缓存、`.quality` 记录、封面和名字不相干的文件一律不碰；正在下载的暂存由
-/// 租约挡住（检查与 unlink 在同一临界区），24 小时的年龄门槛再兜一层底。
-/// 暂存子目录里自己命名的交付目标（`.m4a`）不在白名单里：它由下次下载的
-/// `stage_path` 或淘汰收尾负责，巡检不凭后缀判断 `.m4a` 的归属。
-/// 返回删除的文件数。调用方必须在后台执行。
-pub fn sweep_stale_staging_in(dir: &Path) -> usize {
-    sweep_scan(scan_files(dir))
-}
-
-/// 白名单清扫的执行核心：过期的暂存尾巴按租约放行逐个删除并记日志。
-fn sweep_scan(scan: Scan) -> usize {
-    let removed = scan
-        .files
-        .into_iter()
-        .filter(|file| {
-            is_staging_residue_name(
-                file.path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(""),
-            ) && file.modified.elapsed().unwrap_or_default() >= PART_MAX_AGE
-        })
-        .filter(|file| remove_idle(&file.path))
-        .count();
     if removed > 0 {
         log_event(
             LogLevel::Info,
             LogTopic::App,
-            "stale_staging_swept",
+            "legacy_residue_swept",
             &[("removed", removed.to_string().as_str())],
         );
     }
-    removed
+    complete.then_some(removed)
 }
 
 /// 首轮巡检的连续不完整轮数上限：到顶就放弃，进程内不再重试。
 /// 5 轮 ≈ 5 分钟（按主心跳 60 秒一轮维护算，见 app_actions 的 maintain_cache），
-/// 子树长期读不到（权限不对、目录一直被占）时不至于每 60 秒一次全量扫盘
-/// 永不停止——那正是进程级一次性门要省的开销。
+/// 目录长期读不到时不至于每 60 秒一次全量扫盘永不停止——那正是进程级
+/// 一次性门要省的开销。
 const SWEEP_MAX_INCOMPLETE_ROUNDS: usize = 5;
 
 /// 首轮巡检的门：进程级状态（连续不完整轮数 + 是否已结束）独立成结构体，
-/// 让「不完整到上限就置完成」「完成后再喂扫描直接返回 0、不再动文件」这两条
-/// 关键行为能在单测里直接固定——进程级静态本身依赖 root_dir，测不到。
+/// 让「不完整到上限就置完成」「完成后再喂结果直接返回 0」这两条关键行为
+/// 能在单测里直接固定——进程级静态本身依赖 root_dir，测不到。
 struct SweepGate {
     incomplete_rounds: usize,
     finished: bool,
@@ -706,27 +682,29 @@ impl SweepGate {
         }
     }
 
-    /// 喂一轮扫描结果：完整就清扫并结束；不完整这轮跳过、计数加一并留痕，
-    /// 连续到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮就放弃（带日志）并结束。
-    /// 与封面淘汰同一条教训（#225）：子树临时读不到（权限抖动、盘忙、被锁）
-    /// 会让扫描标成不完整，可读部分里的残留这轮不清，留给下轮维护重试；
-    /// 但重试必须有界，否则长期读不到时每轮维护都在空扫。日志也有界：
-    /// 首轮一条 `stale_staging_sweep_incomplete`，放弃时一条
-    /// `stale_staging_sweep_gave_up`，中间轮次静默。返回删除的文件数。
-    fn advance(&mut self, scan: Scan) -> usize {
+    /// 门是否已结束（完成或放弃）。
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// 喂一轮结果：`Some(删除数)` 这轮收工；`None` 目录没读全就跳过本轮、
+    /// 计数加一并留痕，连续到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮就放弃
+    /// （带日志）并结束。日志有界：首轮一条 `legacy_residue_sweep_incomplete`，
+    /// 放弃时一条 `legacy_residue_sweep_gave_up`，中间轮次静默。
+    /// 返回删除的文件数。
+    fn advance(&mut self, outcome: Option<usize>) -> usize {
         if self.finished {
             return 0;
         }
-        if scan.incomplete {
+        let Some(removed) = outcome else {
             self.incomplete_rounds += 1;
             let rounds = self.incomplete_rounds;
-            let readable_files = scan.files.len().to_string();
             if rounds == 1 {
                 log_event(
                     LogLevel::Warn,
                     LogTopic::App,
-                    "stale_staging_sweep_incomplete",
-                    &[("readable_files", readable_files.as_str())],
+                    "legacy_residue_sweep_incomplete",
+                    &[],
                 );
             }
             if rounds >= SWEEP_MAX_INCOMPLETE_ROUNDS {
@@ -734,48 +712,122 @@ impl SweepGate {
                 log_event(
                     LogLevel::Warn,
                     LogTopic::App,
-                    "stale_staging_sweep_gave_up",
-                    &[
-                        ("rounds", rounds_text.as_str()),
-                        ("readable_files", readable_files.as_str()),
-                    ],
+                    "legacy_residue_sweep_gave_up",
+                    &[("rounds", rounds_text.as_str())],
                 );
                 self.finished = true;
             }
             return 0;
-        }
+        };
         self.finished = true;
-        sweep_scan(scan)
+        removed
     }
 }
 
-/// 对整个音频缓存目录（含暂存子目录）跑一轮残留清扫，返回删除的文件数。
+/// 音频根下历史暂存残留的启动巡检：清旧格式孤儿数据，返回删除的文件数。
 ///
-/// 只在启动后的首轮维护实际执行：主心跳约 60 秒就调一轮维护，而残留的年龄门槛
-/// 是 24 小时，会话期间新产生的残留本来就不满 24 小时，每轮重扫几乎全是空跑；
-/// 音频目录可能上万文件，这个代价省得掉。会话期间攒下的残留留给下次启动清，
-/// 与「每次启动的缓存巡检顺手清掉」的口径一致。整个门（查状态 → 扫描 → 落位）
-/// 由一把互斥锁串行化，用 [`std::sync::Mutex::try_lock`] 而不是阻塞等锁：
-/// 拿不到锁说明另一轮巡检正在进行，本轮直接空转返回——后到者不为一次全量
-/// 扫盘干等，同一时刻也不会有两个调用各烧一个不完整轮数名额。锁中毒不是
-/// 「有人在扫」：拿回状态继续跑，别让一次 panic 把进程级一次性门永久静默关掉。
-/// 这是 pub 函数，正确性不押在调用方恰好单飞上。扫描完整或连续不完整到
-/// [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮才算结束。调用方必须在后台执行。
-pub fn sweep_stale_staging() -> usize {
+/// 只在启动后的首轮维护实际执行：主心跳约 60 秒就调一轮维护，跨过年龄门槛
+/// 的老残留不会每分钟变多，每轮重扫几乎全是空跑；目录可能上万文件，
+/// 这个代价省得掉。门整体由一把互斥锁串行化，用 [`std::sync::Mutex::try_lock`]
+/// 而不是阻塞等锁：拿不到锁说明另一轮巡检正在进行，本轮直接空转返回——
+/// 后到者不为一次目录扫描干等，同一时刻也不会有两个调用各烧一个不完整轮数
+/// 名额。锁中毒不是「有人在扫」：拿回状态继续跑，别让一次 panic 把进程级
+/// 一次性门永久静默关掉。这是 pub 函数，正确性不押在调用方恰好单飞上。
+/// 锁文件永不删（#243），staging 子目录留给 [`purge_stale_staging_in`]。
+/// 调用方必须在后台执行。
+pub fn sweep_legacy_residue() -> usize {
     static SWEEP_GATE: Mutex<SweepGate> = Mutex::new(SweepGate::new());
     let mut gate = match SWEEP_GATE.try_lock() {
         Ok(gate) => gate,
         Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return 0,
     };
-    gate.advance(scan_files(&root_dir().join("audio")))
+    gate.advance(sweep_legacy_residue_once(&root_dir().join("audio")))
 }
 
+/// staging 子目录名。下载把暂存放这里（`session.rs` 的 `staging_dir` 用同一份名字），
+/// 维护把超过保留期的残留从这里清走。
+pub(crate) const STAGING_DIR_NAME: &str = "staging";
+
+/// 暂存残留保留 7 天，和 libresoda 自己的过期清扫同一条口径（#243）；
+/// 过了 24 小时新鲜窗就不再受保护，配额超额时按 LRU 先走。
+const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub fn trim_audio(limit_mb: u64) -> u64 {
-    trim_audio_in(
-        &root_dir().join("audio"),
-        limit_mb.saturating_mul(1024 * 1024),
-    )
+    let dir = root_dir().join("audio");
+    let remaining = trim_audio_in(&dir, limit_mb.saturating_mul(1024 * 1024));
+    // 配额淘汰只在超额时动暂存，libresoda 的 7 天清扫又只搭下次下载的车；
+    // 配额宽裕且长期不下载时残留会一直占着磁盘，维护每轮按保留期兜底清一遍。
+    purge_stale_staging_in(&dir.join(STAGING_DIR_NAME), STALE_STAGING_MAX_AGE);
+    remaining
+}
+
+/// 把 staging 子目录里超过保留期的残留无条件清掉，返回删掉的文件数。
+///
+/// staging 目录是下载的专用地盘，里面超过保留期的普通文件都是残留。
+/// 过期按**整族**判：族里任一成员还年轻就整族不动——中断重写的记录
+/// mtime 比数据新，逐文件判龄会在边界上拆开续传对；族全过期才逐个删。
+/// 动手时走 [`remove_idle`] 的租约临界区，且 `.part.lock` 永不删
+/// （它的 mtime 停在首次下载，年久不代表失效；删掉正被内核锁挂着的锁
+/// 会破坏互斥）。
+pub(crate) fn purge_stale_staging_in(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    // 第一遍：按保护键把暂存族归组，记下每件成员是否过期；交付目标与
+    // 非族名文件自成一件。只动普通文件：目录、符号链接、拿不到元数据的
+    // 位置整条跳过。
+    let mut families: HashMap<PathBuf, Vec<(PathBuf, bool)>> = HashMap::new();
+    let mut standalone: Vec<(PathBuf, bool)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        // 锁文件不参与族判定，也不会被删（remove_idle 的同一条规则）。
+        if name.ends_with(".part.lock") {
+            continue;
+        }
+        // mtime 在未来（时钟回拨）也算拿不到年龄，按「还没过期」处理。
+        // modified() 与 duration_since() 错误类型不同，只能分两步取。
+        let expired = match meta.modified() {
+            Ok(modified) => now.duration_since(modified).is_ok_and(|age| age >= max_age),
+            Err(_) => false,
+        };
+        if staged_family_member(name) {
+            families
+                .entry(protection_key(&path))
+                .or_default()
+                .push((path, expired));
+        } else {
+            standalone.push((path, expired));
+        }
+    }
+    // 第二遍：族里所有成员都过期才动（任一成员还年轻就整族留给下一次）。
+    let mut removed = 0;
+    for members in families.values() {
+        if members.iter().all(|&(_, expired)| expired) {
+            for (path, _) in members {
+                if remove_idle(path) {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    for (path, expired) in &standalone {
+        if *expired && remove_idle(path) {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 曲目 id 写进缓存文件名前先过这一步：字母数字原样留着，其余字节写成 `_XX`
@@ -1881,8 +1933,7 @@ mod tests {
         let scan = scan_denying(dir.path(), &dir.path().join("deep"));
         assert!(scan.incomplete);
         // 可读部分共 30 字节，上限 20：淘汰最旧那组（音频 + sidecar 20 字节），停在 10。
-        let staging = dir.path().join("staging");
-        assert_eq!(trim_audio_scan(scan, 20, &staging), 10);
+        assert_eq!(trim_audio_scan(scan, 20), 10);
         assert!(!old.exists(), "音频照旧淘汰可读部分里最旧的");
         assert!(recent.exists());
     }
@@ -2723,18 +2774,17 @@ mod tests {
         assert!(!target.exists());
     }
 
-    /// 同一个缓存目标的文件共享保护键：租约挂在暂存目标上时，
-    /// 它的全部暂存尾巴（.part / .part.lock / .part.meta / .part.meta.tmp / .dec.tmp）
-    /// 不会被维护线程当废弃文件删掉。
+    /// 同一个暂存目标的文件共享保护键：租约挂在暂存目标上时，
+    /// 可续传路径写下的整族文件（数据 / 记录 / 记录临时 / 锁 / 解密临时）
+    /// 都不会被维护线程当废弃文件删掉。
     #[test]
     fn audio_staging_files_share_the_target_lease() {
         let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
         for staged in [
             "/cache/audio/staging/123-lossless-normal.m4a.part",
-            "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
             "/cache/audio/staging/123-lossless-normal.m4a.part.meta",
             "/cache/audio/staging/123-lossless-normal.m4a.part.meta.tmp",
-            "/cache/audio/staging/123-lossless-normal.m4a.part.dec.tmp",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
             "/cache/audio/staging/123-lossless-normal.m4a.dec.tmp",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
@@ -2751,6 +2801,116 @@ mod tests {
         );
     }
 
+    /// 可续传的暂存整族在 24 小时窗口内都算「还在用」：数据和记录少一边，
+    /// 下次就接不上上次那段字节了。
+    #[test]
+    fn resumable_staging_family_counts_as_fresh_within_the_window() {
+        let dir = "/cache/audio/staging/123-lossless-normal.m4a";
+        for staged in [
+            format!("{dir}.part"),
+            format!("{dir}.part.meta"),
+            format!("{dir}.part.meta.tmp"),
+            format!("{dir}.dec.tmp"),
+        ] {
+            assert!(
+                is_fresh_part(Path::new(&staged), SystemTime::now()),
+                "{staged} 在窗口内必须受保护"
+            );
+        }
+        // 过了 24 小时窗口就不再保护：残留交给配额淘汰、保留期清扫
+        // 与 libresoda 的 7 天清扫。
+        let old = SystemTime::now() - PART_MAX_AGE;
+        assert!(!is_fresh_part(Path::new(&format!("{dir}.part")), old));
+        assert!(!is_fresh_part(Path::new(&format!("{dir}.part.meta")), old));
+    }
+
+    /// 超过保留期的暂存残留由维护无条件清掉：交付目标、数据、记录、解密临时
+    /// 都算残留；`.part.lock` 与租约保护的整族除外（#243）。
+    #[test]
+    fn purge_stale_staging_removes_expired_residue_but_spares_lock_and_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(STAGING_DIR_NAME);
+        let old = STALE_STAGING_MAX_AGE.as_secs() + 60;
+        let expired_target = file(&staging, "123-lossless-normal.m4a", old);
+        let expired_data = file(&staging, "123-lossless-normal.m4a.part", old);
+        let expired_meta = file(&staging, "123-lossless-normal.m4a.part.meta", old);
+        let expired_tmp = file(&staging, "123-lossless-normal.m4a.dec.tmp", old);
+        let stale_lock = file(&staging, "123-lossless-normal.m4a.part.lock", old);
+        let fresh_data = file(&staging, "456-high-normal.m4a.part", 0);
+        // 混合年龄的族：数据过期、记录还年轻（中断重写了记录）——整族不动，
+        // 留给下一次下载由 libresoda 的 load_record 判定。
+        let mixed_data = file(&staging, "666-lossless-normal.m4a.part", old);
+        let mixed_record = file(&staging, "666-lossless-normal.m4a.part.meta", 0);
+        // 租约挂在暂存目标上时，它的整族过期文件也受保护。`_lease` 只是为了
+        // 让租约活到断言结束：这里不需要读它。
+        let leased_target = file(&staging, "789-lossless-normal.m4a", old);
+        let leased_data = file(&staging, "789-lossless-normal.m4a.part", old);
+        let _lease = CacheLease::acquire(&leased_target);
+
+        let removed = purge_stale_staging_in(&staging, STALE_STAGING_MAX_AGE);
+
+        assert_eq!(removed, 4, "删掉的：交付目标 + 数据 + 记录 + 解密临时");
+        assert!(!expired_target.exists(), "过期的交付目标必须清掉");
+        assert!(!expired_data.exists(), "过期的 .part 必须清掉");
+        assert!(!expired_meta.exists(), "过期的记录必须清掉");
+        assert!(!expired_tmp.exists(), "过期的解密临时必须清掉");
+        assert!(
+            stale_lock.exists(),
+            ".part.lock 的 mtime 停在首次下载，年久不代表失效，永不动"
+        );
+        assert!(fresh_data.exists(), "保留期窗口内的暂存不能动");
+        assert!(
+            mixed_data.exists() && mixed_record.exists(),
+            "族里任一成员还年轻就整族不动，不在边界上拆开续传对"
+        );
+        assert!(
+            leased_target.exists() && leased_data.exists(),
+            "租约保护的整族（正在下载/待交付）不能动"
+        );
+    }
+
+    /// `.part.lock` 不走任何删除路径：配额淘汰只看 mtime 会把复用中的锁
+    /// 误判成残留，跨进程时租约又看不见内核锁。
+    #[test]
+    fn quota_eviction_never_touches_staged_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(STAGING_DIR_NAME);
+        let lock = file(&staging, "123-lossless-normal.m4a.part.lock", 90_000);
+        assert!(!remove_idle(&lock), "过期的锁也不能由维护删");
+        assert!(lock.exists(), "锁文件只能由 libresoda 的下载路径作废");
+    }
+
+    /// 配额淘汰按整族判新鲜：记录年轻、数据过期的续传对整族存活，
+    /// 不能在配额压力下删掉 `.part` 留下对不上的记录（#243）。
+    #[test]
+    fn quota_eviction_keeps_mixed_age_staging_family_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(STAGING_DIR_NAME);
+        let old_data = file(&staging, "123-lossless-normal.m4a.part", 90_000);
+        let fresh_meta = file(&staging, "123-lossless-normal.m4a.part.meta", 0);
+        let victim = file(&staging, "456-high-normal.m4a.part", 90_000);
+        // 三份各 10 字节，限 10 字节：唯一可淘汰的是全过期的 victim 那组。
+        // 受保护的族留在总量里，淘汰合法地停在额度之上——与租约文件
+        // 「可暂时超额」是同一条既有语义。
+        let remaining = trim_audio_scan(scan_files(dir.path()), 10);
+        assert_eq!(remaining, 20);
+        assert!(!victim.exists(), "全过期的族照常按 LRU 淘汰");
+        assert!(
+            old_data.exists() && fresh_meta.exists(),
+            "混合年龄的族整族存活：删了数据就接不上了"
+        );
+    }
+
+    /// 清缓存同样按整族保留混合年龄的续传对。
+    #[test]
+    fn clear_keeps_mixed_age_staging_family_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_data = file(dir.path(), "staging/123-lossless-normal.m4a.part", 90_000);
+        let fresh_meta = file(dir.path(), "staging/123-lossless-normal.m4a.part.meta", 0);
+        assert_eq!(clear_in(dir.path()), 0, "族里有新鲜成员就一件都不删");
+        assert!(old_data.exists() && fresh_meta.exists(), "清缓存不拆续传对");
+    }
+
     /// 临时名每次都不一样：同一张封面的两个写者不会写到同一个文件里。
     /// 名字以 `.part` 结尾，所以写了一半的临时文件也享有「24 小时内不淘汰」的保护。
     #[test]
@@ -2765,13 +2925,13 @@ mod tests {
         );
     }
 
-    /// 保护键的映射必须与 [`STAGING_TAILS`] 同源：名单里每条尾巴挂在交付目标
+    /// 保护键的映射必须与 [`STAGED_SUFFIXES`] 同源：名单里每条尾巴挂在交付目标
     /// `.m4a` 后面都能折回交付目标。加尾巴只改数组，这条测试守住保护键不漏。
     #[test]
     fn protection_key_maps_every_staging_tail_to_the_target() {
         let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
-        for tail in STAGING_TAILS {
-            let staged = format!("/cache/audio/staging/123-lossless-normal.m4a{tail}");
+        for suffix in STAGED_SUFFIXES {
+            let staged = format!("/cache/audio/staging/123-lossless-normal{suffix}");
             assert_eq!(protection_key(Path::new(&staged)), target, "{staged}");
         }
         // 挂在别处（封面那类 `.img.*.part`）不进映射，保持原样。
@@ -2781,87 +2941,45 @@ mod tests {
         );
     }
 
-    /// 暂存子目录里的文件名要能映射回正式缓存名：所有暂存尾巴都剥得掉，
-    /// 名字对不上我们命名规则的一律 None。
+    /// #242：音频根下旧格式暂存残留按族名清掉，锁、正式缓存、子目录一个不碰。
     #[test]
-    fn staging_committed_name_maps_all_residue_suffixes() {
-        for residue in [
-            "100-old-auto-normal.m4a",
-            "100-old-auto-normal.m4a.part",
-            "100-old-auto-normal.m4a.part.lock",
-            "100-old-auto-normal.m4a.part.meta",
-            "100-old-auto-normal.m4a.part.meta.tmp",
-            "100-old-auto-normal.m4a.dec.tmp",
-            "100-old-auto-normal.m4a.part.dec.tmp",
-            "100-old-auto-upgrade.m4a.part.lock",
-        ] {
-            assert_eq!(
-                staging_committed_name(residue),
-                Some("100-old-auto.m4a".to_string()),
-                "{residue}"
-            );
-        }
-        // 档位标签可以带连字符，剥掉的必须是末尾的用途层。
-        assert_eq!(
-            staging_committed_name("7427204361343191057-hi-res-normal.m4a.part.lock"),
-            Some("7427204361343191057-hi-res.m4a".to_string())
-        );
-        // 标签自己叫 foo-normal 时，交付名是两层 -normal，剥掉最后一层正好回到正式名。
-        assert_eq!(
-            staging_committed_name("x-foo-normal-normal.m4a"),
-            Some("x-foo-normal.m4a".to_string())
-        );
-        // 不是我们命名的暂存：没有用途尾巴、剥完不是 .m4a，都不许碰。
-        assert_eq!(staging_committed_name("x-auto.m4a"), None, "正式名不映射");
-        assert_eq!(staging_committed_name("x-auto.m4a.part"), None);
-        assert_eq!(staging_committed_name("x-auto.m4a.old"), None);
-        assert_eq!(staging_committed_name("notes.txt"), None);
-        // 历史残留（无用途后缀）只归启动巡检管，映射不出正式名。
-        assert_eq!(staging_committed_name("222-low-4242-7.m4a.part.part"), None);
-    }
-
-    /// #242：过期的暂存残留按白名单清掉，其余一个不碰。
-    #[test]
-    fn sweep_removes_only_stale_whitelisted_residue() {
+    fn legacy_residue_sweep_removes_old_staging_but_spares_locks_and_cache() {
         let dir = tempfile::tempdir().unwrap();
-        // 过期残留：六种尾巴各一个（dec.tmp 的两种拼法都算），外加历史格式的
-        // 孤儿数据和锁、新暂存子目录里的锁。
+        // 旧格式残留（#241 之前直接落在音频根下）：过期才清。
         let stale = [
-            "111-auto.m4a.part",
-            "111-auto.m4a.part.lock",
-            "111-auto.m4a.part.meta",
-            "111-auto.m4a.part.meta.tmp",
-            "111-auto.m4a.dec.tmp",
-            "111-auto.m4a.part.dec.tmp",
-            "222-low-4242-7.m4a.part.part",
-            "222-low-4242-7.m4a.part.part.lock",
-            "staging/333-auto-normal.m4a.part.lock",
+            "111-auto-4242-7.m4a.part",
+            "111-auto-4242-7.m4a.part.part",
+            "111-auto-4242-7.m4a.part.meta",
+            "111-auto-4242-7.m4a.dec.tmp",
         ];
         for name in stale {
             file(dir.path(), name, 90_000);
         }
-        // 不能碰的：正式缓存与 sidecar（过期也留着）、封面式名字、不相干文件、
-        // 暂存里的交付目标（不在白名单，由 stage_path 与淘汰收尾负责），
-        // 以及 24 小时内的残留。
+        // 不碰的：锁（#243 永不删）、24 小时内的残留、正式缓存与 sidecar、
+        // 封面式名字、不相干文件，以及 staging 子目录里的东西（归 7 天保留期管）。
         let keep = [
-            "111-auto.m4a",
-            "111-auto.quality",
+            "111-auto-4242-7.m4a.part.lock",
+            "222-auto.m4a.part",
+            "333-auto.m4a",
+            "333-auto.quality",
             "abcd-160.img",
             "notes.txt",
-            "staging/444-auto-upgrade.m4a",
-            "555-auto.m4a.part.lock",
-            "staging/666-auto-normal.m4a.part",
+            "staging/444-auto-normal.m4a.part",
         ];
         for name in keep {
-            // 暂存尾巴的文件用新鲜时间（1 小时）：年龄门槛挡住的正是它们。
-            let age = if name.ends_with(".part.lock") || name.ends_with(".part") {
+            let age = if name == "222-auto.m4a.part" {
                 3_600
             } else {
                 90_000
             };
             file(dir.path(), name, age);
         }
-        assert_eq!(sweep_stale_staging_in(dir.path()), stale.len());
+
+        assert_eq!(
+            sweep_legacy_residue_once(dir.path()),
+            Some(stale.len()),
+            "过期的旧格式残留全部清掉"
+        );
         for name in stale {
             assert!(!dir.path().join(name).exists(), "{name} 该清掉");
         }
@@ -2870,147 +2988,65 @@ mod tests {
         }
     }
 
-    /// #242：巡检不删租约还在的暂存，放开后下一轮清走。
-    #[test]
-    fn sweep_respects_download_leases() {
-        let dir = tempfile::tempdir().unwrap();
-        let stage = staging_dir(dir.path());
-        let part = file(&stage, "777-auto-normal.m4a.part", 90_000);
-        let lock = file(&stage, "777-auto-normal.m4a.part.lock", 90_000);
-        let meta = file(&stage, "777-auto-normal.m4a.part.meta", 90_000);
-        let dec_tmp = file(&stage, "777-auto-normal.m4a.dec.tmp", 90_000);
-        let lease = CacheLease::acquire(&stage.join("777-auto-normal.m4a"));
-
-        assert_eq!(sweep_stale_staging_in(dir.path()), 0);
-        assert!(
-            part.exists() && lock.exists() && meta.exists() && dec_tmp.exists(),
-            "正在下载的暂存不能被清"
-        );
-
-        drop(lease);
-        assert_eq!(sweep_stale_staging_in(dir.path()), 4);
-        assert!(!part.exists() && !lock.exists());
-        assert!(!meta.exists() && !dec_tmp.exists());
-    }
-
-    /// #242：首轮巡检赶上扫描不完整就跳过本轮，连续到上限就放弃并结束。
+    /// #242：音频目录不存在（首次启动）按空目录处理，不算缺口。
     ///
-    /// 一次性门绝不能在不完整的扫描上落位（#225 同款教训）：
-    /// 可读部分的残留要等完整扫描再清；放弃后不再动文件。
+    /// 读不全的 `None` 语义由上面的门测试固定；这里钉死「全新安装别白跑重试」。
     #[test]
-    fn sweep_gate_skips_incomplete_scans_until_limit_then_gives_up() {
+    fn legacy_residue_sweep_treats_missing_dir_as_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = file(dir.path(), "111-auto.m4a.part", 90_000);
-        file(dir.path(), "unreadable/222-auto.m4a.part", 90_000);
-        let denied = dir.path().join("unreadable");
-
-        let mut gate = SweepGate::new();
-        // 连续不完整：跳过、计数，可读部分的残留这轮不清；上限前不结束。
-        for _ in 0..SWEEP_MAX_INCOMPLETE_ROUNDS - 1 {
-            assert_eq!(gate.advance(scan_denying(dir.path(), &denied)), 0);
-            assert!(!gate.is_finished());
-            assert!(stale.exists(), "可读部分的残留也要等完整扫描再清");
-        }
-        // 到上限：放弃并结束，扫盘与日志都有上界。
-        assert_eq!(gate.advance(scan_denying(dir.path(), &denied)), 0);
-        assert!(gate.is_finished());
-        assert!(stale.exists(), "放弃后残留留待下次启动");
-
-        // 换一个新门（下一次进程）、扫描恢复完整：上轮看漏的一起清掉。
-        let mut gate = SweepGate::new();
-        assert_eq!(gate.advance(scan_files(dir.path())), 2);
-        assert!(gate.is_finished());
-        assert!(!stale.exists());
-        assert!(!dir
-            .path()
-            .join("unreadable")
-            .join("222-auto.m4a.part")
-            .exists());
+        assert_eq!(
+            sweep_legacy_residue_once(&dir.path().join("missing")),
+            Some(0)
+        );
     }
 
-    /// #242：门结束后再喂扫描也直接返回 0、不再动文件。
+    /// #242：首轮巡检没读全就跳过本轮，连续到上限就放弃并结束。
+    ///
+    /// 一次性门绝不能在不完整的结果上落位：读完再清；放弃后不再动文件。
+    #[test]
+    fn sweep_gate_skips_incomplete_rounds_until_limit_then_gives_up() {
+        let mut gate = SweepGate::new();
+        // 连续不完整：跳过、计数，上限前不结束。
+        for _ in 0..SWEEP_MAX_INCOMPLETE_ROUNDS - 1 {
+            assert_eq!(gate.advance(None), 0);
+            assert!(!gate.is_finished());
+        }
+        // 到上限：放弃并结束，扫描与日志都有上界。
+        assert_eq!(gate.advance(None), 0);
+        assert!(gate.is_finished());
+        // 放弃后再喂什么都不再干活。
+        assert_eq!(gate.advance(Some(3)), 0);
+        assert!(gate.is_finished());
+    }
+
+    /// #242：门在读完一轮后就结束，之后的调用直接返回 0。
     ///
     /// 「第二次调用返回 0」的回归保护：进程级静态测不到，这层必须钉死。
     #[test]
     fn sweep_gate_stops_after_finishing() {
-        let dir = tempfile::tempdir().unwrap();
-        let stale = file(dir.path(), "111-auto.m4a.part", 90_000);
-
-        // 完整扫描清干净并结束。
         let mut gate = SweepGate::new();
-        assert_eq!(gate.advance(scan_files(dir.path())), 1);
+        assert_eq!(gate.advance(Some(2)), 2);
         assert!(gate.is_finished());
-        assert!(!stale.exists());
-
-        // 结束后再来一轮（哪怕扫得到新的残留）也不动文件。
-        let again = file(dir.path(), "222-auto.m4a.part", 90_000);
-        assert_eq!(gate.advance(scan_files(dir.path())), 0);
+        assert_eq!(gate.advance(Some(2)), 0, "门已关闭，不再清扫");
         assert!(gate.is_finished());
-        assert!(again.exists(), "门已关闭，不再清扫");
     }
 
-    /// #242：超额淘汰正式音频时，它的暂存整组同批消失，别曲目的不沾。
+    /// #242：巡检不碰租约保护下的旧格式残留，放开后下一轮清走。
     #[test]
-    fn evicted_audio_takes_its_staging_group_along() {
+    fn legacy_residue_sweep_respects_download_leases() {
         let dir = tempfile::tempdir().unwrap();
-        let old = file(dir.path(), "100-old-auto.m4a", 90_000);
-        file(dir.path(), "100-old-auto.quality", 90_000);
-        let recent = file(dir.path(), "200-new-auto.m4a", 0);
-        file(dir.path(), "200-new-auto.quality", 0);
-        let stage = staging_dir(dir.path());
-        // 被淘汰那首的整组暂存：过期的交付目标、数据、锁、元数据，另一用途的锁，
-        // 以及 24 小时内不参与淘汰的 `.part` 和新锁——它们只能靠淘汰收尾带走。
-        let gone_with_it = [
-            file(&stage, "100-old-auto-normal.m4a", 90_000),
-            file(&stage, "100-old-auto-normal.m4a.part", 90_000),
-            file(&stage, "100-old-auto-normal.m4a.part.lock", 90_000),
-            file(&stage, "100-old-auto-normal.m4a.part.meta", 90_000),
-            file(&stage, "100-old-auto-upgrade.m4a.part.lock", 90_000),
-            file(&stage, "100-old-auto-upgrade.m4a.part", 3_600),
-            file(&stage, "100-old-auto-upgrade.m4a.part.lock", 3_600),
-        ];
-        // 别的曲目的暂存：正式文件没被淘汰，它的锁必须留着。
-        let others = file(&stage, "300-other-auto-normal.m4a.part.lock", 0);
+        // 旧格式残留挂在交付目标名下，租约也挂在同一个交付目标上。
+        let target = dir.path().join("777-auto-4242-7.m4a");
+        let part = file(dir.path(), "777-auto-4242-7.m4a.part", 90_000);
+        let meta = file(dir.path(), "777-auto-4242-7.m4a.part.meta", 90_000);
+        let lease = CacheLease::acquire(&target);
 
-        // 断言 30 的算法：全部文件各 10 字节共 120，上限 60 正好在过期组收完时停
-        // （正式对 20 + 交付目标组 40）。升级锁过期和新锁同组、使用时间取较新的，
-        // 落进新鲜段不动；新鲜升级 `.part` 不参与分组——这 30 字节全靠收尾带走。
-        assert_eq!(trim_audio_in(dir.path(), 60), 30);
-        assert!(!old.exists() && !old.with_extension("quality").exists());
-        for path in gone_with_it {
-            assert!(!path.exists(), "{} 该跟着正式文件一起走", path.display());
-        }
-        assert!(recent.exists() && recent.with_extension("quality").exists());
-        assert!(others.exists(), "别的曲目的暂存不属于这批淘汰，不能顺手删");
-    }
-
-    /// #242：下载进行中的暂存不被淘汰收尾删，正式缓存照常淘汰。
-    #[test]
-    fn eviction_spares_staging_of_running_download() {
-        let dir = tempfile::tempdir().unwrap();
-        let committed = file(dir.path(), "500-old-auto.m4a", 90_000);
-        file(dir.path(), "500-old-auto.quality", 90_000);
-        let stage = staging_dir(dir.path());
-        let part = file(&stage, "500-old-auto-normal.m4a.part", 90_000);
-        let lock = file(&stage, "500-old-auto-normal.m4a.part.lock", 90_000);
-        let meta = file(&stage, "500-old-auto-normal.m4a.part.meta", 90_000);
-        let dec_tmp = file(&stage, "500-old-auto-normal.m4a.dec.tmp", 90_000);
-        // 与 stage_path 一致：租约挂在交付目标上。meta 与 dec.tmp 没有自己的租约，
-        // 也必须跟着交付目标走，否则下载进行中被收尾删掉，断点续传信息就毁了。
-        let lease = CacheLease::acquire(&stage.join("500-old-auto-normal.m4a"));
-
-        // 正式文件 + sidecar（20 字节）被淘汰；租约挡着的 40 字节暂存留在统计里。
-        assert_eq!(trim_audio_in(dir.path(), 0), 40);
-        assert!(!committed.exists(), "正式缓存没租约，照常淘汰");
-        assert!(
-            part.exists() && lock.exists() && meta.exists() && dec_tmp.exists(),
-            "正在下载的暂存不能被淘汰收尾删掉"
-        );
+        assert_eq!(sweep_legacy_residue_once(dir.path()), Some(0));
+        assert!(part.exists() && meta.exists(), "正在下载的残留不能被清");
 
         drop(lease);
-        assert_eq!(trim_audio_in(dir.path(), 0), 0);
-        assert!(!part.exists() && !lock.exists());
-        assert!(!meta.exists() && !dec_tmp.exists());
+        assert_eq!(sweep_legacy_residue_once(dir.path()), Some(2));
+        assert!(!part.exists() && !meta.exists());
     }
 
     #[cfg(unix)]

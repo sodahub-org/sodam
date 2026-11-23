@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 /// 失败发生的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// 取回可用流及其地址，含向签名服务请求签名（阶段一 无法把两者分开）。
+    /// 取回可用流及其地址，含向签名服务请求签名（libresoda 内部把两步
+    /// 串在一次调用里，本层无法把两者分开）。
     ResolveStream,
     /// 把音频体的字节从 CDN 搬到本地。
     Transfer,
@@ -431,6 +432,20 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
         );
     }
 
+    // libresoda 暂存路径的锁文本（`acquire_lock` 的文档化错误）：撞锁说明这个
+    // 目标正被另一个下载占着。应用内同目标下载本来就由 download_lock 串行
+    // （那是字面意义的「排队」），能走到这里的只有跨进程或暂存名撞车的缝隙；
+    // 按可重试抖动交还，界面上落「暂时连不上」的兜底文案并跳下一首，绝不会
+    // 把半截文件当播放产物（#243）。
+    if detail.contains("being staged by another download") {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Transient,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
+
     // 下架 / 取不到 / 非 Cookie 参数错误仍走既有 PickAnother：它们与上面的
     // TrackUnavailable 同属按曲目不可播（由 `is_per_track` 统一判定），
     // 但给用户的成因文案是「这首当前取不到」。
@@ -487,48 +502,107 @@ pub fn classify(error: &SodaError) -> PlaybackFailure {
 
 /// `SodaError::Http` 只剩字符串，相位信息已经在上游丢失；这里只解析结构化的状态码。
 fn classify_http(detail: &str) -> PlaybackFailure {
+    let lower = detail.to_ascii_lowercase();
+    // 状态码先行：429/401/403/404/5xx 各有语义，不能被后面的文本判据盖掉。
+    // 状态错误文本只含状态码与地址、不含磁盘字样，所以先解析不会漏判；
+    // 磁盘满的文本无论上游怎么包装都不带状态码，放在它后面才接得住。
     let status = detail
         .split("status ")
         .nth(1)
         .and_then(|rest| rest.chars().take(3).collect::<String>().parse::<u16>().ok());
-    let (retryability, action) = match status {
-        Some(429) => (Retryability::Throttled, RecoveryAction::Nothing),
-        Some(401) => (Retryability::Never, RecoveryAction::Relogin),
-        // 403 既可能是 Cookie 权益，也可能是签名 URL 过期：后者换一次地址就能好，
-        // 所以按可重试处理，让它走一次「重新解析」而不是永久失败。
-        Some(403) => (Retryability::Transient, RecoveryAction::Nothing),
-        Some(404) => (Retryability::Never, RecoveryAction::PickAnother),
-        Some(500..=599) => (Retryability::Transient, RecoveryAction::Nothing),
-        Some(_) => (Retryability::Never, RecoveryAction::Nothing),
-        None => {
-            // 没有状态码的都是传输层。判据必须盖住真实的握手类文本——本机实测到的就是
-            // `Connection Failed: tls connection init failed: unexpected end of file`；
-            // 只认 "timeout" 会把这类抖动误判成永久错误，一次都不重试。
-            let lower = detail.to_ascii_lowercase();
-            let transport = [
-                "timed out",
-                "timeout",
-                "tls",
-                "connection",
-                "dns",
-                "failed to lookup address",
-                "end of file",
-                "broken pipe",
-                "reset by peer",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
-            if transport {
-                (Retryability::Transient, RecoveryAction::Nothing)
-            } else {
-                (Retryability::Never, RecoveryAction::Nothing)
-            }
-        }
+    if let Some(code) = status {
+        let (retryability, action) = match code {
+            429 => (Retryability::Throttled, RecoveryAction::Nothing),
+            401 => (Retryability::Never, RecoveryAction::Relogin),
+            // 403 既可能是 Cookie 权益，也可能是签名 URL 过期：后者换一次地址就能好，
+            // 所以按可重试处理，让它走一次「重新解析」而不是永久失败。
+            403 => (Retryability::Transient, RecoveryAction::Nothing),
+            404 => (Retryability::Never, RecoveryAction::PickAnother),
+            500..=599 => (Retryability::Transient, RecoveryAction::Nothing),
+            _ => (Retryability::Never, RecoveryAction::Nothing),
+        };
+        let stage = if detail.contains("http request failed") {
+            // 这个前缀是 `get_full` / `get_reader` 在**拿到状态码**时产出的，归地址解析；
+            Stage::ResolveStream
+        } else {
+            // 有状态码但没有这个前缀：分不清相位，别装作知道。
+            Stage::Network
+        };
+        return PlaybackFailure::new(stage, retryability, action, detail);
+    }
+    // 磁盘满：写盘失败经暂存路径或裸 io 冒出来，任何包装都认，重试不会好，
+    // 交给 FreeSpace——预取按磁盘类挂起、状态行指向腾空间。io 文本可能
+    // 本地化（中文 Windows「磁盘空间不足」）。errno 必须按平台认：
+    // ENOSPC=28 是 POSIX 通用，但 39 / 112 在 Linux 是 ENOTEMPTY /
+    // EHOSTDOWN（断网的 `Host is down (os error 112)`），122 在 Linux
+    // 是 EDQUOT 而在 Windows 是 ERROR_INSUFFICIENT_BUFFER——跨平台
+    // 硬认会把断网判成磁盘满。
+    const DISK_FULL_TEXT: [&str; 5] = [
+        "no space left",
+        "not enough space",
+        "disk full",
+        "quota exceeded",
+        "空间不足",
+    ];
+    #[cfg(windows)]
+    const ERRNO_DISK_FULL: [&str; 2] = ["os error 39", "os error 112"];
+    #[cfg(not(windows))]
+    const ERRNO_DISK_FULL: [&str; 2] = ["os error 28", "os error 122"];
+    let disk_full = DISK_FULL_TEXT.iter().any(|marker| lower.contains(marker))
+        || ERRNO_DISK_FULL.iter().any(|marker| lower.contains(marker));
+    if disk_full {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Never,
+            RecoveryAction::FreeSpace,
+            detail,
+        );
+    }
+    // libresoda 暂存路径的文档化错误文本（#243 的口径）：
+    // * 传输中断 / 服务器把开放区间封顶——重试从缺口接着补，值得再试一次；
+    // * 字节与 Content-Range 不符——那批字节已被库内作废，重试是整份重来，
+    //   别在慢链路上白烧带宽，按不再自动重试处理。
+    if detail.contains("staged download interrupted")
+        || detail.contains("download did not complete")
+    {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Transient,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
+    if detail.contains("staged download disagrees") {
+        return PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Never,
+            RecoveryAction::Nothing,
+            detail,
+        );
+    }
+    // 没有状态码、也不是上述契约形态的，都是传输层或兜底。判据必须盖住真实的
+    // 握手类文本——本机实测到的就是 `Connection Failed: tls connection init
+    // failed: unexpected end of file`；只认 "timeout" 会把这类抖动误判成
+    // 永久错误，一次都不重试。
+    let transport = [
+        "timed out",
+        "timeout",
+        "tls",
+        "connection",
+        "dns",
+        "failed to lookup address",
+        "end of file",
+        "broken pipe",
+        "reset by peer",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let (retryability, action) = if transport {
+        (Retryability::Transient, RecoveryAction::Nothing)
+    } else {
+        (Retryability::Never, RecoveryAction::Nothing)
     };
-    let stage = if detail.contains("http request failed") {
-        // 这个前缀是 `get_full` / `get_reader` 在**拿到状态码**时产出的，归地址解析；
-        Stage::ResolveStream
-    } else if detail.contains("reading response") || detail.contains("reading body") {
+    let stage = if detail.contains("reading response") || detail.contains("reading body") {
         // 已经在读响应体：明确的音频体传输故障。
         Stage::Transfer
     } else {
@@ -604,10 +678,11 @@ pub fn strip_urls_for_user(text: &str) -> String {
 /// 一次播放尝试的重试预算：**只有一层，且只按「这次失败值不值得再来一次」判**。
 ///
 /// 不设总墙钟时长：那等于把刚从 libresoda 拆掉的「整首下载总时限」从另一侧装回来，
-/// 慢但仍在推进的传输会被误杀。不设「无进展时长」也不是疏忽——阶段一 里根本没有可观测的
-/// 进展信号：`download_to_cache` 是一次阻塞调用，失败即删掉 `.part`，跨尝试零进度。
-/// 单次尝试内部的「卡住」由 libresoda 的空闲读超时（20s）负责；等阶段二有了
-/// 密文暂存 + `Range` 续传，字节偏移才第一次成为可读的进度，那时才谈得上无进展封顶。
+/// 慢但仍在推进的传输会被误杀。不设「无进展时长」暂不算疏忽：可续传路径落地后
+///（#243）失败不再删暂存，同一首歌的下一次尝试从缺口接着补，跨尝试的进度第一次
+/// 真实存在；但预算这一层拿不到「这次推进了多少」，无进展封顶仍没有直接的观测点，
+/// 等真有需要再把报告里的字节事实接进来。单次尝试内部的「卡住」仍由
+/// libresoda 的空闲读超时（20s）负责。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayBudget {
     pub max_attempts: u8,
@@ -704,6 +779,144 @@ mod tests {
             );
             assert_eq!(classified.action, action, "修复动作错位：{classified:?}");
         }
+    }
+
+    /// 可续传路径（#243）的错误形态按「这段字节还有没有用」分流：
+    /// 中断与封顶值得再试（重试从缺口接着补）；区间不符的暂存已被库内作废，
+    /// 重试是整份重来，按不自动重试处理；磁盘满交给 FreeSpace。
+    #[test]
+    fn staged_path_errors_split_by_whether_the_bytes_are_still_useful() {
+        // 传输中断 / 服务器封顶：可重试，重试接得上。
+        for error in [
+            SodaError::http("staged download interrupted: connection reset by peer"),
+            SodaError::http("download did not complete: 1048576 of 26214400 bytes on disk"),
+        ] {
+            let classified = failure(error);
+            assert_eq!(
+                classified.retryability,
+                Retryability::Transient,
+                "中断与封顶都该再试：{classified:?}"
+            );
+            assert_eq!(classified.stage, Stage::Transfer, "{classified:?}");
+            assert_eq!(classified.action, RecoveryAction::Nothing, "{classified:?}");
+        }
+
+        // 区间不符：字节被库内作废，重试是整份重来，不自动重试。
+        let mismatch = failure(SodaError::http(
+            "staged download disagrees with its Content-Range",
+        ));
+        assert_eq!(mismatch.retryability, Retryability::Never, "{mismatch:?}");
+        assert_eq!(mismatch.stage, Stage::Transfer, "{mismatch:?}");
+
+        // 磁盘满藏在传输中断文本里（io 文本可能是本地化的），必须认出来给 FreeSpace。
+        for error in [
+            SodaError::http("staged download interrupted: no space left on device"),
+            SodaError::http("staged download interrupted: 磁盘空间不足。 (os error 112)"),
+        ] {
+            let classified = failure(error);
+            assert_eq!(
+                classified.action,
+                RecoveryAction::FreeSpace,
+                "磁盘满要指向腾空间：{classified:?}"
+            );
+            assert_eq!(
+                classified.retryability,
+                Retryability::Never,
+                "磁盘满重试不会好：{classified:?}"
+            );
+        }
+
+        // errno 的含义随平台变：Linux 的 112 是 EHOSTDOWN，断网会包成
+        // `Host is down (os error 112)`，不能跨平台硬认成磁盘满。
+        let host_down = failure(SodaError::http(
+            "staged download interrupted: Host is down (os error 112)",
+        ));
+        #[cfg(windows)]
+        {
+            // Windows 上 112 恰好是 ERROR_DISK_FULL，这条在 Windows 仍是磁盘满。
+            assert_eq!(host_down.action, RecoveryAction::FreeSpace, "{host_down:?}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                host_down.retryability,
+                Retryability::Transient,
+                "断网是可重试的传输中断，不是磁盘满：{host_down:?}"
+            );
+            assert_eq!(host_down.action, RecoveryAction::Nothing, "{host_down:?}");
+            assert_eq!(host_down.stage, Stage::Transfer, "{host_down:?}");
+        }
+
+        // 磁盘配额是另一路：文本在所有平台都指磁盘，errno 只在 POSIX 侧认
+        // （Linux EDQUOT=122；Windows 的 122 是 ERROR_INSUFFICIENT_BUFFER）。
+        let quota_text = failure(SodaError::http(
+            "staged download interrupted: Disk quota exceeded (os error 122)",
+        ));
+        assert_eq!(
+            quota_text.action,
+            RecoveryAction::FreeSpace,
+            "{quota_text:?}"
+        );
+        assert_eq!(
+            quota_text.retryability,
+            Retryability::Never,
+            "{quota_text:?}"
+        );
+        let errno_only = failure(SodaError::http("staged download interrupted: os error 122"));
+        #[cfg(not(windows))]
+        assert_eq!(
+            errno_only.action,
+            RecoveryAction::FreeSpace,
+            "POSIX 侧 122 是 EDQUOT：{errno_only:?}"
+        );
+        #[cfg(windows)]
+        assert_ne!(
+            errno_only.action,
+            RecoveryAction::FreeSpace,
+            "Windows 的 122 不是磁盘含义：{errno_only:?}"
+        );
+    }
+
+    /// 状态码先行：带 quota 字样的限流回包先落自己的语义，不被磁盘文本
+    /// 判据盖掉；磁盘满不带任何暂存上下文（上游换包装）也接得住。
+    #[test]
+    fn status_codes_win_over_text_markers_and_disk_full_needs_no_context() {
+        let throttled = failure(SodaError::http(
+            "http request failed: status 429 (https://x.test quota exceeded)",
+        ));
+        assert_eq!(
+            throttled.retryability,
+            Retryability::Throttled,
+            "429 先落限流语义：{throttled:?}"
+        );
+        assert_eq!(throttled.stage, Stage::ResolveStream, "{throttled:?}");
+
+        let plain = failure(SodaError::http("no space left on device"));
+        assert_eq!(
+            plain.action,
+            RecoveryAction::FreeSpace,
+            "裸磁盘满文本也要指向腾空间：{plain:?}"
+        );
+        assert_eq!(plain.retryability, Retryability::Never, "{plain:?}");
+    }
+
+    /// 撞暂存锁是「正在下载，稍后再来」：可重试，不指向磁盘，也不算按曲目不可播。
+    #[test]
+    fn staged_lock_contention_is_transient_not_a_disk_or_track_failure() {
+        let classified = failure(SodaError::Io(
+            "download target is being staged by another download".into(),
+        ));
+        assert_eq!(
+            classified.retryability,
+            Retryability::Transient,
+            "{classified:?}"
+        );
+        assert_eq!(classified.stage, Stage::Transfer, "{classified:?}");
+        assert_eq!(classified.action, RecoveryAction::Nothing, "{classified:?}");
+        assert!(
+            !classified.is_per_track(),
+            "撞锁与曲目无关，换一首也一样：{classified:?}"
+        );
     }
 
     /// 「结论是否关于单个曲目」只看结论对象，不看可重试性。
@@ -899,7 +1112,7 @@ mod tests {
         // 永久错误一次都不重试：再打只是打扰那台共享签名服务。
         assert_eq!(budget.next_delay(1, &permanent, 0.5), None);
         assert!(budget.next_delay(1, &transient, 0.5).is_some());
-        // 次数封顶是唯一的上限（阶段一 没有可观测的字节进度，见 PlayBudget 文档）。
+        // 次数封顶是唯一的上限（预算这一层拿不到字节进度，见 PlayBudget 文档）。
         assert_eq!(budget.next_delay(3, &transient, 0.5), None);
         // full jitter：等待时长受抖动系数缩放，且不超过上限。
         let ceiling = budget.next_delay(1, &transient, 0.999).unwrap();
