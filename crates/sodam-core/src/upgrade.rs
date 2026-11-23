@@ -14,9 +14,8 @@ use std::collections::HashSet;
 pub enum StopReason {
     /// 登录身份变了：落盘完成的退出登录、换号，或会员状态刷新推进了代数。
     IdentityChanged,
-    /// 正在退出登录、落盘还没回来。`auth_epoch` 要等落盘成功才推进，慢盘上那几秒里批量还能
-    /// 拿旧 Cookie 再发一首，所以不等落盘就停；可落盘也可能失败、账号还在，那时候说「账号已
-    /// 变更」是撒谎，只能说「正在退出登录」。
+    /// 正在退出登录、落盘还没回来：不等落盘就停。落盘可能失败、账号还在，
+    /// 所以只说「正在退出登录」，不说「账号已变更」。
     LoggingOut,
     /// 用户点了取消。只停在下一首之前，正在下的那一首不打断。
     Cancelled,
@@ -120,13 +119,17 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
+    /// 按升级前后两份流的样子判定：拿到整曲才算成功，还是试听一律不算。
     ///
+    /// 光比档位分不够：试听换试听也可能换到更高分，盘上那 30 秒片段不能算「升级成功」。
     /// 档位分走 `readable_rank` 那一道闸：0 分是「量过但认不出」，
     /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
     /// 会被当成一次升级。
     pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
-        if before.preview && !after.preview {
+        if after.preview {
+            return Self::NoHigherTier;
+        }
+        if before.preview {
             return Self::Upgraded;
         }
         if crate::quality::readable_rank(after.rank) > crate::quality::readable_rank(before.rank) {
@@ -374,6 +377,17 @@ mod tests {
             preview: false,
         };
         assert_eq!(Outcome::of_shapes(preview, full), Outcome::Upgraded);
+        // 试听换更高分的试听：文件确实换了，但用户手里还是片段，不算升级。
+        assert_eq!(
+            Outcome::of_shapes(
+                preview,
+                StreamShape {
+                    rank: Some(100),
+                    preview: true
+                }
+            ),
+            Outcome::NoHigherTier
+        );
         // 整曲换成试听什么时候都不算升级（这条路本来就另有护栏挡着）。
         assert_eq!(Outcome::of_shapes(full, preview), Outcome::NoHigherTier);
     }
