@@ -2938,14 +2938,16 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
-    /// 批量几百首逐个记 Info 会刷屏，规格只要求开跑、收尾各一行，所以批量降到 Debug。
+    /// `success_level` / `failure_level` 分开给：单首一次升级是用户能感知的事，
+    /// 成功记 Info、失败记 Warn；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// 所以两行都降到 Debug。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
         success_level: LogLevel,
+        failure_level: LogLevel,
     ) -> Outcome {
         let session = Session::new(settings);
         // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
@@ -2974,10 +2976,10 @@ impl Root {
                 outcome
             }
             Err(failure) => {
-                // 默认阈值是 INFO，Debug 不落盘；升级失败是用户能感知的「音质没变」，
-                // 至少用 WARN 让默认日志里查得到（#249）。
+                // 默认阈值是 INFO，Debug 不落盘；失败要让人在默认日志里查得到。
+                // 级别由调用方定：单首用 WARN，批量用 DEBUG，免得几百首逐首刷屏。
                 log_outlet::log_event(
-                    LogLevel::Warn,
+                    failure_level,
                     LogTopic::Player,
                     "cache_upgrade_failed",
                     &[
@@ -3016,7 +3018,14 @@ impl Root {
 
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
-            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
+            Self::upgrade_one_cached_track(
+                settings,
+                track,
+                intent,
+                account_is_vip,
+                LogLevel::Info,
+                LogLevel::Warn,
+            )
         });
         cx.spawn(async move |this, cx| {
             // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
@@ -3151,6 +3160,7 @@ impl Root {
                             track,
                             target_clone,
                             is_vip,
+                            LogLevel::Debug,
                             LogLevel::Debug,
                         )
                     })
