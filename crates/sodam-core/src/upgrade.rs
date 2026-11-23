@@ -38,7 +38,7 @@ impl StopReason {
 /// 字段带名字：两个布尔挨着当参数，调用点把 `cancelled` 和 `logging_out` 写反了照样编译，
 /// 症状是点取消却弹「正在退出登录」。
 #[derive(Debug, Clone, Copy)]
-pub struct StopCheck {
+pub struct StopConditions {
     pub start_epoch: u64,
     pub current_epoch: u64,
     pub cancelled: bool,
@@ -49,14 +49,14 @@ pub struct StopCheck {
 ///
 /// 优先级：正在退出登录 > 身份变了 > 用户取消。登出还在落盘也停，理由见
 /// [`StopReason::LoggingOut`]；身份和取消同时来也报身份变了，用户先要处理换号。
-pub fn stop_reason(check: StopCheck) -> Option<StopReason> {
-    if check.logging_out {
+pub fn stop_reason(conditions: StopConditions) -> Option<StopReason> {
+    if conditions.logging_out {
         return Some(StopReason::LoggingOut);
     }
-    if check.current_epoch != check.start_epoch {
+    if conditions.current_epoch != conditions.start_epoch {
         return Some(StopReason::IdentityChanged);
     }
-    check.cancelled.then_some(StopReason::Cancelled)
+    conditions.cancelled.then_some(StopReason::Cancelled)
 }
 
 /// 一份缓存流的样子：档位分 + 标签能证明的档位下限 + 码率 + 是不是试听。
@@ -215,8 +215,8 @@ impl UpgradeAttempts {
 mod tests {
     use super::*;
 
-    fn check(start: u64, current: u64, cancelled: bool, logging_out: bool) -> StopCheck {
-        StopCheck {
+    fn check(start: u64, current: u64, cancelled: bool, logging_out: bool) -> StopConditions {
+        StopConditions {
             start_epoch: start,
             current_epoch: current,
             cancelled,

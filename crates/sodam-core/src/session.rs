@@ -675,7 +675,7 @@ fn would_downgrade_to_preview(
 /// 判定与「这一首算不算真升级」共用 [`crate::upgrade::stream_is_better`]：档位已知只认
 /// 档位提升；档位未知的旧三字段缓存（#89）先看标签能证明的下限，再比标签里记着的码率；
 /// 试听片段换成整曲永远是提升。同码率只是重新量了一遍档位，不值得重写文件——
-/// 否则批量小结会把这种「没变好」也算成升级（#271）。
+/// 否则批量小结会把这种「没变好」也算成升级。
 fn is_better_stream(
     info: &libresoda::soda::types::DownloadInfo,
     current: &CachedTrack,

@@ -17,7 +17,7 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::upgrade::{stop_reason, Outcome, StopCheck, StopReason, StreamShape, Tally};
+use sodam_core::upgrade::{stop_reason, Outcome, StopConditions, StopReason, StreamShape, Tally};
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -3257,12 +3257,11 @@ impl Root {
                                 ),
                                 (Some(before), Some(now)) if before != now
                             );
-                            let template = if account_changed {
-                                "账号已变更，批量已停止 ({} / {})"
+                            let message = if account_changed {
+                                root.localized("账号已变更，批量已停止 ({} / {})", &counts)
                             } else {
-                                "登录状态已变化，批量已停止 ({} / {})"
+                                root.localized("登录状态已变化，批量已停止 ({} / {})", &counts)
                             };
-                            let message = root.localized(template, &counts);
                             root.notify_warning_once("batch-upgrade-stopped", message);
                         }
                         Some(StopReason::LoggingOut) => {
@@ -3299,7 +3298,7 @@ impl Root {
 
     /// 这一轮批量现在该不该停。判据全在 [`stop_reason`] 里，这里只负责把状态喂进去。
     fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
-        stop_reason(StopCheck {
+        stop_reason(StopConditions {
             start_epoch,
             current_epoch: self.auth_epoch,
             cancelled: self.batch_upgrade_cancel,
