@@ -74,19 +74,21 @@ fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) ->
     pending.or(queued).map(|track| track.cover.clone())
 }
 
-/// 原图下载完成后的落账：要发布哪张图、要不要放行「已尝试」。
+/// 原图下载完成后的去向。
 #[derive(Debug, PartialEq, Eq)]
-struct OriginalCoverSettlement {
-    /// 文件还在、可以发布的路径；`None` 表示这次没有能用的图。
-    publish: Option<PathBuf>,
-    /// 解析到了路径但文件已经没了：放行「已尝试」，下次需要时能重新排。
-    release_attempted: bool,
+enum OriginalCoverSettlement {
+    /// 文件还在，可以发布。
+    Published(PathBuf),
+    /// 解析到了路径，但文件已经被清缓存或淘汰删掉：不发布，放行「已尝试」。
+    Vanished,
+    /// 压根没解析出路径（下载失败）：不发布，保留「已尝试」。
+    Failed,
 }
 
 /// 判定一张原图下载完成后的去向。
 ///
-/// 清缓存或缓存淘汰可能刚好撞上在飞的下载：`original_cover_path` 解析出了路径，
-/// 落地前文件已经被删。这里必须再查一次文件在不在——死路径一旦写进
+/// 清缓存或缓存淘汰可能刚好把文件删掉：`original_cover_path` 解析出了路径，
+/// 回调跑在删除之后时没人兜底，所以这里自己再查一遍。死路径一旦写进
 /// `original_covers`，`ensure_original_cover` 开头就会把它当成命中，这首歌的
 /// 歌词页大图整个会话都回不来。缩略图那条路早就是这样做的。
 fn settle_original_cover(
@@ -94,18 +96,9 @@ fn settle_original_cover(
     file_exists: impl FnOnce(&std::path::Path) -> bool,
 ) -> OriginalCoverSettlement {
     match path {
-        Some(path) if file_exists(&path) => OriginalCoverSettlement {
-            publish: Some(path),
-            release_attempted: false,
-        },
-        Some(_) => OriginalCoverSettlement {
-            publish: None,
-            release_attempted: true,
-        },
-        None => OriginalCoverSettlement {
-            publish: None,
-            release_attempted: false,
-        },
+        Some(path) if file_exists(&path) => OriginalCoverSettlement::Published(path),
+        Some(_) => OriginalCoverSettlement::Vanished,
+        None => OriginalCoverSettlement::Failed,
     }
 }
 
@@ -1495,38 +1488,37 @@ impl Root {
                 // 和缩略图一样在回调里复核文件在不在：清缓存的清表也是
                 // 同一线程的 update，后清表会把这次抢先写进去的死路径一起扫掉。
                 let settlement = settle_original_cover(path, |file| file.exists());
-                if settlement.release_attempted {
-                    // 下载期间文件被清缓存或淘汰删掉了：别把死路径记进表，
-                    // 否则 ensure_original_cover 会一直当成命中，本会话再也
-                    // 排不进来。先无条件放行记号；同一个 URL 可能因此多下
-                    // 一份，重复下载是已知代价，后续在飞记账单独收。
-                    {
-                        let mut attempted = root
-                            .original_cover_attempted
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        attempted.remove(&fetch_url);
+                match settlement {
+                    OriginalCoverSettlement::Published(path) => {
+                        root.original_covers.insert(fetch_url.clone(), path.clone());
+                        // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
+                        if !root.covers.contains_key(&fetch_url) {
+                            Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
+                        }
+                        cx.notify();
                     }
-                    // 淘汰删文件时 drop_removed_covers 反查不到还没发布过的
-                    // URL，这里得自己补；清缓存进行中则交给它的补偿。
-                    let displayed_cover =
-                        current_cover_url(root.pending_track.as_ref(), root.queue.current());
-                    if retry_vanished_original_cover(
-                        root.cache_clearing,
-                        displayed_cover.as_deref(),
-                        &fetch_url,
-                    ) {
-                        root.ensure_original_cover(&fetch_url, cx);
+                    OriginalCoverSettlement::Vanished => {
+                        // 文件没了：别把死路径记进表，放行记号，让下一次
+                        // ensure 能重排。要不要马上补见 retry_vanished_original_cover。
+                        {
+                            let mut attempted = root
+                                .original_cover_attempted
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            attempted.remove(&fetch_url);
+                        }
+                        let displayed_cover =
+                            current_cover_url(root.pending_track.as_ref(), root.queue.current());
+                        if retry_vanished_original_cover(
+                            root.cache_clearing,
+                            displayed_cover.as_deref(),
+                            &fetch_url,
+                        ) {
+                            root.ensure_original_cover(&fetch_url, cx);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
-                }
-                if let Some(path) = settlement.publish {
-                    root.original_covers.insert(fetch_url.clone(), path.clone());
-                    // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
-                    if !root.covers.contains_key(&fetch_url) {
-                        Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
-                    }
-                    cx.notify();
+                    OriginalCoverSettlement::Failed => {}
                 }
             });
             // 在飞位空出来了：把限流期间排队的原图补上，不许被丢掉。
@@ -5690,7 +5682,7 @@ mod tests {
     use super::{
         current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
         lyrics_scroll_ease, retry_vanished_original_cover, settle_original_cover,
-        urls_for_removed_paths,
+        urls_for_removed_paths, OriginalCoverSettlement,
     };
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
     use std::collections::HashMap;
@@ -5744,17 +5736,21 @@ mod tests {
     #[test]
     fn vanished_original_cover_is_not_published() {
         let path = PathBuf::from("covers/original/gone.img");
-        let vanished = settle_original_cover(Some(path.clone()), |_| false);
-        assert_eq!(vanished.publish, None, "文件没了就不能发布死路径");
-        assert!(vanished.release_attempted, "要放行「已尝试」，下次能重排");
-
-        let ready = settle_original_cover(Some(path.clone()), |_| true);
-        assert_eq!(ready.publish, Some(path), "文件还在就直接用");
-        assert!(!ready.release_attempted, "文件还在不用放行");
-
-        let failed = settle_original_cover(None, |_| true);
-        assert_eq!(failed.publish, None, "下载失败没有图可发布");
-        assert!(!failed.release_attempted, "下载失败保留记号，避免每帧空转");
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| false),
+            OriginalCoverSettlement::Vanished,
+            "文件没了就不能发布死路径"
+        );
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| true),
+            OriginalCoverSettlement::Published(path),
+            "文件还在就直接用"
+        );
+        assert_eq!(
+            settle_original_cover(None, |_| true),
+            OriginalCoverSettlement::Failed,
+            "下载失败保留记号，避免每帧空转"
+        );
     }
 
     /// 文件没了要不要补：清缓存进行中交给它的补偿，淘汰删文件时自己补。
