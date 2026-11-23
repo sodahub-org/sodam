@@ -391,15 +391,16 @@ pub fn batch_upgrade_needs_confirmed_entitlement(
     intent.requires_membership() && is_vip != Some(true)
 }
 
-/// 这个目标档位的「没有更高流」结论能否持久化。
+/// 「要过这个档位、没拿到更高流」的结论能否持久化。
 ///
-/// 账号信息只有一个 VIP 布尔：低于会员门槛的档位无需权益，无损（100）能由 VIP 确认；
-/// 杜比与 Hi-Res 需要更高等级，布尔分不清，宁可下次再探，也不能把权益不足写成曲库没有。
+/// 低于会员门槛的档位无需权益；会员门槛（88）及以上只在确认账号是会员时才记。
+/// 记录含义与有效期见 [`crate::cache::UPGRADE_CHECK_TTL`]：它记的是「当时账号要过这个档位」，
+/// 不是「曲库永远没有」。
 pub fn can_record_unavailable(target_rank: Option<i64>, is_vip: Option<bool>) -> bool {
     match target_rank {
         Some(rank) if rank < MEMBERSHIP_MIN_RANK => true,
-        Some(rank) if preference_rank("lossless") == Some(rank) => is_vip == Some(true),
-        _ => false,
+        Some(_) => is_vip == Some(true),
+        None => false,
     }
 }
 
@@ -844,8 +845,8 @@ mod tests {
         ));
     }
 
-    /// 负结果只在能确认账号权益时落盘：非会员档位无需权益，无损需要 VIP，
-    /// 更高档位无法由一个布尔确认，宁可下次再探。
+    /// 负结果只在能确认账号权益时落盘：非会员档位无需权益，无损及更高档位需要 VIP。
+    /// 记录含义与有效期见 `cache::UPGRADE_CHECK_TTL`。
     #[test]
     fn unavailable_results_only_recorded_with_confirmed_entitlement() {
         assert!(can_record_unavailable(Some(50), None));
@@ -853,9 +854,12 @@ mod tests {
         assert!(can_record_unavailable(Some(100), Some(true)));
         assert!(!can_record_unavailable(Some(100), Some(false)));
         assert!(!can_record_unavailable(Some(100), None));
-        // Hi-Res 与杜比需要更高等级，VIP 布尔分不清，不写负结果。
-        assert!(!can_record_unavailable(Some(110), Some(true)));
-        assert!(!can_record_unavailable(Some(88), Some(true)));
+        // Hi-Res / 杜比都过会员门槛：确认会员才写负结果。
+        assert!(can_record_unavailable(Some(110), Some(true)));
+        assert!(can_record_unavailable(Some(88), Some(true)));
+        assert!(!can_record_unavailable(Some(110), Some(false)));
+        assert!(!can_record_unavailable(Some(110), None));
+        assert!(!can_record_unavailable(Some(88), None));
         assert!(!can_record_unavailable(None, Some(true)));
     }
 

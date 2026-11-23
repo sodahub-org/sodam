@@ -402,7 +402,7 @@ impl Session {
     /// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
     /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
     /// 第四到第七个字段后加：实际档位缺失时视为未知，不据此标记降档；
-    /// 第五、六个字段记录「没有更高档位」的结论，第七个记录试听补整曲的最近一次尝试。
+    /// 第五、六个字段记录「已经向服务端要过哪个档位」的探测结论，第七个记录试听补整曲的最近一次尝试。
     /// 后两者必须分开：试听不是「曲库没有更高档位」，权益一变就可能拿到整曲。
     fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
         let safe_id = encode_track_id(track_id);
@@ -487,7 +487,7 @@ pub struct CachedTrack {
     /// 与所选是否相符是**每次读取时现算**的：用当前意图与这里的实际档位比较，
     /// 结论不写回缓存——否则用户改了意图，缓存里的旧结论就成了假话。
     pub quality_rank: Option<i64>,
-    /// 仍在有效期内、已确认没有更高档位的目标分数；`None` = 没问过或记录已过期。
+    /// 仍在有效期内、已探测过该目标档位的记录；`None` = 没问过或记录已过期。
     ///
     /// 只用于决定是否再发起升级，不改变降档提示：曲目确实还在低档位播放。
     pub checked_rank: Option<i64>,
@@ -510,7 +510,7 @@ impl CachedTrack {
     /// * 试听片段（#130）：目标是整曲，不是更高档位。只要上次补整曲的尝试已过退避期
     ///   就再试一次，不看 `quality_rank`——尤其不能被认不出的 0 分挡住。试听本来只有
     ///   半条流，重下不是白跑；权益到手后拿到整曲是实打实的提升。
-    /// * 整曲：实际档位已达目标、或最近已经确认过该目标没有更高流时，都不再请求。
+    /// * 整曲：实际档位已达目标、或最近已经向服务端要过该目标档位时，都不再请求。
     ///   没记分数的旧缓存（#89）按 sidecar 的档位标签判断：证明不了达标就重下；
     ///   记了 0 分（认不出档位）的不重下，重下拿回的还是同一条流（#96）。
     pub fn needs_upgrade(
@@ -607,7 +607,7 @@ fn log_resumed_download(report: &libresoda::soda::download::DownloadReport) {
     );
 }
 
-/// 把「确认没有更高档位」写回 sidecar；失败不影响播放，下次再探。
+/// 把「已经向服务端要过这个档位、没拿到更高的流」写回 sidecar；失败不影响播放，下次再探。
 fn record_upgrade_check(
     quality_path: &std::path::Path,
     audio_path: &std::path::Path,
@@ -641,7 +641,8 @@ fn record_preview_upgrade_attempt(
 /// 确认性 miss：拿到完整流、档位可识别、目标存在、权益已确认，且实际档位低于目标。
 ///
 /// 返回应写入 sidecar 的 `checked_rank`。试听回退、权益未确认、档位未知、目标未知或
-/// 实际已经达标都不写——这些结论会随账号权益或曲库变化，不能持久化。
+/// 实际已经达标都不写——这些不是「要过这个档位、服务端没给更高流」的确认性结论。
+/// 写下来的记录只保 30 天（见 [`crate::cache::UPGRADE_CHECK_TTL`]）。
 /// 试听回退也不写：它不是「曲库没有更高档位」，只是「这次只给了半条流」；
 /// 补整曲的重试节奏另由 sidecar 第 7 字段的退避记录管理（#130）。
 fn confirmed_miss_rank(
@@ -703,7 +704,7 @@ fn is_better_stream(
 
 /// 拼出 sidecar 内容。
 ///
-/// 前四字段始终写；有「没有更高档位」结论时补第 5、6 字段；试听补整曲的尝试时间写第 7
+/// 前四字段始终写；有探测结论时补第 5、6 字段；试听补整曲的尝试时间写第 7
 /// 字段——即使第 5、6 字段为空也要留出位置，否则读回来会错位。
 fn encode_sidecar(
     quality: &str,
@@ -1050,7 +1051,7 @@ impl Session {
 
         let default_intent = self.settings.quality_intent();
         let intent = target_intent.unwrap_or(&default_intent);
-        // 明确指定 Tier 时目标分数与会员状态无关，但记录「没有更高档位」需要知道权益：
+        // 明确指定 Tier 时目标分数与会员状态无关，但写探测结论需要知道权益：
         // 非会员请求无损失败并不代表曲库没有无损，买会员后必须重新尝试。
         let vip = match intent {
             crate::quality::QualityIntent::Tier(_) => account_is_vip,
@@ -1061,7 +1062,7 @@ impl Session {
         let can_record_check = crate::quality::can_record_unavailable(target_rank, vip);
 
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
-        // 最近已经确认过该目标没有更高流时同样不再请求，避免跨会话重复下载。
+        // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
         if !current.needs_upgrade(intent, vip) {
             return Ok(current);
         }
@@ -1827,6 +1828,9 @@ mod tests {
         assert_eq!(confirmed_miss_rank(None, 80, false, true), None);
         // 档位算不出来（未知，0 分）时不是确认性结论。
         assert_eq!(confirmed_miss_rank(Some(100), 0, false, true), None);
+        // 杜比 / Hi-Res 拿到低于目标的整曲流，同样是确认性结论。
+        assert_eq!(confirmed_miss_rank(Some(110), 100, false, true), Some(110));
+        assert_eq!(confirmed_miss_rank(Some(88), 80, false, true), Some(88));
     }
 
     /// 写出与解析必须用同一套字段布局，避免两边各改一处后错位。
@@ -1854,24 +1858,42 @@ mod tests {
         assert_eq!(parsed.preview_attempt_at, Some(1_700_000_000));
     }
 
-    /// 命中缓存时，确认过的目标不再触发升级；目标提高后仍要重新探测。
-    #[test]
-    fn needs_upgrade_honours_confirmed_target() {
-        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("t.m4a"));
-        let track = |rank: i64, checked: Option<i64>| CachedTrack {
+    /// 一条档位已知、没有额外标记的整曲缓存，供命中/升级判定用。
+    fn known_rank_track(rank: i64, checked: Option<i64>) -> CachedTrack {
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("known-rank.m4a"));
+        CachedTrack {
             path: std::path::PathBuf::new(),
             quality: "test".into(),
             preview: false,
             quality_rank: Some(rank),
             checked_rank: checked,
             preview_retry_blocked: false,
-            lease: lease.clone(),
-        };
+            lease,
+        }
+    }
+
+    /// 命中缓存时，确认过的目标不再触发升级；目标提高后仍要重新探测。
+    #[test]
+    fn needs_upgrade_honours_confirmed_target() {
         let lossless = crate::quality::QualityIntent::parse("lossless");
-        assert!(track(80, None).needs_upgrade(&lossless, None));
-        assert!(!track(80, Some(100)).needs_upgrade(&lossless, None));
-        assert!(track(80, Some(70)).needs_upgrade(&lossless, None));
-        assert!(!track(100, None).needs_upgrade(&lossless, None));
+        assert!(known_rank_track(80, None).needs_upgrade(&lossless, None));
+        assert!(!known_rank_track(80, Some(100)).needs_upgrade(&lossless, None));
+        assert!(known_rank_track(80, Some(70)).needs_upgrade(&lossless, None));
+        assert!(!known_rank_track(100, None).needs_upgrade(&lossless, None));
+    }
+
+    /// 杜比 / Hi-Res 的探测结论同样要挡住下一次升级，否则每轮都整首重下一遍。
+    #[test]
+    fn high_tier_check_suppresses_the_next_upgrade() {
+        let hires = crate::quality::QualityIntent::parse("hires");
+        let dolby = crate::quality::QualityIntent::parse("dolby");
+
+        assert!(known_rank_track(100, None).needs_upgrade(&hires, Some(true)));
+        assert!(!known_rank_track(100, Some(110)).needs_upgrade(&hires, Some(true)));
+        assert!(!known_rank_track(100, Some(110)).needs_auto_upgrade(&hires, Some(true)));
+        // 杜比目标没升到 88 档、但已经问过：同一目标不再重下。
+        assert!(known_rank_track(80, None).needs_upgrade(&dolby, Some(true)));
+        assert!(!known_rank_track(80, Some(88)).needs_upgrade(&dolby, Some(true)));
     }
 
     /// #89：档位未知的旧三字段缓存也要能升级；自动路径再多一道「结论记不住就别探」的闸。
