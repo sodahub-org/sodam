@@ -22,6 +22,7 @@ pub mod quality;
 pub mod queue;
 pub mod quit_gate;
 pub mod session;
+pub mod upgrade;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;

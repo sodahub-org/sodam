@@ -1,0 +1,280 @@
+//! 缓存音质升级：批量什么时候停、一首跑完算不算成功、去重表跟着谁走（#254）。
+//!
+//! 单首升级和批量升级在应用层共用同一段「跑一首」；这里只放批量那条循环需要的纯逻辑：
+//! 「下一首之前该不该停」和「一首跑完落在哪一档」。身份代数与取消标志由界面线程读出来
+//! 再喂进来——后台任务碰不到 `Root`。
+//!
+//! 停机的三条理由各管一件事：身份变了、用户取消、档位没真提升不算成功。身份变了
+//! **不**自动拿新号接着跑：目标档位是按旧号定的，新号权益可能撑不住，替人花流量不合适。
+
+use std::collections::HashSet;
+
+/// 批量为什么不再发下一首。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// 登录身份变了：退出登录、换号，或会员状态刷新推进了代数。
+    IdentityChanged,
+    /// 用户点了取消。只停在下一首之前，正在下的那一首不打断。
+    Cancelled,
+}
+
+impl StopReason {
+    /// 日志字段 `stop=` 的稳定取值（小写下划线，不随界面语言变化）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::IdentityChanged => "identity_changed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// 下一首之前该不该停。
+///
+/// 两件事同时到达时报身份那次：用户要处理的是「换号了」，取消已经不重要。
+pub fn stop_reason(start_epoch: u64, current_epoch: u64, cancelled: bool) -> Option<StopReason> {
+    if current_epoch != start_epoch {
+        return Some(StopReason::IdentityChanged);
+    }
+    cancelled.then_some(StopReason::Cancelled)
+}
+
+/// 一份缓存流的样子：档位分 + 是不是试听片段。
+///
+/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamShape {
+    /// 这条流的档位分；`None` = 旧缓存没记。
+    pub rank: Option<i64>,
+    /// 是不是试听片段。
+    pub preview: bool,
+}
+
+/// 一首跑完落在哪一档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// 盘上那份确实变好了。
+    Upgraded,
+    /// 跑完了，但服务端能给的最高就这些：不算成功，也不留在「试过了」表里。
+    NoHigherTier,
+    /// 这次没跑成（网络、磁盘、权益……），下次还能再试。
+    Failed,
+}
+
+impl Outcome {
+    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
+    pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
+        if before.preview && !after.preview {
+            return Self::Upgraded;
+        }
+        if after.rank > before.rank {
+            Self::Upgraded
+        } else {
+            Self::NoHigherTier
+        }
+    }
+}
+
+/// 一轮批量的三类计数：成功 / 网络失败 / 确实没更高档位。
+///
+/// 收尾那行日志和界面小结都读它，两边不各数一遍。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub upgraded: usize,
+    pub failed: usize,
+    pub no_higher: usize,
+}
+
+impl Tally {
+    pub fn record(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Upgraded => self.upgraded += 1,
+            Outcome::Failed => self.failed += 1,
+            Outcome::NoHigherTier => self.no_higher += 1,
+        }
+    }
+
+    /// 这一轮真跑了几首。提前停时小于扫出来的总数。
+    pub fn total(&self) -> usize {
+        self.upgraded + self.failed + self.no_higher
+    }
+}
+
+/// 本会话「这一首、这个档位已经试过」的记账。
+///
+/// 表跟着身份走：换号 / 登出后整份作废，同一首同一档位在新账号下重新可试（#254）。
+/// 身份代数由调用方在 [`UpgradeAttempts::observe_epoch`] 里喂进来，这里不自己数。
+#[derive(Debug, Default)]
+pub struct UpgradeAttempts {
+    epoch: u64,
+    keys: HashSet<String>,
+}
+
+impl UpgradeAttempts {
+    /// 记一次尝试；已经记过返回 `false`，这次不用再跑。
+    pub fn begin(&mut self, key: String) -> bool {
+        self.keys.insert(key)
+    }
+
+    /// 这次没真升级：撤掉记号，同一首下次还能再试。
+    ///
+    /// 只在身份没变时撤。换号之后整张表已经作废，这时撤掉的很可能是新号刚记下的
+    /// 那一条，撤了就成了「新号多跑一遍」。
+    pub fn abandon(&mut self, key: &str, epoch: u64) {
+        if epoch == self.epoch {
+            self.keys.remove(key);
+        }
+    }
+
+    /// 身份代数变了就整份作废；返回这次到底清没清。
+    pub fn observe_epoch(&mut self, epoch: u64) -> bool {
+        if epoch == self.epoch {
+            return false;
+        }
+        self.epoch = epoch;
+        self.keys.clear();
+        true
+    }
+
+    /// 盘上的缓存没了：记号跟着作废（清缓存走这条路）。
+    pub fn clear(&mut self) {
+        self.keys.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 换号之后，下一首之前就停；报的是身份变了。
+    #[test]
+    fn identity_change_stops_before_the_next_track() {
+        assert_eq!(stop_reason(7, 7, false), None);
+        assert_eq!(stop_reason(7, 8, false), Some(StopReason::IdentityChanged));
+        // 取消和换号同时到：报身份那次，那才是用户要处理的事。
+        assert_eq!(stop_reason(7, 8, true), Some(StopReason::IdentityChanged));
+    }
+
+    /// 取消之后不再发下一首。
+    #[test]
+    fn cancel_stops_before_the_next_track() {
+        assert_eq!(stop_reason(3, 3, true), Some(StopReason::Cancelled));
+        assert_eq!(stop_reason(3, 3, false), None);
+    }
+
+    /// 档位没真提升不算成功。
+    #[test]
+    fn an_equal_or_lower_tier_is_not_an_upgrade() {
+        let lossless = StreamShape {
+            rank: Some(100),
+            preview: false,
+        };
+        let highest = StreamShape {
+            rank: Some(80),
+            preview: false,
+        };
+        assert_eq!(Outcome::of_shapes(highest, lossless), Outcome::Upgraded);
+        assert_eq!(
+            Outcome::of_shapes(lossless, lossless),
+            Outcome::NoHigherTier,
+            "同一条流拿回来两次不算升级"
+        );
+        assert_eq!(
+            Outcome::of_shapes(lossless, highest),
+            Outcome::NoHigherTier,
+            "拿回更差的流不算升级"
+        );
+        // 旧缓存没记分数：这次量出来一个分数，就是实打实的提升。
+        assert_eq!(
+            Outcome::of_shapes(
+                StreamShape {
+                    rank: None,
+                    preview: false
+                },
+                highest
+            ),
+            Outcome::Upgraded
+        );
+        // 试听换整曲：同档位也算，盘上那份文件确实变完整了。
+        let preview = StreamShape {
+            rank: Some(80),
+            preview: true,
+        };
+        let full = StreamShape {
+            rank: Some(80),
+            preview: false,
+        };
+        assert_eq!(Outcome::of_shapes(preview, full), Outcome::Upgraded);
+        // 整曲换成试听什么时候都不算升级（这条路本来就另有护栏挡着）。
+        assert_eq!(Outcome::of_shapes(full, preview), Outcome::NoHigherTier);
+    }
+
+    /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
+    #[test]
+    fn identity_change_voids_the_attempt_table() {
+        let mut attempts = UpgradeAttempts::default();
+        let key = "8801:lossless".to_string();
+        assert!(attempts.begin(key.clone()));
+        assert!(!attempts.begin(key.clone()), "同一次会话里不重复跑");
+
+        assert!(attempts.observe_epoch(1), "换了身份要整份作废");
+        assert!(attempts.begin(key.clone()), "新账号下重新可试");
+        // 同一个代数再喂一遍：什么都不用清。
+        assert!(!attempts.observe_epoch(1));
+        assert!(!attempts.begin(key.clone()));
+    }
+
+    /// 没真升级的记号可以撤；但旧身份回来的结果撤不掉新身份刚记下的那一条。
+    #[test]
+    fn abandoning_only_works_for_the_same_identity() {
+        let mut attempts = UpgradeAttempts::default();
+        let key = "8801:lossless".to_string();
+
+        assert!(attempts.begin(key.clone()));
+        attempts.abandon(&key, 0);
+        assert!(attempts.begin(key.clone()), "没真升级的可以再试");
+
+        // 换了号，新号记下同一条；旧号在途的结果回来时不能把它撤掉。
+        attempts.observe_epoch(1);
+        assert!(attempts.begin(key.clone()));
+        attempts.abandon(&key, 0);
+        assert!(!attempts.begin(key.clone()));
+    }
+
+    /// 清缓存把记号一起作废，但不算换身份。
+    #[test]
+    fn clearing_drops_the_marks_without_touching_the_epoch() {
+        let mut attempts = UpgradeAttempts::default();
+        let key = "8801:lossless".to_string();
+        assert!(attempts.begin(key.clone()));
+
+        attempts.clear();
+        assert!(attempts.begin(key.clone()));
+        // 代数没动过，旧身份的在途结果照样能撤。
+        attempts.abandon(&key, 0);
+        assert!(attempts.begin(key));
+    }
+
+    /// 收尾的三个数分开记，总数只算真跑过的。
+    #[test]
+    fn tally_keeps_the_three_numbers_apart() {
+        let mut tally = Tally::default();
+        assert_eq!(tally.total(), 0);
+
+        tally.record(Outcome::Upgraded);
+        tally.record(Outcome::Failed);
+        tally.record(Outcome::Failed);
+        tally.record(Outcome::NoHigherTier);
+
+        assert_eq!(tally.upgraded, 1);
+        assert_eq!(tally.failed, 2);
+        assert_eq!(tally.no_higher, 1);
+        assert_eq!(tally.total(), 4);
+    }
+
+    /// 日志取值稳定：小写下划线，不随界面语言变化。
+    #[test]
+    fn stop_log_values_are_stable() {
+        assert_eq!(StopReason::IdentityChanged.as_str(), "identity_changed");
+        assert_eq!(StopReason::Cancelled.as_str(), "cancelled");
+    }
+}
