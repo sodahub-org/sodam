@@ -72,11 +72,16 @@ pub enum IdentityChange {
 }
 
 /// 对齐起始与停下那一刻的账号 id，判断是不是真换了号。
+///
+/// 空串按「没读到」处理：账号信息偶尔会先落一个空 id，不能拿它和真账号比出「换了号」。
 pub fn identity_change(
     start_user_id: Option<&str>,
     current_user_id: Option<&str>,
 ) -> IdentityChange {
-    match (start_user_id, current_user_id) {
+    fn read(id: Option<&str>) -> Option<&str> {
+        id.filter(|value| !value.trim().is_empty())
+    }
+    match (read(start_user_id), read(current_user_id)) {
         (Some(before), Some(now)) if before != now => IdentityChange::AccountChanged,
         _ => IdentityChange::LoginStateChanged,
     }
@@ -116,7 +121,7 @@ pub enum Outcome {
 impl Outcome {
     /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
     ///
-    /// 档位分走 [`crate::quality::readable_rank`] 那一道闸：0 分是「量过但认不出」，
+    /// 档位分走 `readable_rank` 那一道闸：0 分是「量过但认不出」，
     /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
     /// 会被当成一次升级。
     pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
@@ -294,6 +299,15 @@ mod tests {
         );
         assert_eq!(
             identity_change(None, None),
+            IdentityChange::LoginStateChanged
+        );
+        // 空串 id 按没读到处理：不能拿它和真账号比出「换了号」。
+        assert_eq!(
+            identity_change(Some("8801"), Some("")),
+            IdentityChange::LoginStateChanged
+        );
+        assert_eq!(
+            identity_change(Some("8801"), Some("  ")),
             IdentityChange::LoginStateChanged
         );
     }
