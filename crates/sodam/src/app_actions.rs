@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
-use sodam_core::cover::CoverOutcome;
+use sodam_core::cover::{CoverOutcome, CoverWant};
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -681,9 +681,9 @@ impl Root {
     /// 淘汰删了磁盘上的封面后，同步清掉内存里指向它们的路径映射。
     ///
     /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各自独立，
-    /// 只删了缩略图就不动原图映射。清掉后解除对应的下载去重标记、剔掉请求池里的
-    /// 重复项，渲染才能把这几种封面重新排队下载。当前曲目的原图被删时直接补一次下载，
-    /// 歌词页没有原图的自动入队口子，不等它自己回来。
+    /// 只删了缩略图就不动原图映射。清掉缩略图那笔账后，渲染发现缺图会重新排队；
+    /// 当前曲目的原图被删时直接补一次下载，歌词页没有原图的自动入队口子，
+    /// 不等它自己回来。
     pub(crate) fn drop_removed_covers(&mut self, removed: &[PathBuf], cx: &mut Context<Self>) {
         if removed.is_empty() {
             return;
@@ -3311,15 +3311,11 @@ impl Root {
     /// 把封面交给 CoverStore；缺图时渲染先显示占位块。
     ///
     /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
-    /// 返回 (这次新入队数, 因队列满挤掉的张数)，给消费循环降频和日志用。
-    pub fn ensure_covers(
-        &mut self,
-        urls: &[String],
-        cx: &mut Context<Self>,
-    ) -> sodam_core::cover::CoverWant {
-        let added = self.cover_store.want(urls);
-        let stats = self.cover_store.take_want_stats(added.len());
-        if !added.is_empty() {
+    /// 返回这轮新入队 / 挤掉的张数，给消费循环降频和日志用。
+    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> CoverWant {
+        self.cover_store.want(urls);
+        let stats = self.cover_store.take_want_stats();
+        if stats.queued > 0 {
             self.pump_covers(cx);
         }
         stats

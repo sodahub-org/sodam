@@ -13,7 +13,7 @@ use gpui::{
 };
 use sodam_core::{
     config::EnvCookieFill,
-    cover::CoverStore,
+    cover::{CoverStore, CoverWant},
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -1130,7 +1130,7 @@ impl Root {
                         Err(_) => break,
                     }
                 } else {
-                    sodam_core::cover::CoverWant::default()
+                    CoverWant::default()
                 };
                 if had_demand && log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
                     let queued = stats.queued.to_string();

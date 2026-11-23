@@ -1,7 +1,7 @@
 //! 封面缩略图状态：一条 URL 一条记录。
 //!
 //! 取图本身不在这里：这里只回答「这张问过没有 / 排到哪一步了 / 结果是什么」。
-//! 读口子（`path` / `color` / `paths`）是纯内存查询，不碰磁盘也不发请求；
+//! 读口子（`path` / `color` / `paths_snapshot`）是纯内存查询，不碰磁盘也不发请求；
 //! 下载由调用方泵出去，结果再用 [`CoverStore::complete`] 交回来。
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,6 +46,14 @@ pub struct CoverPaths {
 }
 
 impl CoverPaths {
+    /// 这张图有没有已完成路径（只查内存，不克隆）。
+    pub fn contains(&self, url: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(url.trim())
+    }
+
     /// 查一张图的本地路径（只查内存）。
     pub fn get(&self, url: &str) -> Option<PathBuf> {
         let paths = self
@@ -132,6 +140,8 @@ pub struct CoverStore {
     colors: HashMap<String, CoverRgb>,
     /// 在飞期间被 `forget` 的 URL：这次结果作废，结束后退回 `Idle`。
     abandoned: HashSet<String>,
+    /// 上一轮 `want` 新排进来的张数（日志用）。
+    last_queued: usize,
     /// 队列满时挤掉的张数（日志用）。
     evicted: usize,
 }
@@ -144,7 +154,7 @@ impl CoverStore {
         let mut queued = Vec::new();
         for raw in urls {
             let url = raw.trim();
-            if url.is_empty() || self.ready.get(url).is_some() {
+            if url.is_empty() || self.ready.contains(url) {
                 continue;
             }
             let can_queue = self
@@ -162,6 +172,7 @@ impl CoverStore {
             self.queue.push_back(url.to_string());
             queued.push(url.to_string());
         }
+        self.last_queued = queued.len();
         queued
     }
 
@@ -192,12 +203,11 @@ impl CoverStore {
         self.inflight.remove(url);
         if self.abandoned.remove(url) {
             // 下载中被 forget：这次拿回来的东西不要，退回可重排。
+            // 不要动已发布路径：原图可能已经先兜过底，文件还在。
             if let Some(record) = self.records.get_mut(url) {
                 record.state = State::Idle;
                 record.failures = 0;
             }
-            self.ready.remove(url);
-            self.colors.remove(url);
             return;
         }
         match outcome {
@@ -279,7 +289,7 @@ impl CoverStore {
     /// 原图先下回来时给列表兜个底：只发布路径，不动在飞 / 排队记账。
     pub fn adopt_thumbnail(&mut self, url: &str, path: PathBuf) {
         let url = url.trim();
-        if url.is_empty() || self.ready.get(url).is_some() {
+        if url.is_empty() || self.ready.contains(url) {
             return;
         }
         self.ready.insert(url, path);
@@ -306,10 +316,10 @@ impl CoverStore {
         self.ready.clone()
     }
 
-    /// 一轮 `want` 的结果；挤掉的张数顺手清零。
-    pub fn take_want_stats(&mut self, queued: usize) -> CoverWant {
+    /// 取走上一轮 `want` 的计数；两个数都清零。
+    pub fn take_want_stats(&mut self) -> CoverWant {
         CoverWant {
-            queued,
+            queued: std::mem::take(&mut self.last_queued),
             dropped: std::mem::take(&mut self.evicted),
         }
     }
@@ -417,15 +427,15 @@ mod tests {
             .map(|index| format!("cover-{index}"))
             .collect();
         assert_eq!(store.want(&first).len(), MAX_QUEUE);
-        assert_eq!(store.take_want_stats(0).dropped, 0);
+        assert_eq!(store.take_want_stats().dropped, 0);
 
         let extra = urls(&["cover-extra"]);
         assert_eq!(store.want(&extra).len(), 1, "满了也要收新图");
-        assert_eq!(store.take_want_stats(1).dropped, 1, "挤掉了最旧的一张");
+        assert_eq!(store.take_want_stats().dropped, 1, "挤掉了最旧的一张");
 
         let oldest = urls(&["cover-0"]);
         assert_eq!(store.want(&oldest).len(), 1, "被挤掉的那张能重新排队");
-        assert_eq!(store.take_want_stats(1).dropped, 1);
+        assert_eq!(store.take_want_stats().dropped, 1);
         assert!(store.want(&oldest).is_empty(), "排进去之后不重复入队");
     }
 
@@ -553,6 +563,8 @@ mod tests {
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。
+    ///
+    /// 之后再收到这次缩略图的结果（成功 / 失败 / 文件已没）都不能抹掉这条路。
     #[test]
     fn adopt_thumbnail_publishes_without_touching_inflight() {
         let mut store = CoverStore::default();
