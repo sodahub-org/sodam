@@ -284,6 +284,7 @@ impl Lane {
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
             self.requeue_if_demanded(url, ready, records, select);
+            discard_empty_record(records, url);
             return true;
         }
         false
@@ -1337,6 +1338,19 @@ mod tests {
 
         store.forget([url]);
         assert!(store.want_original(url), "作废之后能重新下");
+    }
+
+    /// 作废的在飞结果回来后没人再要：记录也要删掉，别留空壳。
+    #[test]
+    fn abandoned_completion_without_demand_leaves_no_record() {
+        let mut store = CoverStore::default();
+        assert!(store.want_original("original-a"));
+        assert_eq!(store.drain_original(), vec!["original-a".to_string()]);
+
+        store.forget(["original-a"]);
+        store.complete_original("original-a", original_ready("/tmp/full.img"));
+        assert!(store.original_path("original-a").is_none());
+        assert!(store.records.is_empty(), "没人再要就不留空记录");
     }
 
     /// 原图在飞时作废，结果回来后同样不能重复下；有人要就补排。
