@@ -109,6 +109,18 @@ fn settle_original_cover(
     }
 }
 
+/// 文件在下载期间被删掉后，要不要顺手给当前曲目再排一次。
+///
+/// 清缓存还在跑时交给 `clear_cache` 的补偿，别和它抢；淘汰删文件时
+/// `drop_removed_covers` 反查不到还没发布过的 URL，只能在这里补。
+fn retry_vanished_original_cover(
+    cache_clearing: bool,
+    displayed_cover: Option<&str>,
+    url: &str,
+) -> bool {
+    !cache_clearing && displayed_cover == Some(url)
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -1486,15 +1498,25 @@ impl Root {
                 if settlement.release_attempted {
                     // 下载期间文件被清缓存或淘汰删掉了：别把死路径记进表，
                     // 否则 ensure_original_cover 会一直当成命中，本会话再也
-                    // 排不进来。放行记号后，清缓存的补下载在
-                    // restore_current_original_cover 里，下一次 ensure 也能
-                    // 重排；回调这里不再排一份，避免同一 URL 下多份。
+                    // 排不进来。先无条件放行记号；同一个 URL 可能因此多下
+                    // 一份，重复下载是已知代价，后续在飞记账单独收。
                     {
                         let mut attempted = root
                             .original_cover_attempted
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         attempted.remove(&fetch_url);
+                    }
+                    // 淘汰删文件时 drop_removed_covers 反查不到还没发布过的
+                    // URL，这里得自己补；清缓存进行中则交给它的补偿。
+                    let displayed_cover =
+                        current_cover_url(root.pending_track.as_ref(), root.queue.current());
+                    if retry_vanished_original_cover(
+                        root.cache_clearing,
+                        displayed_cover.as_deref(),
+                        &fetch_url,
+                    ) {
+                        root.ensure_original_cover(&fetch_url, cx);
                     }
                     cx.notify();
                 }
@@ -5667,7 +5689,8 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
-        lyrics_scroll_ease, settle_original_cover, urls_for_removed_paths,
+        lyrics_scroll_ease, retry_vanished_original_cover, settle_original_cover,
+        urls_for_removed_paths,
     };
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
     use std::collections::HashMap;
@@ -5732,6 +5755,27 @@ mod tests {
         let failed = settle_original_cover(None, |_| true);
         assert_eq!(failed.publish, None, "下载失败没有图可发布");
         assert!(!failed.release_attempted, "下载失败保留记号，避免每帧空转");
+    }
+
+    /// 文件没了要不要补：清缓存进行中交给它的补偿，淘汰删文件时自己补。
+    #[test]
+    fn vanished_original_cover_retries_only_outside_a_cache_clear() {
+        assert!(
+            retry_vanished_original_cover(false, Some("url/current"), "url/current"),
+            "淘汰删了当前曲目的原图：要补"
+        );
+        assert!(
+            !retry_vanished_original_cover(false, Some("url/other"), "url/current"),
+            "不是当前曲目：不补"
+        );
+        assert!(
+            !retry_vanished_original_cover(false, None, "url/current"),
+            "没有当前曲目：不补"
+        );
+        assert!(
+            !retry_vanished_original_cover(true, Some("url/current"), "url/current"),
+            "清缓存进行中：交给 clear_cache 的补偿"
+        );
     }
 
     /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
