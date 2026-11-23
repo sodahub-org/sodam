@@ -160,6 +160,19 @@ fn original_slot(record: &mut Record) -> &mut Slot {
 
 type SelectSlot = fn(&mut Record) -> &mut Slot;
 
+/// 两格都回到默认状态时把记录删掉，别让淘汰 / 切歌每轮留下空记录。
+fn discard_empty_record(records: &mut HashMap<String, Record>, url: &str) {
+    let empty = records.get(url).is_some_and(|record| {
+        record.thumbnail.state == State::Idle
+            && record.original.state == State::Idle
+            && record.thumbnail.failures == 0
+            && record.original.failures == 0
+    });
+    if empty {
+        records.remove(url);
+    }
+}
+
 /// 一条腿的排队与在飞记账：队列、在飞集合、作废标记。
 ///
 /// 缩略图和原图各有一条，差别只在队列 / 并发上限和完成后的落账；
@@ -294,6 +307,8 @@ impl Lane {
     /// 在飞不立刻放行——否则同一张会同时下两遍。
     fn forget(&mut self, url: &str, records: &mut HashMap<String, Record>, select: SelectSlot) {
         self.queue.retain(|queued| queued.as_str() != url);
+        // 这次作废之后，旧的「结果回来再补排」需求也作废；之后再 want 会重新记。
+        self.requeue_after_release.remove(url);
         let inflight = records
             .get_mut(url)
             .is_some_and(|record| select(record).state == State::Inflight);
@@ -333,18 +348,25 @@ impl Lane {
                     slot.state = State::Idle;
                 }
             }
+            discard_empty_record(records, &url);
         }
     }
 
     /// 挤掉最旧的一条排队项；真挤掉了返回 `true`。
     fn evict_oldest(&mut self, records: &mut HashMap<String, Record>, select: SelectSlot) -> bool {
         while let Some(url) = self.queue.pop_front() {
-            if let Some(record) = records.get_mut(&url) {
+            let evicted = records.get_mut(&url).is_some_and(|record| {
                 let slot = select(record);
                 if slot.state == State::Queued {
                     slot.state = State::Idle;
-                    return true;
+                    true
+                } else {
+                    false
                 }
+            });
+            if evicted {
+                discard_empty_record(records, &url);
+                return true;
             }
         }
         false
@@ -548,7 +570,7 @@ impl CoverStore {
             let url = raw.trim();
             self.forget_thumbnail_url(url);
             self.forget_original_url(url);
-            self.discard_if_empty(url);
+            discard_empty_record(&mut self.records, url);
         }
     }
 
@@ -559,7 +581,7 @@ impl CoverStore {
         for raw in urls {
             let url = raw.trim();
             self.forget_thumbnail_url(url);
-            self.discard_if_empty(url);
+            discard_empty_record(&mut self.records, url);
         }
     }
 
@@ -568,7 +590,7 @@ impl CoverStore {
         for raw in urls {
             let url = raw.trim();
             self.forget_original_url(url);
-            self.discard_if_empty(url);
+            discard_empty_record(&mut self.records, url);
         }
     }
 
@@ -588,19 +610,6 @@ impl CoverStore {
         }
         self.originals.forget(url, &mut self.records, original_slot);
         self.original_paths.remove(url);
-    }
-
-    /// 两格都回到默认状态时把记录删掉，别让淘汰每扫一轮就留下一条空记录。
-    fn discard_if_empty(&mut self, url: &str) {
-        let empty = self.records.get(url).is_some_and(|record| {
-            record.thumbnail.state == State::Idle
-                && record.original.state == State::Idle
-                && record.thumbnail.failures == 0
-                && record.original.failures == 0
-        });
-        if empty {
-            self.records.remove(url);
-        }
     }
 
     /// 切歌时原图排队只留当前曲目；被剔掉的退回可重排，下次播放会重新请求，
@@ -875,6 +884,63 @@ mod tests {
         store.complete("cover-a", CoverOutcome::Failed);
         assert_eq!(store.drain(), url, "作废结果回来后要把这次需求补上");
         assert!(store.want(&url).is_empty(), "补排之后不重复入队");
+    }
+
+    /// 第二次作废要把第一次作废后留的补排需求一起清掉；之后再要仍能重新记。
+    #[test]
+    fn repeated_forget_cancels_deferred_original_demand() {
+        let mut store = CoverStore::default();
+        assert!(store.want_original("original-a"));
+        assert_eq!(store.drain_original(), vec!["original-a".to_string()]);
+
+        store.forget(["original-a"]);
+        assert!(!store.want_original("original-a"), "在飞期间不重下");
+        store.forget(["original-a"]);
+
+        store.complete_original("original-a", original_ready("/tmp/full.img"));
+        assert!(
+            store.original_path("original-a").is_none(),
+            "作废结果不发布"
+        );
+        assert!(
+            store.drain_original().is_empty(),
+            "第二次作废把补排需求也清了"
+        );
+        assert!(store.want_original("original-a"), "之后再要还能排");
+    }
+
+    /// 切歌 / 队列满挤掉的排队项不能留下空记录。
+    #[test]
+    fn dropped_queued_entries_do_not_leave_empty_records() {
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_ORIGINAL_CONCURRENCY + 1)
+            .map(|index| format!("original-{index}"))
+            .collect();
+        for url in &many {
+            assert!(store.want_original(url));
+        }
+        assert_eq!(store.drain_original().len(), MAX_ORIGINAL_CONCURRENCY);
+        assert_eq!(store.records.len(), many.len());
+
+        store.retain_original_only("other-current");
+        assert_eq!(
+            store.records.len(),
+            MAX_ORIGINAL_CONCURRENCY,
+            "被切歌放掉的排队项不留空记录"
+        );
+
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_ORIGINAL_QUEUE + 1)
+            .map(|index| format!("original-{index}"))
+            .collect();
+        for url in &many {
+            assert!(store.want_original(url));
+        }
+        assert_eq!(
+            store.records.len(),
+            MAX_ORIGINAL_QUEUE,
+            "队列满挤掉的最旧项不留空记录"
+        );
     }
 
     /// forget 摘掉排队项和去重标记，重新入队只下一次。
