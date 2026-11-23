@@ -505,7 +505,6 @@ pub(crate) fn scrolling_detail_page(
     let covers = root.cover_store.paths_snapshot();
     let cover_mailbox = root.cover_mailbox.clone();
     let albums = albums.clone();
-    let detail_covers = root.cover_store.paths_snapshot();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
     let unplayable = root.unplayable.snapshot();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
@@ -694,7 +693,7 @@ pub(crate) fn scrolling_detail_page(
             return div().into_any_element();
         };
         let item = album.clone();
-        let cover_path = detail_covers.get(&album.cover);
+        let cover_path = covers.get(&album.cover);
         div()
             .id(gpui::ElementId::Name(
                 format!("detail-album-{}", album.id).into(),

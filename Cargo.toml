@@ -18,6 +18,8 @@ gpui_platform = { git = "https://github.com/sodahub-org/gpui", rev = "d9a82ba", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+futures-channel = "0.3"
+futures-lite = "2"
 sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }

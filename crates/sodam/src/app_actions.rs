@@ -4751,12 +4751,12 @@ const RECOMMENDATION_DEADLINE: std::time::Duration = std::time::Duration::from_s
 
 /// `future::select` 的本地实现：两个 future，谁先完成就用谁的结果。
 ///
-/// 不引新依赖：`futures-lite` 现在只挂在 Linux target 下，而超时兜底是三个平台
-/// 都要的行为。返回 `Some(value)` 表示 `work` 先完成，`None` 表示截止时间先到。
+/// 返回 `Some(value)` 表示 `work` 先完成，`None` 表示截止时间先到。
 ///
 /// 拿 `&mut F` 而不是 `F`：`gpui::Task` 被 drop 时会 `set_canceled()` 真正取消任务
 /// （`async_task::Task` 的 Drop 行为）。超时分支的调用方需要任务活下来去把那一次
 /// 请求跑完，所以所有权必须留在外面，由调用方决定要不要 `detach()`。
+/// `futures_lite::future::or` 会吃掉 future，这里不能用它替代。
 async fn first_of<F>(
     work: &mut F,
     deadline: impl std::future::Future<Output = ()>,

@@ -488,7 +488,7 @@ pub struct Root {
     pub loading_album: bool,
     /// 渲染期收集到的封面需求（虚拟列表只渲染可见行，所以这里排的就是
     /// 「当前真正看得见」的那些封面）。由后台循环消费，新需求会立刻叫醒它。
-    pub cover_mailbox: Arc<CoverMailbox>,
+    pub(crate) cover_mailbox: Arc<CoverMailbox>,
     /// 真实播放过的曲目 id（最近在后）。用于队列抽屉的「已播放」分区；
     /// 不能用「当前下标之前」来推 —— 那会把跳过的歌也算进去（实测踩过）。
     pub played_history: Vec<String>,
@@ -1757,8 +1757,8 @@ impl Root {
         })
         .detach();
 
-        // 用通道 + 轮询而不是 select：`futures-lite` 只在 Linux 目标下引入，
-        // 这里保持跨平台，20ms 一拍足够。
+        // 用通道 + 轮询：退出这拍只需要「落盘有没有完」一个信号，
+        // 20ms 一拍的轮询足够，没必要为它再搭一个 select。
         cx.spawn(async move |this, cx| {
             loop {
                 if matches!(
@@ -2241,8 +2241,25 @@ impl Render for Root {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_verify_window_result, verify_window_step, VerifyWindowState, VerifyWindowStep,
+        apply_verify_window_result, verify_window_step, CoverMailbox, VerifyWindowState,
+        VerifyWindowStep,
     };
+
+    /// 渲染推一条需求，消费循环要被叫醒，`take` 一次拿干净。
+    #[test]
+    fn cover_mailbox_requests_wake_and_drain() {
+        let (wake, mut rx) = futures_channel::mpsc::channel::<()>(1);
+        let mailbox = CoverMailbox::new(wake);
+
+        mailbox.request("cover-a".to_string());
+        assert_eq!(
+            rx.try_next().expect("wake channel still open"),
+            Some(()),
+            "有需求要叫醒消费循环"
+        );
+        assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
+        assert!(mailbox.take().is_empty());
+    }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
     const OPENED_TEXT: &str = "验证窗口已打开；完成后这里会自动更新";

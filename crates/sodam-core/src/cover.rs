@@ -87,6 +87,8 @@ impl CoverPaths {
     }
 
     /// 按被删的文件路径反查 URL；只对命中删除列表的条目做磁盘检查。
+    ///
+    /// 读锁里只挑出命中的几对，`stat` 放到放锁之后，别让写路径等着磁盘。
     pub fn urls_for_removed_paths<F>(
         &self,
         removed: &[PathBuf],
@@ -96,16 +98,21 @@ impl CoverPaths {
         F: FnMut(&Path) -> bool,
     {
         let removed: HashSet<&Path> = removed.iter().map(PathBuf::as_path).collect();
-        let paths = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths
-            .iter()
-            .filter(|(_, path)| {
-                removed.contains(path.as_path()) && is_still_missing(path.as_path())
-            })
-            .map(|(url, _)| url.clone())
+        let candidates: Vec<(String, PathBuf)> = {
+            let paths = self
+                .inner
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            paths
+                .iter()
+                .filter(|(_, path)| removed.contains(path.as_path()))
+                .map(|(url, path)| (url.clone(), path.clone()))
+                .collect()
+        };
+        candidates
+            .into_iter()
+            .filter(|(_, path)| is_still_missing(path.as_path()))
+            .map(|(url, _)| url)
             .collect()
     }
 }
@@ -154,31 +161,39 @@ impl CoverStore {
     ///
     /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
     pub fn want(&mut self, urls: &[String]) -> Vec<String> {
+        // 两个计数都按这一轮重置，日志里的 queued / dropped 才是同一口径。
+        self.last_queued = 0;
+        self.evicted = 0;
         let mut queued = Vec::new();
         for raw in urls {
-            let url = raw.trim();
-            if url.is_empty() || self.ready.contains(url) {
-                continue;
+            if self.enqueue(raw.trim()) {
+                queued.push(raw.trim().to_string());
             }
-            let state = self.records.get(url).map(|record| record.state);
-            let can_queue = matches!(state, None | Some(State::Idle));
-            if !can_queue {
-                // 在飞但已被 forget：把这次需求记下来，等结果回来立刻重排。
-                if state == Some(State::Inflight) && self.abandoned.contains(url) {
-                    self.requeue_after_release.insert(url.to_string());
-                }
-                continue;
-            }
-            if self.queue.len() >= MAX_QUEUE {
-                self.evict_oldest();
-            }
-            let record = self.records.entry(url.to_string()).or_default();
-            record.state = State::Queued;
-            self.queue.push_back(url.to_string());
-            queued.push(url.to_string());
         }
         self.last_queued = queued.len();
         queued
+    }
+
+    /// 单张入队；不动这一轮的统计口径（作废放行补排也走这里）。
+    fn enqueue(&mut self, url: &str) -> bool {
+        if url.is_empty() || self.ready.contains(url) {
+            return false;
+        }
+        let state = self.records.get(url).map(|record| record.state);
+        if !matches!(state, None | Some(State::Idle)) {
+            // 在飞但已被 forget：把这次需求记下来，等结果回来立刻重排。
+            if state == Some(State::Inflight) && self.abandoned.contains(url) {
+                self.requeue_after_release.insert(url.to_string());
+            }
+            return false;
+        }
+        if self.queue.len() >= MAX_QUEUE {
+            self.evict_oldest();
+        }
+        let record = self.records.entry(url.to_string()).or_default();
+        record.state = State::Queued;
+        self.queue.push_back(url.to_string());
+        true
     }
 
     /// 泵的上半截：把排队项推进在飞，最多 [`MAX_CONCURRENCY`] 个。
@@ -215,7 +230,7 @@ impl CoverStore {
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
             if self.requeue_after_release.remove(url) {
-                self.want(&[url.to_string()]);
+                self.enqueue(url);
             }
             return;
         }
@@ -519,6 +534,30 @@ mod tests {
         assert_eq!(store.want(&url).len(), 1, "结束后要能重新排队");
     }
 
+    /// 作废放行时的补排不能污染下一轮 want 的日志计数。
+    #[test]
+    fn requeue_after_release_keeps_want_stats_clean() {
+        use super::CoverWant;
+
+        let mut store = CoverStore::default();
+        let url = urls(&["cover-a"]);
+        store.want(&url);
+        store.drain();
+        store.forget(["cover-a"]);
+        assert!(store.want(&url).is_empty());
+        store.complete("cover-a", CoverOutcome::Failed);
+
+        assert_eq!(store.drain(), url, "补排已经回到队列");
+        assert_eq!(
+            store.take_want_stats(),
+            CoverWant {
+                queued: 0,
+                dropped: 0
+            },
+            "补排不能算进上一轮 want"
+        );
+    }
+
     /// 在飞被 forget 之后又有人要（点重试）：结果回来要立刻补排。
     #[test]
     fn demand_during_abandoned_inflight_requeues_after_completion() {
@@ -556,34 +595,23 @@ mod tests {
         assert_eq!(store.want(&url).len(), 1);
     }
 
-    /// 验收：查路径 / 查颜色 / 取快照不触发取图。
+    /// 验收：查路径 / 查颜色 / 取快照只读，不改状态、不消费排队项。
     ///
-    /// 假取图只挂在泵上；渲染侧那圈只读调用碰不到它，计数必须还是 0。
+    /// store 本身没有取图入口，取图只在 `drain` 之后由调用方做；这里钉住
+    /// 读口子不能把排队项吃掉、不能放行去重、不能凭空变出路径。
     #[test]
-    fn read_ports_never_fetch() {
-        let fetch_calls = std::cell::Cell::new(0);
-        let fetch = |_: &str| {
-            fetch_calls.set(fetch_calls.get() + 1);
-            ready("/tmp/a.img")
-        };
+    fn read_ports_are_side_effect_free() {
         let mut store = CoverStore::default();
-        store.want(&urls(&["cover-a", "cover-b"]));
+        let all = urls(&["cover-a", "cover-b"]);
+        store.want(&all);
 
         for _ in 0..10 {
-            let _ = store.path("cover-a");
-            let _ = store.color("cover-a");
-            let _ = store.paths_snapshot().get("cover-a");
+            assert!(store.path("cover-a").is_none());
+            assert!(store.color("cover-a").is_none());
+            assert!(store.paths_snapshot().get("cover-a").is_none());
         }
-        assert_eq!(fetch_calls.get(), 0, "读口子不能取图");
-
-        let mut pumped = 0;
-        for url in store.drain() {
-            pumped += 1;
-            let outcome = fetch(&url);
-            store.complete(&url, outcome);
-        }
-        assert_eq!(pumped, 2, "只读调用不能把排队项消费掉");
-        assert_eq!(fetch_calls.get(), 2, "只有泵才取图");
+        assert!(store.want(&all).is_empty(), "读口子不能放行去重");
+        assert_eq!(store.drain(), all, "读口子不能消费排队项");
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。
