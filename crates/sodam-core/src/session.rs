@@ -566,14 +566,14 @@ impl CachedTrack {
     }
 }
 
-/// 一次升级跑完的交付物：跑完后盘上的缓存，加上这次有没有真的换成更好的流。
+/// 一次升级跑完的交付物：跑完后内存里的缓存记录，加上这次有没有真的换成更好的流。
 ///
 /// `improved` 在换文件那一刻由 `is_better_stream` 定下来，调用方据此判「升级成功」
-/// 还是「没有更高档位」——不再拿升级前后两份缓存自己比分数，那对档位未知的旧缓存
-/// 会把「量出一个正分」误当成升了一档（#272）。
+/// 还是「没有更高档位」，不在事后拿升级前后的两份缓存自己比分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完后盘上的那份缓存；没换文件时就是原来那份。
+    /// 跑完后内存里的那份缓存；没换文件时就是原来那份。`checked_rank` 等字段可能比
+    /// sidecar 旧——结论有没有落盘以 sidecar 为准，这里不假装它已同步。
     pub track: CachedTrack,
     /// 盘上文件有没有换成更好的流。`false` = 跑完了，但服务端没给更好的。
     pub improved: bool,
@@ -681,10 +681,8 @@ fn confirmed_miss_rank(
 
 /// 档位未知的旧缓存拿回一条正好到目标（或更高）的完整流时，该记下哪个「问过的目标档位」。
 ///
-/// 这种情况文件证不出更好、不会换（#272），但「问过这个目标」仍要记下来（第 4 字段留空），
-/// 否则每轮都整曲重下一遍（#89 / #90）。档位已知或拿回试听时不适用——那些走
-/// [`confirmed_miss_rank`]。判据全部从缓存与流本身读（有没有可比档位、是不是试听），
-/// 只有「结论能不能落盘」由调用方传进来。
+/// 这种文件证不出更好、不会换，但「问过这个目标」仍要写进 sidecar，否则每轮都整曲重下。
+/// 档位已知或拿回试听时走 [`confirmed_miss_rank`]，这里不适用。
 fn legacy_probe_covers_target(
     current: &CachedTrack,
     info: &libresoda::soda::types::DownloadInfo,
@@ -710,21 +708,18 @@ fn would_downgrade_to_preview(
     info.is_preview && !current.preview
 }
 
-/// 这次取到的新流是不是**确实**比本地已有的那一份更好（值得换文件，也算一次升级）。
+/// 这次取到的新流是不是真的比本地已有的那一份更好（值得换文件，也算一次升级）。
 ///
-/// * 试听片段换成整曲永远是提升，哪怕档位与码率都没变。
-/// * 档位已知（sidecar 第 4 字段有分数），或旧标签能证明下限（「无损」开头）：只认分数真变高。
-/// * 档位未知的旧三字段缓存（#89）只剩标签可用。这类记录写于 Hi-Res / 杜比命名之前，
-///   两代旧写入者都把无损写成「无损」开头的标签——所以非无损标签说明旧流不是无损，新流够到
-///   无损就是实打实的提升，哪怕码率更低（无损 FLAC 本来就可能比有损的高码率流小）。其余只能
-///   比标签里记着的码率，**严格更高**才算提升。
+/// 试听只换整曲：试听换试听不算提升，盘上仍是片段。档位已知（或旧「无损」标签给出下限）
+/// 只认分数真变高。档位未知的旧三字段缓存只剩标签可用，直接比标签里记着的码率，严格更高
+/// 才算提升；同码率不算，旧标签连码率都没记时也没有可比证据。
 ///
-/// 同码率不算提升（#272）：服务端回一条同档同码率的流时旧文件不该被顶掉，更不能在事后
-/// 拿这份新旧文件说自己升了一档。旧标签连码率都没记时没有任何可比证据，同样不换。
+/// 无损另算：这类旧记录写于 Hi-Res / 杜比命名之前，非无损标签说明旧流不是无损，新流升到
+/// 无损就是提升，哪怕码率更低（无损 FLAC 本来就可能比有损的高码率流小）。
 fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &CachedTrack) -> bool {
     let new_rank = crate::quality::stream_rank(info);
-    if current.preview && !info.is_preview {
-        return true;
+    if current.preview {
+        return !info.is_preview;
     }
     if let Some(old_rank) = current.known_rank() {
         return new_rank > old_rank;
@@ -1056,9 +1051,9 @@ impl Session {
     ///
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
     /// * 若中途失败，暂存留在 staging 子目录给下次续传（#243），绝不破坏原有缓存；
-    /// * 若新拉到的档位并不**确实**高于当前已有档位，清理临时文件，保留原有缓存并如实
+    /// * 若新拉到的档位并不确实高于当前已有档位，清理临时文件，保留原有缓存并如实
     ///   报「没换」（`UpgradeRun::improved == false`）；档位未知的旧三字段缓存按标签能证明的
-    ///   下限与码率比较（#89 / #272）；
+    ///   下限与码率比较；
     /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
     ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
     ///   档位未知的旧缓存同样记得下（sidecar 第 4 字段留空），否则每轮都会重下一遍。
@@ -1204,14 +1199,13 @@ impl Session {
         }
 
         let new_rank = crate::quality::stream_rank(&info);
-        // 档位已知（或旧「无损」标签给出下限）时按确认性 miss 判；档位未知的旧缓存
-        // 拿回正好到目标的完整流也要记「问过」，否则它不换文件就每轮重下一遍（#89 / #90）。
+        // 档位已知按确认性 miss 判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
+        // 不换文件也要记下来，否则每轮都整曲重下。
         let checked_rank =
             confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check).or_else(
                 || legacy_probe_covers_target(&current, &info, target_rank, can_record_check),
             );
-        // 若新流并不比本地这份更好（含「由试听升级为整曲」这一种提升），丢弃临时文件保留旧文件。
-        // 档位未知的旧缓存怎么比，见 `is_better_stream`。
+        // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
             // 试听：这次仍拿回试听（或更差的试听），记一次退避，别每次命中都重下。
@@ -1892,7 +1886,7 @@ mod tests {
     }
 
     /// 升级路径的「问过目标」记账：档位未知的旧缓存拿回正好到目标的完整流也要记，
-    /// 否则它不换文件就每轮重下一遍（#89 / #90 / #272）；档位已知、试听、权益未确认都不走这条。
+    /// 否则它不换文件就每轮重下；档位已知、试听、权益未确认都不走这条。
     #[test]
     fn legacy_probe_records_equal_target_only_for_unknown_rank() {
         use libresoda::soda::types::DownloadInfo;
@@ -2152,9 +2146,9 @@ mod tests {
         assert!(!would_downgrade_to_preview(&full_stream, &cached(true)));
     }
 
-    /// #89 / #272：新流值不值得换掉本地这份缓存。
+    /// 新流值不值得换掉本地这份缓存。
     ///
-    /// 档位未知的旧文件既不能被更差的流顶掉，也不能被**同码率**的流顶掉——后者一旦被换掉，
+    /// 档位未知的旧文件既不能被更差的流顶掉，也不能被同码率的流顶掉——后者一旦被换掉，
     /// 事后就会把「量出一个正分」当成升了一档。只有证据充分（严格更高码率、或升到无损、
     /// 或试听换整曲）才算更好。
     #[test]
@@ -2194,6 +2188,11 @@ mod tests {
             &info("standard", "m4a", 128_000, false),
             &cached("流畅 128k", Some(50), true)
         ));
+        // 试听换更高分的试听不算提升：盘上仍是片段。
+        assert!(!is_better_stream(
+            &info("lossless", "flac", 871_000, true),
+            &cached("流畅 128k", Some(50), true)
+        ));
 
         // 档位未知、标签也证不出下限：只剩标签里的码率可比。
         let legacy = cached("极高 320k", None, false);
@@ -2202,7 +2201,7 @@ mod tests {
             &info("standard", "m4a", 128_000, false),
             &legacy
         ));
-        // #272：同档同码率不换——服务端回一条 320k 的「极高」时旧文件不该被顶掉，
+        // 同档同码率不换：服务端回一条 320k 的「极高」时旧文件不该被顶掉，
         // 更不能在事后把「从没记分到量出 80 分」当成升了一档。
         assert!(!is_better_stream(
             &info("highest", "m4a", 320_000, false),

@@ -54,7 +54,7 @@ pub fn stop_reason(
 
 /// 一首跑完落在哪一档。
 ///
-/// 由升级那条路自己在换文件那一刻定下来，不在事后拿前后两份 shape 猜（#272）：
+/// 由升级那条路在换文件那一刻定下来，不在事后拿升级前后的两份缓存比分数：
 /// 档位未知的旧缓存没有分数可比，「量出一个正分」并不等于真的升了一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -64,6 +64,17 @@ pub enum Outcome {
     NoHigherTier,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
     Failed,
+}
+
+impl Outcome {
+    /// 把「这次有没有换成更好的流」翻成对外的结论。界面上的成功与否只认这一个映射。
+    pub fn from_improved(improved: bool) -> Self {
+        if improved {
+            Self::Upgraded
+        } else {
+            Self::NoHigherTier
+        }
+    }
 }
 
 /// 一轮批量的三类计数：成功 / 失败 / 确实没更高档位。
@@ -212,5 +223,12 @@ mod tests {
         assert_eq!(StopReason::IdentityChanged.as_str(), "identity_changed");
         assert_eq!(StopReason::LoggingOut.as_str(), "logging_out");
         assert_eq!(StopReason::Cancelled.as_str(), "cancelled");
+    }
+
+    /// 「有没有换成更好的流」是界面报成功的唯一出口，钉住它别被改宽。
+    #[test]
+    fn improved_maps_to_the_reported_outcome() {
+        assert_eq!(Outcome::from_improved(true), Outcome::Upgraded);
+        assert_eq!(Outcome::from_improved(false), Outcome::NoHigherTier);
     }
 }

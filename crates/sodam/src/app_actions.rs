@@ -2961,13 +2961,10 @@ impl Root {
         let session = Session::new(settings);
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(run) => {
-                // 换没换文件由升级那条路自己判定（`is_better_stream`）：它说换了，盘上那份
-                // 就确实变好了；没换就是「跑完但服务端没给更好的」。不在这里拿前后两份
-                // 缓存比分数——档位未知的旧缓存会把「量出一个正分」误当成升了一档（#272）。
-                let (outcome, event) = if run.improved {
-                    (Outcome::Upgraded, "cache_upgraded")
-                } else {
-                    (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier")
+                // 换没换文件由升级那条路自己判定；这里只把它翻成对外结论。
+                let (outcome, event) = match Outcome::from_improved(run.improved) {
+                    Outcome::Upgraded => (Outcome::Upgraded, "cache_upgraded"),
+                    _ => (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier"),
                 };
                 log_outlet::log_event(
                     levels.success,
