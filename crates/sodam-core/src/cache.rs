@@ -108,15 +108,17 @@ pub fn root_dir() -> PathBuf {
 }
 
 // libresoda 可续传路径在暂存目标旁落盘的一族文件后缀（`part_record` 的
-// `staged_paths` 命名表）。保护键与 24 小时新鲜窗共用这一份，上游改命名表
-// 时只改这里。每项带 `.m4a` 前缀：保护键摘掉整个后缀就能还原出交付目标，
-// 也把封面那类没有 `.m4a` 前缀的 `{hash}-160.img.*.part` 挡在映射之外。
-const STAGED_SUFFIXES: [&str; 5] = [
+// `staged_paths` 命名表，外加解密临时文件挂在 `.part` 后的那种拼法）。
+// 保护键与 24 小时新鲜窗共用这一份，上游改命名表时只改这里。每项带
+// `.m4a` 前缀：保护键摘掉整个后缀就能还原出交付目标，也把封面那类没有
+// `.m4a` 前缀的 `{hash}-160.img.*.part` 挡在映射之外。
+const STAGED_SUFFIXES: [&str; 6] = [
     ".m4a.part.meta.tmp",
+    ".m4a.part.dec.tmp",
     ".m4a.part.meta",
     ".m4a.part.lock",
-    ".m4a.part",
     ".m4a.dec.tmp",
+    ".m4a.part",
 ];
 
 // 同一个暂存目标的一族文件与它的交付文件共享保护键：
@@ -2797,6 +2799,7 @@ mod tests {
             "/cache/audio/staging/123-lossless-normal.m4a.part.meta.tmp",
             "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
             "/cache/audio/staging/123-lossless-normal.m4a.dec.tmp",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.dec.tmp",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
         }
