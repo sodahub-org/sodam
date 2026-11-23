@@ -1025,7 +1025,9 @@ pub(crate) fn now_epoch_secs() -> u64 {
 
 /// 已经问过的记录是否覆盖本轮目标档位：记录的目标不低于本次目标，就不必再问。
 ///
-/// 只问过较低档位、现在想升到更高档位时仍应探测——那次结论并不能代表更高档位。
+/// 记录的是取流时的**上限**：请求 110 时服务端会在不超过 110 的候选里挑最优，
+/// 所以「110 没拿到高于 N 的流」也证明更低目标 N 不会有更好的流；反过来只问过低目标
+/// 不能代表更高目标。杜比 88 与无损 100 也按 libresoda 的同一套刻度排序。
 pub fn upgrade_check_covers(checked_rank: Option<i64>, target_rank: Option<i64>) -> bool {
     match (checked_rank, target_rank) {
         (Some(checked), Some(target)) => checked >= target,
