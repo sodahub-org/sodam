@@ -16,7 +16,7 @@ dirs.workspace = true
 ureq.workspace = true
 qrcode = "0.14"
 tempfile = "3"
-futures-channel = "0.3"
+futures-channel.workspace = true
 # 封面在落盘前先缩到列表需要的大小：GPUI 在主线程解码图片，
 # 直接塞原始大图会让长列表首帧卡住。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

@@ -8,6 +8,7 @@ pub mod color;
 pub mod config;
 pub mod config_watch;
 pub mod contributors;
+pub mod cover;
 pub mod failure;
 pub mod library;
 pub mod log_outlet;
