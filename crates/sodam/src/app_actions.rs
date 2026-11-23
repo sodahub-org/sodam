@@ -3146,15 +3146,15 @@ impl Root {
                 }
             }
 
-            // 取消可能落在最后一首下载期间：那时循环已经没有「下一首」可停，这次点击照样要说出来，
-            // 不能被一句「完成」盖掉（#254）。
+            // 取消和换号都可能落在最后一首下载期间：那时循环已经没有「下一首」可停，这两件事
+            // 照样要说出来，不能被一句「完成」盖掉（#254）。判据还是那一个 `stop_reason`，
+            // 免得同一个窗口里两套口径给出两种答案。
             if stopped.is_none() {
-                let cancelled = this
-                    .update(cx, |root, _cx| root.batch_upgrade_cancel)
-                    .unwrap_or(false);
-                if cancelled {
-                    stopped = Some(StopReason::Cancelled);
-                }
+                stopped = this
+                    .update(cx, |root, _cx| {
+                        stop_reason(start_epoch, root.auth_epoch, root.batch_upgrade_cancel)
+                    })
+                    .unwrap_or(None);
             }
 
             let ran_text = tally.total().to_string();
