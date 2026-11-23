@@ -74,24 +74,6 @@ fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) ->
     pending.or(queued).map(|track| track.cover.clone())
 }
 
-/// 清缓存补原图：先清掉原图的去重状态，再交出当前曲目 URL 去 `ensure_original_cover`。
-///
-/// 清状态和取 URL 绑成一步，是为了让顺序写不反。`ensure_original_cover` 见到
-/// `original_covers` 已有该 URL、或 `attempted` 里记过它，就直接返回；若先 ensure
-/// 后清，补下载会被静默跳过，大图停在占位图——正是 #265 的原 bug。
-fn clear_original_state_then_url(
-    originals: &mut HashMap<String, PathBuf>,
-    attempted: &mut HashSet<String>,
-    wait_list: &mut Vec<String>,
-    pending: Option<&TrackItem>,
-    queued: Option<&TrackItem>,
-) -> Option<String> {
-    originals.clear();
-    attempted.clear();
-    wait_list.clear();
-    current_cover_url(pending, queued)
-}
-
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -784,6 +766,30 @@ impl Root {
         }
     }
 
+    /// 清缓存后补下当前曲目的原图。
+    ///
+    /// 清掉原图去重状态和补下载收在一个方法里，调用方拿不到「清完但没 ensure」的
+    /// 中间态，顺序写不反。缩略图靠渲染每帧重新 want 自愈，原图没有这个口子，
+    /// 清完缓存必须显式补一次，否则歌词页大图停在占位图。口径跟歌词页一致：
+    /// `pending_track.or(queue.current())`。
+    pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
+        self.original_covers.clear();
+        if let Ok(mut attempted) = self.original_cover_attempted.lock() {
+            attempted.clear();
+        }
+        if let Ok(mut wait_list) = self.original_cover_pending.lock() {
+            wait_list.clear();
+        }
+        let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
+            return;
+        };
+        // 已知取舍：若这首原图此刻正在下载（inflight 已 +1），清 attempted 后
+        // ensure 会把它当首次见、再 spawn 一次同 URL 下载，多一份内存峰值和请求。
+        // 不额外维护在飞 URL 集合去留，代价小、图也照样回来；要根治得改原图的
+        // 在飞去重设计，另立票。
+        self.ensure_original_cover(&url, cx);
+    }
+
     pub(crate) fn clear_cache(&mut self, cx: &mut Context<Self>) {
         if self.cache_clearing {
             return;
@@ -811,30 +817,10 @@ impl Root {
                 root.cache_upgrade_attempted.clear();
                 // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
                 root.cover_pool.reset_seen_preserving_inflight();
-                // 原图没有渲染期自动入队口子（缩略图靠每帧 want 自愈），清缓存后得
-                // 显式补一次当前曲目的原图，口径跟歌词页一致。清原图去重状态和取
-                // URL 绑成一步（见 clear_original_state_then_url），保证 ensure
-                // 不会因 attempted 还留着 URL 而跳过，图也不会停在占位图。
-                let current_cover = {
-                    let mut attempted = root
-                        .original_cover_attempted
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let mut wait_list = root
-                        .original_cover_pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    clear_original_state_then_url(
-                        &mut root.original_covers,
-                        &mut attempted,
-                        &mut wait_list,
-                        root.pending_track.as_ref(),
-                        root.queue.current(),
-                    )
-                };
-                if let Some(url) = current_cover {
-                    root.ensure_original_cover(&url, cx);
-                }
+                // 原图没有渲染期自动入队口子，显式补一次当前曲目原图。
+                // 清去重状态和补下载都在 restore_current_original_cover 里完成，
+                // 这里拿不到中间态，顺序写不反。
+                root.restore_current_original_cover(cx);
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -5620,11 +5606,11 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_original_state_then_url, current_cover_url, line_undergoing_reveal, lyrics_idle_wait,
-        lyrics_near_next_line, lyrics_scroll_ease, urls_for_removed_paths,
+        current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
+        lyrics_scroll_ease, urls_for_removed_paths,
     };
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     /// 只按被删的文件路径反查 URL，缩略图和原图分开；只删了一侧不能连另一侧一起清。
@@ -5693,50 +5679,6 @@ mod tests {
         );
         // 两个都没有就没有可补的封面。
         assert_eq!(current_cover_url(None, None), None);
-    }
-
-    /// 清缓存补原图：交出 URL 前必须把去重状态清干净，否则 ensure 会早退。
-    ///
-    /// `ensure_original_cover` 有两道早退关卡：命中 `original_covers`、或
-    /// `attempted` 里记过这个 URL，就直接返回。清状态和取 URL 绑在同一函数里，
-    /// 调用方拿到的 URL 一定已经过了这两关。测试按这两关逐一断言，锁住顺序契约。
-    /// （这里测的是纯函数这一半；调用方必须拿它的返回值去 ensure，不得从别处另取 URL。）
-    #[test]
-    fn cleared_dedup_state_lets_original_cover_ensure_through() {
-        let make = |cover: &str| TrackItem {
-            cover: cover.to_string(),
-            ..Default::default()
-        };
-        let pending = make("url/pending");
-        let queued = make("url/queued");
-
-        let mut originals = HashMap::from([("url/pending".to_string(), PathBuf::from("a.jpg"))]);
-        let mut attempted: HashSet<String> = ["url/pending".to_string()].into_iter().collect();
-        let mut wait_list = vec!["url/pending".to_string()];
-
-        let picked = clear_original_state_then_url(
-            &mut originals,
-            &mut attempted,
-            &mut wait_list,
-            Some(&pending),
-            Some(&queued),
-        );
-
-        // 交出去的 URL 跟歌词页同口径。
-        let url = picked.as_deref().expect("应给出当前曲目封面");
-        assert_eq!(url, "url/pending");
-        // ensure 的第一道早退：original_covers 命中就不再下载。
-        assert!(
-            !originals.contains_key(url),
-            "原图映射必须先清，否则 ensure 早退"
-        );
-        // ensure 的第二道早退：attempted 记过就不再下载。
-        assert!(
-            !attempted.contains(url),
-            "attempted 必须先清，否则 ensure 早退"
-        );
-        // 排队表清干净，旧的在飞 URL 不会被补上。
-        assert!(wait_list.is_empty(), "排队表必须先清");
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
