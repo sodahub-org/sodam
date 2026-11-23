@@ -672,16 +672,19 @@ fn would_downgrade_to_preview(
 
 /// 这次取到的新流是否值得换掉本地已有的那一份缓存。
 ///
-/// 判定与「这一首算不算真升级」共用 [`crate::upgrade::stream_is_better`]：档位已知只认
-/// 档位提升；档位未知的旧三字段缓存（#89）先看标签能证明的下限，再比标签里记着的码率；
-/// 试听片段换成整曲永远是提升。同码率只是重新量了一遍档位，不值得重写文件——
-/// 否则批量小结会把这种「没变好」也算成升级。
+/// 档位/码率的比法来自 [`crate::upgrade::stream_is_better`]：档位已知只认档位提升；
+/// 档位未知的旧三字段缓存（#89）先看标签能证明的下限，再比标签里记着的码率；
+/// 试听片段换成整曲永远是提升。
+///
+/// 换文件比「算不算升级」宽一档（见 [`crate::upgrade::should_replace_stream`]）：
+/// 同样码率的流也换一次，把旧缓存没记的档位量进 sidecar，否则这一首每轮批量都会
+/// 重下再丢掉。那次换文件在批量小结里不算成功。
 fn is_better_stream(
     info: &libresoda::soda::types::DownloadInfo,
     current: &CachedTrack,
     target_rank: Option<i64>,
 ) -> bool {
-    crate::upgrade::stream_is_better(
+    crate::upgrade::should_replace_stream(
         crate::upgrade::StreamShape::from(current),
         crate::upgrade::StreamShape::from_download_info(info),
         target_rank,
@@ -2066,8 +2069,9 @@ mod tests {
             &legacy,
             Some(100)
         ));
-        // 同样 320k 的「极高」流：只是把档位重新量了一遍，不值得重写文件。
-        assert!(!is_better_stream(
+        // 同样 320k 的「极高」流：换一次把档位量进 sidecar，否则每轮批量都会重下；
+        // 但 `Outcome::of_shapes` 不会把这次换文件算成升级。
+        assert!(is_better_stream(
             &info("higher", "m4a", 320_000, false),
             &legacy,
             Some(80)
