@@ -2951,9 +2951,6 @@ impl Root {
     /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
     /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
-    ///
-    /// 升级前读不到缓存、升级后却有结果（判为 `Failed`）不写：这是缓存中途被清掉的竞态，
-    /// 没有可靠的失败原因可写。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
@@ -2978,7 +2975,8 @@ impl Root {
                     Outcome::Upgraded => Some("cache_upgraded"),
                     // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
                     Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
-                    // 这一档来自缓存中途被清掉的竞态，没有可靠的失败原因可写。
+                    // 升级前读不到、升级后却有结果，只能是中途重新缓存进来的；判不出有没有
+                    // 真提升，也没有可靠的失败原因可写。
                     Outcome::Failed => None,
                 };
                 if let Some(event) = event {
