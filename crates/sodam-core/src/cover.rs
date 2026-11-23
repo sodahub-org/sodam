@@ -16,7 +16,8 @@ pub const MAX_QUEUE: usize = 400;
 /// 原图下载的并发上限：单张解码最坏 64 MiB（16 位图翻倍），
 /// 用限流防快速切歌时瞬时内存失控。
 pub const MAX_ORIGINAL_CONCURRENCY: usize = 4;
-/// 原图排队上限：超过就丢最旧的（最新切进来的歌最有用）。
+/// 原图排队上限：超过就挤掉最旧的，被挤掉的那张退回可重排状态
+/// （最新切进来的歌最有用）。
 pub const MAX_ORIGINAL_QUEUE: usize = 32;
 /// 同一张图失败几次后放弃。只记内存，重启后再试两次。
 pub const MAX_FAILURES: u8 = 2;
@@ -161,7 +162,8 @@ type SelectSlot = fn(&mut Record) -> &mut Slot;
 
 /// 一条腿的排队与在飞记账：队列、在飞集合、作废标记。
 ///
-/// 缩略图和原图各有一条，差别只在队列 / 并发上限和完成后的落账。
+/// 缩略图和原图各有一条，差别只在队列 / 并发上限和完成后的落账；
+/// 原图额外多一条「清缓存时在飞的那张，落完还缺就补排」。
 #[derive(Debug)]
 struct Lane {
     queue: VecDeque<String>,
@@ -171,10 +173,15 @@ struct Lane {
     /// 作废期间又有人在等这张图：结果回来放行后要立刻重排，
     /// 否则重试按钮要等下一次渲染才生效。
     requeue_after_release: HashSet<String>,
-    /// 队列满时挤掉的张数（日志用；每轮 `want` 重新计数）。
-    evicted: usize,
     max_queue: usize,
     max_inflight: usize,
+}
+
+/// 一次入队的结果：排进去了没有、有没有挤掉最旧的一张。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Enqueued {
+    queued: bool,
+    evicted: bool,
 }
 
 impl Lane {
@@ -184,13 +191,12 @@ impl Lane {
             inflight: HashSet::new(),
             abandoned: HashSet::new(),
             requeue_after_release: HashSet::new(),
-            evicted: 0,
             max_queue,
             max_inflight,
         }
     }
 
-    /// 单张入队。返回是否真的排进去了。
+    /// 单张入队。返回有没有真排进去、有没有挤掉最旧的一张。
     ///
     /// 在飞但已被 `forget` 时，把这次需求记下来，等结果回来立刻重排。
     fn enqueue(
@@ -199,24 +205,29 @@ impl Lane {
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> bool {
+    ) -> Enqueued {
         if url.is_empty() || ready.contains(url) {
-            return false;
+            return Enqueued::default();
         }
         let state = records.get_mut(url).map(|record| select(record).state);
         if !matches!(state, None | Some(State::Idle)) {
             if state == Some(State::Inflight) && self.abandoned.contains(url) {
                 self.requeue_after_release.insert(url.to_string());
             }
-            return false;
+            return Enqueued::default();
         }
-        if self.queue.len() >= self.max_queue {
-            self.evict_oldest(records, select);
-        }
+        let evicted = if self.queue.len() >= self.max_queue {
+            self.evict_oldest(records, select)
+        } else {
+            false
+        };
         let record = records.entry(url.to_string()).or_default();
         select(record).state = State::Queued;
         self.queue.push_back(url.to_string());
-        true
+        Enqueued {
+            queued: true,
+            evicted,
+        }
     }
 
     /// 泵的上半截：把排队项推进在飞，最多 `max_inflight` 个。
@@ -310,17 +321,18 @@ impl Lane {
         }
     }
 
-    fn evict_oldest(&mut self, records: &mut HashMap<String, Record>, select: SelectSlot) {
+    /// 挤掉最旧的一条排队项；真挤掉了返回 `true`。
+    fn evict_oldest(&mut self, records: &mut HashMap<String, Record>, select: SelectSlot) -> bool {
         while let Some(url) = self.queue.pop_front() {
             if let Some(record) = records.get_mut(&url) {
                 let slot = select(record);
                 if slot.state == State::Queued {
                     slot.state = State::Idle;
-                    self.evicted += 1;
-                    return;
+                    return true;
                 }
             }
         }
+        false
     }
 }
 
@@ -334,6 +346,8 @@ pub struct CoverStore {
     thumbnail_paths: CoverPaths,
     original_paths: CoverPaths,
     colors: HashMap<String, CoverRgb>,
+    /// 上一轮 `want` 因队列满挤掉的缩略图张数（日志用）。
+    thumbnail_dropped: usize,
 }
 
 impl Default for CoverStore {
@@ -345,6 +359,7 @@ impl Default for CoverStore {
             thumbnail_paths: CoverPaths::default(),
             original_paths: CoverPaths::default(),
             colors: HashMap::new(),
+            thumbnail_dropped: 0,
         }
     }
 }
@@ -355,16 +370,20 @@ impl CoverStore {
     /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
     pub fn want(&mut self, urls: &[String]) -> Vec<String> {
         // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
-        self.thumbnails.evicted = 0;
+        self.thumbnail_dropped = 0;
         let mut queued = Vec::new();
         for raw in urls {
             let url = raw.trim();
-            if self.thumbnails.enqueue(
+            let result = self.thumbnails.enqueue(
                 url,
                 &self.thumbnail_paths,
                 &mut self.records,
                 thumbnail_slot,
-            ) {
+            );
+            if result.evicted {
+                self.thumbnail_dropped += 1;
+            }
+            if result.queued {
                 queued.push(url.to_string());
             }
         }
@@ -425,12 +444,14 @@ impl CoverStore {
 
     /// 要一张原图；返回这次是否新排进队列。
     pub fn want_original(&mut self, url: &str) -> bool {
-        self.originals.enqueue(
-            url.trim(),
-            &self.original_paths,
-            &mut self.records,
-            original_slot,
-        )
+        self.originals
+            .enqueue(
+                url.trim(),
+                &self.original_paths,
+                &mut self.records,
+                original_slot,
+            )
+            .queued
     }
 
     /// 泵的上半截：原图最多 [`MAX_ORIGINAL_CONCURRENCY`] 个在飞。
@@ -628,7 +649,7 @@ impl CoverStore {
 
     /// 取走上一轮 `want` 因队列满挤掉的张数。
     pub fn take_dropped(&mut self) -> usize {
-        std::mem::take(&mut self.thumbnails.evicted)
+        std::mem::take(&mut self.thumbnail_dropped)
     }
 }
 
