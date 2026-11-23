@@ -505,6 +505,14 @@ impl CachedTrack {
         self.quality_rank.map(crate::quality::tier_label)
     }
 
+    /// 能拿来比大小的档位：记下来的分数，或旧「无损」标签给出的下限。
+    ///
+    /// `None` = 旧三字段缓存，标签也证不出档位——这种记录没有可比的分数，只能看码率。
+    fn known_rank(&self) -> Option<i64> {
+        self.quality_rank
+            .or_else(|| crate::quality::legacy_label_floor_rank(&self.quality))
+    }
+
     /// 命中缓存后是否还需要向服务端要一次流。
     ///
     /// * 试听片段（#130）：目标是整曲，不是更高档位。只要上次补整曲的尝试已过退避期
@@ -671,26 +679,22 @@ fn confirmed_miss_rank(
     (actual_rank < target).then_some(target)
 }
 
-/// 升级跑完后要写进 sidecar 的「问过的目标档位」，比 [`confirmed_miss_rank`] 多认一种旧缓存。
+/// 档位未知的旧缓存拿回一条正好到目标（或更高）的完整流时，该记下哪个「问过的目标档位」。
 ///
-/// 档位未知的旧三字段缓存（`old_rank_known == false`）没有分数可比：拿回一条正好到目标的
-/// 完整流时，文件证不出更好、不会换（#272），但「问过这个目标」仍要记下来，否则每轮都
-/// 整曲重下一遍（#89 / #90）。档位已知（或旧「无损」标签给出下限）时仍按确认性 miss 判。
-fn upgrade_check_rank(
+/// 这种情况文件证不出更好、不会换（#272），但「问过这个目标」仍要记下来（第 4 字段留空），
+/// 否则每轮都整曲重下一遍（#89 / #90）。档位已知或拿回试听时不适用——那些走
+/// [`confirmed_miss_rank`]。参数用真实类型而不是一串布尔，调用点写反顺序编译不过。
+fn legacy_probe_covers_target(
+    current: &CachedTrack,
+    info: &libresoda::soda::types::DownloadInfo,
     target_rank: Option<i64>,
-    actual_rank: i64,
-    preview: bool,
     can_record: bool,
-    old_rank_known: bool,
 ) -> Option<i64> {
-    let target = target_rank?;
-    if preview || !can_record || actual_rank <= 0 {
+    if current.known_rank().is_some() || info.is_preview || !can_record {
         return None;
     }
-    if actual_rank < target {
-        return Some(target);
-    }
-    (!old_rank_known).then_some(target)
+    let new_rank = crate::quality::stream_rank(info);
+    target_rank.filter(|target| new_rank >= *target)
 }
 
 /// 新取到的试听流是否会顶掉已有的整曲缓存。
@@ -709,10 +713,10 @@ fn would_downgrade_to_preview(
 ///
 /// * 试听片段换成整曲永远是提升，哪怕档位与码率都没变。
 /// * 档位已知（sidecar 第 4 字段有分数），或旧标签能证明下限（「无损」开头）：只认分数真变高。
-/// * 档位未知的旧三字段缓存（#89）只剩标签可用：两代旧写入者都把无损写成「无损」开头的
-///   标签，所以非无损标签说明旧流不是无损——新流够到无损就是实打实的提升，哪怕码率更低
-///   （无损 FLAC 本来就可能比有损的高码率流小）。其余只能比标签里记着的码率，**严格更高**
-///   才算提升。
+/// * 档位未知的旧三字段缓存（#89）只剩标签可用。这类记录写于 Hi-Res / 杜比命名之前，
+///   两代旧写入者都把无损写成「无损」开头的标签——所以非无损标签说明旧流不是无损，新流够到
+///   无损就是实打实的提升，哪怕码率更低（无损 FLAC 本来就可能比有损的高码率流小）。其余只能
+///   比标签里记着的码率，**严格更高**才算提升。
 ///
 /// 同码率不算提升（#272）：服务端回一条同档同码率的流时旧文件不该被顶掉，更不能在事后
 /// 拿这份新旧文件说自己升了一档。旧标签连码率都没记时没有任何可比证据，同样不换。
@@ -721,10 +725,7 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
     if current.preview && !info.is_preview {
         return true;
     }
-    if let Some(old_rank) = current
-        .quality_rank
-        .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
-    {
+    if let Some(old_rank) = current.known_rank() {
         return new_rank > old_rank;
     }
     // 旧标签证不出档位：先看新流是否已经升到无损。
@@ -1204,17 +1205,10 @@ impl Session {
         let new_rank = crate::quality::stream_rank(&info);
         // 档位已知（或旧「无损」标签给出下限）时按确认性 miss 判；档位未知的旧缓存
         // 拿回正好到目标的完整流也要记「问过」，否则它不换文件就每轮重下一遍（#89 / #90）。
-        let old_rank_known = current
-            .quality_rank
-            .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
-            .is_some();
-        let checked_rank = upgrade_check_rank(
-            target_rank,
-            new_rank,
-            info.is_preview,
-            can_record_check,
-            old_rank_known,
-        );
+        let checked_rank =
+            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check).or_else(
+                || legacy_probe_covers_target(&current, &info, target_rank, can_record_check),
+            );
         // 若新流并不比本地这份更好（含「由试听升级为整曲」这一种提升），丢弃临时文件保留旧文件。
         // 档位未知的旧缓存怎么比，见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
@@ -1896,31 +1890,67 @@ mod tests {
         assert_eq!(confirmed_miss_rank(Some(88), 80, false, true), Some(88));
     }
 
-    /// 升级路径的「问过目标」记账：档位已知时只记确认性 miss；档位未知的旧缓存
-    /// 拿回正好到目标的完整流也要记，否则它不换文件就每轮重下一遍（#89 / #90 / #272）。
+    /// 升级路径的「问过目标」记账：档位未知的旧缓存拿回正好到目标的完整流也要记，
+    /// 否则它不换文件就每轮重下一遍（#89 / #90 / #272）；档位已知、试听、权益未确认都不走这条。
     #[test]
-    fn upgrade_check_records_legacy_equal_target_probe() {
-        // 档位已知：只有确实低于目标才记。
+    fn legacy_probe_records_equal_target_only_for_unknown_rank() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("p.m4a"));
+        let cached = |rank: Option<i64>| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: "较高 320k".into(),
+            preview: false,
+            quality_rank: rank,
+            checked_rank: None,
+            preview_retry_blocked: false,
+            lease: lease.clone(),
+        };
+        let info = |quality: &str, bitrate: i64, preview: bool| DownloadInfo {
+            quality: quality.into(),
+            bitrate,
+            is_preview: preview,
+            ..Default::default()
+        };
+
+        let legacy = cached(None);
+        // 正好到目标、或已经超过目标：记下目标，避免每轮重下。
         assert_eq!(
-            upgrade_check_rank(Some(100), 80, false, true, true),
-            Some(100)
-        );
-        assert_eq!(upgrade_check_rank(Some(100), 100, false, true, true), None);
-        assert_eq!(upgrade_check_rank(Some(100), 110, false, true, true), None);
-        // 档位未知的旧缓存：正好到目标也算「问过」。
-        assert_eq!(
-            upgrade_check_rank(Some(80), 80, false, true, false),
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, false), Some(80), true),
             Some(80)
         );
         assert_eq!(
-            upgrade_check_rank(Some(80), 70, false, true, false),
-            Some(80)
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, false), Some(70), true),
+            Some(70)
         );
-        // 试听、权益未确认、0 分、目标未知都不记。
-        assert_eq!(upgrade_check_rank(Some(80), 80, true, true, false), None);
-        assert_eq!(upgrade_check_rank(Some(80), 80, false, false, false), None);
-        assert_eq!(upgrade_check_rank(Some(80), 0, false, true, false), None);
-        assert_eq!(upgrade_check_rank(None, 80, false, true, false), None);
+        // 还不到目标：交给 `confirmed_miss_rank`，这条不重复记。
+        assert_eq!(
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, false), Some(100), true),
+            None
+        );
+        // 档位已知的缓存不靠这条（它有自己的「已探测」记录）。
+        assert_eq!(
+            legacy_probe_covers_target(
+                &cached(Some(80)),
+                &info("highest", 320_000, false),
+                Some(80),
+                true
+            ),
+            None
+        );
+        // 试听、权益未确认、目标未知都不记。
+        assert_eq!(
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, true), Some(80), true),
+            None
+        );
+        assert_eq!(
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, false), Some(80), false),
+            None
+        );
+        assert_eq!(
+            legacy_probe_covers_target(&legacy, &info("highest", 320_000, false), None, true),
+            None
+        );
     }
 
     /// 写出与解析必须用同一套字段布局，避免两边各改一处后错位。
