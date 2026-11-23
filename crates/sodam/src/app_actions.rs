@@ -3382,7 +3382,7 @@ impl Root {
                         }
                         None => {
                             let message = root.localized(
-                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位",
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲",
                                 &[
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),
