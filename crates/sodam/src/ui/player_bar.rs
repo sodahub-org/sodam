@@ -946,7 +946,7 @@ fn queue_drawer_inner(
 
     let slots = Arc::new(queue_slots(root));
     let tracks = root.queue_cache.1.clone();
-    let covers = root.cover_store.paths_snapshot();
+    let covers = root.cover_store.paths_handle();
     let cover_mailbox = root.cover_mailbox.clone();
     let liked_ids = root.liked_ids.clone();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。

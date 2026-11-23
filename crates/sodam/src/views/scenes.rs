@@ -13,7 +13,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .collect(),
     );
     let cards = root.scene_cards.clone();
-    let covers = root.cover_store.paths_snapshot();
+    let covers = root.cover_store.paths_handle();
     let cover_mailbox = root.cover_mailbox.clone();
     let selected_scene = root
         .recommendation
