@@ -31,29 +31,25 @@ use super::{
 };
 use sodam_core::queue::{PlayMode, Queue};
 
-/// 按「被淘汰的文件路径」反查对应的 URL，缩略图和原图分开返回。
+/// 按「被淘汰的文件路径」反查原图 URL。
 ///
-/// `covers` / `original_covers` 的 value 就是磁盘路径，按 value 精确匹配即可，
-/// 只删了缩略图就不会连原图映射一起清掉。先拿哈希集合筛出内存中真命中删除列表的
-/// 那几条，再只对这几条做磁盘检查——被淘汰的路径成千上万，绝大多数根本不在内存表里，
-/// 不能在主线程上挨个 stat。已被下载重建回来的路径不算失效。
+/// 只对内存中真命中删除列表的那几条做磁盘检查——被淘汰的路径成千上万，
+/// 绝大多数根本不在内存表里，不能在主线程上挨个 stat。已被下载重建回来的
+/// 路径不算失效。缩略图那份查询在 `CoverPaths::urls_for_removed_paths`。
 fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     covers: &HashMap<String, PathBuf>,
-    original_covers: &HashMap<String, PathBuf>,
     removed: &[PathBuf],
     is_still_missing: F,
-) -> (HashSet<String>, HashSet<String>) {
+) -> HashSet<String> {
     let removed_set: HashSet<&std::path::Path> =
         removed.iter().map(|path| path.as_path()).collect();
-    let pick = |map: &HashMap<String, PathBuf>| {
-        map.iter()
-            .filter(|(_, path)| {
-                removed_set.contains(path.as_path()) && is_still_missing(path.as_path())
-            })
-            .map(|(url, _)| url.clone())
-            .collect()
-    };
-    (pick(covers), pick(original_covers))
+    covers
+        .iter()
+        .filter(|(_, path)| {
+            removed_set.contains(path.as_path()) && is_still_missing(path.as_path())
+        })
+        .map(|(url, _)| url.clone())
+        .collect()
 }
 
 impl Root {
@@ -694,12 +690,12 @@ impl Root {
         }
         // 淘汰到回调之间下载可能把文件重建回来。还活着的路径不当成被删，
         // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
-        let (thumb_urls, original_urls) = urls_for_removed_paths(
-            &self.cover_store.paths(),
-            &self.original_covers,
-            removed,
-            |path| !path.exists(),
-        );
+        let thumb_urls = self
+            .cover_store
+            .paths_snapshot()
+            .urls_for_removed_paths(removed, |path| !path.exists());
+        let original_urls =
+            urls_for_removed_paths(&self.original_covers, removed, |path| !path.exists());
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
@@ -712,7 +708,8 @@ impl Root {
             }
         }
         // 缩略图只动自己的账：清掉路径 / 颜色 / 失败次数，渲染发现缺图会重新排队。
-        self.cover_store.forget(&thumb_urls);
+        self.cover_store
+            .forget(thumb_urls.iter().map(String::as_str));
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
         let current_cover = self
@@ -2109,7 +2106,7 @@ impl Root {
             .lock()
             .ok()
             .map(|mut attempted| attempted.remove(&track.cover));
-        self.cover_store.forget(std::iter::once(&track.cover));
+        self.cover_store.forget([track.cover.as_str()]);
         if let Some(session) = self.session.as_mut() {
             session.invalidate_original_cover(&track.cover);
             session.invalidate_cover_path(&track.cover);
@@ -3315,13 +3312,17 @@ impl Root {
     ///
     /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
     /// 返回 (这次新入队数, 因队列满挤掉的张数)，给消费循环降频和日志用。
-    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> (usize, usize) {
+    pub fn ensure_covers(
+        &mut self,
+        urls: &[String],
+        cx: &mut Context<Self>,
+    ) -> sodam_core::cover::CoverWant {
         let added = self.cover_store.want(urls);
-        let dropped = self.cover_store.take_evicted();
+        let stats = self.cover_store.take_want_stats(added.len());
         if !added.is_empty() {
             self.pump_covers(cx);
         }
-        (added.len(), dropped)
+        stats
     }
 
     /// 驱动请求：保持最多 `MAX_CONCURRENCY` 个下载在飞，完成一个补一个。
@@ -5470,8 +5471,8 @@ mod tests {
             path("covers/thumb-gone.img"),
             path("covers/original/full-only.img"),
         ];
-        let (thumbs, originals_gone) =
-            urls_for_removed_paths(&covers, &originals, &removed, |_| true);
+        let thumbs = urls_for_removed_paths(&covers, &removed, |_| true);
+        let originals_gone = urls_for_removed_paths(&originals, &removed, |_| true);
         assert_eq!(thumbs.len(), 1, "只有缩略图被删的那张要重下缩略图");
         assert!(thumbs.contains("gone-thumb"));
         assert_eq!(originals_gone.len(), 1, "只有原图被删的那张要重下原图");
@@ -5482,7 +5483,8 @@ mod tests {
         assert!(!thumbs.contains("alive-thumb"));
 
         // 被下载重建回来的路径不算缺，映射要留住。
-        let (thumbs2, originals2) = urls_for_removed_paths(&covers, &originals, &removed, |p| {
+        let thumbs2 = urls_for_removed_paths(&covers, &removed, |_| true);
+        let originals2 = urls_for_removed_paths(&originals, &removed, |p| {
             p != std::path::Path::new("covers/original/full-only.img")
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");

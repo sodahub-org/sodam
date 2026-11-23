@@ -5,7 +5,7 @@
 //! 下载由调用方泵出去，结果再用 [`CoverStore::complete`] 交回来。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// 缩略图下载的并发上限。
@@ -17,6 +17,13 @@ pub const MAX_FAILURES: u8 = 2;
 
 /// 封面主色。
 pub type CoverRgb = (u8, u8, u8);
+
+/// 一轮 `want` 的结果：新排进几张、因队列满挤掉几张。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoverWant {
+    pub queued: usize,
+    pub dropped: usize,
+}
 
 /// 一次下载的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +76,29 @@ impl CoverPaths {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    /// 按被删的文件路径反查 URL；只对命中删除列表的条目做磁盘检查。
+    pub fn urls_for_removed_paths<F>(
+        &self,
+        removed: &[PathBuf],
+        mut is_still_missing: F,
+    ) -> HashSet<String>
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        let removed: HashSet<&Path> = removed.iter().map(PathBuf::as_path).collect();
+        let paths = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths
+            .iter()
+            .filter(|(_, path)| {
+                removed.contains(path.as_path()) && is_still_missing(path.as_path())
+            })
+            .map(|(url, _)| url.clone())
+            .collect()
     }
 }
 
@@ -189,8 +219,7 @@ impl CoverStore {
                 if let Some(record) = self.records.get_mut(url) {
                     record.state = State::Idle;
                 }
-                self.ready.remove(url);
-                self.colors.remove(url);
+                // 不抹已发布路径：原图先回来时可能已经兜过底，文件还在。
             }
             CoverOutcome::Failed => {
                 let record = self.records.entry(url.to_string()).or_default();
@@ -208,10 +237,7 @@ impl CoverStore {
     ///
     /// 在飞的那张不会立刻放行——否则同一张会同时下两遍；等这次结果回来再退回
     /// 可重排状态。
-    pub fn forget<'a, I>(&mut self, urls: I)
-    where
-        I: IntoIterator<Item = &'a String>,
-    {
+    pub fn forget<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
         for raw in urls {
             let url = raw.trim();
             if url.is_empty() {
@@ -275,23 +301,17 @@ impl CoverStore {
         self.colors.get(url.trim()).copied()
     }
 
-    /// 全部已完成路径的一份拷贝：只读，且只在清缓存 / 淘汰这种低频路径用。
-    pub fn paths(&self) -> HashMap<String, PathBuf> {
-        self.ready
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     /// 渲染闭包用的只读句柄；克隆的是 `Arc`，不复制表。
     pub fn paths_snapshot(&self) -> CoverPaths {
         self.ready.clone()
     }
 
-    /// 取走这轮 `want` 挤掉的张数（日志用）。
-    pub fn take_evicted(&mut self) -> usize {
-        std::mem::take(&mut self.evicted)
+    /// 一轮 `want` 的结果；挤掉的张数顺手清零。
+    pub fn take_want_stats(&mut self, queued: usize) -> CoverWant {
+        CoverWant {
+            queued,
+            dropped: std::mem::take(&mut self.evicted),
+        }
     }
 
     fn evict_oldest(&mut self) {
@@ -368,7 +388,7 @@ mod tests {
         assert!(store.want(&url).is_empty(), "失败两次后本会话不再自动重试");
         assert!(store.drain().is_empty());
 
-        store.forget(&url);
+        store.forget(url.iter().map(String::as_str));
         assert_eq!(store.want(&url).len(), 1, "清掉失败记录后能重新下");
     }
 
@@ -397,21 +417,21 @@ mod tests {
             .map(|index| format!("cover-{index}"))
             .collect();
         assert_eq!(store.want(&first).len(), MAX_QUEUE);
-        assert_eq!(store.take_evicted(), 0);
+        assert_eq!(store.take_want_stats(0).dropped, 0);
 
         let extra = urls(&["cover-extra"]);
         assert_eq!(store.want(&extra).len(), 1, "满了也要收新图");
-        assert_eq!(store.take_evicted(), 1, "挤掉了最旧的一张");
+        assert_eq!(store.take_want_stats(1).dropped, 1, "挤掉了最旧的一张");
 
         let oldest = urls(&["cover-0"]);
         assert_eq!(store.want(&oldest).len(), 1, "被挤掉的那张能重新排队");
-        assert_eq!(store.take_evicted(), 1);
+        assert_eq!(store.take_want_stats(1).dropped, 1);
         assert!(store.want(&oldest).is_empty(), "排进去之后不重复入队");
     }
 
-    /// #250：clear 只作废已完成，排队 / 在飞原样保留。
+    /// #250：clear 只作废已完成，在飞原样保留；已完成的放行重排。
     #[test]
-    fn clear_completed_keeps_queued_and_inflight() {
+    fn clear_completed_keeps_inflight_and_revives_done() {
         let mut store = CoverStore::default();
         let all = urls(&["downloading", "queued", "done"]);
         assert_eq!(store.want(&all).len(), 3);
@@ -473,7 +493,7 @@ mod tests {
         store.want(&url);
         assert_eq!(store.drain(), url);
 
-        store.forget(&url);
+        store.forget(url.iter().map(String::as_str));
         assert!(store.want(&url).is_empty(), "在飞期间不能重复入队");
         store.complete("cover-a", ready("/tmp/a.img"));
         assert!(store.path("cover-a").is_none(), "这次结果要作废");
@@ -486,7 +506,7 @@ mod tests {
         let mut store = CoverStore::default();
         let both = urls(&["cover-a", "cover-b"]);
         assert_eq!(store.want(&both).len(), 2);
-        store.forget(&urls(&["cover-a"]));
+        store.forget(["cover-a"]);
         assert_eq!(store.want(&urls(&["cover-a"])).len(), 1);
         assert!(store.want(&urls(&["cover-a"])).is_empty());
     }
@@ -513,21 +533,23 @@ mod tests {
             ready("/tmp/a.img")
         };
         let mut store = CoverStore::default();
-        store.want(&urls(&["cover-a"]));
+        store.want(&urls(&["cover-a", "cover-b"]));
 
         for _ in 0..10 {
             let _ = store.path("cover-a");
             let _ = store.color("cover-a");
-            let _ = store.paths();
             let _ = store.paths_snapshot().get("cover-a");
         }
         assert_eq!(fetch_calls.get(), 0, "读口子不能取图");
 
+        let mut pumped = 0;
         for url in store.drain() {
+            pumped += 1;
             let outcome = fetch(&url);
             store.complete(&url, outcome);
         }
-        assert_eq!(fetch_calls.get(), 1, "只有泵才取图");
+        assert_eq!(pumped, 2, "只读调用不能把排队项消费掉");
+        assert_eq!(fetch_calls.get(), 2, "只有泵才取图");
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。

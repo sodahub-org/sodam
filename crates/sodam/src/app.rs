@@ -61,17 +61,20 @@ impl CoverMailbox {
 
     /// 渲染路径只做一次 push；去重交给 `CoverStore::want`，不在这里扫队列。
     pub(crate) fn request(&self, url: String) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.queue.push(url);
-            let _ = inner.wake.try_send(());
-        }
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.queue.push(url);
+        let _ = inner.wake.try_send(());
     }
 
     fn take(&self) -> Vec<String> {
-        match self.inner.lock() {
-            Ok(mut inner) => std::mem::take(&mut inner.queue),
-            Err(_) => Vec::new(),
-        }
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut inner.queue)
     }
 }
 
@@ -1121,17 +1124,17 @@ impl Root {
             cx.spawn(async move |this, cx| loop {
                 let pending = mailbox.take();
                 let had_demand = !pending.is_empty();
-                let (queued, dropped) = if had_demand {
+                let stats = if had_demand {
                     match this.update(cx, |root, cx| root.ensure_covers(&pending, cx)) {
                         Ok(stats) => stats,
                         Err(_) => break,
                     }
                 } else {
-                    (0, 0)
+                    sodam_core::cover::CoverWant::default()
                 };
                 if had_demand && log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
-                    let queued = queued.to_string();
-                    let dropped = dropped.to_string();
+                    let queued = stats.queued.to_string();
+                    let dropped = stats.dropped.to_string();
                     log_event(
                         LogLevel::Debug,
                         LogTopic::App,
@@ -1139,7 +1142,7 @@ impl Root {
                         &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
                     );
                 }
-                if queued > 0 {
+                if stats.queued > 0 {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(60))
                         .await;
