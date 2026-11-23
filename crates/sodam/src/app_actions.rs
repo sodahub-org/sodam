@@ -65,6 +65,15 @@ struct UpgradeLogLevels {
     failure: LogLevel,
 }
 
+/// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
+///
+/// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
+/// 还没进队列的那首歌也显示它。缓存清理后补原图必须同口径，否则那首歌的大图
+/// 补不回来。两处补偿共用这个函数，避免一边改了口径另一边漏掉。
+fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) -> Option<String> {
+    pending.or(queued).map(|track| track.cover.clone())
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -749,11 +758,7 @@ impl Root {
         }
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
-        let current_cover = self
-            .pending_track
-            .as_ref()
-            .or_else(|| self.queue.current())
-            .map(|track| track.cover.clone());
+        let current_cover = current_cover_url(self.pending_track.as_ref(), self.queue.current());
         if let Some(url) = current_cover {
             if original_urls.contains(&url) {
                 self.ensure_original_cover(&url, cx);
@@ -796,6 +801,14 @@ impl Root {
                 root.cache_upgrade_attempted.clear();
                 // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
                 root.cover_pool.reset_seen_preserving_inflight();
+                // 原图没有渲染期自动入队口子（缩略图靠每帧 want 自愈），清缓存后得
+                // 显式补一次当前曲目的原图，口径跟歌词页一致。上面的 attempted /
+                // pending / covers 都已清空，ensure_original_cover 才会真正重新拉起下载。
+                let current_cover =
+                    current_cover_url(root.pending_track.as_ref(), root.queue.current());
+                if let Some(url) = current_cover {
+                    root.ensure_original_cover(&url, cx);
+                }
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -5581,10 +5594,10 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
-        urls_for_removed_paths,
+        current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
+        lyrics_scroll_ease, urls_for_removed_paths,
     };
-    use sodam_core::models::{LyricLine, LyricWord};
+    use sodam_core::models::{LyricLine, LyricWord, TrackItem};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -5628,6 +5641,32 @@ mod tests {
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
+    }
+
+    /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
+    /// 取错口径会让正在装载、还没进队列那首歌的大图补不回来。
+    #[test]
+    fn cover_restore_url_follows_lyrics_page_track_precedence() {
+        let make = |id: &str, cover: &str| TrackItem {
+            id: id.to_string(),
+            cover: cover.to_string(),
+            ..Default::default()
+        };
+        let pending = make("pending", "url/pending");
+        let queued = make("queued", "url/queued");
+
+        // pending 在场时歌词页显示它，补下载也得用它。
+        assert_eq!(
+            current_cover_url(Some(&pending), Some(&queued)).as_deref(),
+            Some("url/pending")
+        );
+        // 没有 pending 才退回队列当前曲目。
+        assert_eq!(
+            current_cover_url(None, Some(&queued)).as_deref(),
+            Some("url/queued")
+        );
+        // 两个都没有就没有可补的封面。
+        assert_eq!(current_cover_url(None, None), None);
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
