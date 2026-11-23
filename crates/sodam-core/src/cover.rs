@@ -140,6 +140,9 @@ pub struct CoverStore {
     colors: HashMap<String, CoverRgb>,
     /// 在飞期间被 `forget` 的 URL：这次结果作废，结束后退回 `Idle`。
     abandoned: HashSet<String>,
+    /// 作废期间又有人在等这张图：结果回来放行后要立刻重排，
+    /// 否则重试按钮要等下一次渲染才生效。
+    requeue_after_release: HashSet<String>,
     /// 上一轮 `want` 新排进来的张数（日志用）。
     last_queued: usize,
     /// 队列满时挤掉的张数（日志用）。
@@ -157,11 +160,13 @@ impl CoverStore {
             if url.is_empty() || self.ready.contains(url) {
                 continue;
             }
-            let can_queue = self
-                .records
-                .get(url)
-                .is_none_or(|record| record.state == State::Idle);
+            let state = self.records.get(url).map(|record| record.state);
+            let can_queue = matches!(state, None | Some(State::Idle));
             if !can_queue {
+                // 在飞但已被 forget：把这次需求记下来，等结果回来立刻重排。
+                if state == Some(State::Inflight) && self.abandoned.contains(url) {
+                    self.requeue_after_release.insert(url.to_string());
+                }
                 continue;
             }
             if self.queue.len() >= MAX_QUEUE {
@@ -207,6 +212,10 @@ impl CoverStore {
             if let Some(record) = self.records.get_mut(url) {
                 record.state = State::Idle;
                 record.failures = 0;
+            }
+            // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
+            if self.requeue_after_release.remove(url) {
+                self.want(&[url.to_string()]);
             }
             return;
         }
@@ -504,10 +513,25 @@ mod tests {
         assert_eq!(store.drain(), url);
 
         store.forget(url.iter().map(String::as_str));
-        assert!(store.want(&url).is_empty(), "在飞期间不能重复入队");
         store.complete("cover-a", ready("/tmp/a.img"));
         assert!(store.path("cover-a").is_none(), "这次结果要作废");
+        assert!(store.drain().is_empty(), "没人再要，就不要自己重排");
         assert_eq!(store.want(&url).len(), 1, "结束后要能重新排队");
+    }
+
+    /// 在飞被 forget 之后又有人要（点重试）：结果回来要立刻补排。
+    #[test]
+    fn demand_during_abandoned_inflight_requeues_after_completion() {
+        let mut store = CoverStore::default();
+        let url = urls(&["cover-a"]);
+        store.want(&url);
+        assert_eq!(store.drain(), url);
+        store.forget(["cover-a"]);
+
+        assert!(store.want(&url).is_empty(), "在飞期间不能重复下");
+        store.complete("cover-a", CoverOutcome::Failed);
+        assert_eq!(store.drain(), url, "作废结果回来后要把这次需求补上");
+        assert!(store.want(&url).is_empty(), "补排之后不重复入队");
     }
 
     /// forget 摘掉排队项和去重标记，重新入队只下一次。

@@ -1142,7 +1142,7 @@ impl Root {
                         &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
                     );
                 }
-                if stats.queued > 0 {
+                if had_demand {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(60))
                         .await;
