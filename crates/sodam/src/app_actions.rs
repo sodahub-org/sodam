@@ -55,6 +55,16 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     (pick(covers), pick(original_covers))
 }
 
+/// 单首 / 批量两条路各自的日志级别。
+///
+/// 用带名字的字段而不是两个挨着的 `LogLevel`：同一个类型相邻，调用点写反了照样编译过，
+/// 只会变成「成功记 WARN、失败记 INFO」这种测不出来的错。
+#[derive(Clone, Copy)]
+struct UpgradeLogLevels {
+    success: LogLevel,
+    failure: LogLevel,
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -2938,14 +2948,17 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
-    /// 批量几百首逐个记 Info 会刷屏，规格只要求开跑、收尾各一行，所以批量降到 Debug。
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
+    /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// 所以这几种逐首日志都降到 DEBUG。
+    ///
+    /// 升级前读不到、升级后却有结果这一档按失败算（批量会进失败数），但不写日志。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
-        success_level: LogLevel,
+        levels: UpgradeLogLevels,
     ) -> Outcome {
         let session = Session::new(settings);
         // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
@@ -2960,11 +2973,18 @@ impl Root {
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
-                if outcome == Outcome::Upgraded {
+                let event = match outcome {
+                    Outcome::Upgraded => Some("cache_upgraded"),
+                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
+                    Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
+                    // 没有可靠的失败原因可写，所以不落日志。
+                    Outcome::Failed => None,
+                };
+                if let Some(event) = event {
                     log_outlet::log_event(
-                        success_level,
+                        levels.success,
                         LogTopic::Player,
-                        "cache_upgraded",
+                        event,
                         &[
                             ("track_id", track.id.as_str()),
                             ("quality", cached.quality.as_str()),
@@ -2974,8 +2994,10 @@ impl Root {
                 outcome
             }
             Err(failure) => {
+                // 级别由调用方定：单首失败要用 WARN 进默认日志；批量几百首逐首记会刷屏，
+                // 用 DEBUG 只在详细模式留痕，默认日志只看收尾汇总。
                 log_outlet::log_event(
-                    LogLevel::Debug,
+                    levels.failure,
                     LogTopic::Player,
                     "cache_upgrade_failed",
                     &[
@@ -3014,7 +3036,16 @@ impl Root {
 
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
-            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
+            Self::upgrade_one_cached_track(
+                settings,
+                track,
+                intent,
+                account_is_vip,
+                UpgradeLogLevels {
+                    success: LogLevel::Info,
+                    failure: LogLevel::Warn,
+                },
+            )
         });
         cx.spawn(async move |this, cx| {
             // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
@@ -3149,7 +3180,10 @@ impl Root {
                             track,
                             target_clone,
                             is_vip,
-                            LogLevel::Debug,
+                            UpgradeLogLevels {
+                                success: LogLevel::Debug,
+                                failure: LogLevel::Debug,
+                            },
                         )
                     })
                     .await;
