@@ -22,6 +22,7 @@ sys-locale = "0.3"
 dirs = "6"
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 
-# c8a9f54 = 上游 main：`download_resumable` 交回的 `DownloadReport` 带上本次
-# 实际使用的流信息，续传路径不用再二次解析补档位。
+# c8a9f54 是并入可续传下载那笔改动后的上游提交（rev 锁的是这一个提交，
+# main 会继续往前走）。它让 `download_resumable` 交回的 `DownloadReport`
+# 带上本次实际使用的流信息，续传路径不用再二次解析补档位。
 libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "c8a9f54" }

@@ -107,16 +107,22 @@ pub fn root_dir() -> PathBuf {
         })
 }
 
-// libresoda 可续传路径在暂存目标旁落盘的一族文件后缀（`part_record` 的
-// `staged_paths` 命名表）。保护键与 24 小时新鲜窗共用这一份，上游改命名表
-// 时只改这里。每项带 `.m4a` 前缀：保护键摘掉整个后缀就能还原出交付目标，
-// 也把封面那类没有 `.m4a` 前缀的 `{hash}-160.img.*.part` 挡在映射之外。
-const STAGED_SUFFIXES: [&str; 5] = [
+// libresoda 可续传路径在暂存目标旁落盘的一族文件后缀。保护键与 24 小时
+// 新鲜窗共用这一份，上游改命名表时只改这里。每项带 `.m4a` 前缀：保护键
+// 摘掉整个后缀就能还原出交付目标，封面那类 `{hash}-160.img.*.part` 没有
+// `.m4a` 前缀，落在映射之外。
+//
+// 命名来源分两种：除 `.m4a.part.dec.tmp` 外都来自上游 `part_record` 的
+// `staged_paths` 命名表；`.m4a.part.dec.tmp` 是本仓库推测的第二种 dec 拼法
+// （解密临时文件挂在 `.part` 后面），未与 libresoda 核对——真机落盘名对不上
+// 时改这一条。
+const STAGED_SUFFIXES: [&str; 6] = [
     ".m4a.part.meta.tmp",
+    ".m4a.part.dec.tmp",
     ".m4a.part.meta",
     ".m4a.part.lock",
-    ".m4a.part",
     ".m4a.dec.tmp",
+    ".m4a.part",
 ];
 
 // 同一个暂存目标的一族文件与它的交付文件共享保护键：
@@ -585,6 +591,177 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
         remove_idle,
     )
     .0
+}
+
+/// 清音频根下旧格式暂存残留，只列顶层、不递归。
+///
+/// 「旧格式」指暂存挪进 `staging/` 之前的老实现落下的文件（#241）：当时
+/// `{曲目}-{档位}-{pid}-{seq}.m4a.part(.part)` 这类文件直接躺在音频根下，
+/// 改到子目录后就没人管了。族名认领用 [`STAGED_SUFFIXES`]，超过
+/// [`PART_MAX_AGE`] 的交给 [`remove_idle`]（租约与 `.part.lock` 的例外都在那儿）。
+///
+/// 不递归进 `staging/`：那里归 [`purge_stale_staging_in`] 的 7 天保留期按
+/// 整族清扫，这里按成员年龄动手会把续传对拆开。
+///
+/// 能摘回交付目标的尾巴（`.part`、`.part.meta`、`.dec.tmp` 等）照样受租约
+/// 保护；只有 `.m4a.part.part` 这种双尾巴摘不回去，保护键就是文件自己——
+/// 好在产生它们的旧进程早已不在，不会有租约指向它们。
+///
+/// 返回 `Some(删除数)`；`None` 表示这轮目录没读全（条目、类型或元数据
+/// 读不到），交给下轮重试。
+fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
+    let entries = match std::fs::read_dir(audio_root) {
+        Ok(entries) => entries,
+        // 目录不存在是正常状态（首次启动、从没下载过）：按空目录处理，别当缺口，
+        // 否则全新机器会白跑满重试轮次再留一条放弃 Warn。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    let mut complete = true;
+    let mut removed = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            complete = false;
+            continue;
+        };
+        // 只动顶层普通文件；目录（含 staging 子目录）与符号链接一律不碰。
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // 锁永不删（#243）：mtime 停在首次下载，删掉正被内核锁挂着的锁
+        // 会让后到的下载者另立新锁，同一目标出现两把锁，互斥就破了。
+        if name.ends_with(".part.lock") {
+            continue;
+        }
+        if !staged_family_member(name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            // 扫描与取元数据之间被删掉是正常竞争；还在却读不到才算缺口。
+            if path.exists() {
+                complete = false;
+            }
+            continue;
+        };
+        let modified = meta.modified().unwrap_or_else(|_| SystemTime::now());
+        if is_fresh_part(&path, modified) {
+            continue;
+        }
+        if remove_idle(&path) {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        log_event(
+            LogLevel::Info,
+            LogTopic::App,
+            "legacy_residue_swept",
+            &[("removed", removed.to_string().as_str())],
+        );
+    }
+    complete.then_some(removed)
+}
+
+/// 首轮巡检的连续不完整轮数上限：到顶就放弃，进程内不再重试。
+/// 5 轮 ≈ 5 分钟（按主心跳 60 秒一轮维护算，见 app_actions 的 maintain_cache），
+/// 目录长期读不到时不至于每 60 秒一次全量扫盘永不停止——那正是进程级
+/// 一次性门要省的开销。
+const SWEEP_MAX_INCOMPLETE_ROUNDS: usize = 5;
+
+/// 首轮巡检的门：进程级状态（连续不完整轮数 + 是否已结束）独立成结构体，
+/// 让「不完整到上限就置完成」「完成后再喂结果直接返回 0」这两条关键行为
+/// 能在单测里直接固定——进程级静态本身依赖 root_dir，测不到。
+struct SweepGate {
+    incomplete_rounds: usize,
+    finished: bool,
+}
+
+impl SweepGate {
+    const fn new() -> Self {
+        Self {
+            incomplete_rounds: 0,
+            finished: false,
+        }
+    }
+
+    /// 门是否已结束（完成或放弃）。
+    ///
+    /// 调用方先问一句再扫：门关了就别再列目录，省掉每轮维护（约 60 秒一次）
+    /// 白付的 read_dir 与逐文件 metadata。
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// 喂一轮结果：`Some(删除数)` 就收工关门；`None` 就跳过本轮、计数加一。
+    /// 连续到 [`SWEEP_MAX_INCOMPLETE_ROUNDS`] 轮放弃并关门。
+    /// 日志只写两条：首轮一条 `legacy_residue_sweep_incomplete`，
+    /// 放弃时一条 `legacy_residue_sweep_gave_up`，中间静默。
+    /// 返回删除的文件数。
+    fn advance(&mut self, outcome: Option<usize>) -> usize {
+        if self.finished {
+            return 0;
+        }
+        let Some(removed) = outcome else {
+            self.incomplete_rounds += 1;
+            let rounds = self.incomplete_rounds;
+            if rounds == 1 {
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::App,
+                    "legacy_residue_sweep_incomplete",
+                    &[],
+                );
+            }
+            if rounds >= SWEEP_MAX_INCOMPLETE_ROUNDS {
+                let rounds_text = rounds.to_string();
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::App,
+                    "legacy_residue_sweep_gave_up",
+                    &[("rounds", rounds_text.as_str())],
+                );
+                self.finished = true;
+            }
+            return 0;
+        };
+        self.finished = true;
+        removed
+    }
+}
+
+/// 音频根下旧格式暂存残留的启动巡检，返回删除的文件数。
+///
+/// 只在启动后的首轮维护实际执行：维护约 60 秒一轮，跨过年龄门槛的老残留
+/// 不会每分钟变多，每轮重扫几乎全是空跑。
+///
+/// 门用互斥锁 + [`std::sync::Mutex::try_lock`] 串行化：拿不到锁说明另一轮
+/// 巡检正在进行，本轮空转返回，不排队干等。锁中毒按「拿回状态继续跑」处理，
+/// 别让一次 panic 把进程级一次性门永久关掉。这是 pub 函数，正确性不押在
+/// 调用方恰好单飞上。
+///
+/// 锁文件永不删，staging 子目录属于 [`purge_stale_staging_in`] 的 7 天保留期。
+/// 调用方必须在后台执行。
+pub fn sweep_legacy_residue() -> usize {
+    static SWEEP_GATE: Mutex<SweepGate> = Mutex::new(SweepGate::new());
+    let mut gate = match SWEEP_GATE.try_lock() {
+        Ok(gate) => gate,
+        Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    // 先问门再列目录：门关了就别每分钟白付一次 read_dir + 每文件 metadata。
+    // 参数立即求值的话，扫完进 advance 才发现已结束，门等于只省了删除不省扫描。
+    if gate.is_finished() {
+        return 0;
+    }
+    gate.advance(sweep_legacy_residue_once(&root_dir().join("audio")))
 }
 
 /// staging 子目录名。下载把暂存放这里（`session.rs` 的 `staging_dir` 用同一份名字），
@@ -2628,6 +2805,7 @@ mod tests {
             "/cache/audio/staging/123-lossless-normal.m4a.part.meta.tmp",
             "/cache/audio/staging/123-lossless-normal.m4a.part.lock",
             "/cache/audio/staging/123-lossless-normal.m4a.dec.tmp",
+            "/cache/audio/staging/123-lossless-normal.m4a.part.dec.tmp",
         ] {
             assert_eq!(protection_key(Path::new(staged)), target, "{staged}");
         }
@@ -2765,6 +2943,132 @@ mod tests {
             is_fresh_part(Path::new(&name), SystemTime::now()),
             "写了一半的封面不能被维护任务顺手删掉"
         );
+    }
+
+    /// 保护键的映射必须与 [`STAGED_SUFFIXES`] 同源：名单里每条尾巴挂在交付目标
+    /// `.m4a` 后面都能折回交付目标。加尾巴只改数组，这条测试守住保护键不漏。
+    #[test]
+    fn protection_key_maps_every_staging_tail_to_the_target() {
+        let target = Path::new("/cache/audio/staging/123-lossless-normal.m4a");
+        for suffix in STAGED_SUFFIXES {
+            let staged = format!("/cache/audio/staging/123-lossless-normal{suffix}");
+            assert_eq!(protection_key(Path::new(&staged)), target, "{staged}");
+        }
+        // 挂在别处（封面那类 `.img.*.part`）不进映射，保持原样。
+        assert_eq!(
+            protection_key(Path::new("/cache/audio/abcd-160.img.123.part")),
+            Path::new("/cache/audio/abcd-160.img.123.part")
+        );
+    }
+
+    /// #242：音频根下旧格式暂存残留按族名清掉，锁、正式缓存、子目录一个不碰。
+    #[test]
+    fn legacy_residue_sweep_removes_old_staging_but_spares_locks_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // 旧格式残留（#241 之前直接落在音频根下）：过期才清。
+        let stale = [
+            "111-auto-4242-7.m4a.part",
+            "111-auto-4242-7.m4a.part.part",
+            "111-auto-4242-7.m4a.part.meta",
+            "111-auto-4242-7.m4a.part.meta.tmp",
+            "111-auto-4242-7.m4a.dec.tmp",
+            "111-auto-4242-7.m4a.part.dec.tmp",
+        ];
+        for name in stale {
+            file(dir.path(), name, 90_000);
+        }
+        // 不碰的：锁（#243 永不删）、24 小时内的残留、正式缓存与 sidecar、
+        // 封面式名字、不相干文件，以及 staging 子目录里的东西（归 7 天保留期管）。
+        let keep = [
+            "111-auto-4242-7.m4a.part.lock",
+            "222-auto.m4a.part",
+            "333-auto.m4a",
+            "333-auto.quality",
+            "abcd-160.img",
+            "notes.txt",
+            "staging/444-auto-normal.m4a.part",
+        ];
+        for name in keep {
+            let age = if name == "222-auto.m4a.part" {
+                3_600
+            } else {
+                90_000
+            };
+            file(dir.path(), name, age);
+        }
+
+        assert_eq!(
+            sweep_legacy_residue_once(dir.path()),
+            Some(stale.len()),
+            "过期的旧格式残留全部清掉"
+        );
+        for name in stale {
+            assert!(!dir.path().join(name).exists(), "{name} 该清掉");
+        }
+        for name in keep {
+            assert!(dir.path().join(name).exists(), "{name} 不能被巡检误删");
+        }
+    }
+
+    /// #242：音频目录不存在（首次启动）按空目录处理，不算缺口。
+    ///
+    /// 读不全的 `None` 语义由上面的门测试固定；这里钉死「全新安装别白跑重试」。
+    #[test]
+    fn legacy_residue_sweep_treats_missing_dir_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sweep_legacy_residue_once(&dir.path().join("missing")),
+            Some(0)
+        );
+    }
+
+    /// #242：首轮巡检没读全就跳过本轮，连续到上限就放弃并结束。
+    ///
+    /// 一次性门绝不能在不完整的结果上落位：读完再清；放弃后不再动文件。
+    #[test]
+    fn sweep_gate_skips_incomplete_rounds_until_limit_then_gives_up() {
+        let mut gate = SweepGate::new();
+        // 连续不完整：跳过、计数，上限前不结束。
+        for _ in 0..SWEEP_MAX_INCOMPLETE_ROUNDS - 1 {
+            assert_eq!(gate.advance(None), 0);
+            assert!(!gate.is_finished());
+        }
+        // 到上限：放弃并结束，扫描与日志都有上界。
+        assert_eq!(gate.advance(None), 0);
+        assert!(gate.is_finished());
+        // 放弃后再喂什么都不再干活。
+        assert_eq!(gate.advance(Some(3)), 0);
+        assert!(gate.is_finished());
+    }
+
+    /// #242：门在读完一轮后就结束，之后的调用直接返回 0。
+    ///
+    /// 「第二次调用返回 0」的回归保护：进程级静态测不到，这层必须钉死。
+    #[test]
+    fn sweep_gate_stops_after_finishing() {
+        let mut gate = SweepGate::new();
+        assert_eq!(gate.advance(Some(2)), 2);
+        assert!(gate.is_finished());
+        assert_eq!(gate.advance(Some(2)), 0, "门已关闭，不再清扫");
+        assert!(gate.is_finished());
+    }
+
+    /// #242：巡检不碰租约保护下的旧格式残留，放开后下一轮清走。
+    #[test]
+    fn legacy_residue_sweep_respects_download_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        // 旧格式残留挂在交付目标名下，租约也挂在同一个交付目标上。
+        let target = dir.path().join("777-auto-4242-7.m4a");
+        let part = file(dir.path(), "777-auto-4242-7.m4a.part", 90_000);
+        let meta = file(dir.path(), "777-auto-4242-7.m4a.part.meta", 90_000);
+        let lease = CacheLease::acquire(&target);
+
+        assert_eq!(sweep_legacy_residue_once(dir.path()), Some(0));
+        assert!(part.exists() && meta.exists(), "正在下载的残留不能被清");
+
+        drop(lease);
+        assert_eq!(sweep_legacy_residue_once(dir.path()), Some(2));
+        assert!(!part.exists() && !meta.exists());
     }
 
     #[cfg(unix)]
