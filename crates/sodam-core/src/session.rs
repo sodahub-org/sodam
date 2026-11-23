@@ -159,12 +159,19 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
 /// 暂存文件单独放一个子目录，别和正式缓存混在一起。
 /// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
 /// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
+/// 目录名与维护侧（`cache::STAGING_DIR_NAME`）共用一份。
 fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
-    audio_dir.join("staging")
+    audio_dir.join(crate::cache::STAGING_DIR_NAME)
 }
 
-/// 准备这组暂存目标：清掉上次被杀留下的交付目标、`.part` 和 `.part.lock`，
-/// 再拿租约挡住缓存维护。正常下载与升级都要走这一步，差异只在用途。
+/// 准备这组暂存目标：清掉上次被杀留下的交付目标，再拿租约挡住缓存维护。
+/// 正常下载与升级都要走这一步，差异只在用途。
+///
+/// 可续传下载的续传来源就是上次失败留下的 `.part`（密文）与 `.part.meta` 记录，
+/// 所以这里**只清交付目标，不动暂存对**：断网被掐断的那份字节就是下次的起点
+///（#243）。`.part` 里这段密钥指纹不对（重解析换了流）时，libresoda 的
+/// `load_record` 会自己作废重下，不需要这里替它判断。`.part.lock` 也留着：
+/// 名字固定后每个目标只有一把锁，删了反而会破坏跨进程的内核锁语义。
 fn stage_path(
     dir: &std::path::Path,
     track_id: &str,
@@ -186,33 +193,25 @@ fn stage_path(
     })?;
     let name = part_file_name(track_id, tag, purpose);
     let part = stage.join(&name);
-    // 名字固定后，上次被杀留下的暂存会挂在下次要用的同一组名字上：交付目标、
-    // `.part` 数据、`.part.lock`。此时调用方已持有该用途的下载锁。
-    // 删不掉记日志，但日志不是护栏：Unix 上正在被写的同名文件也能 unlink 成功，
-    // 这时没有日志，靠的是调用方持有的那把锁保证没人在写。
-    for stale in [
-        part.clone(),
-        stage.join(format!("{name}.part")),
-        stage.join(format!("{name}.part.lock")),
-    ] {
-        // 直接删，NotFound 是正常的（多半没留下残留）；别的错才记日志。
-        // 不用 exists() 先探再删：那两步之间文件可能被别的写者收尾删掉，
-        // 会冒出一条假的清理失败。
-        if let Err(err) = std::fs::remove_file(&stale) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                use crate::log_outlet::{log_event, LogLevel, LogTopic};
-                let file = stale
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let error = err.to_string();
-                log_event(
-                    LogLevel::Warn,
-                    LogTopic::Audio,
-                    "stage_cleanup_failed",
-                    &[("file", file.as_str()), ("error", error.as_str())],
-                );
-            }
+    // 只清交付目标：上次被杀若停在「libresoda 已交付、本侧还没改名到正式缓存」，
+    // 这个文件就是残留，而 Windows 的 rename 不覆盖既有文件，不清掉会挡住这次交付。
+    // 此时调用方已持有该用途的下载锁。删不掉记日志，但日志不是护栏：
+    // Unix 上正在被写的同名文件也能 unlink 成功，这时没有日志，
+    // 靠的是调用方持有的那把锁保证没人在写。
+    if let Err(err) = std::fs::remove_file(&part) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            use crate::log_outlet::{log_event, LogLevel, LogTopic};
+            let file = part
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let error = err.to_string();
+            log_event(
+                LogLevel::Warn,
+                LogTopic::Audio,
+                "stage_cleanup_failed",
+                &[("file", file.as_str()), ("error", error.as_str())],
+            );
         }
     }
     let lease = crate::cache::CacheLease::acquire(&part);
@@ -278,18 +277,21 @@ mod part_tests {
         assert_eq!(upgrade, "123-lossless-upgrade.m4a");
     }
 
-    /// 名字固定后，上次被杀留下的整组暂存会挂在下次要用的同一组名字上。
-    /// stage_path 要把交付目标、`.part`、`.part.lock` 都清掉，再拿租约挡住维护线程。
+    /// 上次被杀留下的交付目标会挂在下次要用的同一组名字上，stage_path 清掉它；
+    /// 续传暂存（`.part` 数据 / `.part.meta` 记录 / `.part.lock`）必须原样保留，
+    /// 那是下次接上缺口的起点（#243）。租约照旧挂在暂存目标上挡住维护线程。
     #[test]
-    fn stage_path_discards_all_stale_staging_and_holds_lease() {
+    fn stage_path_discards_stale_target_but_keeps_resumable_staging() {
         let dir = tempfile::tempdir().unwrap();
         let stage = super::staging_dir(dir.path());
         std::fs::create_dir_all(&stage).unwrap();
         let stale = stage.join("123-lossless-normal.m4a");
         let stale_part = stage.join("123-lossless-normal.m4a.part");
+        let stale_meta = stage.join("123-lossless-normal.m4a.part.meta");
         let stale_lock = stage.join("123-lossless-normal.m4a.part.lock");
         std::fs::write(&stale, b"leftover target").unwrap();
         std::fs::write(&stale_part, b"leftover part data").unwrap();
+        std::fs::write(&stale_meta, b"leftover record").unwrap();
         std::fs::write(&stale_lock, b"").unwrap();
 
         // 正式缓存里放一个同名文件：自定义档位 auto-normal 会撞上这个暂存名，
@@ -307,8 +309,17 @@ mod part_tests {
 
         assert_eq!(part, stale, "暂存目标落在独立的 staging 子目录");
         assert!(!stale.exists(), "上次留下的交付目标必须清掉");
-        assert!(!stale_part.exists(), "半截的 .part 必须清掉");
-        assert!(!stale_lock.exists(), "旧的 .part.lock 必须清掉");
+        assert_eq!(
+            std::fs::read(&stale_part).unwrap(),
+            b"leftover part data",
+            "半截的 .part 必须保留：那是下次续传的起点"
+        );
+        assert_eq!(
+            std::fs::read(&stale_meta).unwrap(),
+            b"leftover record",
+            ".part.meta 记录必须保留：没有它续传对就对不上"
+        );
+        assert!(stale_lock.exists(), ".part.lock 留着：内核锁靠这个文件挂名");
         assert_eq!(
             std::fs::read(&committed).unwrap(),
             b"committed cache",
@@ -573,6 +584,29 @@ fn is_truncated_download(declared: i64, written: u64) -> bool {
     declared > 0 && written < declared as u64
 }
 
+/// 续传发生时把传输事实记进日志（resumed_from / transferred / total_len）：
+/// 「transferred 是否明显小于 total_len」由看日志的人判断——有值就说明这次
+/// 是接在上次那段字节后面补的。点播与升级两条路共用（#243）。
+fn log_resumed_download(report: &libresoda::soda::download::DownloadReport) {
+    let Some(from) = report.resumed_from else {
+        return;
+    };
+    use crate::log_outlet::{log_event, LogLevel, LogTopic};
+    let from = from.to_string();
+    let transferred = report.transferred.to_string();
+    let total = report.total_len.to_string();
+    log_event(
+        LogLevel::Info,
+        LogTopic::Audio,
+        "download_resumed",
+        &[
+            ("resumed_from", from.as_str()),
+            ("transferred", transferred.as_str()),
+            ("total_len", total.as_str()),
+        ],
+    );
+}
+
 /// 把「确认没有更高档位」写回 sidecar；失败不影响播放，下次再探。
 fn record_upgrade_check(
     quality_path: &std::path::Path,
@@ -831,13 +865,19 @@ impl Session {
 
     /// 把曲目下载并**解密**到本地缓存，返回文件路径（已存在则直接复用）。
     ///
-    /// libresoda 的 `download` 会处理加密流（VIP 整曲需要签名服务）。
+    /// 走 libresoda 的可续传路径 [`Soda::download_resumable`]：密文先暂存到
+    /// `{part}.part`，传输被掐断后留下的字节就是下次的起点，重试只补缺口；
+    /// 服务器不支持范围请求时库内退回整份。VIP 整曲需要签名服务，由 libresoda 处理。
     ///
     /// 失败返回 [`PlaybackFailure`]（阶段 + 可否重试 + 修复动作），不再压成一句
     /// 「下载失败」：一次播放请求串着地址解析、签名、音频体传输、解密落盘四类失败，
     /// 把它们混在一起既误导归因，也让永久错误白烧重试次数。
-    /// 相位归因有上限：`download_with_info` 内部同时做了前三件事，
+    /// 相位归因有上限：`download_resumable` 内部同时做了前三件事，
     /// 所以那一段的失败只能靠 `classify` 从 `SodaError` 的形态尽量还原。
+    ///
+    /// 失败不清暂存：暂存留不留由 libresoda 按「这段字节以后还有没有用」决定
+    /// （下架/字节不可信它自己删，传输中断/磁盘满它保留），本侧不再用
+    /// 「瞬时/永久」重判一遍去删数据。
     pub fn download_to_cache(
         &self,
         track: &crate::models::TrackItem,
@@ -886,23 +926,28 @@ impl Session {
             extra: std::collections::BTreeMap::from([("track_id".to_string(), track.id.clone())]),
             ..Default::default()
         };
-        // 先写临时文件，校验完整后再改名 —— 下载中断永远留不下「看起来有效」的半截缓存。
-        // 暂存名固定为「曲目-档位-用途」，重复下载复用同一套锁；正常下载与升级分开，
-        // 两条路并发下同一首时互不撞锁。
-        // 注意：这里写的还是**明文**，所以 `Range` 续传在结构上还不成立（见 issue 阶段二）。
+        // 走可续传路径：密文暂存 `{part}.part`，下完在库内解密交付到 `part`，
+        // 校验完整后再改名到正式缓存 —— 下载中断永远留不下「看起来有效」的半截缓存。
+        // 暂存名固定为「曲目-档位-用途」，重复下载复用同一套名字与锁；
+        // 正常下载与升级分开，两条路并发下同一首时互不撞锁。
+        // 失败不删暂存：留住的字节是下一次的起点（#243）。
         let (part, _part_lease) =
             stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal)?;
-        let info = self
+        let report = self
             .pumpkin
-            .download_with_info(&song, &part)
-            .map_err(|err| {
-                let _ = std::fs::remove_file(&part);
-                classify(&err)
-            })?;
+            .download_resumable(&song, &part)
+            .map_err(|err| classify(&err))?;
+        log_resumed_download(&report);
+        // 档位 / 试听标记取自这次传输自己的 `stream_info`：它跟落盘字节来自
+        // 同一次取流，不会出现「整曲文件 + 试听标记」的错配（libresoda#55）。
+        let info = report.stream_info;
 
-        // 完整性校验：只拒绝「比服务端声明更少」的截断下载（静默 EOF 时可能发生）。
-        // 允许实际字节数更多：个别曲目的 play_info size 元数据会滞后于真实资产
-        //（实测存在声明 10,569,897 / 实际 10,660,358 的完整可播文件），等值校验会误杀。
+        // 完整性校验：只拒绝「比服务端声明更少」的截断下载。可续传路径已保证
+        //「盘上累计 = 这次 Content-Range 总长」，静默 EOF 在库内就会被拦下；
+        // 这道闸只剩兜底作用。允许实际字节数更多：个别曲目的 play_info size
+        // 元数据会滞后于真实资产（实测存在声明 10,569,897 / 实际 10,660,358 的
+        // 完整可播文件），等值校验会误杀。此时暂存对已被交付作废，删的是
+        // 交付出来的成品，不是续传数据。
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if written == 0 || is_truncated_download(info.size, written) {
             let _ = std::fs::remove_file(&part);
@@ -970,7 +1015,7 @@ impl Session {
     /// 原子替换旧文件。
     ///
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
-    /// * 若中途失败，清理临时文件，绝不破坏原有缓存；
+    /// * 若中途失败，暂存留在 staging 子目录给下次续传（#243），绝不破坏原有缓存；
     /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存；
     ///   档位未知的旧三字段缓存按标签能证明的下限比较（#89）；
     /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
@@ -1064,23 +1109,26 @@ impl Session {
             crate::cache::DownloadPurpose::Upgrade,
         )?;
 
+        // 可续传路径，失败不清暂存：升级被掐断后，下次升级从缺口接着补（#243）。
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
-        let info = if let crate::quality::QualityIntent::Tier(tier) = intent {
+        let report = if let crate::quality::QualityIntent::Tier(tier) = intent {
             let mut upgrade_settings = self.settings.clone();
             upgrade_settings.quality = tier.clone();
             let upgrade_session = Session::new(upgrade_settings);
-            upgrade_session.pumpkin.download_with_info(&song, &part)
+            upgrade_session.pumpkin.download_resumable(&song, &part)
         } else {
-            self.pumpkin.download_with_info(&song, &part)
+            self.pumpkin.download_resumable(&song, &part)
         }
         .map_err(|err| {
-            let _ = std::fs::remove_file(&part);
             // 补整曲失败也记一次退避：否则应用每次启动都会把同一首整曲下一遍再失败。
             if current.preview {
                 record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
             }
             classify(&err)
         })?;
+        log_resumed_download(&report);
+        // 与点播同一条口径：档位 / 试听标记用这次传输自己的 stream_info。
+        let info = report.stream_info;
 
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if written == 0 || is_truncated_download(info.size, written) {
