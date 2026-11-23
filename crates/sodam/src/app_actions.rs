@@ -3105,7 +3105,7 @@ impl Root {
             let mut stopped: Option<StopReason> = None;
             for record in upgradeables {
                 // 每首开始前重读身份、取消标志、设置和会员状态。开场那份快照不再用——
-                // 旧 Cookie 就是从这里漏出去的（#254）。
+                // 旧 Cookie 就是从这里漏出去的。
                 let step = this.update(cx, |root, _cx| {
                     (
                         root.batch_upgrade_stop(start_epoch),
@@ -3201,6 +3201,13 @@ impl Root {
                                 root.localized("账号已变更，批量已停止 ({} / {})", &counts);
                             root.notify_warning_once("batch-upgrade-stopped", message);
                         }
+                        Some(StopReason::LoggingOut) => {
+                            // 登出还没落盘就停了批量：这时候说「账号已变更」是撒谎，
+                            // 落盘失败账号还在。说清是「正在退出登录」就够了。
+                            let message =
+                                root.localized("正在退出登录，批量已停止 ({} / {})", &counts);
+                            root.notify_warning_once("batch-upgrade-stopped", message);
+                        }
                         Some(StopReason::Cancelled) => {
                             root.set_status("已取消 ({} / {})", &counts);
                         }
@@ -3230,11 +3237,12 @@ impl Root {
 
     /// 这一轮批量现在该不该停。
     ///
-    /// 正在登出也算：`logout()` 要等落盘成功才推进身份代数，慢盘上那一等就是几秒，
-    /// 这期间批量还能拿旧 Cookie 再发一首——那正是本票要堵的洞，所以不等落盘。
+    /// 正在退出登录也算：`logout()` 要等落盘成功才推进身份代数，慢盘上那一等就是几秒，
+    /// 这期间批量还能拿旧 Cookie 再发一首——那正是要堵的洞，所以不等落盘。但落盘可能失败
+    /// （账号还在），所以这里报的是「正在退出登录」，不冒充「账号已变更」。
     fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
         if self.logout_in_flight {
-            return Some(StopReason::IdentityChanged);
+            return Some(StopReason::LoggingOut);
         }
         stop_reason(start_epoch, self.auth_epoch, self.batch_upgrade_cancel)
     }

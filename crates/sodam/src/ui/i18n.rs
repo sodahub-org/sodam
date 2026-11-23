@@ -540,6 +540,9 @@ impl Language {
                 "Account changed; batch upgrade stopped ({} / {})"
             }
             "已取消 ({} / {})" => "Cancelled ({} / {})",
+            "正在退出登录，批量已停止 ({} / {})" => {
+                "Signing out; batch upgrade stopped ({} / {})"
+            }
             "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位" => {
                 "Cache upgrade complete: upgraded {} songs, {} failed, {} with no higher quality"
             }

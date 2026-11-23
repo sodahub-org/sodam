@@ -12,8 +12,10 @@ use std::collections::HashSet;
 /// 批量为什么不再发下一首。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// 登录身份变了：退出登录、换号，或会员状态刷新推进了代数。
+    /// 登录身份变了：落盘完成的退出登录、换号，或会员状态刷新推进了代数。
     IdentityChanged,
+    /// 正在退出登录、落盘还没回来。成不成都不能说「账号已变更」——落盘失败时账号还在。
+    LoggingOut,
     /// 用户点了取消。只停在下一首之前，正在下的那一首不打断。
     Cancelled,
 }
@@ -23,6 +25,7 @@ impl StopReason {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::IdentityChanged => "identity_changed",
+            Self::LoggingOut => "logging_out",
             Self::Cancelled => "cancelled",
         }
     }
@@ -117,7 +120,7 @@ impl Tally {
 
 /// 本会话「这一首、这个档位已经试过」的记账。
 ///
-/// 表跟着身份走：换号 / 登出后整份作废，同一首同一档位在新账号下重新可试（#254）。
+/// 表跟着身份走：换号 / 登出后整份作废，同一首同一档位在新账号下重新可试。
 /// 身份代数由调用方在 [`UpgradeAttempts::observe_epoch`] 里喂进来，这里不自己数。
 ///
 /// 一条记号记下就一直留着：网络抖一下、或者这首确实没有更高档位，都不该让它在每次播放时
@@ -278,6 +281,7 @@ mod tests {
     #[test]
     fn stop_log_values_are_stable() {
         assert_eq!(StopReason::IdentityChanged.as_str(), "identity_changed");
+        assert_eq!(StopReason::LoggingOut.as_str(), "logging_out");
         assert_eq!(StopReason::Cancelled.as_str(), "cancelled");
     }
 }
