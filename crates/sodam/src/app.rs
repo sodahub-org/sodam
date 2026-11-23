@@ -5,6 +5,7 @@ mod actions;
 #[path = "app_search.rs"]
 mod search_actions;
 
+use futures_lite::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     div, px, Context, Decorations, EntityInputHandler, FocusHandle, Image, Render, UTF16Selection,
@@ -37,6 +38,42 @@ pub(crate) const REMOTE_TEXT: &str = "出现了一点问题，检查网络后重
 pub(crate) const SAVE_TEXT: &str = "没能保存，检查磁盘空间后重试。";
 /// 既不是网络也不是写入的失败（例如本地编码出错）：不指责任何一方，只说重试。
 pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
+
+/// 渲染闭包够不到 `Root`，把封面需求丢进这个邮箱；`request` 顺带叫醒消费循环。
+pub(crate) struct CoverMailbox {
+    inner: Mutex<CoverMailboxInner>,
+}
+
+struct CoverMailboxInner {
+    queue: Vec<String>,
+    wake: futures_channel::mpsc::Sender<()>,
+}
+
+impl CoverMailbox {
+    fn new(wake: futures_channel::mpsc::Sender<()>) -> Self {
+        Self {
+            inner: Mutex::new(CoverMailboxInner {
+                queue: Vec::new(),
+                wake,
+            }),
+        }
+    }
+
+    /// 渲染路径只做一次 push；去重交给 `CoverStore::want`，不在这里扫队列。
+    pub(crate) fn request(&self, url: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.queue.push(url);
+            let _ = inner.wake.try_send(());
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        match self.inner.lock() {
+            Ok(mut inner) => std::mem::take(&mut inner.queue),
+            Err(_) => Vec::new(),
+        }
+    }
+}
 
 /// 列表一次渲染的行数上限：GPUI 没有虚拟滚动，一次性布局几百行 + 解码封面
 /// 会把主线程顶住；分批渲染 + 「显示更多」是这里最稳的做法。
@@ -447,8 +484,8 @@ pub struct Root {
     pub open_album: Option<AlbumDetail>,
     pub loading_album: bool,
     /// 渲染期收集到的封面需求（虚拟列表只渲染可见行，所以这里排的就是
-    /// 「当前真正看得见」的那些封面）。由后台循环定期消费。
-    pub cover_requests: Arc<Mutex<Vec<String>>>,
+    /// 「当前真正看得见」的那些封面）。由后台循环消费，新需求会立刻叫醒它。
+    pub cover_mailbox: Arc<CoverMailbox>,
     /// 真实播放过的曲目 id（最近在后）。用于队列抽屉的「已播放」分区；
     /// 不能用「当前下标之前」来推 —— 那会把跳过的歌也算进去（实测踩过）。
     pub played_history: Vec<String>,
@@ -746,6 +783,8 @@ impl Root {
             tracker.acknowledge(baseline);
             Arc::new(Mutex::new(tracker))
         };
+        let (cover_wake, mut cover_wake_rx) = futures_channel::mpsc::channel::<()>(1);
+        let cover_mailbox = Arc::new(CoverMailbox::new(cover_wake));
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -917,7 +956,7 @@ impl Root {
             theme_snapshot_key: None,
             queue_cache: (0, Arc::new(Vec::new())),
             cover_store: CoverStore::default(),
-            cover_requests: Arc::new(Mutex::new(Vec::new())),
+            cover_mailbox,
             original_covers: HashMap::new(),
             original_cover_attempted: Arc::new(Mutex::new(HashSet::new())),
             original_cover_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1076,39 +1115,42 @@ impl Root {
             cx.notify();
         }
         // 封面需求消费循环：渲染只往邮箱里塞 URL，去重交给 CoverStore::want。
-        // 队列空了降到 500ms 醒一次；有新图排进来立刻回到 60ms（#255）。
+        // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒（#255）。
         {
-            let queue = root.cover_requests.clone();
-            cx.spawn(async move |this, cx| {
-                let mut idle = false;
-                loop {
-                    let wait_ms = if idle { 500 } else { 60 };
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(wait_ms))
-                        .await;
-                    let pending: Vec<String> = {
-                        let mut queue = match queue.lock() {
-                            Ok(queue) => queue,
-                            Err(_) => continue,
-                        };
-                        std::mem::take(&mut *queue)
-                    };
-                    let had_demand = !pending.is_empty();
-                    let stats = this.update(cx, |root, cx| root.ensure_covers(&pending, cx));
-                    let Ok((queued, dropped)) = stats else {
-                        break;
-                    };
-                    idle = queued == 0;
-                    if had_demand && log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
-                        let queued = queued.to_string();
-                        let dropped = dropped.to_string();
-                        log_event(
-                            LogLevel::Debug,
-                            LogTopic::App,
-                            "cover_queue",
-                            &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
-                        );
+            let mailbox = root.cover_mailbox.clone();
+            cx.spawn(async move |this, cx| loop {
+                let pending = mailbox.take();
+                let had_demand = !pending.is_empty();
+                let (queued, dropped) = if had_demand {
+                    match this.update(cx, |root, cx| root.ensure_covers(&pending, cx)) {
+                        Ok(stats) => stats,
+                        Err(_) => break,
                     }
+                } else {
+                    (0, 0)
+                };
+                if had_demand && log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+                    let queued = queued.to_string();
+                    let dropped = dropped.to_string();
+                    log_event(
+                        LogLevel::Debug,
+                        LogTopic::App,
+                        "cover_queue",
+                        &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
+                    );
+                }
+                if queued > 0 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(60))
+                        .await;
+                } else {
+                    let idle = cx
+                        .background_executor()
+                        .timer(std::time::Duration::from_millis(500));
+                    let _ = futures_lite::future::or(idle, async {
+                        let _ = cover_wake_rx.next().await;
+                    })
+                    .await;
                 }
             })
             .detach();

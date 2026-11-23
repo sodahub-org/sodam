@@ -14,7 +14,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     );
     let cards = root.scene_cards.clone();
     let covers = root.cover_store.paths_snapshot();
-    let cover_requests = root.cover_requests.clone();
+    let cover_mailbox = root.cover_mailbox.clone();
     let selected_scene = root
         .recommendation
         .as_ref()
@@ -166,11 +166,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         continue;
                     };
                     let url = card.playlist.cover.clone();
-                    let cached = covers.get(&url).cloned();
+                    let cached = covers.get(&url);
                     if cached.is_none() && !url.is_empty() {
-                        if let Ok(mut pending) = cover_requests.lock() {
-                            pending.push(url.clone());
-                        }
+                        cover_mailbox.request(url.clone());
                     }
 
                     let subtitle = if card.kind == sodam_core::library::SceneCardKind::Radio {

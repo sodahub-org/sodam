@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// 缩略图下载的并发上限。
 pub const MAX_CONCURRENCY: usize = 8;
@@ -30,6 +30,46 @@ pub enum CoverOutcome {
     Vanished,
     /// 没拿到可用路径，按失败记一次。
     Failed,
+}
+
+/// 已完成路径的只读句柄：渲染闭包克隆它查图，不用整表复制。
+#[derive(Debug, Clone, Default)]
+pub struct CoverPaths {
+    inner: Arc<RwLock<HashMap<String, PathBuf>>>,
+}
+
+impl CoverPaths {
+    /// 查一张图的本地路径（只查内存）。
+    pub fn get(&self, url: &str) -> Option<PathBuf> {
+        let paths = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths.get(url.trim()).cloned()
+    }
+
+    fn insert(&self, url: &str, path: PathBuf) {
+        let mut paths = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths.insert(url.to_string(), path);
+    }
+
+    fn remove(&self, url: &str) {
+        let mut paths = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        paths.remove(url);
+    }
+
+    fn clear(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +97,8 @@ pub struct CoverStore {
     records: HashMap<String, Record>,
     queue: VecDeque<String>,
     inflight: HashSet<String>,
-    /// 渲染闭包够不到 `Root`，用它拿一份只读快照。
-    ready: Arc<HashMap<String, PathBuf>>,
+    /// 渲染闭包够不到 `Root`，用它拿一个只读句柄。
+    ready: CoverPaths,
     colors: HashMap<String, CoverRgb>,
     /// 在飞期间被 `forget` 的 URL：这次结果作废，结束后退回 `Idle`。
     abandoned: HashSet<String>,
@@ -74,7 +114,7 @@ impl CoverStore {
         let mut queued = Vec::new();
         for raw in urls {
             let url = raw.trim();
-            if url.is_empty() || self.ready.contains_key(url) {
+            if url.is_empty() || self.ready.get(url).is_some() {
                 continue;
             }
             let can_queue = self
@@ -126,7 +166,7 @@ impl CoverStore {
                 record.state = State::Idle;
                 record.failures = 0;
             }
-            Arc::make_mut(&mut self.ready).remove(url);
+            self.ready.remove(url);
             self.colors.remove(url);
             return;
         }
@@ -135,7 +175,7 @@ impl CoverStore {
                 let record = self.records.entry(url.to_string()).or_default();
                 record.state = State::Ready;
                 record.failures = 0;
-                Arc::make_mut(&mut self.ready).insert(url.to_string(), path);
+                self.ready.insert(url, path);
                 match color {
                     Some(color) => {
                         self.colors.insert(url.to_string(), color);
@@ -149,7 +189,7 @@ impl CoverStore {
                 if let Some(record) = self.records.get_mut(url) {
                     record.state = State::Idle;
                 }
-                Arc::make_mut(&mut self.ready).remove(url);
+                self.ready.remove(url);
                 self.colors.remove(url);
             }
             CoverOutcome::Failed => {
@@ -190,7 +230,7 @@ impl CoverStore {
             } else {
                 self.records.remove(url);
             }
-            Arc::make_mut(&mut self.ready).remove(url);
+            self.ready.remove(url);
             self.colors.remove(url);
         }
     }
@@ -206,17 +246,17 @@ impl CoverStore {
                 record.failures = 0;
             }
         }
-        self.ready = Arc::new(HashMap::new());
+        self.ready.clear();
         self.colors.clear();
     }
 
     /// 原图先下回来时给列表兜个底：只发布路径，不动在飞 / 排队记账。
     pub fn adopt_thumbnail(&mut self, url: &str, path: PathBuf) {
         let url = url.trim();
-        if url.is_empty() || self.ready.contains_key(url) {
+        if url.is_empty() || self.ready.get(url).is_some() {
             return;
         }
-        Arc::make_mut(&mut self.ready).insert(url.to_string(), path);
+        self.ready.insert(url, path);
         if let Some(record) = self.records.get_mut(url) {
             if matches!(record.state, State::Idle | State::Ready | State::Failed) {
                 record.state = State::Ready;
@@ -226,8 +266,8 @@ impl CoverStore {
     }
 
     /// 本地路径：只查内存。
-    pub fn path(&self, url: &str) -> Option<&PathBuf> {
-        self.ready.get(url.trim())
+    pub fn path(&self, url: &str) -> Option<PathBuf> {
+        self.ready.get(url)
     }
 
     /// 氛围色：只查内存。
@@ -235,14 +275,18 @@ impl CoverStore {
         self.colors.get(url.trim()).copied()
     }
 
-    /// 全部已完成路径：只读。
-    pub fn paths(&self) -> &HashMap<String, PathBuf> {
-        &self.ready
+    /// 全部已完成路径的一份拷贝：只读，且只在清缓存 / 淘汰这种低频路径用。
+    pub fn paths(&self) -> HashMap<String, PathBuf> {
+        self.ready
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
-    /// 渲染闭包用的只读快照；克隆的是 `Arc`，不复制表。
-    pub fn paths_snapshot(&self) -> Arc<HashMap<String, PathBuf>> {
-        Arc::clone(&self.ready)
+    /// 渲染闭包用的只读句柄；克隆的是 `Arc`，不复制表。
+    pub fn paths_snapshot(&self) -> CoverPaths {
+        self.ready.clone()
     }
 
     /// 取走这轮 `want` 挤掉的张数（日志用）。
@@ -265,7 +309,7 @@ impl CoverStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoverOutcome, CoverStore, MAX_QUEUE};
+    use super::{CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_QUEUE};
     use std::path::PathBuf;
 
     fn urls(items: &[&str]) -> Vec<String> {
@@ -397,6 +441,30 @@ mod tests {
         assert_eq!(store.want(&urls(&["downloading"])).len(), 1);
     }
 
+    /// 清缓存不能作废还在排队、没轮到泵的 URL。
+    #[test]
+    fn clear_completed_keeps_queued_that_never_started() {
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_CONCURRENCY + 2)
+            .map(|index| format!("cover-{index}"))
+            .collect();
+        assert_eq!(store.want(&many).len(), MAX_CONCURRENCY + 2);
+
+        let started = store.drain();
+        assert_eq!(started.len(), MAX_CONCURRENCY);
+        let queued_tail = many[MAX_CONCURRENCY].clone();
+
+        store.clear_completed();
+        assert!(
+            store.want(std::slice::from_ref(&queued_tail)).is_empty(),
+            "排队中的不能被清缓存作废"
+        );
+
+        // 让出一个在飞位，排队项要照常泵出。
+        store.complete(&started[0], ready("/tmp/a.img"));
+        assert_eq!(store.drain(), vec![queued_tail]);
+    }
+
     /// 在飞时 forget 不能立刻放行，否则同一张会同时下两遍。
     #[test]
     fn forget_keeps_inflight_until_completion() {
@@ -435,27 +503,31 @@ mod tests {
     }
 
     /// 验收：查路径 / 查颜色 / 取快照不触发取图。
+    ///
+    /// 假取图只挂在泵上；渲染侧那圈只读调用碰不到它，计数必须还是 0。
     #[test]
     fn read_ports_never_fetch() {
+        let fetch_calls = std::cell::Cell::new(0);
+        let fetch = |_: &str| {
+            fetch_calls.set(fetch_calls.get() + 1);
+            ready("/tmp/a.img")
+        };
         let mut store = CoverStore::default();
         store.want(&urls(&["cover-a"]));
-        let mut fetches = 0;
+
         for _ in 0..10 {
             let _ = store.path("cover-a");
             let _ = store.color("cover-a");
             let _ = store.paths();
-            let _ = store.paths_snapshot();
+            let _ = store.paths_snapshot().get("cover-a");
         }
-        assert_eq!(fetches, 0, "读口子不能取图");
+        assert_eq!(fetch_calls.get(), 0, "读口子不能取图");
 
-        let pump = |store: &mut CoverStore, fetches: &mut usize| {
-            for url in store.drain() {
-                *fetches += 1;
-                store.complete(&url, ready("/tmp/a.img"));
-            }
-        };
-        pump(&mut store, &mut fetches);
-        assert_eq!(fetches, 1, "只有泵才取图");
+        for url in store.drain() {
+            let outcome = fetch(&url);
+            store.complete(&url, outcome);
+        }
+        assert_eq!(fetch_calls.get(), 1, "只有泵才取图");
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。

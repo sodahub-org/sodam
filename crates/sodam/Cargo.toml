@@ -19,6 +19,9 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 unicode-segmentation = "1.13.3"
+# 封面邮箱：渲染推需求时叫醒消费循环，空队列时只等 500ms。
+futures-channel = "0.3"
+futures-lite = "2"
 
 # StatusNotifier 托盘是 Linux 桌面协议，macOS 上没有 D-Bus session bus。
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -26,7 +29,6 @@ ksni = "0.2"
 # 系统媒体控制：MPRIS（playerctl / 桌面挂件 / 合成器绑的媒体键）。
 mpris-server = "0.10"
 tokio = { version = "1", features = ["sync"] }
-futures-lite = "2"
 
 # macOS / Windows 共用 tray-icon：macOS 走 NSStatusItem，Windows 走 shell 通知区域。
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]

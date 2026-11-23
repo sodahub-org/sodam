@@ -695,7 +695,7 @@ impl Root {
         // 淘汰到回调之间下载可能把文件重建回来。还活着的路径不当成被删，
         // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
         let (thumb_urls, original_urls) = urls_for_removed_paths(
-            self.cover_store.paths(),
+            &self.cover_store.paths(),
             &self.original_covers,
             removed,
             |path| !path.exists(),
@@ -3308,7 +3308,7 @@ impl Root {
 
     /// 封面本地路径（渲染路径唯一入口：只查状态，不发请求）。
     pub fn cover_of(&self, url: &str) -> Option<PathBuf> {
-        self.cover_store.path(url).cloned()
+        self.cover_store.path(url)
     }
 
     /// 把封面交给 CoverStore；缺图时渲染先显示占位块。

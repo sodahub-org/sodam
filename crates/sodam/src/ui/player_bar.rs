@@ -947,7 +947,7 @@ fn queue_drawer_inner(
     let slots = Arc::new(queue_slots(root));
     let tracks = root.queue_cache.1.clone();
     let covers = root.cover_store.paths_snapshot();
-    let cover_requests = root.cover_requests.clone();
+    let cover_mailbox = root.cover_mailbox.clone();
     let liked_ids = root.liked_ids.clone();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
     let unplayable = root.unplayable.snapshot();
@@ -972,12 +972,10 @@ fn queue_drawer_inner(
                             return div().h(px(QUEUE_ROW_H)).into_any_element();
                         };
                         let url = track.cover.clone();
-                        let cached = covers.get(&url).cloned();
+                        let cached = covers.get(&url);
                         // 只有渲染出来的行才排队取封面（虚拟列表只渲染可见行）
                         if cached.is_none() && !url.is_empty() {
-                            if let Ok(mut queue) = cover_requests.lock() {
-                                queue.push(url.clone());
-                            }
+                            cover_mailbox.request(url.clone());
                         }
                         let title = track.title.clone();
                         let artist = track.artist.clone();

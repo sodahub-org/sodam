@@ -598,7 +598,7 @@ fn search_track_row(
         tracks,
         root.liked_ids.clone(),
         root.cover_store.paths_snapshot(),
-        root.cover_requests.clone(),
+        root.cover_mailbox.clone(),
         root.queue.current().map(|track| track.id.clone()),
         unplayable,
     )
@@ -719,7 +719,7 @@ fn search_results_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     Nav::Search,
                     root.liked_ids.clone(),
                     root.cover_store.paths_snapshot(),
-                    root.cover_requests.clone(),
+                    root.cover_mailbox.clone(),
                     cx,
                 )
             }
