@@ -17,7 +17,10 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::upgrade::{stop_reason, Outcome, StopReason, StreamShape, Tally};
+use sodam_core::upgrade::{
+    identity_change, stop_reason, IdentityChange, Outcome, StopConditions, StopReason, StreamShape,
+    Tally,
+};
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -802,9 +805,14 @@ impl Root {
             return;
         }
         // 批量升级期间清缓存，剩下的每一首都会以「文件已被删」失败，结尾还报成功。
-        // 直接拦住：先取消批量，或者等它跑完再清。
+        // 直接拦住：先取消批量，或者等它跑完再清。已经点过取消的另说一句——
+        // 那时 `batch_upgrading` 要等这一首跑完才落假，再让人「先取消」等于让他干等。
         if self.batch_upgrading {
-            let message = self.tr("批量升级进行中，请先取消再清空缓存");
+            let message = if self.batch_upgrade_cancel {
+                self.tr("正在停止批量升级，等这一首跑完再清缓存")
+            } else {
+                self.tr("批量升级进行中，请先取消再清空缓存")
+            };
             self.notify_warning_once("cache-clear-blocked", message);
             cx.notify();
             return;
@@ -3172,6 +3180,9 @@ impl Root {
 
         // 点下去那一刻的身份代数：扫盘也要几百毫秒，期间登出/换号的话这一批一个都不该发。
         let start_epoch = self.auth_epoch;
+        // 收尾文案要分清「真的换了号」和「同一账号的会员状态刷新」：两者都推进代数，
+        // 但后者报「账号已变更」是撒谎。账号信息没加载出来时也不说换了号。
+        let start_user_id = self.account.as_ref().map(|account| account.user_id.clone());
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
@@ -3303,9 +3314,19 @@ impl Root {
                     let counts = [tally.total().to_string(), total.to_string()];
                     match stopped {
                         Some(StopReason::IdentityChanged) => {
-                            // 状态行说清：剩下的不再拿旧号跑。
+                            // 会员状态刷新也会推进代数：只有真换了号才说「账号已变更」。
+                            let current_user_id = root
+                                .account
+                                .as_ref()
+                                .map(|account| account.user_id.as_str());
                             let message =
-                                root.localized("账号已变更，批量已停止 ({} / {})", &counts);
+                                match identity_change(start_user_id.as_deref(), current_user_id) {
+                                    IdentityChange::AccountChanged => {
+                                        root.localized("账号已变更，批量已停止 ({} / {})", &counts)
+                                    }
+                                    IdentityChange::LoginStateChanged => root
+                                        .localized("登录状态已变化，批量已停止 ({} / {})", &counts),
+                                };
                             root.notify_warning_once("batch-upgrade-stopped", message);
                         }
                         Some(StopReason::LoggingOut) => {
@@ -3342,12 +3363,12 @@ impl Root {
 
     /// 这一轮批量现在该不该停。判据全在 [`stop_reason`] 里，这里只负责把状态喂进去。
     fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
-        stop_reason(
+        stop_reason(StopConditions {
             start_epoch,
-            self.auth_epoch,
-            self.batch_upgrade_cancel,
-            self.logout_in_flight,
-        )
+            current_epoch: self.auth_epoch,
+            cancelled: self.batch_upgrade_cancel,
+            logging_out: self.logout_in_flight,
+        })
     }
 
     /// 取消批量升级：只停在下一首之前，正在下的那一首不打断（底层没有取消句柄）。

@@ -33,23 +33,59 @@ impl StopReason {
     }
 }
 
+/// 判断批量该不该停的输入。
+///
+/// 字段带名字：两个布尔挨着当参数，调用点把 `cancelled` 和 `logging_out` 写反了照样编译，
+/// 症状是点取消却弹「正在退出登录」。
+#[derive(Debug, Clone, Copy)]
+pub struct StopConditions {
+    pub start_epoch: u64,
+    pub current_epoch: u64,
+    pub cancelled: bool,
+    pub logging_out: bool,
+}
+
 /// 下一首之前该不该停。
 ///
 /// 优先级：正在退出登录 > 身份变了 > 用户取消。登出还在落盘也停，理由见
 /// [`StopReason::LoggingOut`]；身份和取消同时来也报身份变了，用户先要处理换号。
-pub fn stop_reason(
-    start_epoch: u64,
-    current_epoch: u64,
-    cancelled: bool,
-    logging_out: bool,
-) -> Option<StopReason> {
-    if logging_out {
+pub fn stop_reason(conditions: StopConditions) -> Option<StopReason> {
+    if conditions.logging_out {
         return Some(StopReason::LoggingOut);
     }
-    if current_epoch != start_epoch {
+    if conditions.current_epoch != conditions.start_epoch {
         return Some(StopReason::IdentityChanged);
     }
-    cancelled.then_some(StopReason::Cancelled)
+    conditions.cancelled.then_some(StopReason::Cancelled)
+}
+
+/// 批量因身份代数推进停下时，到底是真换了号，还是同一账号的登录状态变化。
+///
+/// 会员状态刷新也会推进 `auth_epoch`，但用户没换号，文案不能说「账号已变更」；
+/// 两端账号 id 有一端没读到，也不下这个判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityChange {
+    /// 两端账号 id 都读到了，而且不一样：真换了号。
+    AccountChanged,
+    /// 账号 id 没变、有一端没读到、或本来就没登录：只说登录状态变了。
+    LoginStateChanged,
+}
+
+/// 对齐起始与停下那一刻的账号 id，判断是不是真换了号。
+///
+/// 空串和只有空格的值按「没读到」处理：接口给的 user_id 可能为空，不能拿它和真账号
+/// 比出「换了号」。
+pub fn identity_change(
+    start_user_id: Option<&str>,
+    current_user_id: Option<&str>,
+) -> IdentityChange {
+    fn read(id: Option<&str>) -> Option<&str> {
+        id.map(str::trim).filter(|value| !value.is_empty())
+    }
+    match (read(start_user_id), read(current_user_id)) {
+        (Some(before), Some(now)) if before != now => IdentityChange::AccountChanged,
+        _ => IdentityChange::LoginStateChanged,
+    }
 }
 
 /// 一份缓存流的样子：档位分 + 是不是试听片段。
@@ -86,7 +122,7 @@ pub enum Outcome {
 impl Outcome {
     /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
     ///
-    /// 档位分走 [`crate::quality::readable_rank`] 那一道闸：0 分是「量过但认不出」，
+    /// 档位分走 `readable_rank` 那一道闸：0 分是「量过但认不出」，
     /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
     /// 会被当成一次升级。
     pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
@@ -170,14 +206,27 @@ mod tests {
     /// 换号之后，下一首之前就停；报的是身份变了。
     #[test]
     fn identity_change_stops_before_the_next_track() {
-        assert_eq!(stop_reason(7, 7, false, false), None);
+        let same = StopConditions {
+            start_epoch: 7,
+            current_epoch: 7,
+            cancelled: false,
+            logging_out: false,
+        };
+        assert_eq!(stop_reason(same), None);
         assert_eq!(
-            stop_reason(7, 8, false, false),
+            stop_reason(StopConditions {
+                current_epoch: 8,
+                ..same
+            }),
             Some(StopReason::IdentityChanged)
         );
         // 取消和换号同时到：报身份那次，那才是用户要处理的事。
         assert_eq!(
-            stop_reason(7, 8, true, false),
+            stop_reason(StopConditions {
+                current_epoch: 8,
+                cancelled: true,
+                ..same
+            }),
             Some(StopReason::IdentityChanged)
         );
     }
@@ -185,16 +234,87 @@ mod tests {
     /// 取消之后不再发下一首。
     #[test]
     fn cancel_stops_before_the_next_track() {
-        assert_eq!(stop_reason(3, 3, true, false), Some(StopReason::Cancelled));
-        assert_eq!(stop_reason(3, 3, false, false), None);
+        let running = StopConditions {
+            start_epoch: 3,
+            current_epoch: 3,
+            cancelled: false,
+            logging_out: false,
+        };
+        assert_eq!(stop_reason(running), None);
+        assert_eq!(
+            stop_reason(StopConditions {
+                cancelled: true,
+                ..running
+            }),
+            Some(StopReason::Cancelled)
+        );
     }
 
     /// 正在退出登录压过另外两条：落盘可能失败、账号还在，这时候说「账号已变更」没把握。
     #[test]
     fn logging_out_wins_over_identity_and_cancel() {
-        assert_eq!(stop_reason(7, 7, false, true), Some(StopReason::LoggingOut));
-        assert_eq!(stop_reason(7, 8, false, true), Some(StopReason::LoggingOut));
-        assert_eq!(stop_reason(7, 8, true, true), Some(StopReason::LoggingOut));
+        let logging_out = StopConditions {
+            start_epoch: 7,
+            current_epoch: 7,
+            cancelled: false,
+            logging_out: true,
+        };
+        assert_eq!(stop_reason(logging_out), Some(StopReason::LoggingOut));
+        assert_eq!(
+            stop_reason(StopConditions {
+                current_epoch: 8,
+                ..logging_out
+            }),
+            Some(StopReason::LoggingOut)
+        );
+        assert_eq!(
+            stop_reason(StopConditions {
+                current_epoch: 8,
+                cancelled: true,
+                ..logging_out
+            }),
+            Some(StopReason::LoggingOut)
+        );
+    }
+
+    /// 只有两端账号 id 都读到且不同，才算真换号。
+    #[test]
+    fn identity_change_is_only_account_change_when_ids_differ() {
+        assert_eq!(
+            identity_change(Some("8801"), Some("8802")),
+            IdentityChange::AccountChanged
+        );
+        // 同账号的会员状态刷新：代数变了，但号没变。
+        assert_eq!(
+            identity_change(Some("8801"), Some("8801")),
+            IdentityChange::LoginStateChanged
+        );
+        // 有一端没读到账号：不下「换了号」的结论。
+        assert_eq!(
+            identity_change(None, Some("8801")),
+            IdentityChange::LoginStateChanged
+        );
+        assert_eq!(
+            identity_change(Some("8801"), None),
+            IdentityChange::LoginStateChanged
+        );
+        assert_eq!(
+            identity_change(None, None),
+            IdentityChange::LoginStateChanged
+        );
+        assert_eq!(
+            identity_change(Some("8801"), Some("")),
+            IdentityChange::LoginStateChanged
+        );
+        assert_eq!(
+            identity_change(Some("8801"), Some("  ")),
+            IdentityChange::LoginStateChanged
+        );
+        // 两端只有空白差异：同一个号。
+        assert_eq!(
+            identity_change(Some(" 8801 "), Some("8801")),
+            IdentityChange::LoginStateChanged
+        );
     }
 
     /// 档位没真提升不算成功。

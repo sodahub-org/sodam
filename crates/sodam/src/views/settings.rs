@@ -1066,8 +1066,10 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         .text_color(theme::text_muted())
                         .child(root.tr("自动清理较早使用的歌曲；正在播放或下载的文件暂时保留")),
                 )
-                .child(
-                    div()
+                .child({
+                    // 批量升级期间清缓存会被拦下：按钮直接画成不可点，别让人点了才看到提示。
+                    // 已经点过取消时例外：那时 `batch_upgrading` 还没落假，点了会说清在等什么。
+                    let mut btn = div()
                         .id("clear-cache")
                         .flex()
                         .items_center()
@@ -1075,20 +1077,27 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         .h(px(theme::size::CONTROL))
                         .w(px(140.0))
                         .rounded(px(theme::radius::ROW))
-                        .bg(theme::surface_elevated())
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme::surface_hover()))
-                        .text_size(theme::Text::Small.size())
-                        .text_color(theme::text())
-                        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                            root.clear_cache(cx);
-                        }))
-                        .child(if root.cache_clearing {
-                            root.tr("正在清理…")
-                        } else {
-                            root.tr("清空缓存")
-                        }),
-                )
+                        .text_size(theme::Text::Small.size());
+                    if root.batch_upgrading && !root.batch_upgrade_cancel {
+                        btn = btn
+                            .bg(theme::surface_elevated())
+                            .text_color(theme::text_faint());
+                    } else {
+                        btn = btn
+                            .bg(theme::surface_elevated())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .text_color(theme::text())
+                            .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                                root.clear_cache(cx);
+                            }));
+                    }
+                    btn.child(if root.cache_clearing {
+                        root.tr("正在清理…")
+                    } else {
+                        root.tr("清空缓存")
+                    })
+                })
                 .child(
                     div()
                         .flex()
