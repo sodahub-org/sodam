@@ -774,27 +774,27 @@ impl Root {
     /// `pending_track.or(queue.current())`。
     pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
         self.original_covers.clear();
-        // 锁中毒自恢复，跟 ensure_original_cover / load_lyrics 对同两把锁的口径一致；
-        // 这里若静默跳过，attempted 没清，ensure 会早退，原图就补不回来。
-        let mut attempted = self
-            .original_cover_attempted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut wait_list = self
-            .original_cover_pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        attempted.clear();
-        wait_list.clear();
-        drop(attempted);
-        drop(wait_list);
+        // 清状态放在块里：锁跟着块结束自动释放。ensure_original_cover 里还会锁
+        // original_cover_attempted，同一线程重入 std::sync::Mutex 会卡住，而这里
+        // 跑在 UI 更新回调上，卡住就是挂界面。别把 ensure 挪进这个块。
+        {
+            // 锁中毒自恢复，跟 ensure_original_cover / load_lyrics 对同两把锁一致；
+            // 静默跳过的话 attempted 没清，ensure 早退，原图就补不回来。
+            let mut attempted = self
+                .original_cover_attempted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut wait_list = self
+                .original_cover_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attempted.clear();
+            wait_list.clear();
+        }
         let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
             return;
         };
-        // 已知取舍：若这首原图此刻正在下载（inflight 已 +1），清 attempted 后
-        // ensure 会把它当首次见、再 spawn 一次同 URL 下载，多一份内存峰值和请求。
-        // 不额外维护在飞 URL 集合去留，代价小、图也照样回来；要根治得改原图的
-        // 在飞去重设计，另立票。
+        // 这张原图若此刻正在下载，会多下一次同一 URL（attempted 清了、inflight 没动）。
         self.ensure_original_cover(&url, cx);
     }
 
