@@ -598,7 +598,6 @@ impl Language {
                 "Scan and confirm with the Qishui Music app."
             }
             "登录成功，正在读取账号信息…" => "Signed in. Loading account…",
-            "登录成功（会话未初始化）" => "Signed in (session not initialized)",
             "二维码已过期，正在自动换新码…" => "QR code expired. Refreshing…",
             "二维码有效期未知" => "QR expiry unavailable",
             "二维码剩余 {} 分 {} 秒" => "QR code expires in {}m {}s",
