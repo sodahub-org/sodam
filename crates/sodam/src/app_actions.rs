@@ -1401,8 +1401,8 @@ impl Root {
                         root.cover_store.adopt_thumbnail(&fetch_url, path);
                     }
                     if retryable {
-                        // 文件被清缓存 / 淘汰删掉，或第一次下载失败：
-                        // `complete_original` 已经退回可重排（失败次数到顶的除外）。
+                        // 文件被清缓存 / 淘汰删掉，或下载失败：`complete_original`
+                        // 已经记了一次尝试；两次到顶就不再重排。
                         // 清缓存进行中交给它的补偿；当前曲目在这里补一次，
                         // 歌词页不用等下一次切歌或手动点重试。
                         let displayed_cover =

@@ -494,10 +494,16 @@ impl CoverStore {
                 self.original_paths.insert(url, path);
             }
             CoverOutcome::Vanished => {
-                if let Some(record) = self.records.get_mut(url) {
-                    record.original.state = State::Idle;
-                }
-                // 文件已经没了：死路径不能留，否则下一次查询会当成命中。
+                let record = self.records.entry(url.to_string()).or_default();
+                // 文件没了也算一次尝试：每次重下都撞上「解析出路径但文件已被删」
+                // 时不能无限重排，两次后先放弃，等 `forget` / 清缓存再试。
+                record.original.failures = record.original.failures.saturating_add(1);
+                record.original.state = if record.original.failures >= MAX_FAILURES {
+                    State::Failed
+                } else {
+                    State::Idle
+                };
+                // 死路径不能留，否则下一次查询会当成命中。
                 self.original_paths.remove(url);
             }
             CoverOutcome::Failed => {
@@ -604,17 +610,19 @@ impl CoverStore {
             .retain_only(url.trim(), &mut self.records, original_slot);
     }
 
-    /// 清缓存后作废「已完成」的结果：两格里的 `Ready` / `Failed` 都退回 `Idle`。
+    /// 清缓存后作废「已完成」的结果：两格里的 `Ready` / `Failed` 都退回 `Idle`，
+    /// 所有格的失败次数清零。
     ///
-    /// 排队和在飞原样保留：丢掉在飞状态只会让同一张图再排一次，
+    /// 排队和在飞状态原样保留：丢掉在飞状态只会让同一张图再排一次，
     /// 个别情况下并发下两遍。
     pub fn clear_completed(&mut self) {
         for record in self.records.values_mut() {
             for slot in [&mut record.thumbnail, &mut record.original] {
                 if matches!(slot.state, State::Ready | State::Failed) {
                     slot.state = State::Idle;
-                    slot.failures = 0;
                 }
+                // 失败次数一律清零：清缓存后从两次新机会开始。
+                slot.failures = 0;
             }
         }
         self.thumbnail_paths.clear();
@@ -1064,6 +1072,26 @@ mod tests {
         assert!(store.want_original(url), "作废之后能重新下");
     }
 
+    /// 清缓存后失败次数从零开始，不会带着上一次的 1 直接到顶。
+    #[test]
+    fn clear_completed_resets_attempt_count_even_when_idle() {
+        let mut store = CoverStore::default();
+        let url = "original-a";
+
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Failed);
+
+        store.clear_completed();
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Failed);
+        assert!(
+            store.want_original(url),
+            "清缓存后第二次失败仍算第一次，还能再试"
+        );
+    }
+
     /// 验收：第一次失败后还能再排一次，第二次成功就正常落账。
     #[test]
     fn original_first_failure_can_succeed_on_second_attempt() {
@@ -1222,6 +1250,27 @@ mod tests {
             vec!["original-b".to_string()],
             "文件没了才补排"
         );
+    }
+
+    /// 文件每次都被删（`Vanished`）也不能无限重排：两次后先放弃，作废再重下。
+    #[test]
+    fn original_vanished_twice_gives_up_until_forgotten() {
+        let mut store = CoverStore::default();
+        let url = "original-a";
+
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Vanished);
+        assert!(store.original_path(url).is_none(), "死路径不能发布");
+        assert!(store.want_original(url), "文件没了第一次还能再试");
+
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Vanished);
+        assert!(!store.want_original(url), "两次都撞上文件已没就先放弃");
+        assert!(store.drain_original().is_empty());
+
+        store.forget([url]);
+        assert!(store.want_original(url), "作废之后能重新下");
     }
 
     /// 原图在飞时作废，结果回来后同样不能重复下；有人要就补排。
