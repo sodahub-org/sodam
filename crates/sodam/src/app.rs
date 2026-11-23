@@ -47,6 +47,8 @@ pub(crate) struct CoverMailbox {
 struct CoverMailboxInner {
     queue: Vec<String>,
     wake: futures_channel::mpsc::Sender<()>,
+    /// 消费循环已退出只记一次，别让每次推需求都刷一条日志。
+    wake_closed_logged: bool,
 }
 
 impl CoverMailbox {
@@ -55,6 +57,7 @@ impl CoverMailbox {
             inner: Mutex::new(CoverMailboxInner {
                 queue: Vec::new(),
                 wake,
+                wake_closed_logged: false,
             }),
         }
     }
@@ -66,7 +69,14 @@ impl CoverMailbox {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queue.push(url);
-        let _ = inner.wake.try_send(());
+        if let Err(error) = inner.wake.try_send(()) {
+            // 通道满说明已经有一个叫醒信号在路上，不用管；接收端没了说明消费循环
+            // 已经退出，需求只会堆在邮箱里，留一条日志让人能查。
+            if error.is_disconnected() && !inner.wake_closed_logged {
+                inner.wake_closed_logged = true;
+                log_event(LogLevel::Warn, LogTopic::App, "cover_wake_closed", &[]);
+            }
+        }
     }
 
     fn take(&self) -> Vec<String> {
@@ -1124,7 +1134,7 @@ impl Root {
             cx.notify();
         }
         // 封面需求消费循环：渲染只往邮箱里塞 URL，去重交给 CoverStore::want。
-        // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒（#255）。
+        // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒。
         {
             let mailbox = root.cover_mailbox.clone();
             cx.spawn(async move |this, cx| loop {
@@ -1138,7 +1148,9 @@ impl Root {
                 } else {
                     CoverWant::default()
                 };
-                if had_demand && log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+                if stats.queued + stats.dropped > 0
+                    && log_outlet::enabled(LogLevel::Debug, LogTopic::App)
+                {
                     let queued = stats.queued.to_string();
                     let dropped = stats.dropped.to_string();
                     log_event(

@@ -724,7 +724,7 @@ impl Root {
         // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
         let thumb_urls = self
             .cover_store
-            .paths_snapshot()
+            .paths_handle()
             .urls_for_removed_paths(removed, |path| !path.exists());
         let original_urls =
             urls_for_removed_paths(&self.original_covers, removed, |path| !path.exists());
@@ -801,8 +801,7 @@ impl Root {
             let removed = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_clearing = false;
-                // 文件已清理，已完成的结果作废；排队 / 在飞保留，免得同一张下两遍
-                //（这是 #250 定下的清缓存语义）。
+                // 文件已清理，已完成的结果作废；排队 / 在飞保留，免得同一张下两遍。
                 root.cover_store.clear_completed();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
@@ -3415,8 +3414,11 @@ impl Root {
     /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
     /// 返回这轮新入队 / 挤掉的张数，给消费循环降频和日志用。
     pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> CoverWant {
-        self.cover_store.want(urls);
-        let stats = self.cover_store.take_want_stats();
+        let queued = self.cover_store.want(urls);
+        let stats = CoverWant {
+            queued: queued.len(),
+            dropped: self.cover_store.take_dropped(),
+        };
         if stats.queued > 0 {
             self.pump_covers(cx);
         }
@@ -3465,11 +3467,9 @@ impl Root {
                         Some(_) => CoverOutcome::Vanished,
                         None => CoverOutcome::Failed,
                     };
-                    let published = matches!(outcome, CoverOutcome::Ready { .. });
                     root.cover_store.complete(&url, outcome);
-                    if published {
-                        cx.notify();
-                    }
+                    // 失败 / 文件已没也要重绘一次：渲染会重新请求，`want` 的两次上限兜底。
+                    cx.notify();
                     // 一个下载完成就补下一个，始终有界并发
                     root.pump_covers(cx);
                 });
@@ -5610,12 +5610,10 @@ mod tests {
         // alive-thumb 两侧都没被删，谁都不该动。
         assert!(!thumbs.contains("alive-thumb"));
 
-        // 被下载重建回来的路径不算缺，映射要留住。
-        let thumbs2 = urls_for_removed_paths(&covers, &removed, |_| true);
+        // 被下载重建回来的原图不算缺，映射要留住（缩略图那一侧由 core 用例覆盖）。
         let originals2 = urls_for_removed_paths(&originals, &removed, |p| {
             p != std::path::Path::new("covers/original/full-only.img")
         });
-        assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
     }
 

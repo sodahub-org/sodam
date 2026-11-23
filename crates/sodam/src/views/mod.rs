@@ -502,7 +502,7 @@ pub(crate) fn scrolling_detail_page(
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
     let liked_ids = root.liked_ids.clone();
-    let covers = root.cover_store.paths_snapshot();
+    let covers = root.cover_store.paths_handle();
     let cover_mailbox = root.cover_mailbox.clone();
     let albums = albums.clone();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
@@ -694,6 +694,9 @@ pub(crate) fn scrolling_detail_page(
         };
         let item = album.clone();
         let cover_path = covers.get(&album.cover);
+        if cover_path.is_none() && !album.cover.trim().is_empty() {
+            cover_mailbox.request(album.cover.clone());
+        }
         div()
             .id(gpui::ElementId::Name(
                 format!("detail-album-{}", album.id).into(),

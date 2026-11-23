@@ -1,7 +1,7 @@
 //! 封面缩略图状态：一条 URL 一条记录。
 //!
 //! 取图本身不在这里：这里只回答「这张问过没有 / 排到哪一步了 / 结果是什么」。
-//! 读口子（`path` / `color` / `paths_snapshot`）是纯内存查询，不碰磁盘也不发请求；
+//! 读口子（`path` / `color` / `paths_handle`）是纯内存查询，不碰磁盘也不发请求；
 //! 下载由调用方泵出去，结果再用 [`CoverStore::complete`] 交回来。
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -150,9 +150,7 @@ pub struct CoverStore {
     /// 作废期间又有人在等这张图：结果回来放行后要立刻重排，
     /// 否则重试按钮要等下一次渲染才生效。
     requeue_after_release: HashSet<String>,
-    /// 上一轮 `want` 新排进来的张数（日志用）。
-    last_queued: usize,
-    /// 队列满时挤掉的张数（日志用）。
+    /// 队列满时挤掉的张数（日志用；每轮 `want` 重新计数）。
     evicted: usize,
 }
 
@@ -161,8 +159,7 @@ impl CoverStore {
     ///
     /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
     pub fn want(&mut self, urls: &[String]) -> Vec<String> {
-        // 两个计数都按这一轮重置，日志里的 queued / dropped 才是同一口径。
-        self.last_queued = 0;
+        // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
         self.evicted = 0;
         let mut queued = Vec::new();
         for raw in urls {
@@ -170,11 +167,11 @@ impl CoverStore {
                 queued.push(raw.trim().to_string());
             }
         }
-        self.last_queued = queued.len();
         queued
     }
 
-    /// 单张入队；不动这一轮的统计口径（作废放行补排也走这里）。
+    /// 单张入队；入队数由 `want` 的返回值算，这里只可能在满队列时记一次 dropped
+    /// （作废放行补排也走这里）。
     fn enqueue(&mut self, url: &str) -> bool {
         if url.is_empty() || self.ready.contains(url) {
             return false;
@@ -297,7 +294,7 @@ impl CoverStore {
 
     /// 清缓存后作废「已完成」的结果：`Ready` / `Failed` 退回 `Idle`。
     ///
-    /// 排队和在飞原样保留（#250）：丢掉在飞状态只会让同一张图再排一次，
+    /// 排队和在飞原样保留：丢掉在飞状态只会让同一张图再排一次，
     /// 个别情况下并发下两遍。
     pub fn clear_completed(&mut self) {
         for record in self.records.values_mut() {
@@ -336,16 +333,13 @@ impl CoverStore {
     }
 
     /// 渲染闭包用的只读句柄；克隆的是 `Arc`，不复制表。
-    pub fn paths_snapshot(&self) -> CoverPaths {
+    pub fn paths_handle(&self) -> CoverPaths {
         self.ready.clone()
     }
 
-    /// 取走上一轮 `want` 的计数；两个数都清零。
-    pub fn take_want_stats(&mut self) -> CoverWant {
-        CoverWant {
-            queued: std::mem::take(&mut self.last_queued),
-            dropped: std::mem::take(&mut self.evicted),
-        }
+    /// 取走上一轮 `want` 因队列满挤掉的张数。
+    pub fn take_dropped(&mut self) -> usize {
+        std::mem::take(&mut self.evicted)
     }
 
     fn evict_oldest(&mut self) {
@@ -451,19 +445,19 @@ mod tests {
             .map(|index| format!("cover-{index}"))
             .collect();
         assert_eq!(store.want(&first).len(), MAX_QUEUE);
-        assert_eq!(store.take_want_stats().dropped, 0);
+        assert_eq!(store.take_dropped(), 0);
 
         let extra = urls(&["cover-extra"]);
         assert_eq!(store.want(&extra).len(), 1, "满了也要收新图");
-        assert_eq!(store.take_want_stats().dropped, 1, "挤掉了最旧的一张");
+        assert_eq!(store.take_dropped(), 1, "挤掉了最旧的一张");
 
         let oldest = urls(&["cover-0"]);
         assert_eq!(store.want(&oldest).len(), 1, "被挤掉的那张能重新排队");
-        assert_eq!(store.take_want_stats().dropped, 1);
+        assert_eq!(store.take_dropped(), 1);
         assert!(store.want(&oldest).is_empty(), "排进去之后不重复入队");
     }
 
-    /// #250：clear 只作废已完成，在飞原样保留；已完成的放行重排。
+    /// 清缓存只作废已完成的结果；在飞原样保留，已完成的放行重排。
     #[test]
     fn clear_completed_keeps_inflight_and_revives_done() {
         let mut store = CoverStore::default();
@@ -537,8 +531,6 @@ mod tests {
     /// 作废放行时的补排不能污染下一轮 want 的日志计数。
     #[test]
     fn requeue_after_release_keeps_want_stats_clean() {
-        use super::CoverWant;
-
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
         store.want(&url);
@@ -548,14 +540,7 @@ mod tests {
         store.complete("cover-a", CoverOutcome::Failed);
 
         assert_eq!(store.drain(), url, "补排已经回到队列");
-        assert_eq!(
-            store.take_want_stats(),
-            CoverWant {
-                queued: 0,
-                dropped: 0
-            },
-            "补排不能算进上一轮 want"
-        );
+        assert_eq!(store.take_dropped(), 0, "补排不能算进上一轮 want");
     }
 
     /// 在飞被 forget 之后又有人要（点重试）：结果回来要立刻补排。
@@ -608,10 +593,34 @@ mod tests {
         for _ in 0..10 {
             assert!(store.path("cover-a").is_none());
             assert!(store.color("cover-a").is_none());
-            assert!(store.paths_snapshot().get("cover-a").is_none());
+            assert!(store.paths_handle().get("cover-a").is_none());
         }
         assert!(store.want(&all).is_empty(), "读口子不能放行去重");
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
+    }
+
+    /// 淘汰反查只认「真没了」的路径：重建回来的不算缺。
+    #[test]
+    fn removed_paths_skip_rebuilt_files() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["cover-a"]));
+        store.drain();
+        let path = PathBuf::from("/tmp/a.img");
+        store.complete(
+            "cover-a",
+            CoverOutcome::Ready {
+                path: path.clone(),
+                color: None,
+            },
+        );
+
+        let handle = store.paths_handle();
+        assert!(handle
+            .urls_for_removed_paths(std::slice::from_ref(&path), |_| true)
+            .contains("cover-a"));
+        assert!(handle
+            .urls_for_removed_paths(std::slice::from_ref(&path), |_| false)
+            .is_empty());
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。
