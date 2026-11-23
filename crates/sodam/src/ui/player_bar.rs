@@ -946,7 +946,7 @@ fn queue_drawer_inner(
 
     let slots = Arc::new(queue_slots(root));
     let tracks = root.queue_cache.1.clone();
-    let covers = root.covers.clone();
+    let covers = root.cover_store.paths_snapshot();
     let cover_requests = root.cover_requests.clone();
     let liked_ids = root.liked_ids.clone();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
@@ -976,9 +976,7 @@ fn queue_drawer_inner(
                         // 只有渲染出来的行才排队取封面（虚拟列表只渲染可见行）
                         if cached.is_none() && !url.is_empty() {
                             if let Ok(mut queue) = cover_requests.lock() {
-                                if !queue.iter().any(|item| item == &url) {
-                                    queue.push(url.clone());
-                                }
+                                queue.push(url.clone());
                             }
                         }
                         let title = track.title.clone();

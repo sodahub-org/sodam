@@ -295,9 +295,7 @@ fn track_row(
             let cached = covers.get(&url).cloned();
             if cached.is_none() && !url.is_empty() {
                 if let Ok(mut queue) = cover_requests.lock() {
-                    if !queue.iter().any(|item| item == &url) {
-                        queue.push(url.clone());
-                    }
+                    queue.push(url.clone());
                 }
             }
             cover(cached, theme::size::ROW_ART, theme::radius::ART)
@@ -506,10 +504,10 @@ pub(crate) fn scrolling_detail_page(
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
     let liked_ids = root.liked_ids.clone();
-    let covers = root.covers.clone();
+    let covers = root.cover_store.paths_snapshot();
     let cover_requests = root.cover_requests.clone();
     let albums = albums.clone();
-    let detail_covers = root.covers.clone();
+    let detail_covers = root.cover_store.paths_snapshot();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
     let unplayable = root.unplayable.snapshot();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {

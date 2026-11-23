@@ -9,6 +9,7 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
+use sodam_core::cover::CoverOutcome;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -693,37 +694,25 @@ impl Root {
         }
         // 淘汰到回调之间下载可能把文件重建回来。还活着的路径不当成被删，
         // 否则刚下好的封面会被误清。（exists 只对命中内存表的那几条调用。）
-        let (thumb_urls, original_urls) =
-            urls_for_removed_paths(&self.covers, &self.original_covers, removed, |path| {
-                !path.exists()
-            });
+        let (thumb_urls, original_urls) = urls_for_removed_paths(
+            self.cover_store.paths(),
+            &self.original_covers,
+            removed,
+            |path| !path.exists(),
+        );
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
-        {
-            let covers = Arc::make_mut(&mut self.covers);
-            for url in &thumb_urls {
-                covers.remove(url);
-            }
-        }
         for url in &original_urls {
             self.original_covers.remove(url);
-        }
-        if let Ok(mut attempted) = self.cover_attempted.lock() {
-            for url in &thumb_urls {
-                attempted.remove(url);
-            }
         }
         if let Ok(mut attempted) = self.original_cover_attempted.lock() {
             for url in &original_urls {
                 attempted.remove(url);
             }
         }
-        // 只动缩略图请求的去重状态：原图走独立的下载任务，踢这里的队列会把
-        // 排队中的缩略图请求一起干掉，却没清 cover_attempted，导致再也排不进去。
-        for url in &thumb_urls {
-            self.cover_pool.forget(url);
-        }
+        // 缩略图只动自己的账：清掉路径 / 颜色 / 失败次数，渲染发现缺图会重新排队。
+        self.cover_store.forget(&thumb_urls);
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
         let current_cover = self
@@ -756,12 +745,10 @@ impl Root {
             let removed = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_clearing = false;
-                // 文件已清理，路径映射不能继续把不存在的图片当成命中。
-                root.covers = Arc::new(Default::default());
+                // 文件已清理，已完成的结果作废；排队 / 在飞保留，免得同一张下两遍
+                //（#250 的结论）。
+                root.cover_store.clear_completed();
                 root.original_covers.clear();
-                if let Ok(mut tried) = root.cover_attempted.lock() {
-                    tried.clear();
-                }
                 if let Ok(mut tried) = root.original_cover_attempted.lock() {
                     tried.clear();
                 }
@@ -771,8 +758,6 @@ impl Root {
                     .clear();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
-                // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
-                root.cover_pool.reset_seen_preserving_inflight();
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
@@ -1327,7 +1312,7 @@ impl Root {
     }
 
     /// 原图下载的在飞上限：单张解码最坏 64 MiB（16 位图翻倍），这条路没有
-    /// CoverPool 的并发保护，用计数限流防快速切歌时瞬时内存失控。
+    /// CoverStore 的并发保护，用计数限流防快速切歌时瞬时内存失控。
     const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
     /// 原图下载排队的上限：超过就丢最旧的（最新切进来的歌最有用）。
     const MAX_ORIGINAL_COVER_PENDING: usize = 32;
@@ -1351,7 +1336,7 @@ impl Root {
             return;
         }
         // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
-        // 回调补上（照 CoverPool 的 pump 思路），排队的不许被丢掉；
+        // 回调补上（照 CoverStore 的 pump 思路），排队的不许被丢掉；
         // 队列有界（丢最旧），且切歌时只留当前曲目（见 load_lyrics）。
         if self.original_cover_inflight.load(Ordering::SeqCst) >= Self::MAX_ORIGINAL_COVER_INFLIGHT
         {
@@ -1393,9 +1378,7 @@ impl Root {
                 if let Some(path) = path {
                     root.original_covers.insert(fetch_url.clone(), path.clone());
                     // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
-                    if !root.covers.contains_key(&fetch_url) {
-                        Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
-                    }
+                    root.cover_store.adopt_thumbnail(&fetch_url, path.clone());
                     cx.notify();
                 }
             });
@@ -2126,10 +2109,7 @@ impl Root {
             .lock()
             .ok()
             .map(|mut attempted| attempted.remove(&track.cover));
-        self.cover_attempted
-            .lock()
-            .ok()
-            .map(|mut attempted| attempted.remove(&track.cover));
+        self.cover_store.forget(std::iter::once(&track.cover));
         if let Some(session) = self.session.as_mut() {
             session.invalidate_original_cover(&track.cover);
             session.invalidate_cover_path(&track.cover);
@@ -3326,38 +3306,27 @@ impl Root {
         }
     }
 
-    /// 封面本地路径（渲染路径唯一入口：只查缓存，不发请求）。
+    /// 封面本地路径（渲染路径唯一入口：只查状态，不发请求）。
     pub fn cover_of(&self, url: &str) -> Option<PathBuf> {
-        self.covers.get(url).cloned()
+        self.cover_store.path(url).cloned()
     }
 
-    /// 把封面放进请求池（渲染只读缓存，缺图先用占位块）。
+    /// 把封面交给 CoverStore；缺图时渲染先显示占位块。
     ///
-    /// 用 `cover_attempted` 去重：下载失败的 URL 也记下来，
-    /// 否则「缺图 → 每帧重新排队」会变成 CPU/网络空转（实测踩过）。
-    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) {
-        let mut added = false;
-        for url in urls {
-            let url = url.trim();
-            if url.is_empty() {
-                continue;
-            }
-            let first_try = match self.cover_attempted.lock() {
-                Ok(mut attempted) => attempted.insert(url.to_string()),
-                Err(_) => false,
-            };
-            if first_try {
-                added |= self.cover_pool.push(url);
-            }
-        }
-        if added {
+    /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
+    /// 返回 (这次新入队数, 因队列满挤掉的张数)，给消费循环降频和日志用。
+    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> (usize, usize) {
+        let added = self.cover_store.want(urls);
+        let dropped = self.cover_store.take_evicted();
+        if !added.is_empty() {
             self.pump_covers(cx);
         }
+        (added.len(), dropped)
     }
 
-    /// 驱动请求池：保持最多 `MAX_CONCURRENCY` 个下载在飞，完成一个补一个。
+    /// 驱动请求：保持最多 `MAX_CONCURRENCY` 个下载在飞，完成一个补一个。
     pub(crate) fn pump_covers(&mut self, cx: &mut Context<Self>) {
-        while let Some(url) = self.cover_pool.next() {
+        for url in self.cover_store.drain() {
             let settings = self.settings.clone();
             let fetch_url = url.clone();
             let task = cx.background_spawn(async move {
@@ -3369,7 +3338,6 @@ impl Root {
             cx.spawn(async move |this, cx| {
                 let (path, color) = task.await;
                 let _ = this.update(cx, |root, cx| {
-                    root.cover_pool.done(&url);
                     if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
                         let file = path
                             .as_ref()
@@ -3390,29 +3358,20 @@ impl Root {
                             ],
                         );
                     }
-                    // 下载期间这张封面可能刚好被后台淘汰删掉。解析到了路径但文件
-                    // 已经没了：不发布（否则 map 指向空文件），并放行 attempted 和
-                    // pool 的 seen，让渲染能重新排队。普通下载失败（压根没解析出
-                    // 路径）保持去重，否则会每帧空转重下。
-                    let was_resolved = path.is_some();
-                    let path = path.filter(|path| path.exists());
-                    if was_resolved && path.is_none() {
-                        if let Ok(mut attempted) = root.cover_attempted.lock() {
-                            attempted.remove(&url);
-                        }
-                        root.cover_pool.release_seen(&url);
-                    }
-                    let has_result = path.is_some() || color.is_some();
-                    if let Some(path) = path {
-                        Arc::make_mut(&mut root.covers).insert(url.clone(), path);
-                    }
-                    if let Some(color) = color {
-                        root.ambient_colors.insert(url.clone(), color);
-                    }
-                    if has_result {
+                    // 下载期间这张封面可能刚好被后台淘汰删掉：解析出了路径但文件
+                    // 已经没了，按 Vanished 处理，让它退回可重排，而不是把空路径
+                    // 发布出去。拿不到路径则记一次失败，两次之后才放弃。
+                    let outcome = match path {
+                        Some(path) if path.exists() => CoverOutcome::Ready { path, color },
+                        Some(_) => CoverOutcome::Vanished,
+                        None => CoverOutcome::Failed,
+                    };
+                    let published = matches!(outcome, CoverOutcome::Ready { .. });
+                    root.cover_store.complete(&url, outcome);
+                    if published {
                         cx.notify();
                     }
-                    // 一个下载完成就补下一个，池子始终保持有界并发
+                    // 一个下载完成就补下一个，始终有界并发
                     root.pump_covers(cx);
                 });
             })

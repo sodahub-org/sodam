@@ -13,7 +13,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             .collect(),
     );
     let cards = root.scene_cards.clone();
-    let covers = root.covers.clone();
+    let covers = root.cover_store.paths_snapshot();
     let cover_requests = root.cover_requests.clone();
     let selected_scene = root
         .recommendation
@@ -169,9 +169,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     let cached = covers.get(&url).cloned();
                     if cached.is_none() && !url.is_empty() {
                         if let Ok(mut pending) = cover_requests.lock() {
-                            if !pending.iter().any(|item| item == &url) {
-                                pending.push(url.clone());
-                            }
+                            pending.push(url.clone());
                         }
                     }
 

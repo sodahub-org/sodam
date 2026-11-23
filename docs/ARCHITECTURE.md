@@ -78,7 +78,8 @@ libresoda 的 HTTP 和下载是阻塞的；GPUI 渲染不能阻塞。规则如�
 1. 网络请求、文件下载、解密、封面缩放放到 `cx.background_spawn` 或专用线程。
 2. 完成后用 `cx.spawn` + entity update 回到 GPUI 实体上下文，然后 `cx.notify()`。
 3. 带分页 / 可取消语义的请求使用 `request_seq` 丢弃过期结果。
-4. 封面通过 `CoverPool` 有界并发请求，渲染路径只查本地缓存。
+4. 封面状态收在 `sodam-core` 的 `CoverStore`：有界并发、一条 URL 一条记录；
+   渲染路径只查内存快照。
 5. 音频线程独立于 GPUI，通过 channel 接收命令，通过 snapshot 共享状态。
 
 ## 播放链路
@@ -207,7 +208,7 @@ TrackItem + cache path
 ## 主题、ambient color 与 i18n
 
 - 主题支持 `Dark`、`Light` 和首次启动跟随系统。
-- 封面主色提取后写入 `ambient_colors`，再由 `theme::set_ambient_rgb` 影响
+- 封面主色提取后写入 `CoverStore`，再由 `theme::set_ambient_rgb` 影响
   背景、表面、边框、强调色。
 - 左上角与设置页的四色 logo 基于当前封面主色生成：主色、互补色、两个相近色。
 - 界面文案使用 `ui/i18n.rs`；中文原文是稳定 key，英文由词典映射。
