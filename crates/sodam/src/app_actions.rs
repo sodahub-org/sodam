@@ -17,6 +17,7 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
+use sodam_core::upgrade::{stop_reason, Outcome, StopReason, StreamShape, Tally};
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -635,7 +636,9 @@ impl Root {
     }
 
     pub(crate) fn maintain_cache(&mut self, cx: &mut Context<Self>) {
-        if self.cache_maintenance_running || self.cache_clearing {
+        // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
+        // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
+        if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
             return;
         }
         self.cache_maintenance_running = true;
@@ -739,6 +742,14 @@ impl Root {
         if self.cache_clearing {
             return;
         }
+        // 批量升级期间清缓存，剩下的每一首都会以「文件已被删」失败，结尾还报成功。
+        // 直接拦住：先取消批量，或者等它跑完再清。
+        if self.batch_upgrading {
+            let message = self.tr("批量升级进行中，请先取消再清空缓存");
+            self.notify_warning_once("cache-clear-blocked", message);
+            cx.notify();
+            return;
+        }
         self.cache_clearing = true;
         let work = cx.background_spawn(async { sodam_core::audio::clear_cache() });
         cx.spawn(async move |this, cx| {
@@ -758,10 +769,8 @@ impl Root {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
-                if let Ok(mut tried) = root.cache_upgrade_attempted.lock() {
-                    tried.clear();
-                }
-                root.cache_upgrade_inflight.clear();
+                // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
+                root.cache_upgrade_attempted.clear();
                 // 正在下载/排队的封面仍要去重，否则清缓存后同一张会下两遍。
                 root.cover_pool.reset_seen_preserving_inflight();
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
@@ -2462,6 +2471,9 @@ impl Root {
         self.unplayable.clear();
         self.prefetch_cooldown_since.clear();
         self.clear_round_exhaustion();
+        // 升级去重表跟着身份走：换号后同一首同一档位在新账号下要能再试一次。
+        // 正在跑的批量下一首之前会看到代数变了，自己停。
+        self.cache_upgrade_attempted.observe_epoch(self.auth_epoch);
     }
 
     /// 退出登录：落盘成功后清除 Cookie 并回到未登录状态；落盘失败保持登录。
@@ -2921,6 +2933,61 @@ impl Root {
         cx.notify();
     }
 
+    /// 跑一首：建会话 → 调升级 → 按前后两份流判定结果。
+    ///
+    /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
+    /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
+    ///
+    /// `success_level` 只在成功那一行用得上：单首一次升级就是一件用户可感知的事，记 Info；
+    /// 批量几百首逐个记 Info 会刷屏，规格只要求开跑、收尾各一行，所以批量降到 Debug。
+    fn upgrade_one_cached_track(
+        settings: Settings,
+        track: TrackItem,
+        target_intent: sodam_core::quality::QualityIntent,
+        account_is_vip: Option<bool>,
+        success_level: LogLevel,
+    ) -> Outcome {
+        let session = Session::new(settings);
+        // 升级前先记下这一首原来长什么样：没有更高档位时 `upgrade_cached_track` 会原样
+        // 返回旧文件，只有前后对比才分得清「提升了」和「跑了但没变化」。
+        let before = session
+            .cached_track(&track.id)
+            .map(|cached| StreamShape::from(&cached));
+        match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
+            Ok(cached) => {
+                // 升级前读不到、升级后却有结果，只能是这一首在中间被重新缓存进来了。
+                // 这种判不出有没有真提升，按失败算，别谎报成「没有更高档位」。
+                let outcome = before.map_or(Outcome::Failed, |before| {
+                    Outcome::of_shapes(before, StreamShape::from(&cached))
+                });
+                if outcome == Outcome::Upgraded {
+                    log_outlet::log_event(
+                        success_level,
+                        LogTopic::Player,
+                        "cache_upgraded",
+                        &[
+                            ("track_id", track.id.as_str()),
+                            ("quality", cached.quality.as_str()),
+                        ],
+                    );
+                }
+                outcome
+            }
+            Err(failure) => {
+                log_outlet::log_event(
+                    LogLevel::Debug,
+                    LogTopic::Player,
+                    "cache_upgrade_failed",
+                    &[
+                        ("track_id", track.id.as_str()),
+                        ("detail", failure.detail.as_str()),
+                    ],
+                );
+                Outcome::Failed
+            }
+        }
+    }
+
     /// 触发单首曲目的后台缓存升级（命中缓存但档位低于当前所选时）。
     pub(crate) fn spawn_background_cache_upgrade(
         &mut self,
@@ -2932,64 +2999,53 @@ impl Root {
         let max_inflight = prefetch_concurrency().max(1);
         let key = format!("{}:{}", track.id, intent.as_setting());
 
-        // N2 并发上限保护（复用 prefetch_concurrency，避免连续切歌并发冲垮签名服务）
-        if self.cache_upgrade_inflight.len() >= max_inflight {
+        // N2 并发上限保护（复用 prefetch_concurrency，避免连续切歌并发冲垮签名服务）。
+        // 数的是**在跑的任务**，不是「哪几首」：同一首在换号或清缓存之后会重新发起，
+        // 按 key 记的话两次发起会共用一个槽位，上限就守不住了。
+        if self.cache_upgrade_running >= max_inflight {
+            return;
+        }
+        // 本次会话已试过升级该曲目到此档位，避免反复重试
+        if !self.cache_upgrade_attempted.begin(key) {
             return;
         }
 
-        if let Ok(mut attempted) = self.cache_upgrade_attempted.lock() {
-            if !attempted.insert(key.clone()) {
-                // 本次会话已尝试过升级该曲目到此档位，避免反复重试
-                return;
-            }
-        }
-
-        self.cache_upgrade_inflight.insert(key.clone());
+        self.cache_upgrade_running += 1;
 
         let settings = self.settings.clone();
-        let track_clone = track.clone();
         let work = cx.background_spawn(async move {
-            let session = Session::new(settings);
-            session.upgrade_cached_track(&track_clone, Some(&intent), account_is_vip)
+            Self::upgrade_one_cached_track(settings, track, intent, account_is_vip, LogLevel::Info)
         });
-        let key_clone = key;
-        let track_id = track.id.clone();
         cx.spawn(async move |this, cx| {
-            let res = work.await;
+            // 单首这条路不按结果改状态：记号留着，档位结论由 sidecar 与下次命中判定。
+            let _ = work.await;
             let _ = this.update(cx, |root, _cx| {
-                root.cache_upgrade_inflight.remove(&key_clone);
+                root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
             });
-            match res {
-                Ok(cached) => {
-                    log_outlet::log_event(
-                        LogLevel::Info,
-                        LogTopic::Player,
-                        "cache_upgraded",
-                        &[
-                            ("track_id", track_id.as_str()),
-                            ("quality", cached.quality.as_str()),
-                        ],
-                    );
-                }
-                Err(failure) => {
-                    log_outlet::log_event(
-                        LogLevel::Debug,
-                        LogTopic::Player,
-                        "cache_upgrade_failed",
-                        &[
-                            ("track_id", track_id.as_str()),
-                            ("detail", failure.detail.as_str()),
-                        ],
-                    );
-                }
-            }
         })
         .detach();
     }
 
     /// 执行已有缓存的批量升级任务。
+    ///
+    /// 循环只跟单首共用「跑一首」；循环本身、状态和文案留在应用层。
     pub(crate) fn start_batch_upgrade(&mut self, cx: &mut Context<Self>) {
         if self.batch_upgrading {
+            return;
+        }
+        // 正在清缓存或收缩缓存时不开跑：扫完盘到真跑之间那几首会被删掉，剩下的一首首都以
+        // 「文件已被删」失败。和 `clear_cache` / `maintain_cache` 那两道拦的是同一件事。
+        if self.cache_clearing || self.cache_maintenance_running {
+            let message = self.tr("正在整理缓存，请稍后再试");
+            self.notify_warning_once("batch-upgrade-cache-busy", message);
+            cx.notify();
+            return;
+        }
+        // 正在退出登录：每首之前都会按 `LoggingOut` 停住，扫了也是白扫一遍全盘。
+        if self.logout_in_flight {
+            let message = self.tr("正在退出登录，请稍后再试");
+            self.notify_warning_once("batch-upgrade-blocked", message);
+            cx.notify();
             return;
         }
 
@@ -3007,10 +3063,10 @@ impl Root {
         }
 
         self.batch_upgrading = true;
+        self.batch_upgrade_cancel = false;
         self.batch_upgrade_progress = BatchUpgradeProgress::default();
         cx.notify();
 
-        let settings = self.settings.clone();
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
             Some(rank) => rank,
             None => {
@@ -3019,6 +3075,9 @@ impl Root {
                 return;
             }
         };
+
+        // 点下去那一刻的身份代数：扫盘也要几百毫秒，期间登出/换号的话这一批一个都不该发。
+        let start_epoch = self.auth_epoch;
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
@@ -3042,77 +3101,167 @@ impl Root {
                 return;
             }
 
-            if total == 0 {
-                let _ = this.update(cx, |root, cx| {
-                    root.batch_upgrading = false;
-                    root.refresh_upgrade_estimate(cx);
-                    cx.notify();
+            let total_text = total.to_string();
+            log_event(
+                LogLevel::Info,
+                LogTopic::Player,
+                "cache_upgrade_batch_started",
+                &[
+                    ("total", total_text.as_str()),
+                    ("target", target_intent.as_setting()),
+                ],
+            );
+            let mut tally = Tally::default();
+            let mut stopped: Option<StopReason> = None;
+            for record in upgradeables {
+                // 每首开始前重读身份、取消标志、设置和会员状态。开场那份快照不再用——
+                // 旧 Cookie 就是从这里漏出去的。
+                let step = this.update(cx, |root, _cx| {
+                    (
+                        root.batch_upgrade_stop(start_epoch),
+                        root.settings.clone(),
+                        root.account.as_ref().map(|a| a.vip),
+                    )
                 });
-                return;
-            }
+                let Ok((stop, mut settings, is_vip)) = step else {
+                    return;
+                };
+                if let Some(reason) = stop {
+                    stopped = Some(reason);
+                    break;
+                }
 
-            let mut success_count = 0usize;
-            for (index, record) in upgradeables.into_iter().enumerate() {
                 let track = TrackItem {
                     id: record.track_id.clone(),
                     ..Default::default()
                 };
-                let mut settings_clone = settings.clone();
                 // 这里只是为了一次性会话还原缓存文件自己的档位意图，不落盘，所以来源记为
                 // Derived（程序推导），不能冒充成用户的手动选择。
-                settings_clone.set_quality_intent_with_source(
+                settings.set_quality_intent_with_source(
                     &sodam_core::quality::QualityIntent::parse(&record.quality_tag),
                     sodam_core::quality::QualitySource::Derived,
                 );
                 let target_clone = target_intent.clone();
-                let upgrade_result = cx
+                let outcome = cx
                     .background_spawn(async move {
-                        let session = Session::new(settings_clone);
-                        session.upgrade_cached_track(&track, Some(&target_clone), is_vip)
+                        Self::upgrade_one_cached_track(
+                            settings,
+                            track,
+                            target_clone,
+                            is_vip,
+                            LogLevel::Debug,
+                        )
                     })
                     .await;
+                tally.record(outcome);
 
-                // 只有档位确实提升才记为有效升级
-                let is_improved =
-                    matches!(&upgrade_result, Ok(c) if c.quality_rank > record.actual_rank);
-                if is_improved {
-                    success_count += 1;
-                }
-
+                let done = tally.total();
                 let update_res = this.update(cx, |root, cx| {
-                    root.batch_upgrade_progress = BatchUpgradeProgress {
-                        done: index + 1,
-                        total,
-                    };
+                    root.batch_upgrade_progress = BatchUpgradeProgress { done, total };
                     cx.notify();
                 });
                 if update_res.is_err() {
-                    break;
+                    return;
                 }
             }
 
+            // 取消和换号都可能落在最后一首下载期间：那时循环已经没有「下一首」可停，这两件事
+            // 照样要说出来，不能被一句「完成」盖掉。判据还是那一个 `stop_reason`，
+            // 免得同一个窗口里两套口径给出两种答案。
+            if stopped.is_none() {
+                stopped = this
+                    .update(cx, |root, _cx| root.batch_upgrade_stop(start_epoch))
+                    .unwrap_or(None);
+            }
+
+            let ran_text = tally.total().to_string();
+            let upgraded_text = tally.upgraded.to_string();
+            let failed_text = tally.failed.to_string();
+            let no_higher_text = tally.no_higher.to_string();
+            let stop_text = stopped.map_or("done", |reason| reason.as_str());
+            log_event(
+                LogLevel::Info,
+                LogTopic::Player,
+                "cache_upgrade_batch_finished",
+                &[
+                    ("total", total_text.as_str()),
+                    ("ran", ran_text.as_str()),
+                    ("upgraded", upgraded_text.as_str()),
+                    ("failed", failed_text.as_str()),
+                    ("no_higher", no_higher_text.as_str()),
+                    ("stop", stop_text),
+                ],
+            );
+
             let _ = this.update(cx, |root, cx| {
                 root.batch_upgrading = false;
-                root.refresh_cache_stats(cx);
-                let message = if success_count == total {
-                    root.localized(
-                        "缓存升级完成：共升级 {} 首歌曲",
-                        &[success_count.to_string()],
-                    )
-                } else {
-                    root.localized(
-                        "缓存升级完成：成功升级 {} 首，{} 首跳过或无更高档位",
-                        &[
-                            success_count.to_string(),
-                            total.saturating_sub(success_count).to_string(),
-                        ],
-                    )
+                root.batch_upgrade_cancel = false;
+                root.batch_upgrade_progress = BatchUpgradeProgress {
+                    done: tally.total(),
+                    total,
                 };
-                root.notify_success_once("batch-upgrade-complete", message);
+                root.refresh_cache_stats(cx);
+                // 一首都没扫到也照样说一句：用户按过取消或换了号，状态行不能停在「正在停止…」。
+                if total > 0 || stopped.is_some() {
+                    let counts = [tally.total().to_string(), total.to_string()];
+                    match stopped {
+                        Some(StopReason::IdentityChanged) => {
+                            // 状态行说清：剩下的不再拿旧号跑。
+                            let message =
+                                root.localized("账号已变更，批量已停止 ({} / {})", &counts);
+                            root.notify_warning_once("batch-upgrade-stopped", message);
+                        }
+                        Some(StopReason::LoggingOut) => {
+                            let message =
+                                root.localized("正在退出登录，批量已停止 ({} / {})", &counts);
+                            root.notify_warning_once("batch-upgrade-stopped", message);
+                        }
+                        Some(StopReason::Cancelled) => {
+                            root.set_status("已取消 ({} / {})", &counts);
+                        }
+                        None => {
+                            let message = root.localized(
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位",
+                                &[
+                                    tally.upgraded.to_string(),
+                                    tally.failed.to_string(),
+                                    tally.no_higher.to_string(),
+                                ],
+                            );
+                            // 一首都没成、又确实有失败的：别弹绿色成功。
+                            if tally.upgraded == 0 && tally.failed > 0 {
+                                root.notify_warning_once("batch-upgrade-complete", message);
+                            } else {
+                                root.notify_success_once("batch-upgrade-complete", message);
+                            }
+                        }
+                    }
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// 这一轮批量现在该不该停。判据全在 [`stop_reason`] 里，这里只负责把状态喂进去。
+    fn batch_upgrade_stop(&self, start_epoch: u64) -> Option<StopReason> {
+        stop_reason(
+            start_epoch,
+            self.auth_epoch,
+            self.batch_upgrade_cancel,
+            self.logout_in_flight,
+        )
+    }
+
+    /// 取消批量升级：只停在下一首之前，正在下的那一首不打断（底层没有取消句柄）。
+    pub(crate) fn cancel_batch_upgrade(&mut self, cx: &mut Context<Self>) {
+        if !self.batch_upgrading || self.batch_upgrade_cancel {
+            return;
+        }
+        self.batch_upgrade_cancel = true;
+        // 正在下的那一首跑完才停：先说清在等什么，别让按钮看起来没反应。
+        self.set_status_text(self.tr("正在停止批量升级…"));
+        cx.notify();
     }
 
     /// 通用返回：同页详情优先关闭，再按真实访问历史回退。

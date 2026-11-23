@@ -1199,7 +1199,19 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .rounded(px(theme::radius::ROW))
                                 .text_size(theme::Text::Small.size());
 
-                            if can_upgrade {
+                            if root.batch_upgrading {
+                                // 升级中变「取消」：只停在下一首之前，正在下的那一首不打断。
+                                btn = btn
+                                    .bg(theme::surface_elevated())
+                                    .text_color(theme::text())
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::surface_hover()))
+                                    .on_click(cx.listener(
+                                        |root, _event: &ClickEvent, _window, cx| {
+                                            root.cancel_batch_upgrade(cx);
+                                        },
+                                    ));
+                            } else if can_upgrade {
                                 btn = btn
                                     .bg(theme::accent())
                                     .text_color(theme::accent_foreground())
@@ -1217,7 +1229,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                             }
 
                             btn.child(if root.batch_upgrading {
-                                root.tr("正在升级…")
+                                root.tr("取消")
                             } else {
                                 root.tr("批量升级")
                             })

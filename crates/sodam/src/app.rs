@@ -609,11 +609,15 @@ pub struct Root {
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
     pub(crate) batch_upgrade_estimate: Option<sodam_core::cache::UpgradeEstimate>,
     pub(crate) batch_upgrading: bool,
+    /// 用户点了「取消」：批量只停在下一首之前，正在下的那一首不打断。
+    pub(crate) batch_upgrade_cancel: bool,
     pub(crate) batch_upgrade_progress: BatchUpgradeProgress,
     /// 单曲后台缓存升级尝试记录（避免同一首低档曲目在切歌或重播时反复拉取升级）。
-    pub(crate) cache_upgrade_attempted: Arc<Mutex<HashSet<String>>>,
-    /// 单曲后台缓存升级当前在飞集合（限制并发，避免连续切歌时打满网络与签名服务）。
-    pub(crate) cache_upgrade_inflight: HashSet<String>,
+    ///
+    /// 跟着身份走：换号后整份作废，同一首同一档位在新账号下重新可试。
+    pub(crate) cache_upgrade_attempted: sodam_core::upgrade::UpgradeAttempts,
+    /// 正在跑的单曲后台缓存升级任务数，卡并发用（默认上限见 `prefetch_concurrency`）。
+    pub(crate) cache_upgrade_running: usize,
     /// 正在删除诊断日志；只用于禁用重复点击，与缓存清理互不影响。
     pub(crate) log_clearing: bool,
     /// 下载完成后交给音频线程的装载序号；避免同一曲目重载/失败时永久 loading。
@@ -987,9 +991,10 @@ impl Root {
             batch_upgrade_target: sodam_core::quality::QualityIntent::Tier("lossless".into()),
             batch_upgrade_estimate: None,
             batch_upgrading: false,
+            batch_upgrade_cancel: false,
             batch_upgrade_progress: BatchUpgradeProgress::default(),
-            cache_upgrade_attempted: Arc::new(Mutex::new(HashSet::new())),
-            cache_upgrade_inflight: HashSet::new(),
+            cache_upgrade_attempted: sodam_core::upgrade::UpgradeAttempts::default(),
+            cache_upgrade_running: 0,
             log_clearing: false,
             pending_engine_load: None,
             pending_track: None,
