@@ -55,6 +55,34 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     (pick(covers), pick(original_covers))
 }
 
+/// 原图下载回调的落账结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OriginalCoverArrival {
+    /// 解析出路径，文件也还在：可以发布。
+    Ready(PathBuf),
+    /// 解析出路径，但文件已经被清缓存或淘汰删掉：不发布，放行「已尝试」。
+    Vanished,
+    /// 压根没解析出路径（下载失败）：不发布，保留「已尝试」。
+    Failed,
+}
+
+/// 判定一张原图下载完成后的去向。
+///
+/// 清缓存或缓存淘汰可能刚好撞上在飞的下载：`original_cover_path` 解析出了路径，
+/// 回调落地前文件已经被删。这里必须再查一次文件在不在——死路径一旦写进
+/// `original_covers`，`ensure_original_cover` 开头就会把它当成命中，这首歌的
+/// 歌词页大图整个会话都回不来（#264）。缩略图那条路早就是这样做的。
+fn settle_original_cover(
+    path: Option<PathBuf>,
+    file_exists: impl FnOnce(&std::path::Path) -> bool,
+) -> OriginalCoverArrival {
+    match path {
+        Some(path) if file_exists(&path) => OriginalCoverArrival::Ready(path),
+        Some(_) => OriginalCoverArrival::Vanished,
+        None => OriginalCoverArrival::Failed,
+    }
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -1390,13 +1418,24 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let path = work.await;
             let _ = this.update(cx, |root, cx| {
-                if let Some(path) = path {
-                    root.original_covers.insert(fetch_url.clone(), path.clone());
-                    // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
-                    if !root.covers.contains_key(&fetch_url) {
-                        Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
+                match settle_original_cover(path, |file| file.exists()) {
+                    OriginalCoverArrival::Ready(path) => {
+                        root.original_covers.insert(fetch_url.clone(), path.clone());
+                        // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
+                        if !root.covers.contains_key(&fetch_url) {
+                            Arc::make_mut(&mut root.covers).insert(fetch_url.clone(), path);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
+                    OriginalCoverArrival::Vanished => {
+                        // 下载期间文件被清缓存或淘汰删掉了：别把死路径记进表，
+                        // 否则 ensure_original_cover 会一直当成命中，本会话再也
+                        // 排不进来。放行「已尝试」，下次需要时能重新下一次。
+                        if let Ok(mut attempted) = root.original_cover_attempted.lock() {
+                            attempted.remove(&fetch_url);
+                        }
+                    }
+                    OriginalCoverArrival::Failed => {}
                 }
             });
             // 在飞位空出来了：把限流期间排队的原图补上，不许被丢掉。
@@ -5482,7 +5521,7 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line, lyrics_scroll_ease,
-        urls_for_removed_paths,
+        settle_original_cover, urls_for_removed_paths, OriginalCoverArrival,
     };
     use sodam_core::models::{LyricLine, LyricWord};
     use std::collections::HashMap;
@@ -5528,6 +5567,28 @@ mod tests {
         });
         assert!(thumbs2.contains("gone-thumb"), "缩略图仍是被删状态");
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
+    }
+
+    /// 清缓存或淘汰撞上在飞的原图：回调解析出路径但文件已经没了，
+    /// 不能写进 `original_covers`，否则这首歌的歌词页大图整个会话都回不来（#264）。
+    #[test]
+    fn vanished_original_cover_is_not_published() {
+        let path = PathBuf::from("covers/original/gone.img");
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| false),
+            OriginalCoverArrival::Vanished,
+            "文件没了就不发布，并把「已尝试」放行，下次能重排"
+        );
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| true),
+            OriginalCoverArrival::Ready(path),
+            "文件还在就直接用"
+        );
+        assert_eq!(
+            settle_original_cover(None, |_| true),
+            OriginalCoverArrival::Failed,
+            "压根没解析出路径是下载失败，保留记号避免每帧空转"
+        );
     }
 
     fn line(start: f64, end: f64, has_word_timeline: bool) -> LyricLine {
