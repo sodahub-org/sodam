@@ -672,34 +672,20 @@ fn would_downgrade_to_preview(
 
 /// 这次取到的新流是否值得换掉本地已有的那一份缓存。
 ///
-/// * 档位已知（sidecar 第 4 字段有分数）：新流档位更高才算提升；
-/// * 档位未知的旧三字段缓存（#89）只剩标签可用：旧「无损」标签给得出下限就按下限比，
-///   给不出就用标签里记着的码率兜底——新流码率更低说明这次是拿差货换好货（权益过期、
-///   曲库退档都会走到这里），不换；但新流已经够到用户要的目标档位时照样换，
-///   无损 FLAC 的码率本来就可能低于有损的高码率流，不能被这道闸误挡；
-/// * 试听片段换成整曲永远是提升。
+/// 判定与「这一首算不算真升级」共用 [`crate::upgrade::stream_is_better`]：档位已知只认
+/// 档位提升；档位未知的旧三字段缓存（#89）先看标签能证明的下限，再比标签里记着的码率；
+/// 试听片段换成整曲永远是提升。同码率只是重新量了一遍档位，不值得重写文件——
+/// 否则批量小结会把这种「没变好」也算成升级（#271）。
 fn is_better_stream(
     info: &libresoda::soda::types::DownloadInfo,
     current: &CachedTrack,
     target_rank: Option<i64>,
 ) -> bool {
-    let new_rank = crate::quality::stream_rank(info);
-    if current.preview && !info.is_preview {
-        return true;
-    }
-    let Some(old_rank) = current
-        .quality_rank
-        .or_else(|| crate::quality::legacy_label_floor_rank(&current.quality))
-    else {
-        if new_rank <= 0 {
-            return false;
-        }
-        let bitrate = libresoda::soda::quality::normalize_bitrate(info.bitrate.max(0));
-        return crate::quality::legacy_label_bitrate_kbps(&current.quality)
-            .is_none_or(|old_bitrate| bitrate >= old_bitrate)
-            || target_rank.is_some_and(|target| new_rank >= target);
-    };
-    new_rank > old_rank
+    crate::upgrade::stream_is_better(
+        crate::upgrade::StreamShape::from(current),
+        crate::upgrade::StreamShape::from_download_info(info),
+        target_rank,
+    )
 }
 
 /// 拼出 sidecar 内容。
@@ -2080,8 +2066,14 @@ mod tests {
             &legacy,
             Some(100)
         ));
-        assert!(is_better_stream(
+        // 同样 320k 的「极高」流：只是把档位重新量了一遍，不值得重写文件。
+        assert!(!is_better_stream(
             &info("higher", "m4a", 320_000, false),
+            &legacy,
+            Some(80)
+        ));
+        assert!(is_better_stream(
+            &info("lossless", "flac", 871_000, false),
             &legacy,
             Some(100)
         ));

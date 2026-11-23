@@ -33,32 +33,45 @@ impl StopReason {
     }
 }
 
+/// 判断批量该不该停的输入。
+///
+/// 字段带名字：两个布尔挨着当参数，调用点把 `cancelled` 和 `logging_out` 写反了照样编译，
+/// 症状是点取消却弹「正在退出登录」。
+#[derive(Debug, Clone, Copy)]
+pub struct StopCheck {
+    pub start_epoch: u64,
+    pub current_epoch: u64,
+    pub cancelled: bool,
+    pub logging_out: bool,
+}
+
 /// 下一首之前该不该停。
 ///
 /// 优先级：正在退出登录 > 身份变了 > 用户取消。登出还在落盘也停，理由见
 /// [`StopReason::LoggingOut`]；身份和取消同时来也报身份变了，用户先要处理换号。
-pub fn stop_reason(
-    start_epoch: u64,
-    current_epoch: u64,
-    cancelled: bool,
-    logging_out: bool,
-) -> Option<StopReason> {
-    if logging_out {
+pub fn stop_reason(check: StopCheck) -> Option<StopReason> {
+    if check.logging_out {
         return Some(StopReason::LoggingOut);
     }
-    if current_epoch != start_epoch {
+    if check.current_epoch != check.start_epoch {
         return Some(StopReason::IdentityChanged);
     }
-    cancelled.then_some(StopReason::Cancelled)
+    check.cancelled.then_some(StopReason::Cancelled)
 }
 
-/// 一份缓存流的样子：档位分 + 是不是试听片段。
+/// 一份缓存流的样子：档位分 + 标签能证明的档位下限 + 码率 + 是不是试听。
 ///
-/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了。
+/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了；
+/// 旧三字段缓存的档位分是 `None`，得靠标签下限和码率兜底，否则「重新量了一次」
+/// 会被当成升级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamShape {
     /// 这条流的档位分；`None` = 旧缓存没记。
     pub rank: Option<i64>,
+    /// 旧标签能证明的档位下限（见 [`crate::quality::legacy_label_floor_rank`]）；证不出为 `None`。
+    pub label_floor_rank: Option<i64>,
+    /// 码率（kbps）；不知道为 `None`。新流总有，旧缓存看标签里有没有写。
+    pub bitrate_kbps: Option<i64>,
     /// 是不是试听片段。
     pub preview: bool,
 }
@@ -67,8 +80,47 @@ impl From<&crate::session::CachedTrack> for StreamShape {
     fn from(cached: &crate::session::CachedTrack) -> Self {
         Self {
             rank: cached.quality_rank,
+            label_floor_rank: crate::quality::legacy_label_floor_rank(&cached.quality),
+            bitrate_kbps: crate::quality::legacy_label_bitrate_kbps(&cached.quality),
             preview: cached.preview,
         }
+    }
+}
+
+impl StreamShape {
+    /// 刚从服务端取到、还没落盘的一条流。
+    pub fn from_download_info(info: &libresoda::soda::types::DownloadInfo) -> Self {
+        Self {
+            rank: Some(crate::quality::stream_rank(info)),
+            label_floor_rank: None,
+            bitrate_kbps: Some(libresoda::soda::quality::normalize_bitrate(
+                info.bitrate.max(0),
+            )),
+            preview: info.is_preview,
+        }
+    }
+}
+
+/// 新流是不是真的比本地这份好。换文件与算升级共用这一条，免得两边各说各话。
+///
+/// 档位已知就只认档位提升；档位未知的旧缓存先看标签能证明的下限，再比码率——
+/// 同样码率只是把档位重新量了一遍，不算更好，也不值得重写文件；码率变低时只有新流
+/// 已经够到用户要的目标档位才算（无损的 300k 换掉有损的 320k）。
+pub fn stream_is_better(before: StreamShape, after: StreamShape, target_rank: Option<i64>) -> bool {
+    if before.preview && !after.preview {
+        return true;
+    }
+    let Some(after_rank) = crate::quality::readable_rank(after.rank) else {
+        return false;
+    };
+    if let Some(old_rank) = crate::quality::readable_rank(before.rank).or(before.label_floor_rank) {
+        return after_rank > old_rank;
+    }
+    let reached_target = target_rank.is_some_and(|target| after_rank >= target);
+    match (before.bitrate_kbps, after.bitrate_kbps) {
+        (Some(old), Some(new)) => new > old || (new < old && reached_target),
+        // 旧标签没写码率：只有新流够到目标档位才敢说它更好。
+        _ => reached_target,
     }
 }
 
@@ -84,16 +136,12 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位分真变高算提升，其余不算。
+    /// 按升级前后两份流的样子判定：试听换整曲算提升，档位真变高算提升，其余不算。
     ///
-    /// 档位分走 [`crate::quality::readable_rank`] 那一道闸：0 分是「量过但认不出」，
-    /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
-    /// 会被当成一次升级。
-    pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
-        if before.preview && !after.preview {
-            return Self::Upgraded;
-        }
-        if crate::quality::readable_rank(after.rank) > crate::quality::readable_rank(before.rank) {
+    /// 判定和 `session::is_better_stream` 共用 [`stream_is_better`]：旧三字段缓存
+    /// （`rank = None`）不能再因为「量出了分数」就报成功，同码率只是把档位重新量了一遍。
+    pub fn of_shapes(before: StreamShape, after: StreamShape, target_rank: Option<i64>) -> Self {
+        if stream_is_better(before, after, target_rank) {
             Self::Upgraded
         } else {
             Self::NoHigherTier
@@ -167,17 +215,26 @@ impl UpgradeAttempts {
 mod tests {
     use super::*;
 
+    fn check(start: u64, current: u64, cancelled: bool, logging_out: bool) -> StopCheck {
+        StopCheck {
+            start_epoch: start,
+            current_epoch: current,
+            cancelled,
+            logging_out,
+        }
+    }
+
     /// 换号之后，下一首之前就停；报的是身份变了。
     #[test]
     fn identity_change_stops_before_the_next_track() {
-        assert_eq!(stop_reason(7, 7, false, false), None);
+        assert_eq!(stop_reason(check(7, 7, false, false)), None);
         assert_eq!(
-            stop_reason(7, 8, false, false),
+            stop_reason(check(7, 8, false, false)),
             Some(StopReason::IdentityChanged)
         );
         // 取消和换号同时到：报身份那次，那才是用户要处理的事。
         assert_eq!(
-            stop_reason(7, 8, true, false),
+            stop_reason(check(7, 8, true, false)),
             Some(StopReason::IdentityChanged)
         );
     }
@@ -185,77 +242,118 @@ mod tests {
     /// 取消之后不再发下一首。
     #[test]
     fn cancel_stops_before_the_next_track() {
-        assert_eq!(stop_reason(3, 3, true, false), Some(StopReason::Cancelled));
-        assert_eq!(stop_reason(3, 3, false, false), None);
+        assert_eq!(
+            stop_reason(check(3, 3, true, false)),
+            Some(StopReason::Cancelled)
+        );
+        assert_eq!(stop_reason(check(3, 3, false, false)), None);
     }
 
     /// 正在退出登录压过另外两条：落盘可能失败、账号还在，这时候说「账号已变更」没把握。
     #[test]
     fn logging_out_wins_over_identity_and_cancel() {
-        assert_eq!(stop_reason(7, 7, false, true), Some(StopReason::LoggingOut));
-        assert_eq!(stop_reason(7, 8, false, true), Some(StopReason::LoggingOut));
-        assert_eq!(stop_reason(7, 8, true, true), Some(StopReason::LoggingOut));
+        assert_eq!(
+            stop_reason(check(7, 7, false, true)),
+            Some(StopReason::LoggingOut)
+        );
+        assert_eq!(
+            stop_reason(check(7, 8, false, true)),
+            Some(StopReason::LoggingOut)
+        );
+        assert_eq!(
+            stop_reason(check(7, 8, true, true)),
+            Some(StopReason::LoggingOut)
+        );
+    }
+
+    fn shape(
+        rank: Option<i64>,
+        floor: Option<i64>,
+        bitrate: Option<i64>,
+        preview: bool,
+    ) -> StreamShape {
+        StreamShape {
+            rank,
+            label_floor_rank: floor,
+            bitrate_kbps: bitrate,
+            preview,
+        }
     }
 
     /// 档位没真提升不算成功。
     #[test]
     fn an_equal_or_lower_tier_is_not_an_upgrade() {
-        let lossless = StreamShape {
-            rank: Some(100),
-            preview: false,
-        };
-        let highest = StreamShape {
-            rank: Some(80),
-            preview: false,
-        };
-        assert_eq!(Outcome::of_shapes(highest, lossless), Outcome::Upgraded);
+        let lossless = shape(Some(100), None, Some(871), false);
+        let highest = shape(Some(80), None, Some(320), false);
         assert_eq!(
-            Outcome::of_shapes(lossless, lossless),
+            Outcome::of_shapes(highest, lossless, None),
+            Outcome::Upgraded
+        );
+        assert_eq!(
+            Outcome::of_shapes(lossless, lossless, None),
             Outcome::NoHigherTier,
             "同一条流拿回来两次不算升级"
         );
         assert_eq!(
-            Outcome::of_shapes(lossless, highest),
+            Outcome::of_shapes(lossless, highest, None),
             Outcome::NoHigherTier,
             "拿回更差的流不算升级"
         );
-        // 旧缓存没记分数：这次量出来一个分数，就是实打实的提升。
+        // 旧缓存没记分数、码率确实变高：实打实的提升。
         assert_eq!(
             Outcome::of_shapes(
-                StreamShape {
-                    rank: None,
-                    preview: false
-                },
-                highest
+                shape(None, None, Some(192), false),
+                shape(Some(80), None, Some(320), false),
+                None
+            ),
+            Outcome::Upgraded
+        );
+        // 旧缓存没记分数、换成同样 320k 的「极高」流：只是重新量了一遍档位，不算成功。
+        assert_eq!(
+            Outcome::of_shapes(
+                shape(None, None, Some(320), false),
+                shape(Some(80), None, Some(320), false),
+                Some(80)
+            ),
+            Outcome::NoHigherTier,
+            "同码率重写一遍文件不是升级"
+        );
+        // 旧标签是无损：按下限比，同档位的新流不算升级，哪怕码率更高。
+        assert_eq!(
+            Outcome::of_shapes(
+                shape(None, Some(100), Some(300), false),
+                shape(Some(100), None, Some(871), false),
+                Some(100)
+            ),
+            Outcome::NoHigherTier
+        );
+        // 旧标签没写码率：新流够到目标档位才算提升。
+        assert_eq!(
+            Outcome::of_shapes(
+                shape(None, None, None, false),
+                shape(Some(100), None, None, false),
+                Some(100)
             ),
             Outcome::Upgraded
         );
         // 旧缓存没记分数、这次量出来 0 分（认不出）：不算已知档位，也不算升级。
         assert_eq!(
             Outcome::of_shapes(
-                StreamShape {
-                    rank: None,
-                    preview: false
-                },
-                StreamShape {
-                    rank: Some(0),
-                    preview: false
-                }
+                shape(None, None, Some(320), false),
+                shape(Some(0), None, Some(320), false),
+                None
             ),
             Outcome::NoHigherTier
         );
         // 试听换整曲：同档位也算，盘上那份文件确实变完整了。
-        let preview = StreamShape {
-            rank: Some(80),
-            preview: true,
-        };
-        let full = StreamShape {
-            rank: Some(80),
-            preview: false,
-        };
-        assert_eq!(Outcome::of_shapes(preview, full), Outcome::Upgraded);
+        let preview = shape(Some(80), None, Some(320), true);
+        let full = shape(Some(80), None, Some(320), false);
+        assert_eq!(Outcome::of_shapes(preview, full, None), Outcome::Upgraded);
         // 整曲换成试听什么时候都不算升级（这条路本来就另有护栏挡着）。
-        assert_eq!(Outcome::of_shapes(full, preview), Outcome::NoHigherTier);
+        assert_eq!(
+            Outcome::of_shapes(full, preview, None),
+            Outcome::NoHigherTier
+        );
     }
 
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
