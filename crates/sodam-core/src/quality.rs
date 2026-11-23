@@ -186,9 +186,10 @@ impl QualityIntent {
 ///
 /// `quality_rank` 在档位标签与码率都对不上时给 0：那不是「比谁都低」，是「没认出来」。
 /// 拿它当分数比大小，就是向用户断言一件查不到的事（#96）。负数同样不在这套刻度上。
-/// 本模块里判不符与判重下的地方共用这一道闸，免得对同一个文件给出不同结论。
+/// 本模块里判不符与判重下的地方共用这一道闸，免得对同一个文件给出不同结论；
+/// 升级那条路判「这一首算不算真升上去了」也走它（见 [`crate::upgrade::Outcome::of_shapes`]）。
 /// 档位显示名走 [`tier_label`]：它共用的是刻度，不是这个函数——0 分照样命名成「未知」。
-fn readable_rank(actual: Option<i64>) -> Option<i64> {
+pub(crate) fn readable_rank(actual: Option<i64>) -> Option<i64> {
     actual.filter(|rank| *rank > 0)
 }
 

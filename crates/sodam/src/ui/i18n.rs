@@ -535,10 +535,21 @@ impl Language {
             "正在计算升级预估…" => "Estimating upgrade…",
             "正在升级 ({} / {})…" => "Upgrading ({} / {})…",
             "批量升级" => "Batch Upgrade",
-            "正在升级…" => "Upgrading…",
-            "缓存升级完成：共升级 {} 首歌曲" => "Cache upgrade complete: upgraded {} songs",
-            "缓存升级完成：成功升级 {} 首，{} 首跳过或无更高档位" => {
-                "Cache upgrade complete: upgraded {} songs, {} skipped or no higher quality"
+            "正在停止批量升级…" => "Stopping batch upgrade…",
+            "账号已变更，批量已停止 ({} / {})" => {
+                "Account changed; batch upgrade stopped ({} / {})"
+            }
+            "已取消 ({} / {})" => "Cancelled ({} / {})",
+            "正在退出登录，批量已停止 ({} / {})" => {
+                "Signing out; batch upgrade stopped ({} / {})"
+            }
+            "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更高档位" => {
+                "Cache upgrade complete: upgraded {} songs, {} failed, {} with no higher quality"
+            }
+            "正在整理缓存，请稍后再试" => "Cache maintenance is running; try again in a moment",
+            "正在退出登录，请稍后再试" => "Signing out; try again in a moment",
+            "批量升级进行中，请先取消再清空缓存" => {
+                "Batch upgrade is running; cancel it before clearing the cache"
             }
             "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
             "「{}」音质需 VIP 会员权限，当前账号未确认该权益" => {
