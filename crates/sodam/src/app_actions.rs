@@ -654,7 +654,7 @@ impl Root {
         }
         let work = cx.background_spawn(async move {
             // 首轮维护先清音频根下的旧格式暂存残留（孤儿 .part 等，锁永不删）。
-            // 扫全一次就收工；目录没读全最多再试 5 轮，到上限放弃。
+            // 扫全一次就收工；目录没读全最多再来 4 轮（连首轮共 5 轮），到上限放弃。
             sodam_core::cache::sweep_legacy_residue();
             sodam_core::cache::trim_audio(limit);
             let removed =

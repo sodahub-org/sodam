@@ -595,16 +595,17 @@ fn trim_audio_scan(scan: Scan, limit_bytes: u64) -> u64 {
 
 /// 清音频根下旧格式暂存残留，只列顶层、不递归。
 ///
-/// 「旧格式」指 #241 之前直接落在音频目录根下的暂存：
-/// `{曲目}-{档位}-{pid}-{seq}.m4a.part(.part)` 之类的老文件，改到 `staging/`
-/// 子目录后没人管了。族名认领用 [`STAGED_SUFFIXES`]，超过 [`PART_MAX_AGE`]
-/// 的交给 [`remove_idle`]（租约与 `.part.lock` 的例外都在那儿）。
+/// 「旧格式」指暂存挪进 `staging/` 之前的老实现落下的文件（#241）：当时
+/// `{曲目}-{档位}-{pid}-{seq}.m4a.part(.part)` 这类文件直接躺在音频根下，
+/// 改到子目录后就没人管了。族名认领用 [`STAGED_SUFFIXES`]，超过
+/// [`PART_MAX_AGE`] 的交给 [`remove_idle`]（租约与 `.part.lock` 的例外都在那儿）。
 ///
 /// 不递归进 `staging/`：那里归 [`purge_stale_staging_in`] 的 7 天保留期按
 /// 整族清扫，这里按成员年龄动手会把续传对拆开。
 ///
-/// 旧格式文件名在 [`protection_key`] 里还原不出交付目标，保护键就是文件
-/// 自己；但产生它们的旧进程早已不在，不会有租约指向它们。
+/// 能摘回交付目标的尾巴（`.part`、`.part.meta`、`.dec.tmp` 等）照样受租约
+/// 保护；只有 `.m4a.part.part` 这种双尾巴摘不回去，保护键就是文件自己——
+/// 好在产生它们的旧进程早已不在，不会有租约指向它们。
 ///
 /// 返回 `Some(删除数)`；`None` 表示这轮目录没读全（条目、类型或元数据
 /// 读不到），交给下轮重试。
@@ -2969,7 +2970,9 @@ mod tests {
             "111-auto-4242-7.m4a.part",
             "111-auto-4242-7.m4a.part.part",
             "111-auto-4242-7.m4a.part.meta",
+            "111-auto-4242-7.m4a.part.meta.tmp",
             "111-auto-4242-7.m4a.dec.tmp",
+            "111-auto-4242-7.m4a.part.dec.tmp",
         ];
         for name in stale {
             file(dir.path(), name, 90_000);
