@@ -36,7 +36,7 @@ impl StopReason {
 /// 下一首之前该不该停。
 ///
 /// 优先级：正在退出登录 > 身份变了 > 用户取消。登出还在落盘也停，理由见
-/// [`StopReason::LoggingOut`]；身份和取消同时到时报身份那次——用户要处理的是「换号了」。
+/// [`StopReason::LoggingOut`]；身份和取消同时来也报身份变了，用户先要处理换号。
 pub fn stop_reason(
     start_epoch: u64,
     current_epoch: u64,
