@@ -774,12 +774,20 @@ impl Root {
     /// `pending_track.or(queue.current())`。
     pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
         self.original_covers.clear();
-        if let Ok(mut attempted) = self.original_cover_attempted.lock() {
-            attempted.clear();
-        }
-        if let Ok(mut wait_list) = self.original_cover_pending.lock() {
-            wait_list.clear();
-        }
+        // 锁中毒自恢复，跟 ensure_original_cover / load_lyrics 对同两把锁的口径一致；
+        // 这里若静默跳过，attempted 没清，ensure 会早退，原图就补不回来。
+        let mut attempted = self
+            .original_cover_attempted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut wait_list = self
+            .original_cover_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempted.clear();
+        wait_list.clear();
+        drop(attempted);
+        drop(wait_list);
         let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
             return;
         };
