@@ -16,6 +16,7 @@
 ```text
 crates/sodam-core/src/   领域层：配置 / 会话 / 队列 / 音乐库 / 播放引擎（不依赖 GPUI）
   config.rs              配置读写 + 环境变量补全
+  cover.rs               封面缩略图状态（纯状态机，不碰磁盘）
   session.rs             配置 → libresoda Soda（Cookie、签名器、音质）
   library.rs             推荐、听歌模式、搜索、歌单、收藏、艺人/专辑数据
   models.rs              TrackItem / PlaylistItem / ArtistItem / AlbumItem / SceneItem

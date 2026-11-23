@@ -197,8 +197,8 @@ fn track_row(
     cols: Columns,
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     liked_ids: std::sync::Arc<std::collections::HashSet<String>>,
-    covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
-    cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    covers: sodam_core::cover::CoverPaths,
+    cover_mailbox: std::sync::Arc<crate::app::CoverMailbox>,
     current_track_id: Option<String>,
     // 这首在当前账号下已被确认放不出来：只加标记，不禁用、不隐藏。
     unplayable: bool,
@@ -292,13 +292,9 @@ fn track_row(
             // 封面：只在「这一行真的被渲染出来」时才把 URL 丢进请求队列，
             // 没滚到的行不会发任何请求（虚拟列表天然只渲染可见行）。
             let url = track.cover.clone();
-            let cached = covers.get(&url).cloned();
+            let cached = covers.get(&url);
             if cached.is_none() && !url.is_empty() {
-                if let Ok(mut queue) = cover_requests.lock() {
-                    if !queue.iter().any(|item| item == &url) {
-                        queue.push(url.clone());
-                    }
-                }
+                cover_mailbox.request(url.clone());
             }
             cover(cached, theme::size::ROW_ART, theme::radius::ART)
         })
@@ -404,8 +400,8 @@ fn track_list(
     tracks: std::sync::Arc<Vec<sodam_core::models::TrackItem>>,
     nav: Nav,
     liked_ids: std::sync::Arc<std::collections::HashSet<String>>,
-    covers: std::sync::Arc<std::collections::HashMap<String, std::path::PathBuf>>,
-    cover_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    covers: sodam_core::cover::CoverPaths,
+    cover_mailbox: std::sync::Arc<crate::app::CoverMailbox>,
     cx: &mut Context<Root>,
 ) -> AnyElement {
     if tracks.is_empty() {
@@ -434,7 +430,7 @@ fn track_list(
                         tracks.clone(),
                         liked_ids.clone(),
                         covers.clone(),
-                        cover_requests.clone(),
+                        cover_mailbox.clone(),
                         current_track_id.clone(),
                         unplayable.contains(&track.id),
                     )
@@ -506,10 +502,9 @@ pub(crate) fn scrolling_detail_page(
     let cols = columns_for(root.list_width.lock().map(|width| *width).unwrap_or(1200.0));
     let width_slot = root.list_width.clone();
     let liked_ids = root.liked_ids.clone();
-    let covers = root.covers.clone();
-    let cover_requests = root.cover_requests.clone();
+    let covers = root.cover_store.paths_handle();
+    let cover_mailbox = root.cover_mailbox.clone();
     let albums = albums.clone();
-    let detail_covers = root.covers.clone();
     // 渲染只读快照：只含已确认结论，见 UnplayableTracks::snapshot。
     let unplayable = root.unplayable.snapshot();
     let list = gpui::list(list_state.clone(), move |index, _window, _cx| {
@@ -644,7 +639,7 @@ pub(crate) fn scrolling_detail_page(
                 row_tracks.clone(),
                 liked_ids.clone(),
                 covers.clone(),
-                cover_requests.clone(),
+                cover_mailbox.clone(),
                 current_track_id.clone(),
                 unplayable.contains(&track.id),
             );
@@ -698,7 +693,10 @@ pub(crate) fn scrolling_detail_page(
             return div().into_any_element();
         };
         let item = album.clone();
-        let cover_path = detail_covers.get(&album.cover).cloned();
+        let cover_path = covers.get(&album.cover);
+        if cover_path.is_none() && !album.cover.trim().is_empty() {
+            cover_mailbox.request(album.cover.clone());
+        }
         div()
             .id(gpui::ElementId::Name(
                 format!("detail-album-{}", album.id).into(),

@@ -539,6 +539,9 @@ impl Language {
             "账号已变更，批量已停止 ({} / {})" => {
                 "Account changed; batch upgrade stopped ({} / {})"
             }
+            "登录状态已变化，批量已停止 ({} / {})" => {
+                "Sign-in state changed; batch upgrade stopped ({} / {})"
+            }
             "已取消 ({} / {})" => "Cancelled ({} / {})",
             "正在退出登录，批量已停止 ({} / {})" => {
                 "Signing out; batch upgrade stopped ({} / {})"
@@ -550,6 +553,9 @@ impl Language {
             "正在退出登录，请稍后再试" => "Signing out; try again in a moment",
             "批量升级进行中，请先取消再清空缓存" => {
                 "Batch upgrade is running; cancel it before clearing the cache"
+            }
+            "正在停止批量升级，等这一首跑完再清缓存" => {
+                "Stopping batch upgrade; clear the cache after the current song finishes"
             }
             "「{}」音质需 VIP 会员权限" => "\"{}\" quality requires VIP membership",
             "「{}」音质需 VIP 会员权限，当前账号未确认该权益" => {
