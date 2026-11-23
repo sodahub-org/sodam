@@ -155,16 +155,16 @@ pub struct CoverStore {
 }
 
 impl CoverStore {
-    /// 要这几张；返回这次真正新排进队列的 URL。
+    /// 要这几张；返回这次真正新排进队列的张数。
     ///
     /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
-    pub fn want(&mut self, urls: &[String]) -> Vec<String> {
+    pub fn want(&mut self, urls: &[String]) -> usize {
         // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
         self.evicted = 0;
-        let mut queued = Vec::new();
+        let mut queued = 0;
         for raw in urls {
             if self.enqueue(raw.trim()) {
-                queued.push(raw.trim().to_string());
+                queued += 1;
             }
         }
         queued
@@ -376,14 +376,14 @@ mod tests {
     fn want_same_url_ten_times_fetches_once() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
-        assert_eq!(store.want(&url).len(), 1);
+        assert_eq!(store.want(&url), 1);
         for _ in 0..9 {
-            assert!(store.want(&url).is_empty());
+            assert_eq!(store.want(&url), 0);
         }
         assert_eq!(store.drain(), url, "只该泵出一张");
         assert!(store.drain().is_empty(), "在飞时不能重复泵出");
         store.complete("cover-a", ready("/tmp/a.img"));
-        assert!(store.want(&url).is_empty(), "已完成也不能重复入队");
+        assert_eq!(store.want(&url), 0, "已完成也不能重复入队");
     }
 
     /// 排队 / 在飞 / 已完成三种状态下都不重复入队。
@@ -391,12 +391,12 @@ mod tests {
     fn want_skips_queued_inflight_and_ready() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
-        assert_eq!(store.want(&url).len(), 1, "排队");
-        assert!(store.want(&url).is_empty());
+        assert_eq!(store.want(&url), 1, "排队");
+        assert_eq!(store.want(&url), 0);
         assert_eq!(store.drain(), url, "在飞");
-        assert!(store.want(&url).is_empty());
+        assert_eq!(store.want(&url), 0);
         store.complete("cover-a", ready("/tmp/a.img"));
-        assert!(store.want(&url).is_empty(), "已完成");
+        assert_eq!(store.want(&url), 0, "已完成");
         assert!(store.path("cover-a").is_some());
     }
 
@@ -406,18 +406,18 @@ mod tests {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
 
-        assert_eq!(store.want(&url).len(), 1);
+        assert_eq!(store.want(&url), 1);
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
-        assert_eq!(store.want(&url).len(), 1, "失败一次还能再试");
+        assert_eq!(store.want(&url), 1, "失败一次还能再试");
 
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
-        assert!(store.want(&url).is_empty(), "失败两次后本会话不再自动重试");
+        assert_eq!(store.want(&url), 0, "失败两次后本会话不再自动重试");
         assert!(store.drain().is_empty());
 
         store.forget(url.iter().map(String::as_str));
-        assert_eq!(store.want(&url).len(), 1, "清掉失败记录后能重新下");
+        assert_eq!(store.want(&url), 1, "清掉失败记录后能重新下");
     }
 
     /// 清缓存后失败户也能重新下。
@@ -431,10 +431,10 @@ mod tests {
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Failed);
-        assert!(store.want(&url).is_empty());
+        assert_eq!(store.want(&url), 0);
 
         store.clear_completed();
-        assert_eq!(store.want(&url).len(), 1);
+        assert_eq!(store.want(&url), 1);
     }
 
     /// 验收：队列塞满后挤掉的那张还能重新排进来。
@@ -444,41 +444,34 @@ mod tests {
         let first: Vec<String> = (0..MAX_QUEUE)
             .map(|index| format!("cover-{index}"))
             .collect();
-        assert_eq!(store.want(&first).len(), MAX_QUEUE);
+        assert_eq!(store.want(&first), MAX_QUEUE);
         assert_eq!(store.take_dropped(), 0);
 
         let extra = urls(&["cover-extra"]);
-        assert_eq!(store.want(&extra).len(), 1, "满了也要收新图");
+        assert_eq!(store.want(&extra), 1, "满了也要收新图");
         assert_eq!(store.take_dropped(), 1, "挤掉了最旧的一张");
 
         let oldest = urls(&["cover-0"]);
-        assert_eq!(store.want(&oldest).len(), 1, "被挤掉的那张能重新排队");
+        assert_eq!(store.want(&oldest), 1, "被挤掉的那张能重新排队");
         assert_eq!(store.take_dropped(), 1);
-        assert!(store.want(&oldest).is_empty(), "排进去之后不重复入队");
+        assert_eq!(store.want(&oldest), 0, "排进去之后不重复入队");
     }
 
     /// 清缓存只作废已完成的结果；在飞原样保留，已完成的放行重排。
     #[test]
     fn clear_completed_keeps_inflight_and_revives_done() {
         let mut store = CoverStore::default();
-        let all = urls(&["downloading", "queued", "done"]);
-        assert_eq!(store.want(&all).len(), 3);
-        assert_eq!(store.drain().len(), 3, "三张都进了在飞");
+        let all = urls(&["downloading", "done"]);
+        assert_eq!(store.want(&all), 2);
+        assert_eq!(store.drain().len(), 2, "两张都进了在飞");
         store.complete("done", ready("/tmp/done.img"));
         assert!(store.path("done").is_some());
 
         store.clear_completed();
         assert!(store.path("done").is_none(), "已完成的结果要作废");
-        assert!(
-            store.want(&urls(&["downloading"])).is_empty(),
-            "在飞不能被再次入队"
-        );
-        assert!(
-            store.want(&urls(&["queued"])).is_empty(),
-            "在飞不能被再次入队"
-        );
+        assert_eq!(store.want(&urls(&["downloading"])), 0, "在飞不能被再次入队");
         assert_eq!(
-            store.want(&urls(&["done"])).len(),
+            store.want(&urls(&["done"])),
             1,
             "已完成的放行，清缓存后能重新请求"
         );
@@ -486,7 +479,7 @@ mod tests {
 
         // 磁盘被清空的在飞封面：这次下载结束时退回可重排，否则一直占位图。
         store.complete("downloading", CoverOutcome::Vanished);
-        assert_eq!(store.want(&urls(&["downloading"])).len(), 1);
+        assert_eq!(store.want(&urls(&["downloading"])), 1);
     }
 
     /// 清缓存不能作废还在排队、没轮到泵的 URL。
@@ -496,15 +489,16 @@ mod tests {
         let many: Vec<String> = (0..MAX_CONCURRENCY + 2)
             .map(|index| format!("cover-{index}"))
             .collect();
-        assert_eq!(store.want(&many).len(), MAX_CONCURRENCY + 2);
+        assert_eq!(store.want(&many), MAX_CONCURRENCY + 2);
 
         let started = store.drain();
         assert_eq!(started.len(), MAX_CONCURRENCY);
         let queued_tail = many[MAX_CONCURRENCY].clone();
 
         store.clear_completed();
-        assert!(
-            store.want(std::slice::from_ref(&queued_tail)).is_empty(),
+        assert_eq!(
+            store.want(std::slice::from_ref(&queued_tail)),
+            0,
             "排队中的不能被清缓存作废"
         );
 
@@ -525,7 +519,7 @@ mod tests {
         store.complete("cover-a", ready("/tmp/a.img"));
         assert!(store.path("cover-a").is_none(), "这次结果要作废");
         assert!(store.drain().is_empty(), "没人再要，就不要自己重排");
-        assert_eq!(store.want(&url).len(), 1, "结束后要能重新排队");
+        assert_eq!(store.want(&url), 1, "结束后要能重新排队");
     }
 
     /// 在飞被 forget 之后又有人要（点重试）：结果回来要立刻补排。
@@ -537,10 +531,10 @@ mod tests {
         assert_eq!(store.drain(), url);
         store.forget(["cover-a"]);
 
-        assert!(store.want(&url).is_empty(), "在飞期间不能重复下");
+        assert_eq!(store.want(&url), 0, "在飞期间不能重复下");
         store.complete("cover-a", CoverOutcome::Failed);
         assert_eq!(store.drain(), url, "作废结果回来后要把这次需求补上");
-        assert!(store.want(&url).is_empty(), "补排之后不重复入队");
+        assert_eq!(store.want(&url), 0, "补排之后不重复入队");
     }
 
     /// forget 摘掉排队项和去重标记，重新入队只下一次。
@@ -548,10 +542,10 @@ mod tests {
     fn forget_allows_exactly_one_requeue() {
         let mut store = CoverStore::default();
         let both = urls(&["cover-a", "cover-b"]);
-        assert_eq!(store.want(&both).len(), 2);
+        assert_eq!(store.want(&both), 2);
         store.forget(["cover-a"]);
-        assert_eq!(store.want(&urls(&["cover-a"])).len(), 1);
-        assert!(store.want(&urls(&["cover-a"])).is_empty());
+        assert_eq!(store.want(&urls(&["cover-a"])), 1);
+        assert_eq!(store.want(&urls(&["cover-a"])), 0);
     }
 
     /// 文件解析出来后又被删：退回可重排。
@@ -562,7 +556,7 @@ mod tests {
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
-        assert_eq!(store.want(&url).len(), 1);
+        assert_eq!(store.want(&url), 1);
     }
 
     /// 验收：查路径 / 查颜色 / 取快照只读，不改状态、不消费排队项。
@@ -580,7 +574,7 @@ mod tests {
             assert!(store.color("cover-a").is_none());
             assert!(store.paths_handle().get("cover-a").is_none());
         }
-        assert!(store.want(&all).is_empty(), "读口子不能放行去重");
+        assert_eq!(store.want(&all), 0, "读口子不能放行去重");
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
     }
 
@@ -609,8 +603,7 @@ mod tests {
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。
-    ///
-    /// 之后再收到这次缩略图的结果（成功 / 失败 / 文件已没）都不能抹掉这条路。
+    /// 之后这次缩略图成功返回，会改用刚下载的路径。
     #[test]
     fn adopt_thumbnail_publishes_without_touching_inflight() {
         let mut store = CoverStore::default();
@@ -620,14 +613,15 @@ mod tests {
 
         store.adopt_thumbnail("cover-a", PathBuf::from("/tmp/original.img"));
         assert!(store.path("cover-a").is_some());
-        assert!(store.want(&url).is_empty(), "已经有路径了，不再入队");
+        assert_eq!(store.want(&url), 0, "已经有路径了，不再入队");
 
         store.complete("cover-a", ready("/tmp/a.img"));
         assert_eq!(
             store
                 .path("cover-a")
                 .map(|path| path.to_string_lossy().into_owned()),
-            Some("/tmp/a.img".to_string())
+            Some("/tmp/a.img".to_string()),
+            "缩略图下载完成后改用新路径"
         );
     }
 }

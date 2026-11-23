@@ -1068,7 +1068,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                 )
                 .child({
                     // 批量升级期间清缓存会被拦下：按钮直接画成不可点，别让人点了才看到提示。
-                    // 已经点过取消时例外：那时 `batch_upgrading` 还没落假，点了会说清在等什么。
+                    // 已经点过取消时例外：那时候 `batch_upgrading` 还是 `true`，点了会说清在等什么。
                     let mut btn = div()
                         .id("clear-cache")
                         .flex()
