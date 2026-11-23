@@ -552,12 +552,16 @@ impl Root {
     /// 当前这首不重载：中途断开已取到的流不划算，也与主流客户端一致。
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
         let intent = sodam_core::quality::QualityIntent::parse(quality);
-        self.settings.set_quality_intent_by_user(&intent);
+        // 先改一份副本，写盘成功了才认：失败时 `self.settings` 原样不动。会话只认
+        // 写进盘的档位，预取和点播又是拿 `self.settings` 现建会话的，两边不能一个
+        // 新档一个旧档——缓存文件按档位命名，错开就会互相找不到。
+        let mut next = self.settings.clone();
+        next.set_quality_intent_by_user(&intent);
         let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
-        match self.settings.save() {
+        match next.save() {
             Ok(()) => {
-                // 上面那次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
-                // 写盘成功才换档——失败时界面报的是失败，会话也别偷偷按新档位取流。
+                // 这一次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
+                self.settings = next;
                 if let Some(session) = self.session.as_mut() {
                     session.adopt(&self.settings);
                 }
