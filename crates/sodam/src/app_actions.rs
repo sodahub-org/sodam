@@ -2948,11 +2948,12 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `levels` 决定这一首的两行日志：单首默认日志要看得见，所以成功记 INFO、失败记 WARN；
-    /// 批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，两行都降到 DEBUG。
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
+    /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// 所以这几种逐首日志都降到 DEBUG。
     ///
-    /// 只有真升级（`Upgraded`）和真报错（`Err`）落行：服务端没有更高档位（`NoHigherTier`）、
-    /// 升级前缓存已不在（判为 `Failed`）都不写，别把这两档算进「成功/失败各一行」。
+    /// 升级前读不到缓存、升级后却有结果（判为 `Failed`）不写：这是缓存中途被清掉的竞态，
+    /// 没有可靠的失败原因可写。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
@@ -2973,8 +2974,8 @@ impl Root {
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
-                if outcome == Outcome::Upgraded {
-                    log_outlet::log_event(
+                match outcome {
+                    Outcome::Upgraded => log_outlet::log_event(
                         levels.success,
                         LogTopic::Player,
                         "cache_upgraded",
@@ -2982,7 +2983,19 @@ impl Root {
                             ("track_id", track.id.as_str()),
                             ("quality", cached.quality.as_str()),
                         ],
-                    );
+                    ),
+                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，
+                    // 别让它一声不响。
+                    Outcome::NoHigherTier => log_outlet::log_event(
+                        levels.success,
+                        LogTopic::Player,
+                        "cache_upgrade_no_higher_tier",
+                        &[
+                            ("track_id", track.id.as_str()),
+                            ("quality", cached.quality.as_str()),
+                        ],
+                    ),
+                    Outcome::Failed => {}
                 }
                 outcome
             }
