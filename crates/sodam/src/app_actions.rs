@@ -3075,13 +3075,14 @@ impl Root {
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(cached) => {
                 // 升级前读不到、升级后却有结果，只能是这一首在中间被重新缓存进来了。
-                // 这种判不出有没有真提升，按失败算，别谎报成「没有更高档位」。
+                // 这种判不出有没有真提升，按失败算，别谎报成「没有更好整曲」。
                 let outcome = before.map_or(Outcome::Failed, |before| {
                     Outcome::of_shapes(before, StreamShape::from(&cached))
                 });
                 let event = match outcome {
                     Outcome::Upgraded => Some("cache_upgraded"),
-                    // 跑完但服务端最高就这档：这是「为什么音质没变」最常见的答案，别静音。
+                    // 跑完但没换成更好的整曲（没更高档，或只给试听）：这是「为什么音质没变」
+                    // 最常见的答案，别静音。
                     Outcome::NoHigherTier => Some("cache_upgrade_no_higher_tier"),
                     // 没有可靠的失败原因可写，所以不落日志。
                     Outcome::Failed => None,
