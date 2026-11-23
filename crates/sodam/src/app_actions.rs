@@ -50,7 +50,11 @@ struct UpgradeLogLevels {
 /// 还没进队列的那首歌也显示它。缓存清理后补原图必须同口径，否则那首歌的大图
 /// 补不回来。两处补偿共用这个函数，避免一边改了口径另一边漏掉。
 fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) -> Option<String> {
-    pending.or(queued).map(|track| track.cover.clone())
+    // `CoverStore` 里存的和查的都是 trim 过的 key；这里不 trim，淘汰反查
+    // 时当前曲目就会跟删除列表对不上，原图不会补回来。
+    pending
+        .or(queued)
+        .map(|track| track.cover.trim().to_string())
 }
 
 /// 判定一张原图下载完成后的去向。
@@ -70,11 +74,13 @@ fn settle_original_cover(
     }
 }
 
-/// 文件在下载期间被删掉后，要不要顺手给当前曲目再排一次。
+/// 原图这次没成功（文件没了，或失败一次）后，要不要顺手给当前曲目再排一次。
 ///
 /// 清缓存还在跑时交给 `clear_cache` 的补偿，别和它抢；淘汰删文件时
 /// `drop_removed_covers` 反查不到还没发布过的 URL，只能在这里补。
-fn retry_vanished_original_cover(
+/// 失败重试也走这里：缩略图靠渲染每帧 `want`，原图没有这个口子，
+/// 第一次失败后不主动再排，就只剩重试按钮。
+fn retry_current_original_cover(
     cache_clearing: bool,
     displayed_cover: Option<&str>,
     url: &str,
@@ -1387,19 +1393,21 @@ impl Root {
                     // 和缩略图一样在回调里复核文件在不在：清缓存的清表也是
                     // 同一线程的 update，后清表会把这次抢先写进去的死路径一起扫掉。
                     let outcome = settle_original_cover(path, |file| file.exists());
-                    let vanished = outcome == CoverOutcome::Vanished;
+                    let retryable =
+                        matches!(outcome, CoverOutcome::Vanished | CoverOutcome::Failed);
                     root.cover_store.complete_original(&fetch_url, outcome);
                     // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
                     if let Some(path) = root.cover_store.original_path(&fetch_url) {
                         root.cover_store.adopt_thumbnail(&fetch_url, path);
                     }
-                    if vanished {
-                        // 文件在下载期间被清缓存 / 淘汰删掉：`complete_original`
-                        // 已经退回可重排。清缓存进行中交给它的补偿；淘汰时
-                        // 当前曲目在这里补一次，歌词页不用等下一次切歌。
+                    if retryable {
+                        // 文件被清缓存 / 淘汰删掉，或第一次下载失败：
+                        // `complete_original` 已经退回可重排（失败次数到顶的除外）。
+                        // 清缓存进行中交给它的补偿；当前曲目在这里补一次，
+                        // 歌词页不用等下一次切歌或手动点重试。
                         let displayed_cover =
                             current_cover_url(root.pending_track.as_ref(), root.queue.current());
-                        if retry_vanished_original_cover(
+                        if retry_current_original_cover(
                             root.cache_clearing,
                             displayed_cover.as_deref(),
                             &fetch_url,
@@ -4136,6 +4144,8 @@ impl Root {
         self.pending_engine_load = None;
         self.progress_preview = None;
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
+        // 每次切歌都只留新曲目的原图需求；不在歌词页时也要清掉上一轮的排队和补排。
+        self.cover_store.retain_original_only(&track.cover);
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         if self.nav == Nav::Lyrics {
             self.load_lyrics(track.clone(), false, cx);
@@ -5537,7 +5547,7 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
-        lyrics_scroll_ease, retry_vanished_original_cover, settle_original_cover,
+        lyrics_scroll_ease, retry_current_original_cover, settle_original_cover,
     };
     use sodam_core::cover::CoverOutcome;
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
@@ -5566,23 +5576,23 @@ mod tests {
         );
     }
 
-    /// 文件没了要不要补：清缓存进行中交给它的补偿，淘汰删文件时自己补。
+    /// 原图没成功要不要补：清缓存进行中交给它的补偿，当前曲目才自己补。
     #[test]
-    fn vanished_original_cover_retries_only_outside_a_cache_clear() {
+    fn original_cover_retries_only_current_track_outside_a_cache_clear() {
         assert!(
-            retry_vanished_original_cover(false, Some("url/current"), "url/current"),
-            "淘汰删了当前曲目的原图：要补"
+            retry_current_original_cover(false, Some("url/current"), "url/current"),
+            "当前曲目的原图没成功：要补"
         );
         assert!(
-            !retry_vanished_original_cover(false, Some("url/other"), "url/current"),
+            !retry_current_original_cover(false, Some("url/other"), "url/current"),
             "不是当前曲目：不补"
         );
         assert!(
-            !retry_vanished_original_cover(false, None, "url/current"),
+            !retry_current_original_cover(false, None, "url/current"),
             "没有当前曲目：不补"
         );
         assert!(
-            !retry_vanished_original_cover(true, Some("url/current"), "url/current"),
+            !retry_current_original_cover(true, Some("url/current"), "url/current"),
             "清缓存进行中：交给 clear_cache 的补偿"
         );
     }
@@ -5598,6 +5608,7 @@ mod tests {
         };
         let pending = make("pending", "url/pending");
         let queued = make("queued", "url/queued");
+        let padded = make("padded", "  url/queued  ");
 
         // pending 在场时歌词页显示它，补下载也得用它。
         assert_eq!(
@@ -5607,6 +5618,11 @@ mod tests {
         // 没有 pending 才退回队列当前曲目。
         assert_eq!(
             current_cover_url(None, Some(&queued)).as_deref(),
+            Some("url/queued")
+        );
+        // 跟 CoverStore 的 key 一样 trim 过，淘汰反查才对得上。
+        assert_eq!(
+            current_cover_url(None, Some(&padded)).as_deref(),
             Some("url/queued")
         );
         // 两个都没有就没有可补的封面。

@@ -1064,6 +1064,24 @@ mod tests {
         assert!(store.want_original(url), "作废之后能重新下");
     }
 
+    /// 验收：第一次失败后还能再排一次，第二次成功就正常落账。
+    #[test]
+    fn original_first_failure_can_succeed_on_second_attempt() {
+        let mut store = CoverStore::default();
+        let url = "original-a";
+
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Failed);
+
+        assert!(store.want_original(url), "第一次失败还能再试");
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, original_ready("/tmp/full.img"));
+
+        assert!(store.original_path(url).is_some(), "第二次成功就落账");
+        assert!(!store.want_original(url), "有路径了不再重排");
+    }
+
     /// 验收：清缓存两格一起作废，在飞原图原样保留。
     #[test]
     fn clear_completed_clears_both_lanes_and_keeps_inflight_original() {
