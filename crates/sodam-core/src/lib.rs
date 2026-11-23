@@ -26,7 +26,7 @@ pub mod session;
 pub mod upgrade;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
-pub use config::Settings;
+pub use config::{SessionInputs, Settings};
 pub use log_outlet::{flush_global, LogLevel, LogOutlet, LogRecord, LogTopic};
 pub use models::{PlaylistItem, SceneItem, TrackItem};
 pub use play_report::PlayReporter;

@@ -1,6 +1,7 @@
 //! 应用配置（`~/.config/sodam/config.json`）。
 
 use crate::log_outlet::{log_event, LogLevel, LogTopic};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,6 +133,70 @@ pub struct Settings {
     /// 与环境变量是并集关系——两边都只能「记更多」，不存在谁覆盖谁。
     #[serde(default)]
     pub detailed_logs: bool,
+}
+
+/// 会话初始化真正要的字段：只有这 10 个。
+///
+/// 会话只持这一小份，不再持整份设置，所以「登录要把整份副本写回盘」那套补丁没了；
+/// 其余设置（音量、缓存上限、播放模式、主题、语言、标题栏、快捷键、搜索历史、
+/// 详细日志）会话根本不看，界面上改完当场生效，不用重建会话。
+///
+/// 「哪些字段算会话输入」只有一张表：[`Settings::session_inputs`]。那边解构
+/// `Settings` 不写 `..`，加了设置字段却不表态算不算会话输入，就编译不过。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionInputs {
+    /// 登录 Cookie。
+    pub cookie: String,
+    /// 签名服务地址（libmssdk 的 `/sign`，VIP 整曲必需）。
+    pub signer_url: String,
+    /// 签名服务 token。
+    pub signer_token: String,
+    /// 签名设备指纹三件套，必须与签名器一致。
+    pub device_id: String,
+    pub iid: String,
+    pub fp: String,
+    /// 扫码登录用的设备身份（passport），与上面的签名设备是两套东西。
+    pub login_device_id: String,
+    pub login_install_id: String,
+    /// 音质**意图**（`auto` 或某个具体档位）与它的来源。
+    pub quality: String,
+    pub quality_source: crate::quality::QualitySource,
+}
+
+impl SessionInputs {
+    /// 当前音质**意图**。
+    pub fn quality_intent(&self) -> crate::quality::QualityIntent {
+        crate::quality::QualityIntent::parse(&self.quality)
+    }
+
+    /// 扫码登录设备身份（可能无效，调用前先 [`Settings::ensure_login_device`]）。
+    pub fn login_device(&self) -> libresoda::soda::qr_login::QrDevice {
+        qr_device(&self.login_device_id, &self.login_install_id)
+    }
+
+    /// 有没有登录凭据。
+    pub fn has_cookie(&self) -> bool {
+        !self.cookie.trim().is_empty()
+    }
+}
+
+impl From<&Settings> for SessionInputs {
+    fn from(settings: &Settings) -> Self {
+        settings.session_inputs()
+    }
+}
+
+impl From<Settings> for SessionInputs {
+    fn from(settings: Settings) -> Self {
+        settings.session_inputs()
+    }
+}
+
+fn qr_device(device_id: &str, install_id: &str) -> libresoda::soda::qr_login::QrDevice {
+    libresoda::soda::qr_login::QrDevice {
+        device_id: device_id.to_string(),
+        install_id: install_id.to_string(),
+    }
 }
 
 /// 播放控制快捷键的内置默认值。
@@ -830,10 +895,7 @@ impl Settings {
 
     /// 当前扫码登录设备身份（可能无效，调用前先 [`Self::ensure_login_device`]）。
     pub fn login_device(&self) -> libresoda::soda::qr_login::QrDevice {
-        libresoda::soda::qr_login::QrDevice {
-            device_id: self.login_device_id.clone(),
-            install_id: self.login_install_id.clone(),
-        }
+        qr_device(&self.login_device_id, &self.login_install_id)
     }
 
     /// 把老配置里已经失效的写法改到当前形式：内置签名端点、快捷键的显示形式。
@@ -1270,22 +1332,76 @@ impl Settings {
         Self::fill_slot_from_env(&mut self.login_install_id, ENV_LOGIN_INSTALL_ID);
     }
 
-    /// 会话输入字段是否与另一份设置不同：签名地址/Token、Cookie、签名设备身份
-    /// （device_id/iid/fp）、登录设备身份、音质意图。这些字段变了需要重建会话
-    /// 才生效（`Session::adopt` / `Session::apply`），其余字段即时读取。
+    /// 会话输入字段的唯一分类表：抄进会话的字段和「变了要重建会话」的字段，
+    /// 就是这一次解构里的同一批。
     ///
-    /// 「哪些字段算会话输入」是配置的领域知识，收在这里，UI 层不做字段清单。
+    /// 解构故意不写 `..`：`Settings` 加了字段而这里没表态「算不算会话输入」，
+    /// 就编译不过，不会像以前那样一号清单 15 个、二号清单 10 个，音质还同时挂在两张上。
+    pub fn session_inputs(&self) -> SessionInputs {
+        let Settings {
+            // —— 会话输入：会话持这 10 个，变了要重建会话 ——
+            signer_url,
+            signer_token,
+            cookie,
+            device_id,
+            iid,
+            fp,
+            login_device_id,
+            login_install_id,
+            quality,
+            quality_source,
+            // —— 即时生效：会话不持，改了当场就能用 ——
+            volume: _,
+            volume_before_mute: _,
+            play_mode: _,
+            audio_cache_limit_mb: _,
+            search_history_enabled: _,
+            search_history: _,
+            theme: _,
+            language: _,
+            titlebar: _,
+            shortcut_toggle: _,
+            shortcut_previous: _,
+            shortcut_next: _,
+            detailed_logs: _,
+        } = self;
+        SessionInputs {
+            cookie: cookie.clone(),
+            signer_url: signer_url.clone(),
+            signer_token: signer_token.clone(),
+            device_id: device_id.clone(),
+            iid: iid.clone(),
+            fp: fp.clone(),
+            login_device_id: login_device_id.clone(),
+            login_install_id: login_install_id.clone(),
+            quality: quality.clone(),
+            quality_source: *quality_source,
+        }
+    }
+
+    /// 会话输入是否有变化：变了才需要重建会话（`Session::adopt`），其余字段即时读取。
     pub fn session_inputs_differ(&self, other: &Settings) -> bool {
-        self.signer_url != other.signer_url
-            || self.signer_token != other.signer_token
-            || self.cookie != other.cookie
-            || self.device_id != other.device_id
-            || self.iid != other.iid
-            || self.fp != other.fp
-            || self.quality != other.quality
-            || self.quality_source != other.quality_source
-            || self.login_device_id != other.login_device_id
-            || self.login_install_id != other.login_install_id
+        self.session_inputs() != other.session_inputs()
+    }
+
+    /// 登录成功后写入 Cookie：**先落盘，写成功了才算登录**。
+    ///
+    /// 写盘失败时内存里的设置一点不动，Cookie 不进去，会话也不会被当成已登录——
+    /// 半登录状态在界面上看着像登录了，重启后又掉线，比直接报错糟得多。
+    ///
+    /// 同步写：调用方是界面线程。登录成功后用户可能三秒内就退出应用，
+    /// 丢给后台队列会把这枚 Cookie 一起丢掉。
+    pub fn apply_login_cookie(&mut self, cookie: &str) -> anyhow::Result<()> {
+        self.apply_login_cookie_to(&Self::config_path(), cookie)
+    }
+
+    /// [`Self::apply_login_cookie`] 的指定路径版本（测试用）。
+    pub fn apply_login_cookie_to(&mut self, path: &Path, cookie: &str) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        next.cookie = cookie.trim().to_string();
+        next.save_to(path).context("保存登录 Cookie 失败")?;
+        *self = next;
+        Ok(())
     }
 }
 
@@ -2238,6 +2354,181 @@ mod tests {
         std::fs::create_dir_all(&unreadable_backup).unwrap();
         Settings::drop_stale_backup_cookie(&unreadable);
         assert!(unreadable_backup.exists(), "读不出又删不掉的备份保持原样");
+    }
+
+    /// 只有那 10 个字段算会话输入，其余 13 个改了都不重建会话。
+    ///
+    /// 逐字段断言，同时穷举解构 `Settings`：加了设置字段却不在这里表态，
+    /// 这个用例编译不过（#256 的验收）。
+    #[test]
+    fn only_ten_fields_are_session_inputs() {
+        fn changed(
+            name: &'static str,
+            apply: impl FnOnce(&mut Settings),
+        ) -> (&'static str, Settings) {
+            let mut settings = Settings::default();
+            apply(&mut settings);
+            (name, settings)
+        }
+        let cases = vec![
+            changed("signer_url", |s| {
+                s.signer_url = "http://127.0.0.1:1/sign".into()
+            }),
+            changed("signer_token", |s| s.signer_token = "t".into()),
+            changed("cookie", |s| s.cookie = "sessionid_ss=x".into()),
+            changed("device_id", |s| s.device_id = "0000000000000001".into()),
+            changed("iid", |s| s.iid = "iid".into()),
+            changed("fp", |s| s.fp = "fp".into()),
+            changed("login_device_id", |s| {
+                s.login_device_id = "1234567890123456".into()
+            }),
+            changed("login_install_id", |s| {
+                s.login_install_id = "123456789012345".into()
+            }),
+            changed("quality", |s| s.quality = "lossless".into()),
+            changed("quality_source", |s| {
+                s.quality_source = crate::quality::QualitySource::User;
+            }),
+            changed("volume", |s| s.volume = 0.25),
+            changed("volume_before_mute", |s| s.volume_before_mute = 0.25),
+            changed("play_mode", |s| {
+                s.play_mode = crate::queue::PlayMode::Shuffle
+            }),
+            changed("audio_cache_limit_mb", |s| s.audio_cache_limit_mb = 2048),
+            changed("search_history_enabled", |s| {
+                s.search_history_enabled = false
+            }),
+            changed("search_history", |s| {
+                s.search_history = vec!["周杰伦".into()]
+            }),
+            changed("theme", |s| s.theme = "light".into()),
+            changed("language", |s| s.language = "en".into()),
+            changed("titlebar", |s| s.titlebar = "always".into()),
+            changed("shortcut_toggle", |s| s.shortcut_toggle = "ctrl-p".into()),
+            changed("shortcut_previous", |s| {
+                s.shortcut_previous = "ctrl-h".into()
+            }),
+            changed("shortcut_next", |s| s.shortcut_next = "ctrl-n".into()),
+            changed("detailed_logs", |s| s.detailed_logs = true),
+        ];
+
+        // 穷举解构：`Settings` 加字段而这里（和 `session_inputs`）没表态，就编译不过。
+        let Settings {
+            signer_url: _,
+            signer_token: _,
+            cookie: _,
+            device_id: _,
+            iid: _,
+            fp: _,
+            login_device_id: _,
+            login_install_id: _,
+            quality: _,
+            quality_source: _,
+            volume: _,
+            volume_before_mute: _,
+            play_mode: _,
+            audio_cache_limit_mb: _,
+            search_history_enabled: _,
+            search_history: _,
+            theme: _,
+            language: _,
+            titlebar: _,
+            shortcut_toggle: _,
+            shortcut_previous: _,
+            shortcut_next: _,
+            detailed_logs: _,
+        } = Settings::default();
+        assert_eq!(cases.len(), 23, "23 个字段一个都不能漏");
+
+        let session_fields = [
+            "signer_url",
+            "signer_token",
+            "cookie",
+            "device_id",
+            "iid",
+            "fp",
+            "login_device_id",
+            "login_install_id",
+            "quality",
+            "quality_source",
+        ];
+        for (name, settings) in &cases {
+            let differs = settings.session_inputs_differ(&Settings::default());
+            assert_eq!(
+                differs,
+                session_fields.contains(name),
+                "{name} 算不算会话输入，与分类表对不上"
+            );
+        }
+        // 只改即时生效的字段：会话输入一个都不变。
+        let live_only = Settings {
+            volume: 0.1,
+            theme: "light".into(),
+            search_history: vec!["周杰伦".into()],
+            detailed_logs: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            live_only.session_inputs(),
+            Settings::default().session_inputs(),
+            "音量/主题/搜索历史/详细日志都进不了会话输入"
+        );
+    }
+
+    /// 写盘失败时 Cookie 不进内存：会话不能半登录。
+    #[test]
+    fn failed_login_write_keeps_cookie_out_of_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        // 父路径被占成普通文件：建不了目录，落盘必失败。
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("config.json");
+
+        let mut settings = Settings::default();
+        let before = settings.clone();
+        assert!(
+            settings
+                .apply_login_cookie_to(&path, "sessionid_ss=new")
+                .is_err(),
+            "写不进去就得报错"
+        );
+        assert_eq!(settings, before, "写盘失败时内存里的设置一点都不动");
+        assert!(!settings.session_inputs().has_cookie(), "Cookie 不许进内存");
+        assert!(!crate::session::Session::new(&settings).has_cookie());
+    }
+
+    /// 登录轮询期间改过主题：登录写回之后主题还是新值（写回的是当前设置，
+    /// 不是登录开始那一刻的旧快照，#185 / #256）。
+    #[test]
+    fn login_write_back_keeps_theme_changed_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut settings = Settings::default();
+        settings.save_to(&path).unwrap();
+
+        // 登录开始时会话抄走的那份快照（只有 10 个字段）
+        let inputs_before = settings.session_inputs();
+
+        // 登录轮询期间，外部热重载把主题和详细日志改了
+        settings.theme = "light".into();
+        settings.detailed_logs = true;
+
+        settings
+            .apply_login_cookie_to(&path, "sessionid_ss=x")
+            .unwrap();
+
+        let reloaded = settings_on_disk(&path);
+        assert_eq!(reloaded.theme, "light", "登录写回不许把主题写回旧值");
+        assert!(reloaded.detailed_logs);
+        assert_eq!(reloaded.cookie, "sessionid_ss=x");
+        // 会话输入里只有 Cookie 变了，其余照旧。
+        assert_eq!(
+            settings.session_inputs(),
+            SessionInputs {
+                cookie: "sessionid_ss=x".into(),
+                ..inputs_before
+            }
+        );
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。
