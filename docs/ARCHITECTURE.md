@@ -5,7 +5,7 @@
 ```text
 ┌────────────────────────── crates/sodam（GPUI 层） ───────────────────────────┐
 │ Root                                                                          │
-│  ├── 导航 / 设置 / 搜索输入 / 播放队列缓存 / 封面缓存 / ambient colors        │
+│  ├── 导航 / 设置 / 搜索输入 / 播放队列缓存 / 封面邮箱（CoverStore 在 core）    │
 │  ├── app_actions.rs    播放、队列、收藏、歌单、推荐、设置、封面动作             │
 │  ├── app_search.rs     搜索、艺人页、专辑页动作                                │
 │  ├── ui::sidebar       侧边栏、品牌、导航                                     │
@@ -22,7 +22,7 @@
 │ library        推荐 / 听歌模式 / 搜索 / 歌单 / 收藏 / 艺人 / 专辑 / 歌词       │
 │ Queue          当前曲目、历史、下一首、列表循环 / 单曲循环 / 随机             │
 │ PlaybackEngine rodio 线程；接收 Load / Play / Pause / Seek / Volume 命令       │
-│ AudioColor     封面主色提取                                                   │
+│ CoverStore     封面缩略图状态 + 主色（纯状态机）                              │
 └───────────────────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -78,7 +78,8 @@ libresoda 的 HTTP 和下载是阻塞的；GPUI 渲染不能阻塞。规则如�
 1. 网络请求、文件下载、解密、封面缩放放到 `cx.background_spawn` 或专用线程。
 2. 完成后用 `cx.spawn` + entity update 回到 GPUI 实体上下文，然后 `cx.notify()`。
 3. 带分页 / 可取消语义的请求使用 `request_seq` 丢弃过期结果。
-4. 封面通过 `CoverPool` 有界并发请求，渲染路径只查本地缓存。
+4. 封面状态收在 `sodam-core` 的 `CoverStore`：有界并发、一条 URL 一条记录；
+   渲染路径只查内存快照。
 5. 音频线程独立于 GPUI，通过 channel 接收命令，通过 snapshot 共享状态。
 
 ## 播放链路
@@ -209,7 +210,7 @@ TrackItem + cache path
 ## 主题、ambient color 与 i18n
 
 - 主题支持 `Dark`、`Light` 和首次启动跟随系统。
-- 封面主色提取后写入 `ambient_colors`，再由 `theme::set_ambient_rgb` 影响
+- 封面主色提取后写入 `CoverStore`，再由 `theme::set_ambient_rgb` 影响
   背景、表面、边框、强调色。
 - 左上角与设置页的四色 logo 基于当前封面主色生成：主色、互补色、两个相近色。
 - 界面文案使用 `ui/i18n.rs`；中文原文是稳定 key，英文由词典映射。

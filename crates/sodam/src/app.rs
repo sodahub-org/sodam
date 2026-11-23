@@ -5,6 +5,7 @@ mod actions;
 #[path = "app_search.rs"]
 mod search_actions;
 
+use futures_lite::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     div, px, Context, Decorations, EntityInputHandler, FocusHandle, Image, Render, UTF16Selection,
@@ -12,6 +13,7 @@ use gpui::{
 };
 use sodam_core::{
     config::EnvCookieFill,
+    cover::{CoverStore, CoverWant},
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -25,7 +27,7 @@ use sodam_core::{
     session::{AccountInfo, Session},
     PlayReporter, PlaybackEngine, Settings,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -37,88 +39,52 @@ pub(crate) const SAVE_TEXT: &str = "没能保存，检查磁盘空间后重试�
 /// 既不是网络也不是写入的失败（例如本地编码出错）：不指责任何一方，只说重试。
 pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 
-/// 封面请求池：有界并发 + 去重 + 队列上限。
-///
-/// 直接对整页每张封面发请求（尤其是 300 首的歌单）会把网络和 CDN 打爆，
-/// 也会让后台线程池占满。池子只保持 `MAX_CONCURRENCY` 个在飞请求，
-/// 其余排队；渲染永远只读缓存。
-pub(crate) struct CoverPool {
-    queue: VecDeque<String>,
-    inflight: HashSet<String>,
-    seen: HashSet<String>,
-    /// 下载中被淘汰的 URL：这次下载完（成功或失败）要放行 seen，让封面能重排。
-    forgotten: HashSet<String>,
+/// 渲染闭包够不到 `Root`，把封面需求丢进这个邮箱；`request` 顺带叫醒消费循环。
+pub(crate) struct CoverMailbox {
+    inner: Mutex<CoverMailboxInner>,
 }
 
-impl CoverPool {
-    const MAX_CONCURRENCY: usize = 8;
-    const MAX_QUEUE: usize = 400;
+struct CoverMailboxInner {
+    queue: Vec<String>,
+    wake: futures_channel::mpsc::Sender<()>,
+    /// 消费循环已退出只记一次，别让每次推需求都刷一条日志。
+    wake_closed_logged: bool,
+}
 
-    fn new() -> Self {
+impl CoverMailbox {
+    fn new(wake: futures_channel::mpsc::Sender<()>) -> Self {
         Self {
-            queue: VecDeque::new(),
-            inflight: HashSet::new(),
-            seen: HashSet::new(),
-            forgotten: HashSet::new(),
+            inner: Mutex::new(CoverMailboxInner {
+                queue: Vec::new(),
+                wake,
+                wake_closed_logged: false,
+            }),
         }
     }
 
-    /// 入队（去重 + 队列上限），返回是否新增。
-    fn push(&mut self, url: &str) -> bool {
-        let url = url.trim();
-        if url.is_empty() || self.seen.contains(url) || self.queue.len() >= Self::MAX_QUEUE {
-            return false;
-        }
-        self.seen.insert(url.to_string());
-        self.queue.push_back(url.to_string());
-        true
-    }
-
-    fn next(&mut self) -> Option<String> {
-        if self.inflight.len() >= Self::MAX_CONCURRENCY {
-            return None;
-        }
-        let url = self.queue.pop_front()?;
-        self.inflight.insert(url.clone());
-        Some(url)
-    }
-
-    fn done(&mut self, url: &str) {
-        self.inflight.remove(url);
-        if self.forgotten.remove(url) {
-            // 下载中被淘汰过：这次拿回来的文件可能已经被删，也可能压根没下到，
-            // 放行去重标记，渲染发现缺图时才能重新排队。
-            self.seen.remove(url);
+    /// 渲染路径只做一次 push；去重交给 `CoverStore::want`，不在这里扫队列。
+    pub(crate) fn request(&self, url: String) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.queue.push(url);
+        if let Err(error) = inner.wake.try_send(()) {
+            // 通道满说明已经有一个叫醒信号在路上，不用管；接收端没了说明消费循环
+            // 已经退出，需求只会堆在邮箱里，留一条日志让人能查。
+            if error.is_disconnected() && !inner.wake_closed_logged {
+                inner.wake_closed_logged = true;
+                log_event(LogLevel::Warn, LogTopic::App, "cover_wake_closed", &[]);
+            }
         }
     }
 
-    /// 封面被淘汰后想让一个 URL 重新入队：摘掉排队中的旧请求和去重标记。
-    /// 正在下载的那份先记下来，等 `done` 再放行——过早放行会和这次下载撞成两份。
-    fn forget(&mut self, url: &str) {
-        self.queue.retain(|queued| queued != url);
-        if self.inflight.contains(url) {
-            self.forgotten.insert(url.to_string());
-        } else {
-            self.seen.remove(url);
-        }
-    }
-
-    /// 解析成功但文件被淘汰删掉时放行去重标记，让这次封面能重新排队。
-    /// 只摘 seen——调用时 `done` 已经把 inflight 清掉了。
-    fn release_seen(&mut self, url: &str) {
-        self.seen.remove(url);
-    }
-
-    /// 清空缓存后重置去重集合。还在排队/下载中的 URL 保留 seen，否则同一张会下两遍；
-    /// 在飞的一律记进 forgotten，磁盘文件被清掉后 `done` 会放行 seen，让封面能重下。
-    fn reset_seen_preserving_inflight(&mut self) {
-        self.seen = self
-            .queue
-            .iter()
-            .chain(self.inflight.iter())
-            .cloned()
-            .collect();
-        self.forgotten.extend(self.inflight.iter().cloned());
+    fn take(&self) -> Vec<String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut inner.queue)
     }
 }
 
@@ -531,8 +497,8 @@ pub struct Root {
     pub open_album: Option<AlbumDetail>,
     pub loading_album: bool,
     /// 渲染期收集到的封面需求（虚拟列表只渲染可见行，所以这里排的就是
-    /// 「当前真正看得见」的那些封面）。由后台循环定期消费。
-    pub cover_requests: Arc<Mutex<Vec<String>>>,
+    /// 「当前真正看得见」的那些封面）。由后台循环消费，新需求会立刻叫醒它。
+    pub(crate) cover_mailbox: Arc<CoverMailbox>,
     /// 真实播放过的曲目 id（最近在后）。用于队列抽屉的「已播放」分区；
     /// 不能用「当前下标之前」来推 —— 那会把跳过的歌也算进去（实测踩过）。
     pub played_history: Vec<String>,
@@ -639,25 +605,21 @@ pub struct Root {
     pub(crate) theme_snapshot_key: Option<String>,
     /// 队列快照（含版本号）：避免抽屉每帧深拷贝整条队列。
     pub queue_cache: (u64, Arc<Vec<TrackItem>>),
-    /// 已尝试过的封面 URL（成功在 covers 里，失败的也记下来，避免每帧重复排队）。
-    pub cover_attempted: Arc<Mutex<HashSet<String>>>,
-    /// 封面缓存：URL → 本地文件。**只由后台任务写入**，渲染路径只读，
-    /// 绝不在 render 里发网络请求（否则主线程会被下载卡住）。
-    pub covers: Arc<HashMap<String, PathBuf>>,
+    /// 缩略图封面状态：问过没有 / 排没排 / 在不在飞 / 路径与主色。
+    /// 渲染路径只读，下载由后台任务完成后回填。
+    pub cover_store: CoverStore,
     pub original_covers: HashMap<String, PathBuf>,
     pub original_cover_attempted: Arc<Mutex<HashSet<String>>>,
-    /// 在飞的原图下载数：原图解码最坏 64 MiB/张，且这条路没有 CoverPool
+    /// 在飞的原图下载数：原图解码最坏 64 MiB/张，且这条路没有 CoverStore
     /// 的并发上限，手动限流防止快速切歌时瞬时内存失控。
     pub(crate) original_cover_inflight: Arc<std::sync::atomic::AtomicUsize>,
-    /// 限流期间排队的原图 URL：在飞位空出来后由完成回调补上（照 CoverPool
+    /// 限流期间排队的原图 URL：在飞位空出来后由完成回调补上（照 CoverStore
     /// 的 pump 思路），队列有界（丢最旧），切歌时只留当前曲目。
     pub(crate) original_cover_pending: Mutex<Vec<String>>,
     /// “其他”里的贡献者图（contrib.rocks 组合 SVG）；独立缓存，不参与歌曲封面统计。
     pub contributors_image: Option<Arc<Image>>,
     pub(crate) contributors_fetching: bool,
     pub(crate) contributors_failed: bool,
-    pub ambient_colors: HashMap<String, (u8, u8, u8)>,
-    pub(crate) cover_pool: CoverPool,
     /// 各列表当前渲染的行数（点「显示更多」时递增）。
     /// 扫码登录状态与轮询中的 token。
     pub login: LoginState,
@@ -838,6 +800,8 @@ impl Root {
             tracker.acknowledge(baseline);
             Arc::new(Mutex::new(tracker))
         };
+        let (cover_wake, mut cover_wake_rx) = futures_channel::mpsc::channel::<()>(1);
+        let cover_mailbox = Arc::new(CoverMailbox::new(cover_wake));
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -1010,9 +974,8 @@ impl Root {
             lyrics_cover_gate: None,
             theme_snapshot_key: None,
             queue_cache: (0, Arc::new(Vec::new())),
-            cover_attempted: Arc::new(Mutex::new(HashSet::new())),
-            cover_requests: Arc::new(Mutex::new(Vec::new())),
-            covers: Arc::new(HashMap::new()),
+            cover_store: CoverStore::default(),
+            cover_mailbox,
             original_covers: HashMap::new(),
             original_cover_attempted: Arc::new(Mutex::new(HashSet::new())),
             original_cover_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1020,8 +983,6 @@ impl Root {
             contributors_image: None,
             contributors_fetching: false,
             contributors_failed: false,
-            ambient_colors: HashMap::new(),
-            cover_pool: CoverPool::new(),
             login: LoginState::Idle,
             account: None,
             engine,
@@ -1172,25 +1133,46 @@ impl Root {
             root.nav = Nav::Lyrics;
             cx.notify();
         }
-        // 封面需求消费循环：渲染只往队列里塞 URL，这里统一喂给请求池
-        //（最多 8 并发 + 去重），避免渲染过程中做任何网络/状态更新。
+        // 封面需求消费循环：渲染只往邮箱里塞 URL，去重交给 CoverStore::want。
+        // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒。
         {
-            let queue = root.cover_requests.clone();
+            let mailbox = root.cover_mailbox.clone();
             cx.spawn(async move |this, cx| loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(60))
-                    .await;
-                let pending: Vec<String> = {
-                    let mut queue = match queue.lock() {
-                        Ok(queue) => queue,
-                        Err(_) => continue,
-                    };
-                    if queue.is_empty() {
-                        continue;
+                let pending = mailbox.take();
+                let had_demand = !pending.is_empty();
+                let stats = if had_demand {
+                    match this.update(cx, |root, cx| root.ensure_covers(&pending, cx)) {
+                        Ok(stats) => stats,
+                        Err(_) => break,
                     }
-                    std::mem::take(&mut *queue)
+                } else {
+                    CoverWant::default()
                 };
-                let _ = this.update(cx, |root, cx| root.ensure_covers(&pending, cx));
+                if stats.queued + stats.dropped > 0
+                    && log_outlet::enabled(LogLevel::Debug, LogTopic::App)
+                {
+                    let queued = stats.queued.to_string();
+                    let dropped = stats.dropped.to_string();
+                    log_event(
+                        LogLevel::Debug,
+                        LogTopic::App,
+                        "cover_queue",
+                        &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
+                    );
+                }
+                if had_demand {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(60))
+                        .await;
+                } else {
+                    let idle = cx
+                        .background_executor()
+                        .timer(std::time::Duration::from_millis(500));
+                    let _ = futures_lite::future::or(idle, async {
+                        let _ = cover_wake_rx.next().await;
+                    })
+                    .await;
+                }
             })
             .detach();
         }
@@ -1793,8 +1775,8 @@ impl Root {
         })
         .detach();
 
-        // 用通道 + 轮询而不是 select：`futures-lite` 只在 Linux 目标下引入，
-        // 这里保持跨平台，20ms 一拍足够。
+        // 用通道 + 轮询：退出这拍只需要「落盘有没有完」一个信号，
+        // 20ms 一拍的轮询足够，没必要为它再搭一个 select。
         cx.spawn(async move |this, cx| {
             loop {
                 if matches!(
@@ -2004,7 +1986,7 @@ impl Render for Root {
         let ambient_url = self.queue.current().map(|track| track.cover.clone());
         let ambient_color = ambient_url
             .as_deref()
-            .and_then(|url| self.ambient_colors.get(url).copied());
+            .and_then(|url| self.cover_store.color(url));
         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
             let current = self
                 .queue
@@ -2277,83 +2259,20 @@ impl Render for Root {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_verify_window_result, verify_window_step, CoverPool, VerifyWindowState,
+        apply_verify_window_result, verify_window_step, CoverMailbox, VerifyWindowState,
         VerifyWindowStep,
     };
 
-    /// forget 要同时摘掉排队项和去重标记，重新入队才不会下两遍。
+    /// 渲染推一条需求，消费循环要被叫醒，`take` 一次拿干净。
     #[test]
-    fn cover_pool_forget_allows_exactly_one_requeue() {
-        let mut pool = CoverPool::new();
-        assert!(pool.push("cover-a"));
-        assert!(pool.push("cover-b"));
-        assert!(!pool.push("cover-a"), "没 forget 之前不能重复入队");
-        assert_eq!(pool.queue.len(), 2);
+    fn cover_mailbox_requests_wake_and_drain() {
+        let (wake, mut rx) = futures_channel::mpsc::channel::<()>(1);
+        let mailbox = CoverMailbox::new(wake);
 
-        pool.forget("cover-a");
-        assert_eq!(pool.queue.len(), 1, "排队里的旧请求要被摘掉");
-        assert!(!pool.seen.contains("cover-a"), "去重标记也要放行");
-
-        assert!(pool.push("cover-a"), "forget 之后要能重新入队");
-        assert_eq!(pool.queue.iter().filter(|url| *url == "cover-a").count(), 1);
-    }
-
-    /// 正在下载的封面被淘汰时，forget 不能放行去重标记，否则同一张会同时下两遍。
-    #[test]
-    fn cover_pool_forget_keeps_seen_while_inflight() {
-        let mut pool = CoverPool::new();
-        assert!(pool.push("cover-a"));
-        assert_eq!(pool.next().as_deref(), Some("cover-a"), "取出后进入下载中");
-        assert!(pool.inflight.contains("cover-a"));
-
-        pool.forget("cover-a");
-        assert!(
-            !pool.push("cover-a"),
-            "下载中 forget 不能放行，否则同一张下两遍"
-        );
-
-        // 下载中这张被淘汰，文件很可能已删或没下到；这次结束后必须放行 seen，
-        // 渲染发现缺图时才能重新排队——不管这次下载成功还是失败。
-        pool.done("cover-a");
-        assert!(!pool.inflight.contains("cover-a"));
-        assert!(!pool.forgotten.contains("cover-a"));
-        assert!(pool.push("cover-a"), "这次拿回的封面不可用，要能重新入队");
-    }
-
-    /// 解析成功但文件被淘汰删掉的封面，发布前要放行 pool 的去重标记才能重排。
-    #[test]
-    fn cover_pool_release_seen_allows_retry() {
-        let mut pool = CoverPool::new();
-        assert!(pool.push("cover-a"));
-        pool.next();
-        pool.done("cover-a");
-        assert!(pool.seen.contains("cover-a"));
-        pool.release_seen("cover-a");
-        assert!(pool.push("cover-a"), "放行后要能重新入队");
-    }
-
-    /// 清缓存时正在下载/排队的 URL 要留着去重，已经下完的才放行。
-    #[test]
-    fn cover_pool_reset_seen_keeps_active_urls() {
-        let mut pool = CoverPool::new();
-        assert!(pool.push("downloading"));
-        assert!(pool.push("queued"));
-        assert!(pool.push("done"));
-        assert_eq!(pool.next().as_deref(), Some("downloading"));
-        assert_eq!(pool.next().as_deref(), Some("queued"));
-        assert_eq!(pool.next().as_deref(), Some("done"));
-        pool.done("done");
-
-        pool.reset_seen_preserving_inflight();
-        assert!(pool.seen.contains("downloading"), "下载中的要留着去重");
-        assert!(pool.seen.contains("queued"), "另一个在飞的也要留着");
-        assert!(!pool.seen.contains("done"), "下完的放行，能重新请求");
-        assert!(!pool.push("downloading"), "下载中不能被再次入队");
-
-        // 磁盘被清空的在飞封面：这次下载结束时必须放行 seen，否则一直占位图。
-        assert!(pool.forgotten.contains("downloading"));
-        pool.done("downloading");
-        assert!(pool.push("downloading"), "清缓存后在飞的也要能重新入队");
+        mailbox.request("cover-a".to_string());
+        assert!(rx.try_recv().is_ok(), "有需求要叫醒消费循环");
+        assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
+        assert!(mailbox.take().is_empty());
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";
