@@ -2972,8 +2972,10 @@ impl Root {
                     );
                 }
                 Err(failure) => {
+                    // 默认阈值是 INFO，Debug 不落盘；升级失败是用户能感知的「音质没变」，
+                    // 至少用 WARN 让默认日志里查得到（#249）。
                     log_outlet::log_event(
-                        LogLevel::Debug,
+                        LogLevel::Warn,
                         LogTopic::Player,
                         "cache_upgrade_failed",
                         &[
