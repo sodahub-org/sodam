@@ -723,7 +723,7 @@ impl Root {
 
     /// 淘汰删了磁盘上的封面后，同步清掉内存里指向它们的路径映射。
     ///
-    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各自独立，
+    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各查各的，
     /// 只删了缩略图就不动原图映射。清掉缩略图那笔账后，渲染发现缺图会重新排队；
     /// 当前曲目的原图被删时直接补一次下载，歌词页没有原图的自动入队口子，
     /// 不等它自己回来。
@@ -744,17 +744,20 @@ impl Root {
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
-        // 两格共用一套作废：清路径 / 颜色 / 记号 / 失败次数。缩略图靠渲染发现缺图
-        // 重新 want，原图没有这个口子，当前曲目被清到时显式补一次。
-        let mut removed_urls = thumb_urls;
-        removed_urls.extend(original_urls);
+        // 各清各的账：缩略图靠渲染发现缺图重新 want，原图没有这个口子，
+        // 当前曲目被清到时显式补一次。
         self.cover_store
-            .forget(removed_urls.iter().map(String::as_str));
+            .forget_thumbnail(thumb_urls.iter().map(String::as_str));
+        if original_urls.is_empty() {
+            return;
+        }
+        self.cover_store
+            .forget_original(original_urls.iter().map(String::as_str));
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
         let current_cover = current_cover_url(self.pending_track.as_ref(), self.queue.current());
         if let Some(url) = current_cover {
-            if removed_urls.contains(&url) {
+            if original_urls.contains(&url) {
                 self.ensure_original_cover(&url, cx);
             }
         }
@@ -767,13 +770,13 @@ impl Root {
     /// 必须显式补一次，否则歌词页大图停在占位图。口径跟歌词页一致：
     /// `pending_track.or(queue.current())`。
     ///
-    /// `forget` 会把此刻正在下载的那张标成作废；`ensure_original_cover` 期间
-    /// 记下的需求会在旧结果回来后补排，不会同一张并发下两遍。
+    /// 此刻还在下载的那张不打断：完成时按文件在不在照常落账（#250），
+    /// 落完要是文件也没了再补排，不会同一张并发下两遍。
     pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
         let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
             return;
         };
-        self.cover_store.forget([url.as_str()]);
+        self.cover_store.retry_original_after_release(&url);
         self.ensure_original_cover(&url, cx);
     }
 
@@ -1374,8 +1377,8 @@ impl Root {
     pub(crate) fn pump_original_covers(&mut self, cx: &mut Context<Self>) {
         for url in self.cover_store.drain_original() {
             let settings = self.settings.clone();
-            let fetch_url = url.clone();
-            let work_url = fetch_url.clone();
+            let work_url = url.clone();
+            let fetch_url = url;
             let work = cx.background_spawn(async move {
                 Session::new(settings).original_cover_path(&work_url)
             });

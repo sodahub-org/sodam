@@ -474,6 +474,26 @@ impl CoverStore {
                 };
             }
         }
+        // 清缓存时当前曲目的原图还在下载：这次按文件在不在落账，落完还缺就补排。
+        if self.originals.requeue_after_release.remove(url) {
+            self.originals
+                .enqueue(url, &self.original_paths, &mut self.records, original_slot);
+        }
+    }
+
+    /// 清缓存后当前曲目的原图还在下载：这次结果照常落账，落账后还缺再补排。
+    ///
+    /// 不能直接 `forget`：那会把这次已经写完、只是晚一步回来的文件一起丢掉，
+    /// 白白多下一份（#250 的「在飞保留、完成时按文件在不在落账」）。
+    pub fn retry_original_after_release(&mut self, url: &str) {
+        let url = url.trim();
+        if self
+            .records
+            .get(url)
+            .is_some_and(|record| record.original.state == State::Inflight)
+        {
+            self.originals.requeue_after_release.insert(url.to_string());
+        }
     }
 
     /// 作废这些 URL 的两格：清路径、颜色、记号、失败次数；不碰磁盘。
@@ -482,15 +502,60 @@ impl CoverStore {
     pub fn forget<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
         for raw in urls {
             let url = raw.trim();
-            if url.is_empty() {
-                continue;
-            }
-            self.thumbnails
-                .forget(url, &mut self.records, thumbnail_slot);
-            self.originals.forget(url, &mut self.records, original_slot);
-            self.thumbnail_paths.remove(url);
-            self.original_paths.remove(url);
-            self.colors.remove(url);
+            self.forget_thumbnail_url(url);
+            self.forget_original_url(url);
+            self.discard_if_empty(url);
+        }
+    }
+
+    /// 只作废缩略图那格；原图路径和排队原样保留。
+    ///
+    /// 淘汰按文件路径精确反查，只删了缩略图就不该连原图一起清。
+    pub fn forget_thumbnail<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
+        for raw in urls {
+            let url = raw.trim();
+            self.forget_thumbnail_url(url);
+            self.discard_if_empty(url);
+        }
+    }
+
+    /// 只作废原图那格；缩略图路径和排队原样保留。
+    pub fn forget_original<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
+        for raw in urls {
+            let url = raw.trim();
+            self.forget_original_url(url);
+            self.discard_if_empty(url);
+        }
+    }
+
+    fn forget_thumbnail_url(&mut self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        self.thumbnails
+            .forget(url, &mut self.records, thumbnail_slot);
+        self.thumbnail_paths.remove(url);
+        self.colors.remove(url);
+    }
+
+    fn forget_original_url(&mut self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        self.originals.forget(url, &mut self.records, original_slot);
+        self.original_paths.remove(url);
+    }
+
+    /// 两格都回到默认状态时把记录删掉，别让淘汰每扫一轮就留下一条空记录。
+    fn discard_if_empty(&mut self, url: &str) {
+        let empty = self.records.get(url).is_some_and(|record| {
+            record.thumbnail.state == State::Idle
+                && record.original.state == State::Idle
+                && record.thumbnail.failures == 0
+                && record.original.failures == 0
+        });
+        if empty {
+            self.records.remove(url);
         }
     }
 
@@ -925,22 +990,19 @@ mod tests {
     #[test]
     fn original_queue_cap_evicts_oldest_and_allows_requeue() {
         let mut store = CoverStore::default();
-        let total = MAX_ORIGINAL_CONCURRENCY + MAX_ORIGINAL_QUEUE;
-        let many: Vec<String> = (0..total)
+        let many: Vec<String> = (0..MAX_ORIGINAL_QUEUE)
             .map(|index| format!("original-{index}"))
             .collect();
         for url in &many {
             assert!(store.want_original(url));
         }
-        assert_eq!(store.drain_original().len(), MAX_ORIGINAL_CONCURRENCY);
 
-        let oldest_queued = many[MAX_ORIGINAL_CONCURRENCY].clone();
-        let extra = format!("original-{total}");
+        let extra = format!("original-{MAX_ORIGINAL_QUEUE}");
         assert!(store.want_original(&extra), "满了也要收新图");
-        assert!(
-            store.want_original(&oldest_queued),
-            "被挤掉的最旧原图能重新排队"
-        );
+
+        let oldest = many[0].clone();
+        assert!(store.want_original(&oldest), "被挤掉的最旧原图能重新排队");
+        assert!(!store.want_original(&oldest), "排进去之后不重复入队");
     }
 
     /// 验收：原图失败也按两次才放弃，作废之后能重新下。
@@ -1017,6 +1079,70 @@ mod tests {
             .originals_handle()
             .urls_for_removed_paths(&[PathBuf::from("/tmp/thumb.img")], |_| true)
             .is_empty());
+
+        // 淘汰只删了缩略图：原图路径要留住。
+        store.forget_thumbnail(["cover-a"]);
+        assert!(store.path("cover-a").is_none());
+        assert_eq!(
+            store.original_path("cover-a"),
+            Some(PathBuf::from("/tmp/full.img"))
+        );
+
+        // 只删了原图：缩略图不受影响（这次缩略图已经清掉了，补回来再看）。
+        store.want(&urls(&["cover-a"]));
+        store.drain();
+        store.complete("cover-a", ready("/tmp/thumb-2.img"));
+        store.forget_original(["cover-a"]);
+        assert!(store.original_path("cover-a").is_none());
+        assert_eq!(
+            store.path("cover-a"),
+            Some(PathBuf::from("/tmp/thumb-2.img"))
+        );
+    }
+
+    /// 验收：共用同一个 `forget`：缩略图和原图两格一起作废。
+    #[test]
+    fn forget_clears_both_cells() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["cover-a"]));
+        store.drain();
+        store.complete("cover-a", ready("/tmp/thumb.img"));
+        store.want_original("cover-a");
+        store.drain_original();
+        store.complete_original("cover-a", original_ready("/tmp/full.img"));
+
+        store.forget(["cover-a"]);
+        assert!(store.path("cover-a").is_none());
+        assert!(store.original_path("cover-a").is_none());
+        assert_eq!(store.want(&urls(&["cover-a"])).len(), 1, "两格都能重新下");
+        assert!(store.want_original("cover-a"));
+    }
+
+    /// 清缓存后当前曲目的原图还在下载：先按文件在不在落账，缺了才补排。
+    #[test]
+    fn retry_after_release_lands_surviving_file_and_requeues_vanished() {
+        let mut store = CoverStore::default();
+
+        assert!(store.want_original("original-a"));
+        assert_eq!(store.drain_original(), vec!["original-a".to_string()]);
+        store.retry_original_after_release("original-a");
+        store.complete_original("original-a", original_ready("/tmp/full.img"));
+        assert!(
+            store.original_path("original-a").is_some(),
+            "文件还在就落账"
+        );
+        assert!(store.drain_original().is_empty(), "文件在就不用再下");
+
+        assert!(store.want_original("original-b"));
+        assert_eq!(store.drain_original(), vec!["original-b".to_string()]);
+        store.retry_original_after_release("original-b");
+        store.complete_original("original-b", CoverOutcome::Vanished);
+        assert!(store.original_path("original-b").is_none());
+        assert_eq!(
+            store.drain_original(),
+            vec!["original-b".to_string()],
+            "文件没了才补排"
+        );
     }
 
     /// 原图在飞时作废，结果回来后同样不能重复下；有人要就补排。
