@@ -3054,7 +3054,7 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「服务端没有更高档位」
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「没换成更好整曲」
     /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
     ///
@@ -3390,8 +3390,8 @@ impl Root {
                                     tally.no_higher.to_string(),
                                 ],
                             );
-                            // 一首都没成、又确实有失败的：别弹绿色成功。
-                            if tally.upgraded == 0 && tally.failed > 0 {
+                            // 一首都没升级成功：别弹绿色成功，全落在「无更好整曲」也一样。
+                            if tally.upgraded == 0 {
                                 root.notify_warning_once("batch-upgrade-complete", message);
                             } else {
                                 root.notify_success_once("batch-upgrade-complete", message);
