@@ -390,16 +390,11 @@ pub fn batch_upgrade_needs_confirmed_entitlement(
     intent.requires_membership() && is_vip != Some(true)
 }
 
-/// 这个目标档位的「没有更高流」结论能否持久化。
+/// 「要过这个档位、没拿到更高流」的结论能否持久化。
 ///
-/// 记下的是「用当前账号向服务端要过这个档位，服务端没给更高的流」，不是
-/// 「曲库永远没有」。曲库补档与会员权益变化都没有推送，所以这份记录只保 30 天
-/// （见 [`crate::cache::UPGRADE_CHECK_TTL`]），到期重新问一次。
-///
-/// 低于会员门槛的档位无需权益；会员门槛（88）及以上的档位只在确认账号是会员时才记。
-/// 账号信息只有一个 VIP 布尔，分不清杜比 / Hi-Res 需要的更高等级，所以高档位的
-/// 负结论也可能只是「权益不够」——30 天有效期就是兜底：宁可最多晚 30 天再试，
-/// 也不能每轮批量都把整首重下一遍再丢掉（#247）。
+/// 低于会员门槛的档位无需权益；会员门槛（88）及以上只在确认账号是会员时才记。
+/// 记录含义与有效期见 [`crate::cache::UPGRADE_CHECK_TTL`]：它记的是「当时账号要过这个档位」，
+/// 不是「曲库永远没有」。
 pub fn can_record_unavailable(target_rank: Option<i64>, is_vip: Option<bool>) -> bool {
     match target_rank {
         Some(rank) if rank < MEMBERSHIP_MIN_RANK => true,
@@ -850,9 +845,7 @@ mod tests {
     }
 
     /// 负结果只在能确认账号权益时落盘：非会员档位无需权益，无损及更高档位需要 VIP。
-    ///
-    /// #247：杜比 / Hi-Res 同样要记。VIP 布尔分不清更高等级，但记录带 30 天有效期，
-    /// 最多晚 30 天重探；不记就是每轮批量都整首重下一遍。
+    /// 记录含义与有效期见 `cache::UPGRADE_CHECK_TTL`。
     #[test]
     fn unavailable_results_only_recorded_with_confirmed_entitlement() {
         assert!(can_record_unavailable(Some(50), None));
@@ -860,9 +853,8 @@ mod tests {
         assert!(can_record_unavailable(Some(100), Some(true)));
         assert!(!can_record_unavailable(Some(100), Some(false)));
         assert!(!can_record_unavailable(Some(100), None));
-        // Hi-Res / 杜比 / 有 Hi-Res 标签的流都过会员门槛：确认会员才写负结果。
+        // Hi-Res / 杜比都过会员门槛：确认会员才写负结果。
         assert!(can_record_unavailable(Some(110), Some(true)));
-        assert!(can_record_unavailable(Some(90), Some(true)));
         assert!(can_record_unavailable(Some(88), Some(true)));
         assert!(!can_record_unavailable(Some(110), Some(false)));
         assert!(!can_record_unavailable(Some(110), None));

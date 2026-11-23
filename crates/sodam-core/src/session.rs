@@ -642,8 +642,7 @@ fn record_preview_upgrade_attempt(
 ///
 /// 返回应写入 sidecar 的 `checked_rank`。试听回退、权益未确认、档位未知、目标未知或
 /// 实际已经达标都不写——这些不是「要过这个档位、服务端没给更高流」的确认性结论。
-/// 写下来的记录只保 30 天（见 [`crate::cache::UPGRADE_CHECK_TTL`]），账号权益或曲库
-/// 变化后到期会重新探测。
+/// 写下来的记录只保 30 天（见 [`crate::cache::UPGRADE_CHECK_TTL`]）。
 /// 试听回退也不写：它不是「曲库没有更高档位」，只是「这次只给了半条流」；
 /// 补整曲的重试节奏另由 sidecar 第 7 字段的退避记录管理（#130）。
 fn confirmed_miss_rank(
@@ -1021,8 +1020,7 @@ impl Session {
     /// * 若新拉到的档位并不高于当前已有档位，清理临时文件，保留原有缓存并返回原有缓存；
     ///   档位未知的旧三字段缓存按标签能证明的下限比较（#89）；
     /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
-    ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录
-    ///   （#247：杜比 / Hi-Res 也记，权益变化最多等 30 天再重探）。
+    ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
     ///   档位未知的旧缓存同样记得下（sidecar 第 4 字段留空），否则每轮都会重下一遍。
     pub fn upgrade_cached_track(
         &self,
@@ -1830,7 +1828,7 @@ mod tests {
         assert_eq!(confirmed_miss_rank(None, 80, false, true), None);
         // 档位算不出来（未知，0 分）时不是确认性结论。
         assert_eq!(confirmed_miss_rank(Some(100), 0, false, true), None);
-        // #247：杜比 / Hi-Res 拿到低于目标的整曲流，同样是确认性结论。
+        // 杜比 / Hi-Res 拿到低于目标的整曲流，同样是确认性结论。
         assert_eq!(confirmed_miss_rank(Some(110), 100, false, true), Some(110));
         assert_eq!(confirmed_miss_rank(Some(88), 80, false, true), Some(88));
     }
@@ -1884,7 +1882,7 @@ mod tests {
         assert!(!known_rank_track(100, None).needs_upgrade(&lossless, None));
     }
 
-    /// #247：杜比 / Hi-Res 的探测结论同样要挡住下一次升级，否则每轮都整首重下一遍。
+    /// 杜比 / Hi-Res 的探测结论同样要挡住下一次升级，否则每轮都整首重下一遍。
     #[test]
     fn high_tier_check_suppresses_the_next_upgrade() {
         let hires = crate::quality::QualityIntent::parse("hires");

@@ -14,9 +14,8 @@ const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// 探测记录的有效期：记的是「用当时账号向服务端要过这个档位、没拿到更高的流」。
 ///
-/// 曲库补档与会员权益变化都没有推送通知，永久保留一次探测结论会让那些曲目
-/// 再也不参与升级；30 天后重新问一次，代价最多是一次请求。杜比 / Hi-Res 也一样：
-/// 权益变了最多等 30 天，不能每轮批量都整首重下一遍（#247）。
+/// 记录不是曲库永久结论：补档、换号或会员权益变化都不会立刻作废，30 天后重新问一次。
+/// 杜比 / Hi-Res 也走这一条，避免每轮批量都整首重下一遍再丢掉。
 pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// 「上次为补整曲重新取流」记录的有效期。
@@ -2467,7 +2466,7 @@ mod tests {
         assert!(!upgrade_check_covers(Some(80), None));
     }
 
-    /// #247：杜比 / Hi-Res 的探测结论也要挡住批量与预估，不能再整首重下一遍。
+    /// 杜比 / Hi-Res 的探测结论也要挡住批量与预估，不能再整首重下一遍。
     #[test]
     fn high_tier_check_skips_upgrade_and_estimate() {
         let confirmed = CachedAudioRecord {
