@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
-use sodam_core::cover::{CoverOutcome, CoverWant};
+use sodam_core::cover::{cover_paths_for_removed_paths, CoverOutcome, CoverWant};
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -45,13 +45,16 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
 ) -> HashSet<String> {
     let removed_set: HashSet<&std::path::Path> =
         removed.iter().map(|path| path.as_path()).collect();
-    covers
-        .iter()
-        .filter(|(_, path)| {
-            removed_set.contains(path.as_path()) && is_still_missing(path.as_path())
-        })
-        .map(|(url, _)| url.clone())
-        .collect()
+    cover_paths_for_removed_paths(
+        covers
+            .iter()
+            .map(|(url, path)| (url.as_str(), path.as_path())),
+        &removed_set,
+    )
+    .into_iter()
+    .filter(|(_, path)| is_still_missing(path))
+    .map(|(url, _)| url)
+    .collect()
 }
 
 /// 单首 / 批量两条路各自的日志级别。
@@ -73,23 +76,20 @@ fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) ->
     pending.or(queued).map(|track| track.cover.clone())
 }
 
-/// 原图下载完成后的去向。
+/// 原图下载完成后的三种落账。
 #[derive(Debug, PartialEq, Eq)]
 enum OriginalCoverSettlement {
-    /// 文件还在，可以发布。
+    /// 文件还在。
     Published(PathBuf),
-    /// 解析到了路径，但文件已经被清缓存或淘汰删掉：不发布，放行「已尝试」。
+    /// 文件已删，不发布。
     Vanished,
-    /// 压根没解析出路径（下载失败）：不发布，保留「已尝试」。
+    /// 没下到，不发布。
     Failed,
 }
 
-/// 判定一张原图下载完成后的去向。
+/// 文件在就发布；文件已删就不发布并放行重试；没下到则保留失败记号。
 ///
-/// 清缓存或缓存淘汰可能刚好把文件删掉：`original_cover_path` 解析出了路径，
-/// 回调跑在删除之后时没人兜底，所以这里自己再查一遍。死路径一旦写进
-/// `original_covers`，`ensure_original_cover` 开头就会把它当成命中，这首歌的
-/// 歌词页大图整个会话都回不来。缩略图那条路早就是这样做的。
+/// 这条复核不能省：死路径会被 `ensure_original_cover` 当成已有封面，歌词页大图再也回不来。
 fn settle_original_cover(
     path: Option<PathBuf>,
     file_exists: impl FnOnce(&std::path::Path) -> bool,
@@ -101,10 +101,7 @@ fn settle_original_cover(
     }
 }
 
-/// 文件在下载期间被删掉后，要不要顺手给当前曲目再排一次。
-///
-/// 清缓存还在跑时交给 `clear_cache` 的补偿，别和它抢；淘汰删文件时
-/// `drop_removed_covers` 反查不到还没发布过的 URL，只能在这里补。
+/// 文件已删时，只有不在清缓存且仍是当前曲目才立刻补排。
 fn retry_vanished_original_cover(
     cache_clearing: bool,
     displayed_cover: Option<&str>,

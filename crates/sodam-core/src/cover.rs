@@ -45,6 +45,23 @@ pub struct CoverPaths {
     inner: Arc<RwLock<HashMap<String, PathBuf>>>,
 }
 
+/// 从任意 URL → 路径迭代器里挑出被删路径对应的条目。
+///
+/// 只匹配内存里的路径，不碰磁盘；调用方再确认文件是否真的没了。
+pub fn cover_paths_for_removed_paths<'a, I>(
+    entries: I,
+    removed: &HashSet<&Path>,
+) -> Vec<(String, PathBuf)>
+where
+    I: IntoIterator<Item = (&'a str, &'a Path)>,
+{
+    entries
+        .into_iter()
+        .filter(|(_, path)| removed.contains(*path))
+        .map(|(url, path)| (url.to_owned(), path.to_owned()))
+        .collect()
+}
+
 impl CoverPaths {
     /// 这张图有没有已完成路径（只查内存，不克隆）。
     pub fn contains(&self, url: &str) -> bool {
@@ -103,11 +120,12 @@ impl CoverPaths {
                 .inner
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            paths
-                .iter()
-                .filter(|(_, path)| removed.contains(path.as_path()))
-                .map(|(url, path)| (url.clone(), path.clone()))
-                .collect()
+            cover_paths_for_removed_paths(
+                paths
+                    .iter()
+                    .map(|(url, path)| (url.as_str(), path.as_path())),
+                &removed,
+            )
         };
         candidates
             .into_iter()
@@ -357,7 +375,10 @@ impl CoverStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_QUEUE};
+    use super::{
+        cover_paths_for_removed_paths, CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_QUEUE,
+    };
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     fn urls(items: &[&str]) -> Vec<String> {
@@ -371,7 +392,7 @@ mod tests {
         }
     }
 
-    /// 验收：同一 URL 连要十次，最多只发一次取图请求。
+    /// 渲染每帧都会重新要图；去重必须认 URL，不能认请求次数。
     #[test]
     fn want_same_url_ten_times_fetches_once() {
         let mut store = CoverStore::default();
@@ -420,7 +441,7 @@ mod tests {
         assert_eq!(store.want(&url).len(), 1, "清掉失败记录后能重新下");
     }
 
-    /// 清缓存后失败户也能重新下。
+    /// 清缓存后失败的那张也能重新下。
     #[test]
     fn clear_completed_revives_failed_url() {
         let mut store = CoverStore::default();
@@ -437,7 +458,7 @@ mod tests {
         assert_eq!(store.want(&url).len(), 1);
     }
 
-    /// 验收：队列塞满后挤掉的那张还能重新排进来。
+    /// 队列满时先撤回最旧项的去重状态，否则被挤掉的图再也排不回来。
     #[test]
     fn full_queue_evicts_oldest_and_allows_requeue() {
         let mut store = CoverStore::default();
@@ -565,10 +586,7 @@ mod tests {
         assert_eq!(store.want(&url).len(), 1);
     }
 
-    /// 验收：查路径 / 查颜色 / 取快照只读，不改状态、不消费排队项。
-    ///
-    /// store 本身没有取图入口，取图只在 `drain` 之后由调用方做；这里钉住
-    /// 读口子不能把排队项吃掉、不能放行去重、不能凭空变出路径。
+    /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。
     #[test]
     fn read_ports_are_side_effect_free() {
         let mut store = CoverStore::default();
@@ -584,7 +602,7 @@ mod tests {
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
     }
 
-    /// 淘汰反查只认「真没了」的路径：重建回来的不算缺。
+    /// 下载可能把淘汰列表里的文件重建回来，反查不能据此清掉映射。
     #[test]
     fn removed_paths_skip_rebuilt_files() {
         let mut store = CoverStore::default();
@@ -606,6 +624,53 @@ mod tests {
         assert!(handle
             .urls_for_removed_paths(std::slice::from_ref(&path), |_| false)
             .is_empty());
+    }
+
+    /// 被删路径成千上万，不能为了反查 URL 对整张内存表逐个 stat。
+    #[test]
+    fn removed_paths_only_check_matching_entries() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["cover-a", "cover-b"]));
+        store.drain();
+        let removed = PathBuf::from("/tmp/a.img");
+        store.complete(
+            "cover-a",
+            CoverOutcome::Ready {
+                path: removed.clone(),
+                color: None,
+            },
+        );
+        store.complete(
+            "cover-b",
+            CoverOutcome::Ready {
+                path: PathBuf::from("/tmp/b.img"),
+                color: None,
+            },
+        );
+
+        let mut checked = Vec::new();
+        let matches =
+            store
+                .paths_handle()
+                .urls_for_removed_paths(std::slice::from_ref(&removed), |path| {
+                    checked.push(path.to_path_buf());
+                    true
+                });
+        assert_eq!(checked, vec![removed]);
+        assert_eq!(matches.len(), 1);
+        assert!(matches.contains("cover-a"));
+    }
+
+    /// 缩略图是锁里的表，原图是普通 HashMap；匹配函数不能绑定某一种容器。
+    #[test]
+    fn removed_path_helper_accepts_arrays() {
+        let removed = PathBuf::from("/tmp/gone.img");
+        let kept = PathBuf::from("/tmp/kept.img");
+        let entries = [("gone", removed.as_path()), ("kept", kept.as_path())];
+
+        let removed_set = HashSet::from([removed.as_path()]);
+        let matches = cover_paths_for_removed_paths(entries, &removed_set);
+        assert_eq!(matches, vec![("gone".to_string(), removed)]);
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。

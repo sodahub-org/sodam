@@ -1165,6 +1165,7 @@ impl Root {
                         .timer(std::time::Duration::from_millis(60))
                         .await;
                 } else {
+                    // 空队列时把 500ms 定时器和唤醒通道合成一个等待，不额外引入运行时。
                     let idle = cx
                         .background_executor()
                         .timer(std::time::Duration::from_millis(500));
