@@ -507,12 +507,9 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
         )
     };
 
-    let cover_path = root
-        .original_covers
-        .get(&track.cover)
-        .cloned()
-        .or_else(|| root.cover_of(&track.cover));
-    let original_cover_ready = root.original_covers.contains_key(&track.cover);
+    let original_cover_path = root.cover_store.original_path(&track.cover);
+    let original_cover_ready = original_cover_path.is_some();
+    let cover_path = original_cover_path.or_else(|| root.cover_of(&track.cover));
     // 切曲后的前 200ms 强制显示加载态（即便图在缓存里）。
     let cover_loading_gate = root
         .lyrics_cover_gate

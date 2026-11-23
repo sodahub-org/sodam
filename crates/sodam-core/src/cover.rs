@@ -1,8 +1,9 @@
-//! 封面缩略图状态：一条 URL 一条记录。
+//! 封面状态：一条 URL 一条记录，缩略图和原图各占一格。
 //!
 //! 取图本身不在这里：这里只回答「这张问过没有 / 排到哪一步了 / 结果是什么」。
-//! 读口子（`path` / `color` / `paths_handle`）是纯内存查询，不碰磁盘也不发请求；
-//! 下载由调用方泵出去，结果再用 [`CoverStore::complete`] 交回来。
+//! 读口子（`path` / `color` / `original_path` / `paths_handle` / `originals_handle`）
+//! 是纯内存查询，不碰磁盘也不发请求；下载由调用方泵出去，结果再用
+//! [`CoverStore::complete`] / [`CoverStore::complete_original`] 交回来。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -10,8 +11,13 @@ use std::sync::{Arc, RwLock};
 
 /// 缩略图下载的并发上限。
 pub const MAX_CONCURRENCY: usize = 8;
-/// 排队上限：超过就挤掉最旧的，被挤掉的那张退回可重排状态。
+/// 缩略图排队上限：超过就挤掉最旧的，被挤掉的那张退回可重排状态。
 pub const MAX_QUEUE: usize = 400;
+/// 原图下载的并发上限：单张解码最坏 64 MiB（16 位图翻倍），
+/// 用限流防快速切歌时瞬时内存失控。
+pub const MAX_ORIGINAL_CONCURRENCY: usize = 4;
+/// 原图排队上限：超过就丢最旧的（最新切进来的歌最有用）。
+pub const MAX_ORIGINAL_QUEUE: usize = 32;
 /// 同一张图失败几次后放弃。只记内存，重启后再试两次。
 pub const MAX_FAILURES: u8 = 2;
 
@@ -131,20 +137,35 @@ enum State {
 }
 
 #[derive(Debug, Default)]
-struct Record {
+struct Slot {
     state: State,
     failures: u8,
 }
 
-/// 缩略图封面的唯一账本。
+/// 一条 URL 的账：缩略图和原图各一格。
 #[derive(Debug, Default)]
-pub struct CoverStore {
-    records: HashMap<String, Record>,
+struct Record {
+    thumbnail: Slot,
+    original: Slot,
+}
+
+fn thumbnail_slot(record: &mut Record) -> &mut Slot {
+    &mut record.thumbnail
+}
+
+fn original_slot(record: &mut Record) -> &mut Slot {
+    &mut record.original
+}
+
+type SelectSlot = fn(&mut Record) -> &mut Slot;
+
+/// 一条腿的排队与在飞记账：队列、在飞集合、作废标记。
+///
+/// 缩略图和原图各有一条，差别只在队列 / 并发上限和完成后的落账。
+#[derive(Debug)]
+struct Lane {
     queue: VecDeque<String>,
     inflight: HashSet<String>,
-    /// 渲染闭包够不到 `Root`，用它拿一个只读句柄。
-    ready: CoverPaths,
-    colors: HashMap<String, CoverRgb>,
     /// 在飞期间被 `forget` 的 URL：这次结果作废，结束后退回 `Idle`。
     abandoned: HashSet<String>,
     /// 作废期间又有人在等这张图：结果回来放行后要立刻重排，
@@ -152,91 +173,229 @@ pub struct CoverStore {
     requeue_after_release: HashSet<String>,
     /// 队列满时挤掉的张数（日志用；每轮 `want` 重新计数）。
     evicted: usize,
+    max_queue: usize,
+    max_inflight: usize,
 }
 
-impl CoverStore {
-    /// 要这几张；返回这次真正新排进队列的 URL。
-    ///
-    /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
-    pub fn want(&mut self, urls: &[String]) -> Vec<String> {
-        // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
-        self.evicted = 0;
-        let mut queued = Vec::new();
-        for raw in urls {
-            if self.enqueue(raw.trim()) {
-                queued.push(raw.trim().to_string());
-            }
+impl Lane {
+    fn new(max_queue: usize, max_inflight: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            inflight: HashSet::new(),
+            abandoned: HashSet::new(),
+            requeue_after_release: HashSet::new(),
+            evicted: 0,
+            max_queue,
+            max_inflight,
         }
-        queued
     }
 
-    /// 单张入队；入队数由 `want` 的返回值算，这里只可能在满队列时记一次 dropped。
-    /// 作废放行补排也走这里，队列满时同样会挤出最旧的一张。
-    fn enqueue(&mut self, url: &str) -> bool {
-        if url.is_empty() || self.ready.contains(url) {
+    /// 单张入队。返回是否真的排进去了。
+    ///
+    /// 在飞但已被 `forget` 时，把这次需求记下来，等结果回来立刻重排。
+    fn enqueue(
+        &mut self,
+        url: &str,
+        ready: &CoverPaths,
+        records: &mut HashMap<String, Record>,
+        select: SelectSlot,
+    ) -> bool {
+        if url.is_empty() || ready.contains(url) {
             return false;
         }
-        let state = self.records.get(url).map(|record| record.state);
+        let state = records.get_mut(url).map(|record| select(record).state);
         if !matches!(state, None | Some(State::Idle)) {
-            // 在飞但已被 forget：把这次需求记下来，等结果回来立刻重排。
             if state == Some(State::Inflight) && self.abandoned.contains(url) {
                 self.requeue_after_release.insert(url.to_string());
             }
             return false;
         }
-        if self.queue.len() >= MAX_QUEUE {
-            self.evict_oldest();
+        if self.queue.len() >= self.max_queue {
+            self.evict_oldest(records, select);
         }
-        let record = self.records.entry(url.to_string()).or_default();
-        record.state = State::Queued;
+        let record = records.entry(url.to_string()).or_default();
+        select(record).state = State::Queued;
         self.queue.push_back(url.to_string());
         true
     }
 
-    /// 泵的上半截：把排队项推进在飞，最多 [`MAX_CONCURRENCY`] 个。
-    pub fn drain(&mut self) -> Vec<String> {
+    /// 泵的上半截：把排队项推进在飞，最多 `max_inflight` 个。
+    fn drain(&mut self, records: &mut HashMap<String, Record>, select: SelectSlot) -> Vec<String> {
         let mut started = Vec::new();
-        while self.inflight.len() < MAX_CONCURRENCY {
+        while self.inflight.len() < self.max_inflight {
             let Some(url) = self.queue.pop_front() else {
                 break;
             };
-            let record = self.records.entry(url.clone()).or_default();
-            if record.state != State::Queued {
+            let record = records.entry(url.clone()).or_default();
+            let slot = select(record);
+            if slot.state != State::Queued {
                 continue;
             }
-            record.state = State::Inflight;
+            slot.state = State::Inflight;
             self.inflight.insert(url.clone());
             started.push(url);
         }
         started
     }
 
-    /// 泵的下半截：收一次下载结果。
+    /// 泵的下半截的公共记账：出在飞、处理作废。
+    ///
+    /// 返回 `true` 表示这次结果作废，调用方不用再发布。
+    fn finish(
+        &mut self,
+        url: &str,
+        ready: &CoverPaths,
+        records: &mut HashMap<String, Record>,
+        select: SelectSlot,
+    ) -> bool {
+        self.inflight.remove(url);
+        if self.abandoned.remove(url) {
+            // 下载中被 forget：这次拿回来的东西不要，退回可重排。
+            // 不要动已发布路径：这条腿可能是另一格兜的底，文件还在。
+            if let Some(record) = records.get_mut(url) {
+                let slot = select(record);
+                slot.state = State::Idle;
+                slot.failures = 0;
+            }
+            // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
+            if self.requeue_after_release.remove(url) {
+                self.enqueue(url, ready, records, select);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// 作废一张：清队列位置、记号、失败次数；在飞的那张等结果回来再放行。
+    ///
+    /// 在飞不立刻放行——否则同一张会同时下两遍。
+    fn forget(&mut self, url: &str, records: &mut HashMap<String, Record>, select: SelectSlot) {
+        self.queue.retain(|queued| queued.as_str() != url);
+        let inflight = records
+            .get_mut(url)
+            .is_some_and(|record| select(record).state == State::Inflight);
+        if inflight {
+            self.abandoned.insert(url.to_string());
+            if let Some(record) = records.get_mut(url) {
+                select(record).failures = 0;
+            }
+        } else if let Some(record) = records.get_mut(url) {
+            *select(record) = Slot::default();
+        }
+    }
+
+    /// 切歌时只留一张在排队：别的排队项退回可重排，不删失败次数。
+    fn retain_only(
+        &mut self,
+        keep: &str,
+        records: &mut HashMap<String, Record>,
+        select: SelectSlot,
+    ) {
+        let mut dropped = Vec::new();
+        self.queue.retain(|queued| {
+            if queued.as_str() == keep {
+                true
+            } else {
+                dropped.push(queued.clone());
+                false
+            }
+        });
+        for url in dropped {
+            if let Some(record) = records.get_mut(&url) {
+                let slot = select(record);
+                if slot.state == State::Queued {
+                    slot.state = State::Idle;
+                }
+            }
+        }
+    }
+
+    fn evict_oldest(&mut self, records: &mut HashMap<String, Record>, select: SelectSlot) {
+        while let Some(url) = self.queue.pop_front() {
+            if let Some(record) = records.get_mut(&url) {
+                let slot = select(record);
+                if slot.state == State::Queued {
+                    slot.state = State::Idle;
+                    self.evicted += 1;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// 缩略图和原图的唯一账本。
+#[derive(Debug)]
+pub struct CoverStore {
+    records: HashMap<String, Record>,
+    thumbnails: Lane,
+    originals: Lane,
+    /// 渲染闭包够不到 `Root`，用它拿一个只读句柄。
+    thumbnail_paths: CoverPaths,
+    original_paths: CoverPaths,
+    colors: HashMap<String, CoverRgb>,
+}
+
+impl Default for CoverStore {
+    fn default() -> Self {
+        Self {
+            records: HashMap::new(),
+            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY),
+            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY),
+            thumbnail_paths: CoverPaths::default(),
+            original_paths: CoverPaths::default(),
+            colors: HashMap::new(),
+        }
+    }
+}
+
+impl CoverStore {
+    /// 要这几张缩略图；返回这次真正新排进队列的 URL。
+    ///
+    /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
+    pub fn want(&mut self, urls: &[String]) -> Vec<String> {
+        // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
+        self.thumbnails.evicted = 0;
+        let mut queued = Vec::new();
+        for raw in urls {
+            let url = raw.trim();
+            if self.thumbnails.enqueue(
+                url,
+                &self.thumbnail_paths,
+                &mut self.records,
+                thumbnail_slot,
+            ) {
+                queued.push(url.to_string());
+            }
+        }
+        queued
+    }
+
+    /// 泵的上半截：缩略图最多 [`MAX_CONCURRENCY`] 个在飞。
+    pub fn drain(&mut self) -> Vec<String> {
+        self.thumbnails.drain(&mut self.records, thumbnail_slot)
+    }
+
+    /// 泵的下半截：收一次缩略图结果。
     pub fn complete(&mut self, url: &str, outcome: CoverOutcome) {
         let url = url.trim();
         if url.is_empty() {
             return;
         }
-        self.inflight.remove(url);
-        if self.abandoned.remove(url) {
-            // 下载中被 forget：这次拿回来的东西不要，退回可重排。
-            // 不要动已发布路径：原图可能已经先兜过底，文件还在。
-            if let Some(record) = self.records.get_mut(url) {
-                record.state = State::Idle;
-                record.failures = 0;
-            }
-            // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
-            if self.requeue_after_release.remove(url) {
-                self.enqueue(url);
-            }
+        if self.thumbnails.finish(
+            url,
+            &self.thumbnail_paths,
+            &mut self.records,
+            thumbnail_slot,
+        ) {
             return;
         }
         match outcome {
             CoverOutcome::Ready { path, color } => {
                 let record = self.records.entry(url.to_string()).or_default();
-                record.state = State::Ready;
-                record.failures = 0;
-                self.ready.insert(url, path);
+                record.thumbnail.state = State::Ready;
+                record.thumbnail.failures = 0;
+                self.thumbnail_paths.insert(url, path);
                 match color {
                     Some(color) => {
                         self.colors.insert(url.to_string(), color);
@@ -248,14 +407,14 @@ impl CoverStore {
             }
             CoverOutcome::Vanished => {
                 if let Some(record) = self.records.get_mut(url) {
-                    record.state = State::Idle;
+                    record.thumbnail.state = State::Idle;
                 }
                 // 不抹已发布路径：原图先回来时可能已经兜过底，文件还在。
             }
             CoverOutcome::Failed => {
                 let record = self.records.entry(url.to_string()).or_default();
-                record.failures = record.failures.saturating_add(1);
-                record.state = if record.failures >= MAX_FAILURES {
+                record.thumbnail.failures = record.thumbnail.failures.saturating_add(1);
+                record.thumbnail.state = if record.thumbnail.failures >= MAX_FAILURES {
                     State::Failed
                 } else {
                     State::Idle
@@ -264,67 +423,127 @@ impl CoverStore {
         }
     }
 
-    /// 作废这些 URL：清路径、颜色、记号、失败次数；不碰磁盘。
+    /// 要一张原图；返回这次是否新排进队列。
+    pub fn want_original(&mut self, url: &str) -> bool {
+        self.originals.enqueue(
+            url.trim(),
+            &self.original_paths,
+            &mut self.records,
+            original_slot,
+        )
+    }
+
+    /// 泵的上半截：原图最多 [`MAX_ORIGINAL_CONCURRENCY`] 个在飞。
+    pub fn drain_original(&mut self) -> Vec<String> {
+        self.originals.drain(&mut self.records, original_slot)
+    }
+
+    /// 泵的下半截：收一次原图结果。
+    pub fn complete_original(&mut self, url: &str, outcome: CoverOutcome) {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
+        }
+        if self
+            .originals
+            .finish(url, &self.original_paths, &mut self.records, original_slot)
+        {
+            return;
+        }
+        match outcome {
+            CoverOutcome::Ready { path, .. } => {
+                let record = self.records.entry(url.to_string()).or_default();
+                record.original.state = State::Ready;
+                record.original.failures = 0;
+                self.original_paths.insert(url, path);
+            }
+            CoverOutcome::Vanished => {
+                if let Some(record) = self.records.get_mut(url) {
+                    record.original.state = State::Idle;
+                }
+                // 文件已经没了：死路径不能留，否则下一次查询会当成命中。
+                self.original_paths.remove(url);
+            }
+            CoverOutcome::Failed => {
+                let record = self.records.entry(url.to_string()).or_default();
+                record.original.failures = record.original.failures.saturating_add(1);
+                record.original.state = if record.original.failures >= MAX_FAILURES {
+                    State::Failed
+                } else {
+                    State::Idle
+                };
+            }
+        }
+    }
+
+    /// 作废这些 URL 的两格：清路径、颜色、记号、失败次数；不碰磁盘。
     ///
-    /// 在飞的那张不会立刻放行——否则同一张会同时下两遍；等这次结果回来再退回
-    /// 可重排状态。
+    /// 在飞的那张不会立刻放行——等这次结果回来再退回可重排状态。
     pub fn forget<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
         for raw in urls {
             let url = raw.trim();
             if url.is_empty() {
                 continue;
             }
-            self.queue.retain(|queued| queued.as_str() != url);
-            let inflight = self
-                .records
-                .get(url)
-                .is_some_and(|record| record.state == State::Inflight);
-            if inflight {
-                self.abandoned.insert(url.to_string());
-                if let Some(record) = self.records.get_mut(url) {
-                    record.failures = 0;
-                }
-            } else {
-                self.records.remove(url);
-            }
-            self.ready.remove(url);
+            self.thumbnails
+                .forget(url, &mut self.records, thumbnail_slot);
+            self.originals.forget(url, &mut self.records, original_slot);
+            self.thumbnail_paths.remove(url);
+            self.original_paths.remove(url);
             self.colors.remove(url);
         }
     }
 
-    /// 清缓存后作废「已完成」的结果：`Ready` / `Failed` 退回 `Idle`。
+    /// 切歌时原图排队只留当前曲目；被剔掉的退回可重排，下次播放会重新请求。
+    pub fn retain_original_only(&mut self, url: &str) {
+        self.originals
+            .retain_only(url.trim(), &mut self.records, original_slot);
+    }
+
+    /// 清缓存后作废「已完成」的结果：两格里的 `Ready` / `Failed` 都退回 `Idle`。
     ///
     /// 排队和在飞原样保留：丢掉在飞状态只会让同一张图再排一次，
     /// 个别情况下并发下两遍。
     pub fn clear_completed(&mut self) {
         for record in self.records.values_mut() {
-            if matches!(record.state, State::Ready | State::Failed) {
-                record.state = State::Idle;
-                record.failures = 0;
+            for slot in [&mut record.thumbnail, &mut record.original] {
+                if matches!(slot.state, State::Ready | State::Failed) {
+                    slot.state = State::Idle;
+                    slot.failures = 0;
+                }
             }
         }
-        self.ready.clear();
+        self.thumbnail_paths.clear();
+        self.original_paths.clear();
         self.colors.clear();
     }
 
-    /// 原图先下回来时给列表兜个底：只发布路径，不动在飞 / 排队记账。
+    /// 原图先下回来时给列表兜个底：只发布缩略图路径，不动在飞 / 排队记账。
     pub fn adopt_thumbnail(&mut self, url: &str, path: PathBuf) {
         let url = url.trim();
-        if url.is_empty() || self.ready.contains(url) {
+        if url.is_empty() || self.thumbnail_paths.contains(url) {
             return;
         }
-        self.ready.insert(url, path);
+        self.thumbnail_paths.insert(url, path);
         if let Some(record) = self.records.get_mut(url) {
-            if matches!(record.state, State::Idle | State::Ready | State::Failed) {
-                record.state = State::Ready;
-                record.failures = 0;
+            if matches!(
+                record.thumbnail.state,
+                State::Idle | State::Ready | State::Failed
+            ) {
+                record.thumbnail.state = State::Ready;
+                record.thumbnail.failures = 0;
             }
         }
     }
 
-    /// 本地路径：只查内存。
+    /// 缩略图本地路径：只查内存。
     pub fn path(&self, url: &str) -> Option<PathBuf> {
-        self.ready.get(url)
+        self.thumbnail_paths.get(url)
+    }
+
+    /// 原图本地路径：只查内存。
+    pub fn original_path(&self, url: &str) -> Option<PathBuf> {
+        self.original_paths.get(url)
     }
 
     /// 氛围色：只查内存。
@@ -332,32 +551,28 @@ impl CoverStore {
         self.colors.get(url.trim()).copied()
     }
 
-    /// 渲染闭包用的只读句柄；克隆的是 `Arc`，不复制表。
+    /// 渲染闭包用的缩略图只读句柄；克隆的是 `Arc`，不复制表。
     pub fn paths_handle(&self) -> CoverPaths {
-        self.ready.clone()
+        self.thumbnail_paths.clone()
+    }
+
+    /// 渲染闭包用的原图只读句柄；克隆的是 `Arc`，不复制表。
+    pub fn originals_handle(&self) -> CoverPaths {
+        self.original_paths.clone()
     }
 
     /// 取走上一轮 `want` 因队列满挤掉的张数。
     pub fn take_dropped(&mut self) -> usize {
-        std::mem::take(&mut self.evicted)
-    }
-
-    fn evict_oldest(&mut self) {
-        while let Some(url) = self.queue.pop_front() {
-            if let Some(record) = self.records.get_mut(&url) {
-                if record.state == State::Queued {
-                    record.state = State::Idle;
-                    self.evicted += 1;
-                    return;
-                }
-            }
-        }
+        std::mem::take(&mut self.thumbnails.evicted)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_QUEUE};
+    use super::{
+        CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_ORIGINAL_CONCURRENCY, MAX_ORIGINAL_QUEUE,
+        MAX_QUEUE,
+    };
     use std::path::PathBuf;
 
     fn urls(items: &[&str]) -> Vec<String> {
@@ -368,6 +583,13 @@ mod tests {
         CoverOutcome::Ready {
             path: PathBuf::from(path),
             color: Some((1, 2, 3)),
+        }
+    }
+
+    fn original_ready(path: &str) -> CoverOutcome {
+        CoverOutcome::Ready {
+            path: PathBuf::from(path),
+            color: None,
         }
     }
 
@@ -584,6 +806,20 @@ mod tests {
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
     }
 
+    /// 验收：原图读口子同样不碰磁盘、不消费排队项。
+    #[test]
+    fn original_read_ports_are_side_effect_free() {
+        let mut store = CoverStore::default();
+        assert!(store.want_original("cover-a"));
+
+        for _ in 0..10 {
+            assert!(store.original_path("cover-a").is_none());
+            assert!(store.originals_handle().get("cover-a").is_none());
+        }
+        assert!(!store.want_original("cover-a"), "读口子不能放行去重");
+        assert_eq!(store.drain_original(), urls(&["cover-a"]));
+    }
+
     /// 淘汰反查只认「真没了」的路径：重建回来的不算缺。
     #[test]
     fn removed_paths_skip_rebuilt_files() {
@@ -628,6 +864,183 @@ mod tests {
                 .path("cover-a")
                 .map(|path| path.to_string_lossy().into_owned()),
             Some("/tmp/a.img".to_string())
+        );
+    }
+
+    /// 验收：原图在飞上限 4 张生效，空出一个才泵下一张。
+    #[test]
+    fn original_inflight_is_capped_at_four() {
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_ORIGINAL_CONCURRENCY + 2)
+            .map(|index| format!("original-{index}"))
+            .collect();
+        for url in &many {
+            assert!(store.want_original(url));
+        }
+
+        let started = store.drain_original();
+        assert_eq!(started.len(), MAX_ORIGINAL_CONCURRENCY, "最多 4 张在飞");
+        assert!(store.drain_original().is_empty(), "在飞满了不能再泵");
+
+        store.complete_original(&started[0], original_ready("/tmp/a.img"));
+        assert_eq!(
+            store.drain_original(),
+            vec![many[MAX_ORIGINAL_CONCURRENCY].clone()],
+            "空出一个在飞位就补下一张"
+        );
+    }
+
+    /// 验收：切歌只留当前曲目的原图；被放掉的别的原图能重新排进来。
+    #[test]
+    fn switching_song_releases_other_original_queue_entries() {
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_ORIGINAL_CONCURRENCY + 3)
+            .map(|index| format!("original-{index}"))
+            .collect();
+        for url in &many {
+            assert!(store.want_original(url));
+        }
+        assert_eq!(
+            store.drain_original().len(),
+            MAX_ORIGINAL_CONCURRENCY,
+            "先把在飞位占满，剩下的才在排队"
+        );
+
+        let current = many[MAX_ORIGINAL_CONCURRENCY + 2].clone();
+        store.retain_original_only(&current);
+        assert!(
+            !store.want_original(&current),
+            "当前曲目还在排队，不重复入队"
+        );
+
+        let released = many[MAX_ORIGINAL_CONCURRENCY].clone();
+        assert!(
+            store.want_original(&released),
+            "被切歌放掉的别的原图要能重新排进来"
+        );
+        assert!(store.original_path(&current).is_none());
+    }
+
+    /// 原图排队上限 32：满了挤掉最旧的，被挤掉的还能再排。
+    #[test]
+    fn original_queue_cap_evicts_oldest_and_allows_requeue() {
+        let mut store = CoverStore::default();
+        let total = MAX_ORIGINAL_CONCURRENCY + MAX_ORIGINAL_QUEUE;
+        let many: Vec<String> = (0..total)
+            .map(|index| format!("original-{index}"))
+            .collect();
+        for url in &many {
+            assert!(store.want_original(url));
+        }
+        assert_eq!(store.drain_original().len(), MAX_ORIGINAL_CONCURRENCY);
+
+        let oldest_queued = many[MAX_ORIGINAL_CONCURRENCY].clone();
+        let extra = format!("original-{total}");
+        assert!(store.want_original(&extra), "满了也要收新图");
+        assert!(
+            store.want_original(&oldest_queued),
+            "被挤掉的最旧原图能重新排队"
+        );
+    }
+
+    /// 验收：原图失败也按两次才放弃，作废之后能重新下。
+    #[test]
+    fn original_failed_twice_gives_up_until_forgotten() {
+        let mut store = CoverStore::default();
+        let url = "original-a";
+
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Failed);
+        assert!(store.want_original(url), "失败一次还能再试");
+
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+        store.complete_original(url, CoverOutcome::Failed);
+        assert!(!store.want_original(url), "失败两次后本会话不再自动重试");
+        assert!(store.drain_original().is_empty());
+
+        store.forget([url]);
+        assert!(store.want_original(url), "作废之后能重新下");
+    }
+
+    /// 验收：清缓存两格一起作废，在飞原图原样保留。
+    #[test]
+    fn clear_completed_clears_both_lanes_and_keeps_inflight_original() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["thumb-done"]));
+        store.drain();
+        store.complete("thumb-done", ready("/tmp/thumb.img"));
+        assert!(store.want_original("original-done"));
+        store.drain_original();
+        store.complete_original("original-done", original_ready("/tmp/original.img"));
+        assert!(store.original_path("original-done").is_some());
+        assert!(store.want_original("original-inflight"));
+        store.drain_original();
+
+        store.clear_completed();
+        assert!(store.path("thumb-done").is_none(), "缩略图路径要作废");
+        assert!(
+            store.original_path("original-done").is_none(),
+            "原图路径一起作废"
+        );
+        assert!(
+            !store.want_original("original-inflight"),
+            "在飞原图不能被清缓存作废"
+        );
+        assert!(
+            store.want_original("original-done"),
+            "已完成的原图能重新请求"
+        );
+    }
+
+    /// 原图和缩略图的路径表各管各的：只删了一侧不能连另一侧一起清。
+    #[test]
+    fn thumbnail_and_original_paths_stay_separate() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["cover-a"]));
+        store.drain();
+        store.complete("cover-a", ready("/tmp/thumb.img"));
+        store.want_original("cover-a");
+        store.drain_original();
+        store.complete_original("cover-a", original_ready("/tmp/full.img"));
+
+        assert_eq!(store.path("cover-a"), Some(PathBuf::from("/tmp/thumb.img")));
+        assert_eq!(
+            store.original_path("cover-a"),
+            Some(PathBuf::from("/tmp/full.img"))
+        );
+        assert!(store
+            .paths_handle()
+            .urls_for_removed_paths(&[PathBuf::from("/tmp/thumb.img")], |_| true)
+            .contains("cover-a"));
+        assert!(store
+            .originals_handle()
+            .urls_for_removed_paths(&[PathBuf::from("/tmp/thumb.img")], |_| true)
+            .is_empty());
+    }
+
+    /// 原图在飞时作废，结果回来后同样不能重复下；有人要就补排。
+    #[test]
+    fn original_forget_abandons_inflight_until_completion() {
+        let mut store = CoverStore::default();
+        assert!(store.want_original("original-a"));
+        assert_eq!(store.drain_original(), vec!["original-a".to_string()]);
+
+        store.forget(["original-a"]);
+        assert!(!store.want_original("original-a"), "在飞期间不能重复下");
+
+        store.complete_original("original-a", original_ready("/tmp/full.img"));
+        assert!(
+            store.original_path("original-a").is_none(),
+            "这次结果要作废"
+        );
+        assert!(
+            !store.drain_original().is_empty(),
+            "作废期间记下的需求会在结果回来后补排"
+        );
+        assert!(
+            !store.want_original("original-a"),
+            "已经补排过了，不要再重复入队"
         );
     }
 }

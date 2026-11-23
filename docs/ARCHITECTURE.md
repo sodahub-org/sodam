@@ -22,7 +22,7 @@
 │ library        推荐 / 听歌模式 / 搜索 / 歌单 / 收藏 / 艺人 / 专辑 / 歌词       │
 │ Queue          当前曲目、历史、下一首、列表循环 / 单曲循环 / 随机             │
 │ PlaybackEngine rodio 线程；接收 Load / Play / Pause / Seek / Volume 命令       │
-│ CoverStore     封面缩略图状态 + 主色（纯状态机）                              │
+│ CoverStore     封面缩略图 / 原图状态 + 主色（纯状态机）                       │
 └───────────────────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -78,8 +78,8 @@ libresoda 的 HTTP 和下载是阻塞的；GPUI 渲染不能阻塞。规则如�
 1. 网络请求、文件下载、解密、封面缩放放到 `cx.background_spawn` 或专用线程。
 2. 完成后用 `cx.spawn` + entity update 回到 GPUI 实体上下文，然后 `cx.notify()`。
 3. 带分页 / 可取消语义的请求使用 `request_seq` 丢弃过期结果。
-4. 封面状态收在 `sodam-core` 的 `CoverStore`：有界并发、一条 URL 一条记录；
-   渲染路径只查内存快照。
+4. 封面状态收在 `sodam-core` 的 `CoverStore`：缩略图和原图各一格，有界并发、
+   一条 URL 一条记录；渲染路径只查内存快照。
 5. 音频线程独立于 GPUI，通过 channel 接收命令，通过 snapshot 共享状态。
 
 ## 播放链路
