@@ -169,7 +169,8 @@ impl SessionInputs {
         crate::quality::QualityIntent::parse(&self.quality)
     }
 
-    /// 扫码登录设备身份（可能无效，调用前先 [`Settings::ensure_login_device`]）。
+    /// 扫码登录设备身份。转进来的这份可能是空的：补身份是 [`Settings::ensure_login_device`]
+    /// 的活，在抄成 `SessionInputs` 之前就该补好。
     pub fn login_device(&self) -> libresoda::soda::qr_login::QrDevice {
         qr_device(&self.login_device_id, &self.login_install_id)
     }
@@ -2358,87 +2359,106 @@ mod tests {
 
     /// 只有那 10 个字段算会话输入，其余 13 个改了都不重建会话。
     ///
-    /// 逐字段断言，同时穷举解构 `Settings`：加了设置字段却不在这里表态，
-    /// 这个用例编译不过（#256 的验收）。
+    /// 解构不写 `..`：`Settings` 加字段而这里不表态，这个用例编译不过；
+    /// 每个绑定又必须在下面某一个「改一下」里用上，漏一条 `-D warnings` 就拦下了。
     #[test]
     fn only_ten_fields_are_session_inputs() {
+        let base = Settings::default();
+        let Settings {
+            signer_url,
+            signer_token,
+            cookie,
+            device_id,
+            iid,
+            fp,
+            login_device_id,
+            login_install_id,
+            quality,
+            quality_source,
+            volume,
+            volume_before_mute,
+            play_mode,
+            audio_cache_limit_mb,
+            search_history_enabled,
+            search_history,
+            theme,
+            language,
+            titlebar,
+            shortcut_toggle,
+            shortcut_previous,
+            shortcut_next,
+            detailed_logs,
+        } = &base;
+
+        // 拿默认设置、只改一处；另外确认「这个字段改完设置真的变了」，
+        // 免得某天把某个闭包改成空操作、用例还照样绿。
         fn changed(
             name: &'static str,
             apply: impl FnOnce(&mut Settings),
         ) -> (&'static str, Settings) {
             let mut settings = Settings::default();
             apply(&mut settings);
+            assert_ne!(settings, Settings::default(), "{name}：这个改法没改到东西");
             (name, settings)
         }
+
         let cases = vec![
-            changed("signer_url", |s| {
-                s.signer_url = "http://127.0.0.1:1/sign".into()
+            changed("signer_url", |s| s.signer_url = format!("{signer_url}x")),
+            changed("signer_token", |s| {
+                s.signer_token = format!("{signer_token}x")
             }),
-            changed("signer_token", |s| s.signer_token = "t".into()),
-            changed("cookie", |s| s.cookie = "sessionid_ss=x".into()),
-            changed("device_id", |s| s.device_id = "0000000000000001".into()),
-            changed("iid", |s| s.iid = "iid".into()),
-            changed("fp", |s| s.fp = "fp".into()),
+            changed("cookie", |s| s.cookie = format!("{cookie}x")),
+            changed("device_id", |s| s.device_id = format!("{device_id}x")),
+            changed("iid", |s| s.iid = format!("{iid}x")),
+            changed("fp", |s| s.fp = format!("{fp}x")),
             changed("login_device_id", |s| {
-                s.login_device_id = "1234567890123456".into()
+                s.login_device_id = format!("{login_device_id}x")
             }),
             changed("login_install_id", |s| {
-                s.login_install_id = "123456789012345".into()
+                s.login_install_id = format!("{login_install_id}x")
             }),
-            changed("quality", |s| s.quality = "lossless".into()),
+            changed("quality", |s| s.quality = format!("{quality}x")),
             changed("quality_source", |s| {
-                s.quality_source = crate::quality::QualitySource::User;
+                s.quality_source = match quality_source {
+                    crate::quality::QualitySource::User => crate::quality::QualitySource::Derived,
+                    _ => crate::quality::QualitySource::User,
+                };
             }),
-            changed("volume", |s| s.volume = 0.25),
-            changed("volume_before_mute", |s| s.volume_before_mute = 0.25),
+            changed("volume", |s| s.volume = volume + 0.25),
+            changed("volume_before_mute", |s| {
+                s.volume_before_mute = volume_before_mute + 0.25
+            }),
             changed("play_mode", |s| {
-                s.play_mode = crate::queue::PlayMode::Shuffle
+                s.play_mode = match play_mode {
+                    crate::queue::PlayMode::ListLoop => crate::queue::PlayMode::Shuffle,
+                    _ => crate::queue::PlayMode::ListLoop,
+                };
             }),
-            changed("audio_cache_limit_mb", |s| s.audio_cache_limit_mb = 2048),
+            changed("audio_cache_limit_mb", |s| {
+                s.audio_cache_limit_mb = audio_cache_limit_mb + 1
+            }),
             changed("search_history_enabled", |s| {
-                s.search_history_enabled = false
+                s.search_history_enabled = !search_history_enabled
             }),
             changed("search_history", |s| {
-                s.search_history = vec!["周杰伦".into()]
+                s.search_history = vec![format!("{}x", search_history.len())]
             }),
-            changed("theme", |s| s.theme = "light".into()),
-            changed("language", |s| s.language = "en".into()),
-            changed("titlebar", |s| s.titlebar = "always".into()),
-            changed("shortcut_toggle", |s| s.shortcut_toggle = "ctrl-p".into()),
+            changed("theme", |s| s.theme = format!("{theme}light")),
+            changed("language", |s| s.language = format!("{language}en")),
+            changed("titlebar", |s| s.titlebar = format!("{titlebar}always")),
+            changed("shortcut_toggle", |s| {
+                s.shortcut_toggle = format!("{shortcut_toggle}space")
+            }),
             changed("shortcut_previous", |s| {
-                s.shortcut_previous = "ctrl-h".into()
+                s.shortcut_previous = format!("{shortcut_previous}left")
             }),
-            changed("shortcut_next", |s| s.shortcut_next = "ctrl-n".into()),
-            changed("detailed_logs", |s| s.detailed_logs = true),
+            changed("shortcut_next", |s| {
+                s.shortcut_next = format!("{shortcut_next}right")
+            }),
+            changed("detailed_logs", |s| {
+                s.detailed_logs = !*detailed_logs;
+            }),
         ];
-
-        // 穷举解构：`Settings` 加字段而这里（和 `session_inputs`）没表态，就编译不过。
-        let Settings {
-            signer_url: _,
-            signer_token: _,
-            cookie: _,
-            device_id: _,
-            iid: _,
-            fp: _,
-            login_device_id: _,
-            login_install_id: _,
-            quality: _,
-            quality_source: _,
-            volume: _,
-            volume_before_mute: _,
-            play_mode: _,
-            audio_cache_limit_mb: _,
-            search_history_enabled: _,
-            search_history: _,
-            theme: _,
-            language: _,
-            titlebar: _,
-            shortcut_toggle: _,
-            shortcut_previous: _,
-            shortcut_next: _,
-            detailed_logs: _,
-        } = Settings::default();
-        assert_eq!(cases.len(), 23, "23 个字段一个都不能漏");
 
         let session_fields = [
             "signer_url",
@@ -2453,7 +2473,7 @@ mod tests {
             "quality_source",
         ];
         for (name, settings) in &cases {
-            let differs = settings.session_inputs_differ(&Settings::default());
+            let differs = settings.session_inputs_differ(&base);
             assert_eq!(
                 differs,
                 session_fields.contains(name),
@@ -2470,7 +2490,7 @@ mod tests {
         };
         assert_eq!(
             live_only.session_inputs(),
-            Settings::default().session_inputs(),
+            base.session_inputs(),
             "音量/主题/搜索历史/详细日志都进不了会话输入"
         );
     }
@@ -2497,8 +2517,10 @@ mod tests {
         assert!(!crate::session::Session::new(&settings).has_cookie());
     }
 
-    /// 登录轮询期间改过主题：登录写回之后主题还是新值（写回的是当前设置，
-    /// 不是登录开始那一刻的旧快照，#185 / #256）。
+    /// 登录轮询期间改过主题：登录写回之后主题还是新值。
+    ///
+    /// 写回的是当前这份设置，不是登录开始那一刻的旧快照——旧快照还留着老主题，
+    /// 谁要把它写回去，下面这几条断言就会红（#185 / #256）。
     #[test]
     fn login_write_back_keeps_theme_changed_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
@@ -2506,10 +2528,10 @@ mod tests {
         let mut settings = Settings::default();
         settings.save_to(&path).unwrap();
 
-        // 登录开始时会话抄走的那份快照（只有 10 个字段）
-        let inputs_before = settings.session_inputs();
+        // 登录轮询开始时的那份设置（以前会被会话抄一份带走、再整体写回盘）
+        let login_start = settings.clone();
 
-        // 登录轮询期间，外部热重载把主题和详细日志改了
+        // 轮询期间，用户或外部编辑把主题、详细日志改了
         settings.theme = "light".into();
         settings.detailed_logs = true;
 
@@ -2518,17 +2540,13 @@ mod tests {
             .unwrap();
 
         let reloaded = settings_on_disk(&path);
-        assert_eq!(reloaded.theme, "light", "登录写回不许把主题写回旧值");
-        assert!(reloaded.detailed_logs);
         assert_eq!(reloaded.cookie, "sessionid_ss=x");
-        // 会话输入里只有 Cookie 变了，其余照旧。
-        assert_eq!(
-            settings.session_inputs(),
-            SessionInputs {
-                cookie: "sessionid_ss=x".into(),
-                ..inputs_before
-            }
+        assert_ne!(
+            reloaded.theme, login_start.theme,
+            "写回的是当前设置，不是登录开始时那份旧快照"
         );
+        assert_eq!(reloaded.theme, "light");
+        assert!(reloaded.detailed_logs);
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。

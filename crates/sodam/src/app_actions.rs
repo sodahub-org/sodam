@@ -556,6 +556,11 @@ impl Root {
         let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
         match self.settings.save() {
             Ok(()) => {
+                // 上面那次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
+                // 写盘成功才换档——失败时界面报的是失败，会话也别偷偷按新档位取流。
+                if let Some(session) = self.session.as_mut() {
+                    session.adopt(&self.settings);
+                }
                 // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
                 // 不值得再弹一条抢注意力的全局提示（见 #83）。
                 let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
@@ -568,10 +573,6 @@ impl Root {
                 self.notify_error_once("quality-save-failed", message);
             }
         }
-        // 上面那次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
-        if let Some(session) = self.session.as_mut() {
-            session.adopt(&self.settings);
-        }
         // 切档后按新意图重新预取下一首（正在播的这首不受影响）
         self.spawn_prefetch(cx);
         self.quality_menu = None;
@@ -583,8 +584,7 @@ impl Root {
     pub fn set_detailed_logs(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.detailed_logs = enabled;
         log_outlet::set_global_detailed(enabled);
-        // 详细日志不算会话输入，会话根本不看它：排进后台写队列就行，不用通知会话。
-        self.persist_playback_preferences();
+        // 详细日志不算会话输入，会话不用同步；下面那次整份保存就是它的落盘。
         match self.settings.save() {
             Ok(()) => {
                 let message = if enabled {
@@ -661,9 +661,11 @@ impl Root {
         cx.notify();
     }
 
+    /// 播放偏好的后台写。
+    ///
+    /// 队列只合并音量、静音前音量、缓存上限三项（见 `preferences.rs`）。这里以前还要
+    /// 顺手把整份设置抄进会话，登录时靠那份副本回写盘；现在会话没这些字段，没地方抄了。
     fn persist_playback_preferences(&mut self) {
-        // 音量 / 缓存上限 / 播放模式 / 详细日志都不算会话输入，会话那份副本压根没有
-        // 这些字段，所以这里不用再「抄一遍」——交后台写队列就行。
         self.preferences_writer.schedule(&self.settings);
     }
 
@@ -4468,6 +4470,8 @@ impl Root {
         let shortcuts_changed = old.shortcut_toggle != incoming.shortcut_toggle
             || old.shortcut_previous != incoming.shortcut_previous
             || old.shortcut_next != incoming.shortcut_next;
+        // 另算一份「音质变没变」不算第二张分类表：它只决定要不要按新意图重新预取，
+        // 要不要重建会话由下面的 `session_inputs_differ` 统一判。
         let quality_changed =
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
         let session_changed = incoming.session_inputs_differ(&old);
@@ -4509,8 +4513,8 @@ impl Root {
         // 会话类改动：重建会话（不落盘）。当前曲目不断；下一次取流/搜索/上报用新值。
         if session_changed {
             match self.session.as_mut() {
-                Some(session) => session.adopt(incoming.clone()),
-                None => self.session = Some(Session::new(incoming.clone())),
+                Some(session) => session.adopt(&incoming),
+                None => self.session = Some(Session::new(&incoming)),
             }
         }
         self.play_reporter.apply_settings(incoming.clone());
