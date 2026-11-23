@@ -73,13 +73,14 @@ pub enum IdentityChange {
 
 /// 对齐起始与停下那一刻的账号 id，判断是不是真换了号。
 ///
-/// 空串按「没读到」处理：账号信息偶尔会先落一个空 id，不能拿它和真账号比出「换了号」。
+/// 空串和只有空格的值按「没读到」处理：接口给的 user_id 可能为空，不能拿它和真账号
+/// 比出「换了号」。
 pub fn identity_change(
     start_user_id: Option<&str>,
     current_user_id: Option<&str>,
 ) -> IdentityChange {
     fn read(id: Option<&str>) -> Option<&str> {
-        id.filter(|value| !value.trim().is_empty())
+        id.map(str::trim).filter(|value| !value.is_empty())
     }
     match (read(start_user_id), read(current_user_id)) {
         (Some(before), Some(now)) if before != now => IdentityChange::AccountChanged,
@@ -301,13 +302,17 @@ mod tests {
             identity_change(None, None),
             IdentityChange::LoginStateChanged
         );
-        // 空串 id 按没读到处理：不能拿它和真账号比出「换了号」。
         assert_eq!(
             identity_change(Some("8801"), Some("")),
             IdentityChange::LoginStateChanged
         );
         assert_eq!(
             identity_change(Some("8801"), Some("  ")),
+            IdentityChange::LoginStateChanged
+        );
+        // 两端只有空白差异：同一个号。
+        assert_eq!(
+            identity_change(Some(" 8801 "), Some("8801")),
             IdentityChange::LoginStateChanged
         );
     }
