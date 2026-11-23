@@ -132,14 +132,13 @@ impl UpgradeAttempts {
         self.keys.insert(key)
     }
 
-    /// 身份代数变了就整份作废；返回这次到底清没清。
-    pub fn observe_epoch(&mut self, epoch: u64) -> bool {
+    /// 身份代数变了就整份作废。
+    pub fn observe_epoch(&mut self, epoch: u64) {
         if epoch == self.epoch {
-            return false;
+            return;
         }
         self.epoch = epoch;
         self.keys.clear();
-        true
     }
 
     /// 盘上的缓存没了：记号跟着作废（清缓存走这条路）。
@@ -237,10 +236,10 @@ mod tests {
         assert!(attempts.begin(key.clone()));
         assert!(!attempts.begin(key.clone()), "同一次会话里不重复跑");
 
-        assert!(attempts.observe_epoch(1), "换了身份要整份作废");
+        attempts.observe_epoch(1);
         assert!(attempts.begin(key.clone()), "新账号下重新可试");
         // 同一个代数再喂一遍：什么都不用清。
-        assert!(!attempts.observe_epoch(1));
+        attempts.observe_epoch(1);
         assert!(!attempts.begin(key.clone()));
     }
 

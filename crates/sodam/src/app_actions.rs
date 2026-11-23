@@ -2953,6 +2953,7 @@ impl Root {
             .map(|cached| StreamShape::of(&cached));
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(cached) => {
+                // 读不到升级前那份（并发被清掉的极端情形）就按「没真提升」算：宁可少报一次成功。
                 let outcome = before.map_or(Outcome::NoHigherTier, |before| {
                     Outcome::of_shapes(before, StreamShape::of(&cached))
                 });
@@ -3145,6 +3146,17 @@ impl Root {
                 }
             }
 
+            // 取消可能落在最后一首下载期间：那时循环已经没有「下一首」可停，这次点击照样要说出来，
+            // 不能被一句「完成」盖掉（#254）。
+            if stopped.is_none() {
+                let cancelled = this
+                    .update(cx, |root, _cx| root.batch_upgrade_cancel)
+                    .unwrap_or(false);
+                if cancelled {
+                    stopped = Some(StopReason::Cancelled);
+                }
+            }
+
             let ran_text = tally.total().to_string();
             let upgraded_text = tally.upgraded.to_string();
             let failed_text = tally.failed.to_string();
@@ -3172,7 +3184,8 @@ impl Root {
                     total,
                 };
                 root.refresh_cache_stats(cx);
-                if total > 0 {
+                // 一首都没扫到也照样说一句：用户按过取消或换了号，状态行不能停在「正在停止…」。
+                if total > 0 || stopped.is_some() {
                     let counts = [tally.total().to_string(), total.to_string()];
                     match stopped {
                         Some(StopReason::IdentityChanged) => {
