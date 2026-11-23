@@ -74,6 +74,46 @@ fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) ->
     pending.or(queued).map(|track| track.cover.clone())
 }
 
+/// 原图下载完成后的去向。
+#[derive(Debug, PartialEq, Eq)]
+enum OriginalCoverSettlement {
+    /// 文件还在，可以发布。
+    Published(PathBuf),
+    /// 解析到了路径，但文件已经被清缓存或淘汰删掉：不发布，放行「已尝试」。
+    Vanished,
+    /// 压根没解析出路径（下载失败）：不发布，保留「已尝试」。
+    Failed,
+}
+
+/// 判定一张原图下载完成后的去向。
+///
+/// 清缓存或缓存淘汰可能刚好把文件删掉：`original_cover_path` 解析出了路径，
+/// 回调跑在删除之后时没人兜底，所以这里自己再查一遍。死路径一旦写进
+/// `original_covers`，`ensure_original_cover` 开头就会把它当成命中，这首歌的
+/// 歌词页大图整个会话都回不来。缩略图那条路早就是这样做的。
+fn settle_original_cover(
+    path: Option<PathBuf>,
+    file_exists: impl FnOnce(&std::path::Path) -> bool,
+) -> OriginalCoverSettlement {
+    match path {
+        Some(path) if file_exists(&path) => OriginalCoverSettlement::Published(path),
+        Some(_) => OriginalCoverSettlement::Vanished,
+        None => OriginalCoverSettlement::Failed,
+    }
+}
+
+/// 文件在下载期间被删掉后，要不要顺手给当前曲目再排一次。
+///
+/// 清缓存还在跑时交给 `clear_cache` 的补偿，别和它抢；淘汰删文件时
+/// `drop_removed_covers` 反查不到还没发布过的 URL，只能在这里补。
+fn retry_vanished_original_cover(
+    cache_clearing: bool,
+    displayed_cover: Option<&str>,
+    url: &str,
+) -> bool {
+    !cache_clearing && displayed_cover == Some(url)
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -1434,11 +1474,38 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let path = work.await;
             let _ = this.update(cx, |root, cx| {
-                if let Some(path) = path {
-                    root.original_covers.insert(fetch_url.clone(), path.clone());
-                    // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
-                    root.cover_store.adopt_thumbnail(&fetch_url, path.clone());
-                    cx.notify();
+                // 和缩略图一样在回调里复核文件在不在：清缓存的清表也是
+                // 同一线程的 update，后清表会把这次抢先写进去的死路径一起扫掉。
+                let settlement = settle_original_cover(path, |file| file.exists());
+                match settlement {
+                    OriginalCoverSettlement::Published(path) => {
+                        root.original_covers.insert(fetch_url.clone(), path.clone());
+                        // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
+                        root.cover_store.adopt_thumbnail(&fetch_url, path);
+                        cx.notify();
+                    }
+                    OriginalCoverSettlement::Vanished => {
+                        // 文件没了：别把死路径记进表，放行记号，让下一次
+                        // ensure 能重排。要不要马上补见 retry_vanished_original_cover。
+                        {
+                            let mut attempted = root
+                                .original_cover_attempted
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            attempted.remove(&fetch_url);
+                        }
+                        let displayed_cover =
+                            current_cover_url(root.pending_track.as_ref(), root.queue.current());
+                        if retry_vanished_original_cover(
+                            root.cache_clearing,
+                            displayed_cover.as_deref(),
+                            &fetch_url,
+                        ) {
+                            root.ensure_original_cover(&fetch_url, cx);
+                        }
+                        cx.notify();
+                    }
+                    OriginalCoverSettlement::Failed => {}
                 }
             });
             // 在飞位空出来了：把限流期间排队的原图补上，不许被丢掉。
@@ -5592,7 +5659,8 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
-        lyrics_scroll_ease, urls_for_removed_paths,
+        lyrics_scroll_ease, retry_vanished_original_cover, settle_original_cover,
+        urls_for_removed_paths, OriginalCoverSettlement,
     };
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
     use std::collections::HashMap;
@@ -5637,6 +5705,50 @@ mod tests {
             p != std::path::Path::new("covers/original/full-only.img")
         });
         assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
+    }
+
+    /// 清缓存或淘汰撞上在飞的原图：回调解析出路径但文件已经没了，
+    /// 不能写进 `original_covers`，还要放行「已尝试」，否则这首歌的
+    /// 歌词页大图整个会话都回不来。
+    #[test]
+    fn vanished_original_cover_is_not_published() {
+        let path = PathBuf::from("covers/original/gone.img");
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| false),
+            OriginalCoverSettlement::Vanished,
+            "文件没了就不能发布死路径"
+        );
+        assert_eq!(
+            settle_original_cover(Some(path.clone()), |_| true),
+            OriginalCoverSettlement::Published(path),
+            "文件还在就直接用"
+        );
+        assert_eq!(
+            settle_original_cover(None, |_| true),
+            OriginalCoverSettlement::Failed,
+            "下载失败保留记号，避免每帧空转"
+        );
+    }
+
+    /// 文件没了要不要补：清缓存进行中交给它的补偿，淘汰删文件时自己补。
+    #[test]
+    fn vanished_original_cover_retries_only_outside_a_cache_clear() {
+        assert!(
+            retry_vanished_original_cover(false, Some("url/current"), "url/current"),
+            "淘汰删了当前曲目的原图：要补"
+        );
+        assert!(
+            !retry_vanished_original_cover(false, Some("url/other"), "url/current"),
+            "不是当前曲目：不补"
+        );
+        assert!(
+            !retry_vanished_original_cover(false, None, "url/current"),
+            "没有当前曲目：不补"
+        );
+        assert!(
+            !retry_vanished_original_cover(true, Some("url/current"), "url/current"),
+            "清缓存进行中：交给 clear_cache 的补偿"
+        );
     }
 
     /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
