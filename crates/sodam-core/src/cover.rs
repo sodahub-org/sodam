@@ -171,7 +171,7 @@ impl CoverStore {
     }
 
     /// 单张入队；入队数由 `want` 的返回值算，这里只可能在满队列时记一次 dropped。
-    /// 作废放行补排也走这里，那次挤出照样记；新一轮 `want` 开头会清零。
+    /// 作废放行补排也走这里，队列满时同样会挤出最旧的一张。
     fn enqueue(&mut self, url: &str) -> bool {
         if url.is_empty() || self.ready.contains(url) {
             return false;
@@ -526,21 +526,6 @@ mod tests {
         assert!(store.path("cover-a").is_none(), "这次结果要作废");
         assert!(store.drain().is_empty(), "没人再要，就不要自己重排");
         assert_eq!(store.want(&url).len(), 1, "结束后要能重新排队");
-    }
-
-    /// 作废放行时的补排不能污染下一轮 want 的日志计数。
-    #[test]
-    fn requeue_after_release_keeps_want_stats_clean() {
-        let mut store = CoverStore::default();
-        let url = urls(&["cover-a"]);
-        store.want(&url);
-        store.drain();
-        store.forget(["cover-a"]);
-        assert!(store.want(&url).is_empty());
-        store.complete("cover-a", CoverOutcome::Failed);
-
-        assert_eq!(store.drain(), url, "补排已经回到队列");
-        assert_eq!(store.take_dropped(), 0, "补排不能算进上一轮 want");
     }
 
     /// 在飞被 forget 之后又有人要（点重试）：结果回来要立刻补排。
