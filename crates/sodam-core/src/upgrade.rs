@@ -150,13 +150,13 @@ pub fn should_replace_stream(
     if stream_is_better(before, after, target_rank) {
         return true;
     }
-    if before.rank.is_some() || after.preview {
+    if before.rank.is_some() || before.label_floor_rank.is_some() || after.preview {
         return false;
     }
     let Some(after_rank) = crate::quality::readable_rank(after.rank) else {
         return false;
     };
-    // 旧缓存没记档位：新流不比标签里写的码率差就换，把档位补进 sidecar。
+    // 旧缓存没记档位、标签也证不出下限：新流不比标签里写的码率差就换，把档位补进 sidecar。
     match (before.bitrate_kbps, after.bitrate_kbps) {
         (Some(old), Some(new)) => new >= old,
         _ => target_rank.is_some_and(|target| after_rank >= target),
@@ -433,6 +433,20 @@ mod tests {
         // 已经记过档位的不再为了补测量而重写：只有真提升才换。
         let known = shape(Some(80), None, Some(320), false);
         assert!(!should_replace_stream(known, same, Some(80)));
+
+        // 标签能证明无损下限时，同档无损流也不换：下限管着，不靠补测。
+        let legacy_lossless = with_label_tier(shape(None, Some(100), Some(871), false), "无损");
+        let lossless_again = shape(Some(100), None, Some(871), false);
+        assert!(!stream_is_better(
+            legacy_lossless,
+            lossless_again,
+            Some(110)
+        ));
+        assert!(!should_replace_stream(
+            legacy_lossless,
+            lossless_again,
+            Some(110)
+        ));
     }
 
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。

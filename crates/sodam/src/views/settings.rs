@@ -1068,6 +1068,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                 )
                 .child({
                     // 批量升级期间清缓存会被拦下：按钮直接画成不可点，别让人点了才看到提示。
+                    // 已经点过取消时例外：那时 `batch_upgrading` 还没落假，点了会说清在等什么。
                     let mut btn = div()
                         .id("clear-cache")
                         .flex()
@@ -1077,7 +1078,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         .w(px(140.0))
                         .rounded(px(theme::radius::ROW))
                         .text_size(theme::Text::Small.size());
-                    if root.batch_upgrading {
+                    if root.batch_upgrading && !root.batch_upgrade_cancel {
                         btn = btn
                             .bg(theme::surface_elevated())
                             .text_color(theme::text_faint());
