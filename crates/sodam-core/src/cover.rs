@@ -163,16 +163,16 @@ impl CoverStore {
         self.evicted = 0;
         let mut queued = Vec::new();
         for raw in urls {
-            if self.enqueue(raw.trim()) {
+            if self.enqueue(raw.trim(), true) {
                 queued.push(raw.trim().to_string());
             }
         }
         queued
     }
 
-    /// 单张入队；入队数由 `want` 的返回值算，这里只可能在满队列时记一次 dropped
-    /// （作废放行补排也走这里）。
-    fn enqueue(&mut self, url: &str) -> bool {
+    /// 单张入队；入队数由 `want` 的返回值算，这里只可能在满队列时记一次 dropped。
+    /// 作废放行补排也走这里，那次挤出不计入日志（`count_eviction = false`）。
+    fn enqueue(&mut self, url: &str, count_eviction: bool) -> bool {
         if url.is_empty() || self.ready.contains(url) {
             return false;
         }
@@ -185,7 +185,7 @@ impl CoverStore {
             return false;
         }
         if self.queue.len() >= MAX_QUEUE {
-            self.evict_oldest();
+            self.evict_oldest(count_eviction);
         }
         let record = self.records.entry(url.to_string()).or_default();
         record.state = State::Queued;
@@ -227,7 +227,7 @@ impl CoverStore {
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
             if self.requeue_after_release.remove(url) {
-                self.enqueue(url);
+                self.enqueue(url, false);
             }
             return;
         }
@@ -342,12 +342,14 @@ impl CoverStore {
         std::mem::take(&mut self.evicted)
     }
 
-    fn evict_oldest(&mut self) {
+    fn evict_oldest(&mut self, count: bool) {
         while let Some(url) = self.queue.pop_front() {
             if let Some(record) = self.records.get_mut(&url) {
                 if record.state == State::Queued {
                     record.state = State::Idle;
-                    self.evicted += 1;
+                    if count {
+                        self.evicted += 1;
+                    }
                     return;
                 }
             }

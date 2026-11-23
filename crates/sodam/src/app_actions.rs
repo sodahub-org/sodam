@@ -3468,7 +3468,8 @@ impl Root {
                         None => CoverOutcome::Failed,
                     };
                     root.cover_store.complete(&url, outcome);
-                    // 失败 / 文件已没也要重绘一次：渲染会重新请求，`want` 的两次上限兜底。
+                    // 失败 / 文件已没也要重绘一次：渲染会重新请求。失败有两次上限；
+                    // 文件已没会退回可重排，没有上限。
                     cx.notify();
                     // 一个下载完成就补下一个，始终有界并发
                     root.pump_covers(cx);
