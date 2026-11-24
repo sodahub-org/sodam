@@ -2903,6 +2903,8 @@ impl Root {
         let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
         let is_vip = self.account.as_ref().map(|a| a.vip);
+        let account_user_id = self.account.as_ref().map(|account| account.user_id.clone());
+        let scope = sodam_core::cache::unknown_probe_scope(account_user_id.as_deref(), is_vip);
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
             Some(rank) => rank,
             None => {
@@ -2914,7 +2916,7 @@ impl Root {
         let work = cx.background_spawn(async move {
             let dir = sodam_core::audio::cache_dir();
             let records = sodam_core::cache::list_cached_audio(&dir);
-            sodam_core::cache::estimate_upgrade(&records, target_rank)
+            sodam_core::cache::estimate_upgrade(&records, target_rank, scope.as_deref())
         });
         cx.spawn(async move |this, cx| {
             let estimate = work.await;
@@ -2949,28 +2951,39 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「没换成更好整曲」
-    /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功、「没换成更好整曲」和
+    /// 「档位未知」记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
+        account_user_id: Option<String>,
         levels: UpgradeLogLevels,
     ) -> Outcome {
         let session = Session::new(settings);
-        match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
+        match session.upgrade_cached_track(
+            &track,
+            Some(&target_intent),
+            account_is_vip,
+            account_user_id.as_deref(),
+        ) {
             Ok(run) => {
-                // 换没换文件由升级那条路自己判定；事件名和对外结论都只认 improved。
-                let outcome = Outcome::from_improved(run.improved);
-                let event = if run.improved {
-                    "cache_upgraded"
-                } else {
-                    "cache_upgrade_no_higher_tier"
+                let (outcome, event) = match run.outcome {
+                    Outcome::Upgraded => (Outcome::Upgraded, "cache_upgraded"),
+                    Outcome::NoHigherTier => {
+                        (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier")
+                    }
+                    Outcome::UnknownRank => (Outcome::UnknownRank, "cache_upgrade_unknown_rank"),
+                    Outcome::Failed => (Outcome::Failed, "cache_upgrade_failed"),
                 };
                 log_outlet::log_event(
-                    levels.success,
+                    if outcome == Outcome::Failed {
+                        levels.failure
+                    } else {
+                        levels.success
+                    },
                     LogTopic::Player,
                     event,
                     &[
@@ -3003,6 +3016,7 @@ impl Root {
         track: TrackItem,
         intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
+        account_user_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let max_inflight = prefetch_concurrency().max(1);
@@ -3028,6 +3042,7 @@ impl Root {
                 track,
                 intent,
                 account_is_vip,
+                account_user_id,
                 UpgradeLogLevels {
                     success: LogLevel::Info,
                     failure: LogLevel::Warn,
@@ -3040,7 +3055,7 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
                 // 单首升级跑完了，盘上文件或记录可能变了，设置页正开着就不能还拿打开那一刻的数字说话（#248）。
-                // `Upgraded` 一定换了文件；`NoHigherTier` 可能只写了 sidecar 探测记录，也可能什么都没写。
+                // `Upgraded` 一定换了文件；`NoHigherTier` 与 `UnknownRank` 可能只写了 sidecar 记录。
                 // 统计也一起刷：字节数可能变，同一屏不能一新一旧。
                 // `Failed` 不动正式缓存；批量跑着时卡片显示的是进度，收尾那条路自己会重算，这里不白扫一遍。
                 if outcome != Outcome::Failed && root.nav == Nav::Settings && !root.batch_upgrading
@@ -3107,6 +3122,7 @@ impl Root {
         // 收尾文案要分清「真的换了号」和「同一账号的会员状态刷新」：两者都推进代数，
         // 但后者报「账号已变更」是撒谎。账号信息没加载出来时也不说换了号。
         let start_user_id = self.account.as_ref().map(|account| account.user_id.clone());
+        let scan_scope = sodam_core::cache::unknown_probe_scope(start_user_id.as_deref(), is_vip);
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
@@ -3114,7 +3130,7 @@ impl Root {
             let records = sodam_core::cache::list_cached_audio(&dir);
             records
                 .into_iter()
-                .filter(|r| r.is_upgradeable_to(target_rank))
+                .filter(|r| r.is_upgradeable_to(target_rank, scan_scope.as_deref()))
                 .collect::<Vec<_>>()
         });
 
@@ -3150,9 +3166,10 @@ impl Root {
                         root.batch_upgrade_stop(start_epoch),
                         root.settings.clone(),
                         root.account.as_ref().map(|a| a.vip),
+                        root.account.as_ref().map(|account| account.user_id.clone()),
                     )
                 });
-                let Ok((stop, mut settings, is_vip)) = step else {
+                let Ok((stop, mut settings, is_vip, account_user_id)) = step else {
                     return;
                 };
                 if let Some(reason) = stop {
@@ -3178,6 +3195,7 @@ impl Root {
                             track,
                             target_clone,
                             is_vip,
+                            account_user_id,
                             UpgradeLogLevels {
                                 success: LogLevel::Debug,
                                 failure: LogLevel::Debug,
@@ -3210,6 +3228,7 @@ impl Root {
             let upgraded_text = tally.upgraded.to_string();
             let failed_text = tally.failed.to_string();
             let no_higher_text = tally.no_higher.to_string();
+            let unknown_rank_text = tally.unknown_rank.to_string();
             let stop_text = stopped.map_or("done", |reason| reason.as_str());
             log_event(
                 LogLevel::Info,
@@ -3221,6 +3240,7 @@ impl Root {
                     ("upgraded", upgraded_text.as_str()),
                     ("failed", failed_text.as_str()),
                     ("no_higher", no_higher_text.as_str()),
+                    ("unknown_rank", unknown_rank_text.as_str()),
                     ("stop", stop_text),
                 ],
             );
@@ -3263,11 +3283,12 @@ impl Root {
                         }
                         None => {
                             let message = root.localized(
-                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲",
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲，{} 首档位未知",
                                 &[
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),
                                     tally.no_higher.to_string(),
+                                    tally.unknown_rank.to_string(),
                                 ],
                             );
                             match batch_upgrade_notice(tally, message) {
@@ -4198,8 +4219,14 @@ impl Root {
                         let actual_quality = cached.quality.clone();
                         let intent = root.settings.quality_intent();
                         let is_vip = root.account.as_ref().map(|a| a.vip);
-                        let needs_upgrade =
-                            was_cached && cached.needs_auto_upgrade(&intent, is_vip);
+                        let account_user_id =
+                            root.account.as_ref().map(|account| account.user_id.clone());
+                        let scope = sodam_core::cache::unknown_probe_scope(
+                            account_user_id.as_deref(),
+                            is_vip,
+                        );
+                        let needs_upgrade = was_cached
+                            && cached.needs_auto_upgrade(&intent, is_vip, scope.as_deref());
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
@@ -4221,6 +4248,7 @@ impl Root {
                                 track.clone(),
                                 intent.clone(),
                                 is_vip,
+                                account_user_id,
                                 cx,
                             );
                         }
