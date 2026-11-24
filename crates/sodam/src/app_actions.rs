@@ -1280,6 +1280,9 @@ impl Root {
                         root.account = Some(info.clone());
                         root.play_reporter.set_user_id(info.user_id.clone());
                         root.login = LoginState::LoggedIn(info.clone());
+                        if root.nav == Nav::Settings {
+                            root.refresh_upgrade_estimate(cx);
+                        }
                         // 账号请求成功说明网络就绪；若收藏 ids 此前拉取失败，自动重试。
                         if root.liked_ids_failed {
                             root.load_liked_ids(cx);
@@ -4570,6 +4573,9 @@ impl Root {
                 // A 的账号信息（昵称/VIP）不再代表当前身份：先清空，刷新成功写入
                 // B 的信息；刷新失败时 VIP 状态按未知处理，不按 A 的算（#185 审计）。
                 self.account = None;
+                if self.nav == Nav::Settings {
+                    self.refresh_upgrade_estimate(cx);
+                }
                 // 旧账号的歌单/收藏缓存是身份私有数据：换号不清，新账号会直接
                 // 看到旧账号的列表（加载守卫会拦住重拉）。保留当前播放。
                 self.playlists.clear();

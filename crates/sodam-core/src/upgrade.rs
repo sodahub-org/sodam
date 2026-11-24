@@ -337,7 +337,7 @@ mod tests {
 
     /// 收尾的四个数分开记，总数只算真跑过的。
     #[test]
-    fn tally_keeps_the_three_numbers_apart() {
+    fn tally_keeps_the_four_numbers_apart() {
         let mut tally = Tally::default();
         assert_eq!(tally.total(), 0);
 
