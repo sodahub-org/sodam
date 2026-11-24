@@ -2356,12 +2356,16 @@ mod tests {
         };
 
         let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
-        let probe = probe_check(&current, &unknown_stream, Some(100), true);
+        let target = Some(100);
+        let can_record = true;
+        let probe = probe_check(&current, &unknown_stream, target, can_record);
+        assert_eq!(probe.checked_rank, None);
+        assert!(!probe.confirmed_miss);
         let outcome = finish_unimproved_upgrade(
             &mut current,
             &unknown_stream,
-            Some(100),
-            true,
+            target,
+            can_record,
             probe,
             Some(&scope),
             &quality_path,
@@ -2443,13 +2447,16 @@ mod tests {
             ..Default::default()
         };
         let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
-
-        let probe = probe_check(&current, &unknown_stream, Some(100), true);
+        let target = Some(100);
+        let can_record = true;
+        let probe = probe_check(&current, &unknown_stream, target, can_record);
+        assert_eq!(probe.checked_rank, None);
+        assert!(!probe.confirmed_miss);
         let outcome = finish_unimproved_upgrade(
             &mut current,
             &unknown_stream,
-            Some(100),
-            true,
+            target,
+            can_record,
             probe,
             Some(&scope),
             &quality_path,
