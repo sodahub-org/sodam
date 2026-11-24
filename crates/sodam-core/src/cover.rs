@@ -241,7 +241,7 @@ impl Lane {
     }
 
     fn take_dropped(&mut self) -> usize {
-        std::mem::replace(&mut self.queue_evictions, Some(0)).unwrap_or_default()
+        self.queue_evictions.replace(0).unwrap_or_default()
     }
 
     /// 泵的上半截：把排队项推进在飞，最多 `max_inflight` 个。
