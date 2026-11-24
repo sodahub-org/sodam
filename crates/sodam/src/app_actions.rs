@@ -4935,6 +4935,23 @@ mod batch_upgrade_notice_tests {
     }
 
     #[test]
+    fn empty_tally_uses_info() {
+        assert_eq!(
+            batch_upgrade_notice(Tally::default()),
+            BatchUpgradeNotice::Info
+        );
+    }
+
+    #[test]
+    fn info_notice_is_wired_to_status_only() {
+        let source = include_str!("app_actions.rs");
+        assert!(
+            source.contains("BatchUpgradeNotice::Info => root.set_status_text(message),"),
+            "无更好整曲只能写状态行，不能重新接入全局提示"
+        );
+    }
+
+    #[test]
     fn any_failure_uses_warning() {
         let tally = Tally {
             upgraded: 1,
