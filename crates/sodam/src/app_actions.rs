@@ -4276,26 +4276,24 @@ impl Root {
         track: &TrackItem,
         cx: &mut Context<Self>,
     ) {
+        if !identity_current {
+            return;
+        }
         let recorded_at = std::time::Instant::now();
         let previous_failures = self.consecutive_failures;
-        let Some(mut decision) = failure_decision_if_current(
-            identity_current,
-            PlayFailureInput {
-                intent,
+        let mut decision = decide_play_failure(PlayFailureInput {
+            intent,
+            failure,
+            has_candidate: has_playable_after_failure(
+                &self.queue,
+                &self.unplayable,
+                &track.id,
                 failure,
-                has_candidate: has_playable_after_failure(
-                    &self.queue,
-                    &self.unplayable,
-                    &track.id,
-                    failure,
-                    recorded_at,
-                ),
-                consecutive_failures: previous_failures,
-                mode: self.queue.mode,
-            },
-        ) else {
-            return;
-        };
+                recorded_at,
+            ),
+            consecutive_failures: previous_failures,
+            mode: self.queue.mode,
+        });
         self.suspend_prefetch(failure);
 
         match decision.record {
@@ -4775,13 +4773,6 @@ fn clear_attempt_and_check_identity(
     }
     *playing = engine_playing;
     false
-}
-
-fn failure_decision_if_current(
-    identity_current: bool,
-    input: PlayFailureInput<'_>,
-) -> Option<PlayFailureDecision> {
-    identity_current.then(|| decide_play_failure(input))
 }
 
 /// 状态位与暂停回调同一入口，测试可确认没有只改标志位。

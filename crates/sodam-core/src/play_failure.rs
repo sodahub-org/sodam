@@ -98,6 +98,7 @@ pub struct PlayFailureDecision {
 }
 
 /// 纯决策的输入；身份校验和预取挂起留在调用方。
+#[derive(Debug)]
 pub struct PlayFailureInput<'a> {
     /// 现在要声音，还是只预装第一首。
     pub intent: PlayIntent,

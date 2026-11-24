@@ -495,7 +495,7 @@ impl Queue {
         Some(removed)
     }
 
-    /// 移除第 `removed` 项后，同步 `shuffle_round` 与 `history` 里的下标。
+    /// 移除第 `removed` 项后，同步 `shuffle_round`、`history` 与 `redo` 里的下标。
     fn shift_indices_for_removal(&mut self, removed: usize) {
         let adjust = |value: &mut usize| {
             if *value > removed {
@@ -531,7 +531,7 @@ impl Queue {
             let insert_at = self.index + 1;
             let inserted = tracks.len();
             self.tracks.splice(insert_at..insert_at, tracks);
-            // 插入点之后的曲目整体右移，轮次与历史里的下标要跟着 +1，
+            // 插入点之后的曲目整体右移，轮次、历史和 redo 里的下标要跟着 +1，
             // 否则它们会指向错位的歌（「下一首播放」在随机模式下会失效）。
             let shift = |value: &mut usize| {
                 if *value >= insert_at {
