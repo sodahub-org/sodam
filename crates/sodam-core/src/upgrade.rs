@@ -96,7 +96,7 @@ pub enum NotImprovedReason {
     PreviewBackoff,
     /// 拿到完整流但没比旧文件好；目标未知等没有更具体结论的早退也归这里。
     NotBetter,
-    /// 拿到完整流，档位可识别且低于目标，确认这次没有更高档。
+    /// 旧文件没有可比依据，且新流档位可识别、低于目标并确认 miss。
     NoHigherTier,
     /// 这次没发请求：旧缓存已达目标，或已有探测结论覆盖目标。
     AlreadyChecked,
