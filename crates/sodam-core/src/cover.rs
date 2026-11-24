@@ -1002,18 +1002,25 @@ mod tests {
     fn paths_normalize_url_whitespace() {
         let paths = CoverPaths::default();
         let url = "https://example.com/cover.jpg";
+        let raw_url = " \thttps://example.com/cover.jpg\n";
+        let padded_url = " https://example.com/cover.jpg ";
         let path = PathBuf::from("/tmp/cover.jpg");
 
-        paths.insert(" \thttps://example.com/cover.jpg\n", path.clone());
+        paths.insert(raw_url, path.clone());
 
         assert!(paths.contains(url));
-        assert!(paths.contains(" https://example.com/cover.jpg "));
+        assert!(paths.contains(padded_url));
         assert_eq!(paths.get(url), Some(path.clone()));
-        assert_eq!(paths.get(" https://example.com/cover.jpg "), Some(path));
+        assert_eq!(paths.get(padded_url), Some(path.clone()));
 
         paths.remove(url);
-        assert!(!paths.contains(" https://example.com/cover.jpg "));
-        assert_eq!(paths.get(" https://example.com/cover.jpg "), None);
+        assert!(!paths.contains(padded_url));
+        assert_eq!(paths.get(padded_url), None);
+
+        paths.insert(raw_url, path);
+        paths.remove(padded_url);
+        assert!(!paths.contains(url));
+        assert_eq!(paths.get(url), None);
     }
 
     /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。
