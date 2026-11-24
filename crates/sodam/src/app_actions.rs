@@ -4253,13 +4253,13 @@ impl Root {
                         );
                         // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，别用它
                         // 落闸、挂预取、写不可播集合，也别替用户跳歌。
-                        if !run_if_identity_current(identity_current, || {
-                            root.suspend_prefetch(&failure);
-                        }) {
-                            cx.notify();
-                            return;
-                        }
-                        root.handle_play_failure(PlayIntent::Now, &failure, &track, cx);
+                        root.handle_play_failure(
+                            identity_current,
+                            PlayIntent::Now,
+                            &failure,
+                            &track,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -4270,6 +4270,7 @@ impl Root {
 
     fn handle_play_failure(
         &mut self,
+        identity_current: bool,
         intent: PlayIntent,
         failure: &PlaybackFailure,
         track: &TrackItem,
@@ -4277,19 +4278,25 @@ impl Root {
     ) {
         let recorded_at = std::time::Instant::now();
         let previous_failures = self.consecutive_failures;
-        let mut decision = decide_play_failure(PlayFailureInput {
-            intent,
-            failure,
-            has_candidate: has_playable_after_failure(
-                &self.queue,
-                &self.unplayable,
-                &track.id,
+        let Some(mut decision) = failure_decision_if_current(
+            identity_current,
+            PlayFailureInput {
+                intent,
                 failure,
-                recorded_at,
-            ),
-            consecutive_failures: previous_failures,
-            mode: self.queue.mode,
-        });
+                has_candidate: has_playable_after_failure(
+                    &self.queue,
+                    &self.unplayable,
+                    &track.id,
+                    failure,
+                    recorded_at,
+                ),
+                consecutive_failures: previous_failures,
+                mode: self.queue.mode,
+            },
+        ) else {
+            return;
+        };
+        self.suspend_prefetch(failure);
 
         match decision.record {
             FailureRecord::None => {}
@@ -4770,12 +4777,11 @@ fn clear_attempt_and_check_identity(
     false
 }
 
-fn run_if_identity_current(identity_current: bool, action: impl FnOnce()) -> bool {
-    if !identity_current {
-        return false;
-    }
-    action();
-    true
+fn failure_decision_if_current(
+    identity_current: bool,
+    input: PlayFailureInput<'_>,
+) -> Option<PlayFailureDecision> {
+    identity_current.then(|| decide_play_failure(input))
 }
 
 /// 状态位与暂停回调同一入口，测试可确认没有只改标志位。
@@ -5157,6 +5163,20 @@ mod play_failure_flow_tests {
         assert!(pending.is_none());
         assert!(progress_token.is_none());
         assert!(!playing);
+    }
+
+    #[test]
+    fn stale_identity_produces_no_failure_decision() {
+        let failure = per_track_failure();
+        let input = PlayFailureInput {
+            intent: PlayIntent::Now,
+            failure: &failure,
+            has_candidate: true,
+            consecutive_failures: 0,
+            mode: PlayMode::ListLoop,
+        };
+        assert!(failure_decision_if_current(false, input).is_none());
+        assert!(failure_decision_if_current(true, input).is_some());
     }
 
     #[test]
