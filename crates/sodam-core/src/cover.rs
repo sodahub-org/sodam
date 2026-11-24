@@ -27,7 +27,7 @@ pub type CoverRgb = (u8, u8, u8);
 
 /// 一轮封面队列统计：新排进几张、上次读取以来挤掉几张。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CoverQueueStats {
+pub struct CoverWant {
     pub queued: usize,
     pub dropped: usize,
 }
@@ -188,19 +188,19 @@ struct Lane {
     /// 切歌时 `retain_only` 会把非当前曲目的需求裁掉。
     requeue_after_release: HashSet<String>,
     /// 因队列满挤掉、尚未取走的张数；只有缩略图队列需要。
-    dropped: Option<usize>,
+    queue_evictions: Option<usize>,
     max_queue: usize,
     max_inflight: usize,
 }
 
 impl Lane {
-    fn new(max_queue: usize, max_inflight: usize, dropped: Option<usize>) -> Self {
+    fn new(max_queue: usize, max_inflight: usize, queue_evictions: Option<usize>) -> Self {
         Self {
             queue: VecDeque::new(),
             inflight: HashSet::new(),
             abandoned: HashSet::new(),
             requeue_after_release: HashSet::new(),
-            dropped,
+            queue_evictions,
             max_queue,
             max_inflight,
         }
@@ -231,13 +231,17 @@ impl Lane {
         } else {
             false
         };
-        if let Some(dropped) = &mut self.dropped {
-            *dropped += usize::from(evicted);
+        if let Some(queue_evictions) = &mut self.queue_evictions {
+            *queue_evictions += usize::from(evicted);
         }
         let record = records.entry(url.to_string()).or_default();
         select(record).state = State::Queued;
         self.queue.push_back(url.to_string());
         true
+    }
+
+    fn take_dropped(&mut self) -> usize {
+        std::mem::replace(&mut self.queue_evictions, Some(0)).unwrap_or_default()
     }
 
     /// 泵的上半截：把排队项推进在飞，最多 `max_inflight` 个。
@@ -676,7 +680,7 @@ impl CoverStore {
 
     /// 取走上次读取以来因队列满挤掉的张数，包括补排路径。
     pub fn take_dropped(&mut self) -> usize {
-        std::mem::replace(&mut self.thumbnails.dropped, Some(0)).unwrap_or_default()
+        self.thumbnails.take_dropped()
     }
 }
 
