@@ -575,6 +575,19 @@ impl CachedTrack {
                 .is_some_and(|probe| probe.covers(target, scope))
         })
     }
+
+    fn no_upgrade_outcome(
+        &self,
+        target_rank: Option<i64>,
+        scope: Option<&str>,
+    ) -> crate::upgrade::Outcome {
+        let unreadable = !self.preview && self.quality_rank.is_some_and(|rank| rank <= 0);
+        if unreadable || self.unknown_probe_covers(target_rank, scope) {
+            crate::upgrade::Outcome::UnknownRank
+        } else {
+            crate::upgrade::Outcome::NoHigherTier
+        }
+    }
 }
 
 /// 一次升级跑完的交付物：跑完后内存里的缓存记录，以及这次的真实结果。
@@ -1173,14 +1186,9 @@ impl Session {
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
         if !current.needs_upgrade(intent, vip, scope.as_deref()) {
-            let outcome = if current.unknown_probe_covers(target_rank, scope.as_deref()) {
-                crate::upgrade::Outcome::UnknownRank
-            } else {
-                crate::upgrade::Outcome::NoHigherTier
-            };
             return Ok(UpgradeRun {
+                outcome: current.no_upgrade_outcome(target_rank, scope.as_deref()),
                 track: current,
-                outcome,
             });
         }
 
@@ -1202,14 +1210,9 @@ impl Session {
             }
         };
         if !current.needs_upgrade(intent, vip, scope.as_deref()) {
-            let outcome = if current.unknown_probe_covers(target_rank, scope.as_deref()) {
-                crate::upgrade::Outcome::UnknownRank
-            } else {
-                crate::upgrade::Outcome::NoHigherTier
-            };
             return Ok(UpgradeRun {
+                outcome: current.no_upgrade_outcome(target_rank, scope.as_deref()),
                 track: current,
-                outcome,
             });
         }
 
@@ -2099,6 +2102,10 @@ mod tests {
         // 权益未确认时也不探：本来 `needs_auto_upgrade` 会因「结论记不住」放行已知档位的记录，
         // 0 分必须在那道闸之前就挡住。
         assert!(!unreadable.needs_auto_upgrade(&lossless, Some(false), None));
+        assert_eq!(
+            unreadable.no_upgrade_outcome(Some(100), None),
+            crate::upgrade::Outcome::UnknownRank
+        );
         assert!(cached(None, "极高 320k").needs_upgrade(&lossless, Some(true), None));
     }
 
