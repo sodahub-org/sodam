@@ -1147,10 +1147,8 @@ impl Session {
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
         if !current.needs_upgrade(intent, vip) {
-            return Ok(UpgradeRun::not_improved(
-                current,
-                skipped_upgrade_reason(&current, target_rank),
-            ));
+            let reason = skipped_upgrade_reason(&current, target_rank);
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         // 串行化升级操作并获取租约：
@@ -1171,10 +1169,8 @@ impl Session {
             }
         };
         if !current.needs_upgrade(intent, vip) {
-            return Ok(UpgradeRun::not_improved(
-                current,
-                skipped_upgrade_reason(&current, target_rank),
-            ));
+            let reason = skipped_upgrade_reason(&current, target_rank);
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         let target_lease = crate::cache::CacheLease::acquire(&path);
