@@ -4304,7 +4304,16 @@ impl Root {
         };
         let mut advanced = false;
         if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
-            advance_failure_queue(&mut self.queue, &self.unplayable);
+            if advance_failure_queue(&mut self.queue, &self.unplayable) {
+                let message = self.tr(play_failure_text(failure, true)).to_string();
+                self.playback_error = None;
+                self.clear_round_exhaustion();
+                self.notify_warning_once("track-unavailable", message);
+                self.progress_preview = None;
+                self.sync_queue_cache();
+                self.start_track(false, cx);
+                return;
+            }
         }
         if decision.advance == Advance::Next {
             advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
