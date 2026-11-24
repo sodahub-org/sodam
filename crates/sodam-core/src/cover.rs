@@ -187,20 +187,20 @@ struct Lane {
     /// 结果落完要立刻补排，否则重试按钮 / 歌词页大图要等下一次请求才生效。
     /// 切歌时 `retain_only` 会把非当前曲目的需求裁掉。
     requeue_after_release: HashSet<String>,
-    /// 因队列满挤掉、尚未取走的张数。
-    dropped: usize,
+    /// 因队列满挤掉、尚未取走的张数；只有缩略图队列需要。
+    dropped: Option<usize>,
     max_queue: usize,
     max_inflight: usize,
 }
 
 impl Lane {
-    fn new(max_queue: usize, max_inflight: usize) -> Self {
+    fn new(max_queue: usize, max_inflight: usize, dropped: Option<usize>) -> Self {
         Self {
             queue: VecDeque::new(),
             inflight: HashSet::new(),
             abandoned: HashSet::new(),
             requeue_after_release: HashSet::new(),
-            dropped: 0,
+            dropped,
             max_queue,
             max_inflight,
         }
@@ -231,8 +231,8 @@ impl Lane {
         } else {
             false
         };
-        if evicted {
-            self.dropped += 1;
+        if let Some(dropped) = &mut self.dropped {
+            *dropped += usize::from(evicted);
         }
         let record = records.entry(url.to_string()).or_default();
         select(record).state = State::Queued;
@@ -386,8 +386,8 @@ impl Default for CoverStore {
     fn default() -> Self {
         Self {
             records: HashMap::new(),
-            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY),
-            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY),
+            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY, Some(0)),
+            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY, None),
             thumbnail_paths: CoverPaths::default(),
             original_paths: CoverPaths::default(),
             colors: HashMap::new(),
@@ -676,7 +676,7 @@ impl CoverStore {
 
     /// 取走上次读取以来因队列满挤掉的张数，包括补排路径。
     pub fn take_dropped(&mut self) -> usize {
-        std::mem::take(&mut self.thumbnails.dropped)
+        std::mem::replace(&mut self.thumbnails.dropped, Some(0)).unwrap_or_default()
     }
 }
 
