@@ -1,7 +1,6 @@
 //! 右侧内容区路由与共享列表组件。
 
 use super::*;
-use crate::app::SAVE_TEXT;
 use crate::ui::i18n::Language;
 #[cfg(target_os = "linux")]
 use sodam_core::config::TitlebarMode;
@@ -217,17 +216,14 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.settings.titlebar = mode.key().to_string();
-                if let Err(err) = root.settings.save() {
-                    let message = root.failure_text("窗口按钮已切换，但保存失败", &err, SAVE_TEXT);
-                    root.notify_error_once("titlebar-save-failed", message);
-                } else {
-                    let status = match mode {
-                        TitlebarMode::Auto => root.tr("窗口按钮：自动（跟随桌面）").to_string(),
-                        TitlebarMode::Always => root.tr("窗口按钮：总是显示").to_string(),
-                        TitlebarMode::Never => root.tr("窗口按钮：不显示").to_string(),
-                    };
-                    root.set_status_text(status);
-                }
+                // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
+                root.save_settings();
+                let status = match mode {
+                    TitlebarMode::Auto => root.tr("窗口按钮：自动（跟随桌面）").to_string(),
+                    TitlebarMode::Always => root.tr("窗口按钮：总是显示").to_string(),
+                    TitlebarMode::Never => root.tr("窗口按钮：不显示").to_string(),
+                };
+                root.set_status_text(status);
                 cx.notify();
             }))
             .child(
@@ -870,21 +866,13 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     root.language = Language::system_locale();
                                     root.language_follows_system = true;
                                     root.settings.language = "auto".to_string();
-                                    if let Err(err) = root.settings.save() {
-                                        let message = root.failure_text(
-                                            "语言已恢复为跟随系统，但保存失败",
-                                            &err,
-                                            SAVE_TEXT,
-                                        );
-                                        root.notify_error_once("language-save-failed", message);
+                                    root.save_settings();
+                                    let status = if root.language.is_zh() {
+                                        root.tr("语言已恢复为跟随系统").to_string()
                                     } else {
-                                        let status = if root.language.is_zh() {
-                                            root.tr("语言已恢复为跟随系统").to_string()
-                                        } else {
-                                            "Language restored to system".to_string()
-                                        };
-                                        root.set_status_text(status);
-                                    }
+                                        "Language restored to system".to_string()
+                                    };
+                                    root.set_status_text(status);
                                     // macOS 菜单栏的标题也要跟着换语言。
                                     #[cfg(target_os = "macos")]
                                     crate::menus::refresh(cx, root.language);

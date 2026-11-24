@@ -4,7 +4,6 @@
 //! 这样按下新组合键时不会顺带触发一次播放动作。
 
 use super::*;
-use crate::app::SAVE_TEXT;
 use crate::shortcuts::{self, Slot};
 
 /// 存储串 → 给人看的按键形式。
@@ -236,20 +235,14 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                             move |root, _event: &ClickEvent, _window, cx| {
                                 shortcuts::set_keystroke(&mut root.settings, slot, String::new());
                                 root.shortcuts_dirty = true;
+                                // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
+                                root.save_settings();
                                 let status = if root.language.is_zh() {
                                     root.tr("快捷键已恢复默认").to_string()
                                 } else {
                                     root.tr("Shortcut reset to default").to_string()
                                 };
                                 root.set_status_text(status);
-                                if let Err(err) = root.settings.save() {
-                                    let message = root.failure_text(
-                                        "快捷键已恢复默认，但保存失败",
-                                        &err,
-                                        SAVE_TEXT,
-                                    );
-                                    root.notify_error_once("shortcut-save-failed", message);
-                                }
                                 cx.notify();
                             },
                         )),
@@ -380,11 +373,8 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         Some(crate::ui::message::DEFAULT_DURATION),
                         "shortcut-updated",
                     );
-                    if let Err(err) = root.settings.save() {
-                        let message =
-                            root.failure_text("快捷键已更新，但保存失败", &err, SAVE_TEXT);
-                        root.notify_error_once("shortcut-save-failed", message);
-                    }
+                    // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
+                    root.save_settings();
                     cx.stop_propagation();
                     cx.notify();
                 }))

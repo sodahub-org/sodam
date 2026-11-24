@@ -1,6 +1,6 @@
 //! 搜索、音乐人和专辑详情相关动作。
 
-use super::{REMOTE_TEXT, RETRY_TEXT, SAVE_TEXT};
+use super::REMOTE_TEXT;
 use gpui::prelude::*;
 use gpui::Context;
 use sodam_core::library::SearchScope;
@@ -21,46 +21,30 @@ impl Root {
 
     pub fn remove_search_history(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.settings.remove_search_history(index) {
-            let _ = self.settings.save();
+            self.save_settings();
         }
         cx.notify();
     }
 
     pub fn clear_search_history(&mut self, cx: &mut Context<Self>) {
         self.settings.clear_search_history();
-        match self.settings.save() {
-            Ok(()) => self.set_status_text(self.tr("搜索历史已清空")),
-            Err(err) => {
-                self.notify_error_once(
-                    "search-history-save-failed",
-                    self.failure_text("清空搜索历史失败", &err, RETRY_TEXT),
-                );
-            }
-        }
+        self.save_settings();
+        self.set_status_text(self.tr("搜索历史已清空"));
         cx.notify();
     }
 
     pub fn toggle_search_history(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.settings.search_history_is_enabled();
         self.settings.set_search_history_enabled(enabled);
-        match self.settings.save() {
-            Ok(()) => {
-                let status = self
-                    .tr(if enabled {
-                        "搜索历史已开启"
-                    } else {
-                        "搜索历史已关闭，记录已清空"
-                    })
-                    .to_string();
-                self.set_status_text(status);
-            }
-            Err(err) => {
-                self.notify_error_once(
-                    "search-history-save-failed",
-                    self.failure_text("保存搜索历史设置失败", &err, SAVE_TEXT),
-                );
-            }
-        }
+        self.save_settings();
+        let status = self
+            .tr(if enabled {
+                "搜索历史已开启"
+            } else {
+                "搜索历史已关闭，记录已清空"
+            })
+            .to_string();
+        self.set_status_text(status);
         cx.notify();
     }
 
@@ -76,7 +60,7 @@ impl Root {
             return;
         }
         if self.settings.record_search(&keyword) {
-            let _ = self.settings.save();
+            self.save_settings();
         }
         let scope = self.search_tab;
         let settings = self.settings.clone();

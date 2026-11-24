@@ -29,7 +29,6 @@ use sodam_core::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
@@ -477,7 +476,7 @@ pub struct Root {
     pub queue_scroll: gpui::UniformListScrollHandle,
     /// 队列抽屉是否展开。
     pub queue_open: bool,
-    pub(crate) preferences_writer: sodam_core::preferences::PreferencesWriter,
+    pub(crate) settings_writer: sodam_core::settings_writer::SettingsWriter,
     /// 播放栏弹层锚点：触发元素（音质徽章/音量/队列）在窗口里的位置，
     /// 由画布测量，弹层据此精确贴住入口。
     /// 进度条轨道在窗口里的位置（画布测量，鼠标事件据此换算 seek 位置）。
@@ -557,11 +556,9 @@ pub struct Root {
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
     /// 结论），回来时不能挂起刚恢复的管线，也不能写回已作废的不可播集合。
     pub(crate) auth_epoch: u64,
-    /// 退出登录的落盘还在后台跑：这段时间里再点登出直接忽略，
-    /// 免得连点起两个保存、把状态清理跑两遍（#197）。
+    /// 退出登录的落盘还在队列里排着：这段时间里再点登出直接忽略，
+    /// 免得连点起两次保存、把状态清理跑两遍（#197）。
     pub(crate) logout_in_flight: bool,
-    /// 登出收尾任务的句柄：退出应用时要等它写完，别让旧 Cookie 留在盘上（#197）。
-    pub(crate) logout_save_task: Option<gpui::Task<()>>,
     /// 预取管线的挂起状态（规则见 `sodam_core::prefetch`）。
     ///
     /// 与 `prefetch_cooldown_since`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
@@ -629,13 +626,7 @@ pub struct Root {
     pub(crate) env_cookie_opted_out: bool,
     /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
     pub(crate) volume_scrubbing: bool,
-    /// 启动期欠下的落盘修正：首帧后由心跳取走，在后台线程执行（#191）。
-    pub(crate) startup_write_back: Option<sodam_core::config::StartupWriteBack>,
-    /// 首拍取走后的后台落盘任务：退出时等它写完，不能 detached 放着（#191）。
-    pub(crate) startup_persist_task: Option<gpui::Task<()>>,
-    /// 启动落盘结果：后台任务写、心跳取走提示；退出时兜底写日志（#191）。
-    pub(crate) startup_persist_result: Arc<Mutex<Option<Result<(), String>>>>,
-    /// 主动退出闸门：托盘 / ⌘Q 先等启动期落盘做完再退（#198）。
+    /// 主动退出闸门：托盘 / ⌘Q 先等设置写队列刷完再退（#198）。
     pub(crate) quit_gate: QuitGate,
 }
 
@@ -668,53 +659,13 @@ impl ConfigPollRequest {
     }
 }
 
-/// 启动期欠下的落盘工作：回存、首拍任务、偏好写线程刷尾。
-///
-/// 退出有两条路（`on_app_quit` 的 200ms 兜底、`Root::request_quit` 的主动等待），
-/// 要等的是同一批东西，收在这里，避免两边各写一份（#191 / #198）。
-struct PendingStartupPersist {
-    /// 退出时补做的启动回存（首拍还没取走时）。
-    write_back: Option<gpui::Task<()>>,
-    /// 心跳首拍已经交给后台的那次回存。
-    heartbeat_task: Option<gpui::Task<()>>,
-    preferences: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    result: Arc<Mutex<Option<Result<(), String>>>>,
-}
-
-impl PendingStartupPersist {
-    /// 等全部写完；在后台线程跑，别在 UI 线程等磁盘。
-    async fn wait(self) -> Arc<Mutex<Option<Result<(), String>>>> {
-        if let Some(task) = self.write_back {
-            task.await;
-        }
-        if let Some(task) = self.heartbeat_task {
-            task.await;
-        }
-        self.preferences.await;
-        self.result
-    }
-}
-
-/// 首拍任务失败但心跳没来得及提示：把原文写进诊断日志，界面只给退出动作本身。
-fn log_startup_persist_failure(result: &Arc<Mutex<Option<Result<(), String>>>>) {
-    let error = result.lock().unwrap_or_else(|err| err.into_inner()).take();
-    if let Some(Err(error)) = error {
-        log_event(
-            LogLevel::Error,
-            LogTopic::App,
-            "failure",
-            &[("context", "启动配置回存失败"), ("detail", error.as_str())],
-        );
-    }
-}
-
 impl Root {
     /// 构造根视图：加载配置、建立会话、恢复播放模式并起心跳。
     pub fn new(cx: &mut Context<Self>) -> Self {
         let config_path = Settings::config_path();
         // 安全加载：坏文件绝不覆盖。备份可用就从备份继续、坏文件改名保留并告诉
         // 用户在哪；否则默认值启动并提示出错的大致位置。恢复编排收在领域层（#185）。
-        // 读盘阶段只做内存修正，备份 / 回存 / 隔离改名全部留给首帧后的后台任务（#191）。
+        // 读盘阶段只做内存修正，备份 / 回存 / 隔离改名全部交给写队列在后台做（#191）。
         // `baseline` 是读盘前记的文件指纹：热重载基线和后台回写保护共用这一份。
         let sodam_core::config::StartupLoad {
             settings,
@@ -730,11 +681,17 @@ impl Root {
         let engine = PlaybackEngine::with_volume(settings.volume);
         settings.volume = engine.snapshot().volume;
         // 首次运行要落盘（用户可以直接编辑 config.json 换签名服务 / 钉死设备指纹）。
-        // 旧行为保存的是补过环境变量的这份设置；内容交给首帧后的后台回存，不在 UI 线程写。
+        // 旧行为保存的是补过环境变量的这份设置；内容交给写队列里的回存，不在 UI 线程写。
         if first_run {
             if let Some(write_back) = write_back.as_mut() {
                 write_back.adopt_settings(settings.clone());
             }
+        }
+        // 一条队列管所有设置落盘：界面线程只管改内存，写盘全在它自己的工作线程上。
+        // 读盘阶段欠下的修正（隔离坏文件 / 迁移回存 / 刷备份）第一位排进去（#191 / #259）。
+        let settings_writer = sodam_core::settings_writer::SettingsWriter::new(config_path.clone());
+        if let Some(write_back) = write_back {
+            settings_writer.persist_startup(write_back);
         }
         let theme_follows_system = ThemeKind::from_key(&settings.theme).is_none();
         let theme = ThemeKind::from_key(&settings.theme)
@@ -787,7 +744,7 @@ impl Root {
         let play_reporter = PlayReporter::new(settings.clone());
         let config_reload = {
             let mut tracker = sodam_core::config_watch::ReloadTracker::new();
-            // 以读盘前的文件状态作基线：首帧后的隔离 / 回写不算外部改动，
+            // 以读盘前的文件状态作基线：之后的隔离 / 回写不算外部改动，
             // 慢盘上也不会把「正在恢复」误报成配置文件损坏（#191）。
             tracker.acknowledge(baseline);
             Arc::new(Mutex::new(tracker))
@@ -933,9 +890,6 @@ impl Root {
             open_album: None,
             loading_album: false,
             queue_open: false,
-            preferences_writer: sodam_core::preferences::PreferencesWriter::new(
-                Settings::config_path(),
-            ),
             progress_track_bounds: Arc::new(Mutex::new(None)),
             volume_track_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
@@ -943,7 +897,6 @@ impl Root {
             prefetch_patrol: 0,
             auth_epoch: 0,
             logout_in_flight: false,
-            logout_save_task: None,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_summary_request_seq: 0,
@@ -979,22 +932,16 @@ impl Root {
             config_poll_busy: false,
             env_cookie_opted_out: false,
             volume_scrubbing: false,
-            startup_write_back: write_back,
-            startup_persist_task: None,
-            startup_persist_result: Arc::new(Mutex::new(None)),
+            settings_writer,
             quit_gate: QuitGate::new(QUIT_PERSIST_TIMEOUT),
         };
-        cx.on_app_quit(|root, cx| {
+        cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
-            // 登出落盘还没回来就退出：等它写完，别让旧 Cookie 留在盘上（#197）。
-            let logout_task = root.logout_save_task.take();
-            let work = root.take_pending_startup_persist(cx);
+            // 退出只等这一条队列：启动回存、界面上排队的改动、登出摘 Cookie 都排在里头
+            // （#259）。等它在后台线程里刷完，别在 UI 线程等磁盘。
+            let flush = root.settings_writer.flush();
             async move {
-                if let Some(task) = logout_task {
-                    task.await;
-                }
-                let result = work.wait().await;
-                log_startup_persist_failure(&result);
+                flush.await;
                 // 上面的日志可能是在第一次 flush 之后写的，退出前再刷一次。
                 sodam_core::flush_global();
             }
@@ -1680,61 +1627,14 @@ impl Root {
         text
     }
 
-    /// 取走启动期欠下的落盘修正（心跳首拍在首帧后调用，见 main.rs）。
-    pub(crate) fn take_startup_write_back(
-        &mut self,
-    ) -> Option<sodam_core::config::StartupWriteBack> {
-        self.startup_write_back.take()
-    }
-
-    /// 取走启动期欠下的落盘工作（回存 + 首拍任务 + 偏好刷尾）。
+    /// 设置改完就排进后台写队列：界面线程只改内存，不碰磁盘。
     ///
-    /// 两条退出路径共用：`on_app_quit` 的兜底与 `request_quit` 的主动等待。
-    fn take_pending_startup_persist(&mut self, cx: &mut Context<Self>) -> PendingStartupPersist {
-        let write_back = self.startup_write_back.take().map(|write_back| {
-            cx.background_spawn(async move {
-                if let Err(error) = write_back.persist() {
-                    log_event(
-                        LogLevel::Error,
-                        LogTopic::App,
-                        "failure",
-                        &[
-                            ("context", "启动配置回存失败（退出前补做）"),
-                            ("detail", error.as_str()),
-                        ],
-                    );
-                }
-            })
-        });
-        PendingStartupPersist {
-            write_back,
-            heartbeat_task: self.startup_persist_task.take(),
-            preferences: Box::pin(self.preferences_writer.flush()),
-            result: self.startup_persist_result.clone(),
-        }
+    /// 一个例外：扫码登录成功那一次要在界面线程当场写盘，见 `apply_login_cookie`。
+    pub(crate) fn save_settings(&mut self) {
+        self.settings_writer.schedule(&self.settings);
     }
 
-    /// 心跳每拍检查一次启动落盘结果：失败时技术原文进日志，状态行只给人话。
-    pub(crate) fn report_startup_persist_result(&mut self, cx: &mut Context<Self>) {
-        // 正在等落盘退出：状态行要一直显示「正在保存…」，结果交给 request_quit 收尾。
-        if self.quit_gate.is_saving() {
-            return;
-        }
-        let result = self
-            .startup_persist_result
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .take();
-        if let Some(Err(error)) = result {
-            // 复用本地保存类失败的统一说法；「本次运行不受影响」留在日志上下文里。
-            let message = self.failure_text("启动配置回存失败", &error, SAVE_TEXT);
-            self.set_status_text(message);
-            cx.notify();
-        }
-    }
-
-    /// 应用内主动退出（托盘「退出」、macOS ⌘Q）：先等启动期欠下的落盘做完，
-    /// 再真正退出（#198）。
+    /// 应用内主动退出（托盘「退出」、macOS ⌘Q）：先等设置写队列刷完，再真正退出（#198）。
     ///
     /// GPUI 只给 `on_app_quit` 的等待约 200ms；慢盘 / 杀软扫描 / 写锁被占时写不完。
     /// 这里把等待放到自己的任务里，期间界面保持可交互；再点一次退出，或等满
@@ -1742,24 +1642,18 @@ impl Root {
     pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
         if self.quit_gate.request(std::time::Instant::now()) == QuitRequest::QuitNow {
             // 用户再点一次：不再等写线程，慢盘上也退得掉（#198）。
-            self.preferences_writer.abandon_on_drop();
+            self.settings_writer.abandon_on_drop();
             cx.quit();
             return;
         }
         self.set_status_text(self.tr("正在保存…"));
         cx.notify();
 
-        // 取走这轮要等的落盘工作，后台等完再回主线程退出。
-        // 登出落盘还没回来时也算一份：慢盘上别把「已退出登录」留在内存、盘上还是旧 Cookie（#197）。
-        let logout_task = self.logout_save_task.take();
-        let work = self.take_pending_startup_persist(cx);
+        // 只等这一条队列刷完：排队中的改动、启动回存、登出摘 Cookie 都在里头（#259）。
+        let flush = self.settings_writer.flush();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         cx.background_spawn(async move {
-            if let Some(task) = logout_task {
-                task.await;
-            }
-            let result = work.wait().await;
-            log_startup_persist_failure(&result);
+            flush.await;
             let _ = done_tx.send(());
         })
         .detach();
@@ -1777,8 +1671,8 @@ impl Root {
                 match this.update(cx, |root, _| {
                     let timed_out = root.quit_gate.timed_out(std::time::Instant::now());
                     if timed_out {
-                        // 超时强制退出：析构时不再等可能卡在慢 IO 的偏好写线程。
-                        root.preferences_writer.abandon_on_drop();
+                        // 超时强制退出：析构时不再等可能卡在慢 IO 的写线程。
+                        root.settings_writer.abandon_on_drop();
                     }
                     timed_out
                 }) {
@@ -1912,21 +1806,14 @@ impl Root {
     pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.apply_language_state(language.key(), cx);
         self.settings.language = language.key().to_string();
-        let save_result = self.settings.save();
-        match save_result {
-            Ok(()) => {
-                let status = if language.is_zh() {
-                    language.text("语言已切换为中文").to_string()
-                } else {
-                    language.text("Language switched to English").to_string()
-                };
-                self.set_status_text(status);
-            }
-            Err(err) => {
-                let message = self.failure_text("语言已切换，但保存失败", &err, SAVE_TEXT);
-                self.notify_warning_once("language-save-failed", message);
-            }
-        }
+        // 落盘排进后台队列；写失败了下一拍由心跳写进状态行，不在这里等磁盘。
+        self.save_settings();
+        let status = if language.is_zh() {
+            language.text("语言已切换为中文").to_string()
+        } else {
+            language.text("Language switched to English").to_string()
+        };
+        self.set_status_text(status);
         cx.notify();
     }
 }
