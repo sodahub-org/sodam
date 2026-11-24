@@ -189,7 +189,7 @@ impl From<&Settings> for SessionInputs {
 
 impl From<Settings> for SessionInputs {
     /// 已经拿到所有权，字段直接搬走：会话是每个后台请求都新建一份的，
-    /// 没必要为了这一步再 clone 十个 `String`。
+    /// 没必要为了这一步再把每个 `String` 拷一遍。
     fn from(settings: Settings) -> Self {
         let Settings {
             signer_url,
@@ -1414,8 +1414,7 @@ impl Settings {
     /// 写盘失败时内存一点不动，Cookie 不进去，会话也不会被当成已登录。
     ///
     /// 这次写是整份覆盖：内存这份把文件整个盖掉，盘上这段时间被外部手改的内容会丢。
-    /// 登出那条路（[`Self::save_signed_out`]）是先读盘、只改 Cookie，两条口径不一致；
-    /// 登录也得合并外部手改的话，要等写入口统一收成一条之后再做。
+    /// 登出那条路（[`Self::save_signed_out`]）是先读盘、只改 Cookie，两条口径不一致。
     ///
     /// 同步写：调用方是界面线程。登录成功后用户可能三秒内就退出应用，
     /// 丢给后台队列会把这枚 Cookie 一起丢掉。
@@ -2558,7 +2557,7 @@ mod tests {
         // 登录轮询开始时的那份设置，留作对照
         let login_start = settings.clone();
 
-        // 轮询期间，用户或外部编辑把主题、详细日志改了
+        // 轮询期间，内存里把主题、详细日志改了
         settings.theme = "light".into();
         settings.detailed_logs = true;
 

@@ -18,7 +18,7 @@
                                  ▼
 ┌──────────────────── crates/sodam-core（领域层，无 GPUI） ─────────────────────┐
 │ Settings       配置文件 + 环境变量补全                                        │
-│ Session        只持会话输入那 10 个字段（Cookie、设备身份、签名、音质意图）   │
+│ Session        只持会话输入那几个字段（Cookie、设备身份、签名、音质意图）     │
 │ library        推荐 / 听歌模式 / 搜索 / 歌单 / 收藏 / 艺人 / 专辑 / 歌词       │
 │ Queue          当前曲目、历史、下一首、列表循环 / 单曲循环 / 随机             │
 │ PlaybackEngine rodio 线程；接收 Load / Play / Pause / Seek / Volume 命令       │

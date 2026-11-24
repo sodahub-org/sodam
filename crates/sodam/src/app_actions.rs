@@ -1057,7 +1057,7 @@ impl Root {
                         // 当场落盘——用户可能登录成功三秒内就退出应用。
                         match root.settings.apply_login_cookie(&cookie) {
                             Ok(()) => {
-                                // 会话只持那 10 个字段，换 Cookie 就是重建会话；其它设置
+                                // 会话只持会话输入那几个字段，换 Cookie 就是重建会话；其它设置
                                 // （登录期间改过的主题、音量等）本来就没进过会话，不会被写回旧值。
                                 match root.session.as_mut() {
                                     Some(session) => session.adopt(&root.settings),

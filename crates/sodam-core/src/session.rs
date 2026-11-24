@@ -767,7 +767,7 @@ impl Session {
     /// 用给定设置构建会话：注入 Cookie、设备指纹、签名器与音质偏好。
     ///
     /// 收 `impl Into<SessionInputs>`：`Settings` / `&Settings` 都能直接给，
-    /// 现有构造点一处不用改；只认那 10 个字段，多的一点都拿不进来。
+    /// 现有构造点一处不用改。会话只认会话输入那几个字段，别的拿不进来。
     pub fn new(inputs: impl Into<SessionInputs>) -> Self {
         let inputs = inputs.into();
         let pumpkin = Soda::new(inputs.cookie.clone());
