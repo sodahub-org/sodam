@@ -568,16 +568,14 @@ impl CachedTrack {
 
 /// 一次升级跑完的交付物：跑完后内存里的缓存记录，加上这次有没有真的换成更好的流。
 ///
-/// `improved` 在换文件那一刻由 `is_better_stream` 定下来，调用方据此判「升级成功」
-/// 还是「没换成更好的流」，不在事后拿升级前后的两份缓存自己比分数。
+/// `not_improved_reason` 在换文件那一刻定下来：`None` 表示升级成功，`Some` 表示没换成更好的流。
+/// 调用方据此判结果，不在事后拿升级前后的两份缓存自己比分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
     /// 跑完那一刻的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
     /// sidecar，要准的值去读 sidecar。
     pub track: CachedTrack,
-    /// 盘上文件有没有换成更好的流。`false` = 跑完了，但没换成更好的流。
-    pub improved: bool,
-    /// `improved == false` 时的日志原因；成功升级时为 `None`。
+    /// 没换成更好的流时的日志原因；成功升级时为 `None`。
     pub not_improved_reason: Option<NotImprovedReason>,
 }
 
@@ -585,7 +583,6 @@ impl UpgradeRun {
     fn not_improved(track: CachedTrack, reason: NotImprovedReason) -> Self {
         Self {
             track,
-            improved: false,
             not_improved_reason: Some(reason),
         }
     }
@@ -593,7 +590,6 @@ impl UpgradeRun {
     fn improved(track: CachedTrack) -> Self {
         Self {
             track,
-            improved: true,
             not_improved_reason: None,
         }
     }
