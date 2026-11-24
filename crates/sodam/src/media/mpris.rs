@@ -7,7 +7,6 @@
 //! 应用侧的每次发布只是往 channel 里排一条更新，按顺序应用。
 
 use std::ffi::c_void;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +16,7 @@ use mpris_server::{Metadata, PlaybackStatus, Player, Time, TrackId};
 use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
 use tokio::sync::mpsc;
 
-use super::{Command, NowPlaying, BUS_NAME, DESKTOP_ENTRY, DISPLAY_NAME};
+use super::{Command, CommandSender, NowPlaying, BUS_NAME, DESKTOP_ENTRY, DISPLAY_NAME};
 
 /// 注册失败后的首次重试间隔；之后指数退避到这个上限。
 const REGISTER_RETRY: Duration = Duration::from_secs(5);
@@ -37,11 +36,7 @@ pub struct Controls {
 
 impl Controls {
     /// 起后台任务去抢总线名。抢不到只记日志，之后每次发布都变成空操作。
-    pub fn new(
-        _hwnd: Option<*mut c_void>,
-        commands: Sender<Command>,
-        cx: &mut App,
-    ) -> Result<Self> {
+    pub fn new(_hwnd: Option<*mut c_void>, commands: CommandSender, cx: &mut App) -> Result<Self> {
         let (updates, mut receiver) = mpsc::unbounded_channel();
         let _server = cx.spawn(async move |cx| {
             // 抢总线名可能失败：上一个实例还没退出、或者同时开了两个 sodam。
@@ -135,7 +130,7 @@ impl Controls {
 }
 
 /// 注册 `org.mpris.MediaPlayer2.sodam`，把播放器接受的方法转成 `Command`。
-async fn build(commands: Sender<Command>) -> mpris_server::zbus::Result<Player> {
+async fn build(commands: CommandSender) -> mpris_server::zbus::Result<Player> {
     let player = Player::builder(BUS_NAME)
         .identity(DISPLAY_NAME)
         .desktop_entry(DESKTOP_ENTRY)

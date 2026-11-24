@@ -10,7 +10,9 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use gpui::{App, Global};
 use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
@@ -40,6 +42,24 @@ pub enum Command {
     Toggle,
     Next,
     Previous,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandSender {
+    tx: Sender<Command>,
+    pending: Arc<AtomicBool>,
+}
+
+impl CommandSender {
+    fn new(tx: Sender<Command>, pending: Arc<AtomicBool>) -> Self {
+        Self { tx, pending }
+    }
+
+    fn send(&self, command: Command) {
+        if self.tx.send(command).is_ok() {
+            self.pending.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// 要发布给系统的播放状态。
@@ -95,6 +115,7 @@ const POSITION_JUMP_SECONDS: f64 = 2.5;
 struct Media {
     controls: Controls,
     commands: Receiver<Command>,
+    commands_pending: Arc<AtomicBool>,
     published_metadata: Option<(String, Option<String>)>,
     published_playback: Option<(String, bool)>,
     /// 上次发布出去的进度，用来识别拖动/切曲这种跳转。
@@ -114,8 +135,13 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
     if cx.has_global::<Attached>() {
         return;
     }
-    let (sender, commands) = std::sync::mpsc::channel::<Command>();
-    let controls = match Controls::new(hwnd, sender, cx) {
+    let (command_tx, commands) = std::sync::mpsc::channel::<Command>();
+    let commands_pending = Arc::new(AtomicBool::new(false));
+    let controls = match Controls::new(
+        hwnd,
+        CommandSender::new(command_tx, commands_pending.clone()),
+        cx,
+    ) {
         Ok(controls) => controls,
         Err(error) => {
             let detail = format!("{error:#}");
@@ -132,6 +158,7 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
         media: RefCell::new(Media {
             controls,
             commands,
+            commands_pending,
             published_metadata: None,
             published_playback: None,
             last_position: 0.0,
@@ -139,10 +166,20 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
     });
 }
 
+/// 托盘循环在进 app 前先看这个哨兵。
+pub(crate) fn command_signal(cx: &App) -> Option<Arc<AtomicBool>> {
+    cx.try_global::<Attached>()
+        .map(|attached| attached.media.borrow().commands_pending.clone())
+}
+
 /// 取走桌面媒体控件发来的命令。
 pub fn drain_commands(cx: &App) -> Vec<Command> {
     cx.try_global::<Attached>()
-        .map(|attached| attached.media.borrow().commands.try_iter().collect())
+        .map(|attached| {
+            let mut media = attached.media.borrow_mut();
+            media.commands_pending.store(false, Ordering::Release);
+            media.commands.try_iter().collect()
+        })
         .unwrap_or_default()
 }
 

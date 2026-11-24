@@ -5,6 +5,7 @@ mod actions;
 #[path = "app_search.rs"]
 mod search_actions;
 
+use crate::loop_probe::LoopProbe;
 use futures_lite::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -29,6 +30,7 @@ use sodam_core::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
@@ -465,7 +467,7 @@ pub struct Root {
     /// 不走 `status` —— 那个字段现在没有任何地方渲染（见 #40），提示必须长在出问题的行上。
     pub shortcut_note: Option<&'static str>,
     /// 快捷键配置有改动，需要重新注册 keymap（由 main 的托盘循环统一应用）。
-    pub shortcuts_dirty: bool,
+    pub shortcuts_dirty: Arc<AtomicBool>,
     /// 搜索结果与加载状态。
     pub results: Arc<Vec<TrackItem>>,
     pub search_results: SearchResults,
@@ -866,7 +868,7 @@ impl Root {
             shortcut_focus: cx.focus_handle(),
             shortcut_capture: None,
             shortcut_note: None,
-            shortcuts_dirty: false,
+            shortcuts_dirty: Arc::new(AtomicBool::new(false)),
             results: Arc::new(Vec::new()),
             search_results: SearchResults::default(),
             search_tab: SearchScope::All,
@@ -1111,49 +1113,50 @@ impl Root {
         // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒。
         {
             let mailbox = root.cover_mailbox.clone();
-            cx.spawn(async move |this, cx| loop {
-                let pending = mailbox.take();
-                let mailbox_dropped = mailbox.take_dropped();
-                let had_demand = !pending.is_empty();
-                let stats = if had_demand {
-                    match this.update(cx, |root, cx| {
-                        let queued = root.ensure_covers(&pending, cx);
-                        CoverWant {
-                            queued,
-                            dropped: root.cover_store.take_dropped() + mailbox_dropped,
+            cx.spawn(async move |this, cx| {
+                let mut probe = LoopProbe::new("cover");
+                loop {
+                    probe.tick();
+                    let pending = mailbox.take();
+                    let mailbox_dropped = mailbox.take_dropped();
+                    let had_demand = !pending.is_empty();
+                    let stats = if had_demand {
+                        probe.app_entry();
+                        match this.update(cx, |root, cx| {
+                            let queued = root.ensure_covers(&pending, cx);
+                            CoverWant {
+                                queued,
+                                dropped: root.cover_store.take_dropped() + mailbox_dropped,
                         }
-                    }) {
-                        Ok(stats) => stats,
-                        Err(_) => break,
+                    } else {
+                        CoverWant::default()
+                    };
+                    if stats.queued + stats.dropped > 0
+                        && log_outlet::enabled(LogLevel::Debug, LogTopic::App)
+                    {
+                        let queued = stats.queued.to_string();
+                        let dropped = stats.dropped.to_string();
+                        log_event(
+                            LogLevel::Debug,
+                            LogTopic::App,
+                            "cover_queue",
+                            &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
+                        );
                     }
-                } else {
-                    CoverWant::default()
-                };
-                if stats.queued + stats.dropped > 0
-                    && log_outlet::enabled(LogLevel::Debug, LogTopic::App)
-                {
-                    let queued = stats.queued.to_string();
-                    let dropped = stats.dropped.to_string();
-                    log_event(
-                        LogLevel::Debug,
-                        LogTopic::App,
-                        "cover_queue",
-                        &[("queued", queued.as_str()), ("dropped", dropped.as_str())],
-                    );
-                }
-                if had_demand {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(60))
+                    if had_demand {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(60))
+                            .await;
+                    } else {
+                        // 空队列时把 500ms 定时器和唤醒通道合成一个等待，不额外引入运行时。
+                        let idle = cx
+                            .background_executor()
+                            .timer(std::time::Duration::from_millis(500));
+                        let _ = futures_lite::future::or(idle, async {
+                            let _ = cover_wake_rx.next().await;
+                        })
                         .await;
-                } else {
-                    // 空队列时把 500ms 定时器和唤醒通道合成一个等待，不额外引入运行时。
-                    let idle = cx
-                        .background_executor()
-                        .timer(std::time::Duration::from_millis(500));
-                    let _ = futures_lite::future::or(idle, async {
-                        let _ = cover_wake_rx.next().await;
-                    })
-                    .await;
+                    }
                 }
             })
             .detach();

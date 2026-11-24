@@ -5,7 +5,6 @@
 //! Windows 的控件挂在窗口上，`MediaControls::new` 必须拿到 HWND。
 
 use std::ffi::c_void;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -15,18 +14,14 @@ use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
 };
 
-use super::{Command, NowPlaying, BUS_NAME, DISPLAY_NAME};
+use super::{Command, CommandSender, NowPlaying, BUS_NAME, DISPLAY_NAME};
 
 pub struct Controls {
     controls: MediaControls,
 }
 
 impl Controls {
-    pub fn new(
-        hwnd: Option<*mut c_void>,
-        commands: Sender<Command>,
-        _cx: &mut App,
-    ) -> Result<Self> {
+    pub fn new(hwnd: Option<*mut c_void>, commands: CommandSender, _cx: &mut App) -> Result<Self> {
         let config = PlatformConfig {
             dbus_name: BUS_NAME,
             display_name: DISPLAY_NAME,
