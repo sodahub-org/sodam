@@ -165,10 +165,10 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         row_element = row_element.child(div().flex_1().min_w(px(0.0)));
                         continue;
                     };
-                    let url = card.playlist.cover.clone();
-                    let cached = covers.get(&url);
-                    if cached.is_none() && !url.is_empty() {
-                        cover_mailbox.request(url.clone());
+                    let url = &card.playlist.cover;
+                    let cached = covers.get(url);
+                    if cached.is_none() && !covers.is_failed(url) && !url.trim().is_empty() {
+                        cover_mailbox.request(url);
                     }
 
                     let subtitle = if card.kind == sodam_core::library::SceneCardKind::Radio {

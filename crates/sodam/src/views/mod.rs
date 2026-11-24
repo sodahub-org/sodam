@@ -291,10 +291,10 @@ fn track_row(
         .child({
             // 封面：只在「这一行真的被渲染出来」时才把 URL 丢进请求队列，
             // 没滚到的行不会发任何请求（虚拟列表天然只渲染可见行）。
-            let url = track.cover.clone();
-            let cached = covers.get(&url);
-            if cached.is_none() && !url.is_empty() {
-                cover_mailbox.request(url.clone());
+            let url = &track.cover;
+            let cached = covers.get(url);
+            if cached.is_none() && !covers.is_failed(url) && !url.trim().is_empty() {
+                cover_mailbox.request(url);
             }
             cover(cached, theme::size::ROW_ART, theme::radius::ART)
         })
@@ -694,8 +694,9 @@ pub(crate) fn scrolling_detail_page(
         };
         let item = album.clone();
         let cover_path = covers.get(&album.cover);
-        if cover_path.is_none() && !album.cover.trim().is_empty() {
-            cover_mailbox.request(album.cover.clone());
+        if cover_path.is_none() && !covers.is_failed(&album.cover) && !album.cover.trim().is_empty()
+        {
+            cover_mailbox.request(&album.cover);
         }
         div()
             .id(gpui::ElementId::Name(
