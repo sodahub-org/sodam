@@ -451,14 +451,18 @@ impl UnplayableTracks {
         entries
             .iter()
             .filter(|(_, entry)| entry.retryability != Retryability::Never)
-            .min_by_key(|(track_id, entry)| (entry.recorded_at, track_id))
+            .min_by(|(left_id, left), (right_id, right)| {
+                (left.recorded_at, left_id).cmp(&(right.recorded_at, right_id))
+            })
             .map(|(track_id, _)| track_id.as_str())
     }
 
     fn oldest(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
         entries
             .iter()
-            .min_by_key(|(track_id, entry)| (entry.recorded_at, track_id))
+            .min_by(|(left_id, left), (right_id, right)| {
+                (left.recorded_at, left_id).cmp(&(right.recorded_at, right_id))
+            })
             .map(|(track_id, _)| track_id.as_str())
     }
 }
