@@ -265,14 +265,14 @@ impl Lane {
 
     /// 泵的下半截的公共记账：出在飞、处理作废。
     ///
-    /// 返回 `Some(evicted)` 表示这次结果作废，调用方不用再发布。
+    /// 返回 `Some(requeued)` 表示这次结果作废，调用方不用再发布。
     fn finish(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> Option<bool> {
+    ) -> Option<Enqueued> {
         self.inflight.remove(url);
         if self.abandoned.remove(url) {
             // 下载中被 forget：这次拿回来的东西不要，退回可重排。
@@ -283,25 +283,25 @@ impl Lane {
                 slot.failures = 0;
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
-            let evicted = self.requeue_if_demanded(url, ready, records, select);
+            let requeued = self.requeue_if_demanded(url, ready, records, select);
             discard_empty_record(records, url);
-            return Some(evicted);
+            return Some(requeued);
         }
         None
     }
 
-    /// 有人在这张图在飞期间留了需求：结果落完立刻补排，返回是否挤掉了旧项。
+    /// 有人在这张图在飞期间留了需求：结果落完立刻补排，返回本次入队结果。
     fn requeue_if_demanded(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> bool {
+    ) -> Enqueued {
         if self.requeue_after_release.remove(url) {
-            self.enqueue(url, ready, records, select).evicted
+            self.enqueue(url, ready, records, select)
         } else {
-            false
+            Enqueued::default()
         }
     }
 
@@ -439,13 +439,13 @@ impl CoverStore {
         if url.is_empty() {
             return;
         }
-        if let Some(evicted) = self.thumbnails.finish(
+        if let Some(requeued) = self.thumbnails.finish(
             url,
             &self.thumbnail_paths,
             &mut self.records,
             thumbnail_slot,
         ) {
-            if evicted {
+            if requeued.evicted {
                 self.thumbnail_dropped += 1;
             }
             return;
