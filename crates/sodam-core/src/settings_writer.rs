@@ -51,26 +51,34 @@ pub struct WriteFailure {
     pub detail: String,
 }
 
-/// 启动回存失败的共享槽：托盘只查是否有待报项，界面线程取走一次。
+/// 启动回存失败的共享槽：原子标志给托盘快速判断，失败详情只由这个对象维护。
 #[derive(Clone, Debug, Default)]
 pub struct StartupFailureSlot {
     failure: Arc<Mutex<Option<WriteFailure>>>,
+    pending: Arc<AtomicBool>,
 }
 
 impl StartupFailureSlot {
-    /// 当前能否看见待报项；拿不到锁按没有处理，托盘下一拍会再看。
+    /// 托盘在进 app 前先读这个原子标志。
     pub fn is_pending(&self) -> bool {
-        self.failure.try_lock().is_ok_and(|slot| slot.is_some())
+        self.pending.load(Ordering::Acquire)
     }
 
     fn take(&self) -> Option<WriteFailure> {
-        self.failure.lock().ok()?.take()
+        let failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if failure.is_some() {
+            self.pending.store(false, Ordering::Release);
+        }
+        failure
     }
 
     fn set(&self, failure: WriteFailure) {
-        if let Ok(mut slot) = self.failure.lock() {
-            *slot = Some(failure);
-        }
+        *self.failure.lock().unwrap_or_else(|err| err.into_inner()) = Some(failure);
+        self.pending.store(true, Ordering::Release);
     }
 }
 
