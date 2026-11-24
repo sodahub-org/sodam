@@ -105,17 +105,6 @@ pub enum Outcome {
     Failed,
 }
 
-impl Outcome {
-    /// 把「这次有没有换成更好的流」翻成对外的结论；档位未知由升级路径单独给出。
-    pub fn from_improved(improved: bool) -> Self {
-        if improved {
-            Self::Upgraded
-        } else {
-            Self::NoHigherTier
-        }
-    }
-}
-
 /// 一轮批量的计数：成功 / 失败 / 没换成更好的整曲 / 档位未知。
 ///
 /// 没换成更好的整曲不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里。
@@ -299,13 +288,6 @@ mod tests {
             identity_change(Some(" 8801 "), Some("8801")),
             IdentityChange::LoginStateChanged
         );
-    }
-
-    /// 「有没有换成更好的流」是界面报成功的唯一出口，钉住它别被改宽。
-    #[test]
-    fn improved_maps_to_the_reported_outcome() {
-        assert_eq!(Outcome::from_improved(true), Outcome::Upgraded);
-        assert_eq!(Outcome::from_improved(false), Outcome::NoHigherTier);
     }
 
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
