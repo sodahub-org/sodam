@@ -1129,7 +1129,13 @@ impl Root {
                 let pending = mailbox.take();
                 let had_demand = !pending.is_empty();
                 let stats = if had_demand {
-                    match this.update(cx, |root, cx| root.ensure_covers(&pending, cx)) {
+                    match this.update(cx, |root, cx| {
+                        let queued = root.ensure_covers(&pending, cx);
+                        CoverWant {
+                            queued,
+                            dropped: root.cover_store.take_dropped(),
+                        }
+                    }) {
                         Ok(stats) => stats,
                         Err(_) => break,
                     }
