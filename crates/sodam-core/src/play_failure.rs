@@ -114,17 +114,26 @@ pub struct PlayFailureInput<'a> {
 /// 连续几次装载失败后停止本轮。
 pub const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 
-/// 只有点播的抖动类失败（`RecoveryAction::Nothing`）才让连败数加一。
+/// 只有点播的 `RecoveryAction::Nothing` 失败才让连败数加一。
 /// 加一由调用方自己做，不进四输出。
 pub fn counts_consecutive_failure(intent: PlayIntent, failure: &PlaybackFailure) -> bool {
     intent == PlayIntent::Now && failure.action == RecoveryAction::Nothing
+}
+
+/// 这次失败要不要记进不可播集合。
+pub fn failure_record(failure: &PlaybackFailure) -> FailureRecord {
+    if failure.is_per_track() {
+        FailureRecord::Unplayable
+    } else {
+        FailureRecord::None
+    }
 }
 
 /// 按现状决定一次播放失败的后果。
 ///
 /// 预装仍只试一次，不走点播的连败封顶；这里记录差异，不替预装改行为。
 pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
-    if input.failure.is_per_track() {
+    if failure_record(input.failure) == FailureRecord::Unplayable {
         return if input.has_candidate {
             PlayFailureDecision {
                 record: FailureRecord::Unplayable,
@@ -423,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn only_point_transient_failures_count() {
+    fn only_point_nothing_failures_count() {
         for action in [
             RecoveryAction::TrackUnavailable,
             RecoveryAction::PickAnother,
@@ -445,5 +454,12 @@ mod tests {
             PlayIntent::PrepareFirst,
             &transient
         ));
+        let never_nothing = PlaybackFailure::new(
+            Stage::Transfer,
+            Retryability::Never,
+            RecoveryAction::Nothing,
+            "staged download disagrees",
+        );
+        assert!(counts_consecutive_failure(PlayIntent::Now, &never_nothing));
     }
 }

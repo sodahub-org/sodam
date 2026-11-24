@@ -18,8 +18,8 @@ use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::play_failure::{
-    counts_consecutive_failure, decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel,
-    NoticeSlot, PlayFailureDecision, PlayFailureInput, PlayIntent,
+    counts_consecutive_failure, decide_play_failure, failure_record, Advance, FailureRecord, Halt,
+    NoticeChannel, NoticeSlot, PlayFailureDecision, PlayFailureInput, PlayIntent,
 };
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
@@ -4275,25 +4275,17 @@ impl Root {
         track: &TrackItem,
         cx: &mut Context<Self>,
     ) {
+        if failure_record(failure) == FailureRecord::Unplayable {
+            self.unplayable.record_failure(&track.id, failure);
+        }
         let decision = decide_play_failure(PlayFailureInput {
             intent,
             failure,
-            has_candidate: has_playable_after_failure(
-                &self.queue,
-                &self.unplayable,
-                &track.id,
-                failure,
-            ),
+            has_candidate: self.has_playable_ahead(),
             consecutive_failures: self.consecutive_failures,
             mode: self.queue.mode,
         });
 
-        match decision.record {
-            FailureRecord::None => {}
-            FailureRecord::Unplayable => {
-                self.unplayable.record_failure(&track.id, failure);
-            }
-        }
         if counts_consecutive_failure(intent, failure) {
             self.consecutive_failures += 1;
         }
@@ -4305,17 +4297,8 @@ impl Root {
         };
         let mut advanced = false;
         if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
-            // 整圈也先实际推进：能走就清理失效 redo 并加载下一首。
-            if advance_failure_queue(&mut self.queue, &self.unplayable) {
-                let message = self.tr(play_failure_text(failure, true)).to_string();
-                self.playback_error = None;
-                self.clear_round_exhaustion();
-                self.notify_warning_once("track-unavailable", message);
-                self.progress_preview = None;
-                self.sync_queue_cache();
-                self.start_track(false, cx);
-                return;
-            }
+            // 整圈仍消费一次失效 redo；候选已按真实记账结果查询。
+            advance_failure_queue(&mut self.queue, &self.unplayable);
         }
         if decision.advance == Advance::Next {
             advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
@@ -4735,17 +4718,6 @@ fn stage_label(stage: Stage) -> &'static str {
     }
 }
 
-fn has_playable_after_failure(
-    queue: &Queue,
-    unplayable: &UnplayableTracks,
-    track_id: &str,
-    failure: &PlaybackFailure,
-) -> bool {
-    queue
-        .next_playable(|id| unplayable.is_unavailable_after_failure(track_id, id, failure))
-        .is_some()
-}
-
 fn advance_failure_queue(queue: &mut Queue, unplayable: &UnplayableTracks) -> bool {
     queue
         .advance_playable(|id| unplayable.is_unavailable(id))
@@ -5013,7 +4985,6 @@ mod upgrade_estimate_tests {
 mod play_failure_flow_tests {
     use super::*;
     use sodam_core::failure::Retryability;
-    use sodam_core::play_failure::PlayFailureDecision;
 
     fn per_track_failure() -> PlaybackFailure {
         PlaybackFailure::new(
@@ -5022,38 +4993,6 @@ mod play_failure_flow_tests {
             RecoveryAction::TrackUnavailable,
             "returned preview stream",
         )
-    }
-
-    #[test]
-    fn candidate_query_uses_the_set_after_recording_and_eviction() {
-        let mut tracks = vec![TrackItem {
-            id: "current".into(),
-            ..Default::default()
-        }];
-        tracks.extend((0..UnplayableTracks::CAPACITY).map(|index| TrackItem {
-            id: format!("old-{index}"),
-            ..Default::default()
-        }));
-        let mut queue = Queue::new(tracks);
-        let mut unplayable = UnplayableTracks::default();
-        let failure = per_track_failure();
-        for index in 0..UnplayableTracks::CAPACITY {
-            unplayable.record_failure(&format!("old-{index}"), &failure);
-        }
-        unplayable.reset_scan();
-        assert!(queue
-            .next_playable(|id| unplayable.is_unavailable(id))
-            .is_none());
-
-        assert!(has_playable_after_failure(
-            &queue,
-            &unplayable,
-            "current",
-            &failure
-        ));
-        unplayable.record_failure("current", &failure);
-        assert_eq!(unplayable.len(), UnplayableTracks::CAPACITY);
-        assert!(advance_failure_queue(&mut queue, &unplayable));
     }
 
     #[test]
@@ -5132,21 +5071,35 @@ mod play_failure_flow_tests {
     #[test]
     fn stale_identity_blocks_failure_consequences() {
         let failure = per_track_failure();
-        let mut decision: Option<PlayFailureDecision> = None;
-        let mut consequences = [false; 5];
+        let mut unplayable = UnplayableTracks::default();
+        let mut queue = Queue::new(vec![
+            TrackItem {
+                id: "current".into(),
+                ..Default::default()
+            },
+            TrackItem {
+                id: "next".into(),
+                ..Default::default()
+            },
+        ]);
+        let before = queue.current().map(|track| track.id.clone());
+        let mut playback_error: Option<String> = None;
+        let mut playback_halted = false;
+        let mut prefetch_suspended = false;
         let continued = run_if_identity_current(false, || {
-            decision = Some(decide_play_failure(PlayFailureInput {
-                intent: PlayIntent::Now,
-                failure: &failure,
-                has_candidate: true,
-                consecutive_failures: 0,
-                mode: PlayMode::ListLoop,
-            }));
-            consequences.fill(true);
+            prefetch_suspended = true;
+            unplayable.record_failure("current", &failure);
+            queue.advance();
+            playback_error = Some("should not appear".into());
+            playback_halted = true;
         });
+
         assert!(!continued);
-        assert!(decision.is_none());
-        assert_eq!(consequences, [false; 5]);
+        assert!(!prefetch_suspended);
+        assert!(unplayable.is_empty());
+        assert_eq!(queue.current().map(|track| track.id.clone()), before);
+        assert!(playback_error.is_none());
+        assert!(!playback_halted);
     }
 
     #[test]

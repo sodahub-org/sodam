@@ -261,35 +261,6 @@ impl UnplayableTracks {
         self.entries.contains_key(track_id) || self.attempted.contains(track_id)
     }
 
-    /// 只读预测：记录这次失败后，候选曲目是否仍不可用。
-    pub fn is_unavailable_after_failure(
-        &self,
-        failed_track_id: &str,
-        candidate_id: &str,
-        failure: &PlaybackFailure,
-    ) -> bool {
-        if UnplayableReason::from_action(failure.action).is_none() {
-            return self.is_unavailable(candidate_id);
-        }
-        if candidate_id == failed_track_id || self.attempted.contains(candidate_id) {
-            return true;
-        }
-        let recorded = self.entries.contains_key(candidate_id);
-        if self.entries.contains_key(failed_track_id) || self.entries.len() < Self::CAPACITY {
-            return recorded;
-        }
-        let victim = Self::eviction_victim_with_incoming(
-            &self.entries,
-            failed_track_id,
-            failure.retryability,
-            Instant::now(),
-        );
-        if victim == Some(candidate_id) {
-            return false;
-        }
-        recorded
-    }
-
     /// 已确认结论的成因（供显式点播不重打网络就给出原因）。
     ///
     /// 只认结论集合，不含「本轮试过但结论已被容量淘汰」的扫描游标——
@@ -354,15 +325,6 @@ impl UnplayableTracks {
         reason: UnplayableReason,
         at: Instant,
     ) {
-        let victim = (self.entries.len() >= Self::CAPACITY && !self.entries.contains_key(track_id))
-            .then(|| Self::eviction_victim_with_incoming(&self.entries, track_id, retryability, at))
-            .flatten()
-            .map(str::to_string);
-        if let Some(victim) = victim.as_deref() {
-            if victim != track_id {
-                Arc::make_mut(&mut self.entries).remove(victim);
-            }
-        }
         Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
             UnplayableEntry {
@@ -371,9 +333,6 @@ impl UnplayableTracks {
                 reason,
             },
         );
-        if victim.as_deref() == Some(track_id) {
-            Arc::make_mut(&mut self.entries).remove(track_id);
-        }
         self.evict_over_capacity();
     }
 
@@ -407,27 +366,6 @@ impl UnplayableTracks {
 
     fn eviction_victim(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
         Self::oldest_transient(entries).or_else(|| Self::oldest(entries))
-    }
-
-    fn eviction_victim_with_incoming<'a>(
-        entries: &'a HashMap<String, UnplayableEntry>,
-        incoming_id: &'a str,
-        incoming_retryability: Retryability,
-        incoming_at: Instant,
-    ) -> Option<&'a str> {
-        if incoming_retryability != Retryability::Never {
-            return match Self::oldest_transient(entries) {
-                Some(track_id) if entries[track_id].recorded_at <= incoming_at => Some(track_id),
-                _ => Some(incoming_id),
-            };
-        }
-        if let Some(track_id) = Self::oldest_transient(entries) {
-            return Some(track_id);
-        }
-        match Self::oldest(entries) {
-            Some(track_id) if entries[track_id].recorded_at <= incoming_at => Some(track_id),
-            _ => Some(incoming_id),
-        }
     }
 
     fn oldest_transient(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
@@ -1412,98 +1350,6 @@ mod tests {
         );
         assert!(!set.invalidate_if_account_changed(None, ("user-b", false)));
         assert!(set.contains("track-3"));
-    }
-
-    /// 预测与真实记录一致，且预测本身不修改集合。
-    #[test]
-    fn failure_projection_matches_real_recording_without_mutating() {
-        let per_track = PlaybackFailure::new(
-            Stage::ResolveStream,
-            Retryability::Never,
-            RecoveryAction::TrackUnavailable,
-            "returned preview stream",
-        );
-        let mut set = UnplayableTracks::default();
-        for index in 0..UnplayableTracks::CAPACITY {
-            set.record_failure(&format!("old-{index}"), &per_track);
-        }
-        set.reset_scan();
-        let before_len = set.len();
-        let mut actual = set.clone();
-        actual.record_failure("current", &per_track);
-
-        for candidate in ["current", "old-0", "old-1", "new"] {
-            assert_eq!(
-                set.is_unavailable_after_failure("current", candidate, &per_track),
-                actual.is_unavailable(candidate),
-                "{candidate}"
-            );
-        }
-        assert_eq!(set.len(), before_len);
-
-        let transient = PlaybackFailure::new(
-            Stage::Network,
-            Retryability::Transient,
-            RecoveryAction::Nothing,
-            "timeout",
-        );
-        assert!(!set.is_unavailable_after_failure("current", "current", &transient));
-
-        let transient_track = PlaybackFailure::new(
-            Stage::ResolveStream,
-            Retryability::Transient,
-            RecoveryAction::TrackUnavailable,
-            "preview stream",
-        );
-        let mut actual = set.clone();
-        actual.record_failure("current", &transient_track);
-        for candidate in ["current", "old-0", "old-1", "new"] {
-            assert_eq!(
-                set.is_unavailable_after_failure("current", candidate, &transient_track),
-                actual.is_unavailable(candidate),
-                "{candidate}"
-            );
-        }
-    }
-
-    #[test]
-    fn permanent_failure_projection_prefers_the_transient_victim() {
-        let base = Instant::now();
-        let mut set = UnplayableTracks::default();
-        set.record_at(
-            "oldest-permanent",
-            Retryability::Never,
-            UnplayableReason::NoFullTrack,
-            base,
-        );
-        set.record_at(
-            "newer-transient",
-            Retryability::Transient,
-            UnplayableReason::NoFullTrack,
-            base + Duration::from_millis(1),
-        );
-        for index in 2..UnplayableTracks::CAPACITY {
-            set.record_at(
-                &format!("permanent-{index}"),
-                Retryability::Never,
-                UnplayableReason::NoFullTrack,
-                base + Duration::from_millis(index as u64 + 1),
-            );
-        }
-        set.reset_scan();
-        let incoming = PlaybackFailure::new(
-            Stage::ResolveStream,
-            Retryability::Never,
-            RecoveryAction::TrackUnavailable,
-            "preview stream",
-        );
-        let mut actual = set.clone();
-        actual.record_failure("current", &incoming);
-
-        assert!(actual.is_unavailable("oldest-permanent"));
-        assert!(!actual.is_unavailable("newer-transient"));
-        assert!(set.is_unavailable_after_failure("current", "oldest-permanent", &incoming));
-        assert!(!set.is_unavailable_after_failure("current", "newer-transient", &incoming));
     }
 
     /// 超界时先清瞬时类，再按失败时刻先进先出。
