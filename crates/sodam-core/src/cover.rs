@@ -189,6 +189,7 @@ struct Lane {
     requeue_after_release: HashSet<String>,
     /// 因队列满挤掉、尚未取走的张数。
     queue_evictions: usize,
+    /// 只有缩略图需要把挤压数交给 `cover_queue`；原图保持关闭。
     track_queue_evictions: bool,
     max_queue: usize,
     max_inflight: usize,
@@ -208,7 +209,15 @@ impl Lane {
         }
     }
 
-    /// 单张入队。返回有没有真排进去；挤掉数由 Lane 自己累计。
+    fn for_thumbnails() -> Self {
+        Self::new(MAX_QUEUE, MAX_CONCURRENCY, true)
+    }
+
+    fn for_originals() -> Self {
+        Self::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY, false)
+    }
+
+    /// 单张入队。返回有没有真排进去；启用计数的 Lane 自己累计挤压数。
     ///
     /// 在飞但已被 `forget` 时，把这次需求记下来，等结果回来立刻重排。
     fn enqueue(
@@ -392,8 +401,8 @@ impl Default for CoverStore {
     fn default() -> Self {
         Self {
             records: HashMap::new(),
-            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY, true),
-            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY, false),
+            thumbnails: Lane::for_thumbnails(),
+            originals: Lane::for_originals(),
             thumbnail_paths: CoverPaths::default(),
             original_paths: CoverPaths::default(),
             colors: HashMap::new(),
