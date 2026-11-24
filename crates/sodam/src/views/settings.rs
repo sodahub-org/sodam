@@ -1079,15 +1079,14 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         .text_size(theme::Text::Small.size())
                         .bg(theme::surface_elevated())
                         .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface_hover()))
                         .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
                             root.clear_cache(cx);
                         }));
                     if root.batch_upgrading && !root.batch_upgrade_cancel {
                         btn = btn.text_color(theme::text_faint());
                     } else {
-                        btn = btn
-                            .hover(|style| style.bg(theme::surface_hover()))
-                            .text_color(theme::text());
+                        btn = btn.text_color(theme::text());
                     }
                     btn.child(if root.cache_clearing {
                         root.tr("正在清理…")
