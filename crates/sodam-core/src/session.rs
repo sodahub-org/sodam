@@ -2475,6 +2475,7 @@ mod tests {
             preview,
             quality_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
