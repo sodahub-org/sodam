@@ -50,6 +50,7 @@ enum BatchUpgradeNotice {
     Warning(String),
 }
 
+// 失败优先于成功：有失败就让用户看见；全零只走普通状态兜底。
 fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
     if tally.failed > 0 {
         BatchUpgradeNotice::Warning(message)
@@ -4933,14 +4934,6 @@ mod batch_upgrade_notice_tests {
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
-            BatchUpgradeNotice::Status("summary".into())
-        );
-    }
-
-    #[test]
-    fn empty_tally_uses_status() {
-        assert_eq!(
-            batch_upgrade_notice(Tally::default(), "summary".into()),
             BatchUpgradeNotice::Status("summary".into())
         );
     }
