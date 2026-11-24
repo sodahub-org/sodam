@@ -55,10 +55,10 @@ impl CommandSender {
         Self { tx, pending }
     }
 
-    fn send(&self, command: Command) {
-        if self.tx.send(command).is_ok() {
-            self.pending.store(true, Ordering::Release);
-        }
+    fn send(&self, command: Command) -> Result<(), std::sync::mpsc::SendError<Command>> {
+        self.tx.send(command)?;
+        self.pending.store(true, Ordering::Release);
+        Ok(())
     }
 }
 

@@ -289,11 +289,7 @@ impl SettingsWriter {
 
     /// 取走启动期回存失败；同一个失败只交出来一次。
     pub fn take_startup_error(&self) -> Option<WriteFailure> {
-        let failure = self
-            .startup_failure
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .take();
+        let failure = self.startup_failure.lock().ok()?.take();
         if failure.is_some() {
             self.startup_error_signal.store(false, Ordering::Release);
         }

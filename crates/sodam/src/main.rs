@@ -181,11 +181,13 @@ fn start_tray_service(
                 let request = cx.update(|cx| app.update(cx, |root, _cx| root.begin_config_poll()));
                 if let Some(request) = request {
                     let app = app.clone();
+                    let app_entries = tray_probe.app_entry_counter();
                     cx.spawn(async move |cx| {
                         let (event, snapshot) = cx
                             .background_executor()
                             .spawn(async move { request.poll() })
                             .await;
+                        app_entries.fetch_add(1, Ordering::Relaxed);
                         app.update(cx, |root, cx| root.finish_config_poll(event, snapshot, cx));
                     })
                     .detach();
