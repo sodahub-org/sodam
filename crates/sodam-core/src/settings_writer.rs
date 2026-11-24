@@ -145,9 +145,8 @@ impl SettingsWriter {
         let thread = match spawned {
             Ok(thread) => Some(thread),
             Err(err) => {
-                // 线程起不来 = 队列从头就是死的：提示按「队列停了」说，
-                // 原因（内存紧张 / 线程数打满）只有日志能留下，绝不能闷在失败槽里——
-                // 界面只按 kind 给一句通用话，不读 detail。
+                // 线程起不来 = 队列从头就是死的。原因（内存紧张 / 线程数打满）写进日志；
+                // 失败槽只带 kind，界面按 kind 给用户一句人话，不看 detail。
                 let detail = err.to_string();
                 log_event(
                     LogLevel::Error,
