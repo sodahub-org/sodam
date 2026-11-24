@@ -176,7 +176,7 @@ pub(crate) fn command_signal(cx: &App) -> Option<Arc<AtomicBool>> {
 pub fn drain_commands(cx: &App) -> Vec<Command> {
     cx.try_global::<Attached>()
         .map(|attached| {
-            let mut media = attached.media.borrow_mut();
+            let media = attached.media.borrow_mut();
             media.commands_pending.store(false, Ordering::Release);
             media.commands.try_iter().collect()
         })
