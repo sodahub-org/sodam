@@ -97,7 +97,7 @@ fn start_tray_service(
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
         let mut tray_probe = LoopProbe::new("tray");
-        let mut single_probe = LoopProbe::new("single");
+        let mut single_probe = LoopProbe::new_shared_timer("single");
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(100))

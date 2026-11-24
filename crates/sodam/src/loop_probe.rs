@@ -1,5 +1,6 @@
-//! 帧日志开关下的循环计时器唤醒、轮询、进 app 与引擎快照计数。
+//! 帧日志开关下的循环迭代、进 app 与引擎快照计数。
 //! `SODAM_FRAME_LOG=1` 时每个循环每 60 秒输出一行 `loop_counts`。
+//! `timer=shared:tray` 表示逻辑循环借用托盘拍，不额外产生定时器唤醒。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,10 +12,10 @@ const REPORT_AFTER: Duration = Duration::from_secs(60);
 
 pub(crate) struct LoopProbe {
     name: &'static str,
+    timer: &'static str,
     started: Instant,
     logging: bool,
-    timer_wakes: u64,
-    polls: u64,
+    wakes: u64,
     app_entries: Arc<AtomicU64>,
     signal_app_entries: u64,
     engine_snapshots: u64,
@@ -22,12 +23,20 @@ pub(crate) struct LoopProbe {
 
 impl LoopProbe {
     pub(crate) fn new(name: &'static str) -> Self {
+        Self::with_timer(name, "independent")
+    }
+
+    pub(crate) fn new_shared_timer(name: &'static str) -> Self {
+        Self::with_timer(name, "shared:tray")
+    }
+
+    fn with_timer(name: &'static str, timer: &'static str) -> Self {
         Self {
             name,
+            timer,
             started: Instant::now(),
             logging: false,
-            timer_wakes: 0,
-            polls: 0,
+            wakes: 0,
             app_entries: Arc::new(AtomicU64::new(0)),
             signal_app_entries: 0,
             engine_snapshots: 0,
@@ -35,12 +44,12 @@ impl LoopProbe {
     }
 
     pub(crate) fn tick(&mut self) {
-        self.timer_wakes += 1;
+        self.wakes += 1;
         self.report();
     }
 
     pub(crate) fn check(&mut self) {
-        self.polls += 1;
+        self.wakes += 1;
         self.report();
     }
 
@@ -81,10 +90,8 @@ impl LoopProbe {
         }
 
         let seconds = elapsed.as_secs_f64();
-        let timer_wakes = self.timer_wakes.to_string();
-        let timer_wakes_per_s = rate(self.timer_wakes, seconds);
-        let polls = self.polls.to_string();
-        let polls_per_s = rate(self.polls, seconds);
+        let wakes = self.wakes.to_string();
+        let wakes_per_s = rate(self.wakes, seconds);
         let app_entries_count = self.app_entries.swap(0, Ordering::Relaxed);
         let app_entries = app_entries_count.to_string();
         let app_entries_per_s = rate(app_entries_count, seconds);
@@ -98,10 +105,9 @@ impl LoopProbe {
             "loop_counts",
             &[
                 ("loop", self.name),
-                ("timer_wakes", timer_wakes.as_str()),
-                ("timer_wakes_per_s", timer_wakes_per_s.as_str()),
-                ("polls", polls.as_str()),
-                ("polls_per_s", polls_per_s.as_str()),
+                ("timer", self.timer),
+                ("wakes", wakes.as_str()),
+                ("wakes_per_s", wakes_per_s.as_str()),
                 ("app_entries", app_entries.as_str()),
                 ("app_entries_per_s", app_entries_per_s.as_str()),
                 ("signal_app_entries", signal_app_entries.as_str()),
@@ -118,8 +124,7 @@ impl LoopProbe {
     }
 
     fn clear_counts(&mut self) {
-        self.timer_wakes = 0;
-        self.polls = 0;
+        self.wakes = 0;
         self.signal_app_entries = 0;
         self.engine_snapshots = 0;
     }

@@ -58,6 +58,7 @@ pub struct StartupFailureSlot {
 }
 
 impl StartupFailureSlot {
+    /// 当前能否看见待报项；拿不到锁按没有处理，托盘下一拍会再看。
     pub fn is_pending(&self) -> bool {
         self.failure.try_lock().is_ok_and(|slot| slot.is_some())
     }
@@ -215,11 +216,11 @@ impl SettingsWriter {
 
     /// 写线程已经没了：这一笔排不进去，也不能装作没事。
     ///
-    /// 记一行日志，再往失败槽里塞一条——下一拍心跳会把提示写进状态行，
-    /// 用户重启时不会突然发现刚才的改动白改了。
+    /// 普通保存排队失败由心跳上报；启动入队失败只由托盘拍上报，并清掉普通槽里
+    /// 同类的 QueueStopped，避免同一个队列停止提示两次。
     ///
     /// 队列死了就再也起不来：日志只记第一笔，免得连点设置刷一串一样的行；
-    /// 但提示每次都要塞——心跳取走一条就清空，不塞用户后面就永远看不到「没存上」。
+    /// 但提示每次都要塞——对应消费者取走一条就清空，不塞用户后面就永远看不到「没存上」。
     fn note_dead_queue(&self) {
         self.note_dead_queue_to(false);
     }
@@ -656,7 +657,9 @@ mod tests {
             .expect("首启要回存");
         let (mut writer, _log) = writer_with(recording(false));
         writer.note_dead_queue();
-        writer.tx = mpsc::channel().0;
+        let (disconnected_tx, disconnected_rx) = mpsc::channel::<Message>();
+        drop(disconnected_rx);
+        writer.tx = disconnected_tx;
 
         writer.persist_startup(work);
 
