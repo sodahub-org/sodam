@@ -10,7 +10,9 @@ use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
 use sodam_core::cover::CoverOutcome;
-use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
+use sodam_core::failure::{
+    PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason, UnplayableTracks,
+};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
@@ -3927,9 +3929,10 @@ impl Root {
     /// 只写 `playing = false` 拦不住任何事——引擎照旧出声，播完照旧翻下一首，
     /// 于是「连续 3 首没播出来，已暂停」成了谎话（真机踩到）。
     pub(crate) fn halt_playback(&mut self) {
-        self.playback_halted = true;
-        self.playing = false;
-        self.engine.pause();
+        let engine = &self.engine;
+        halt_playback_with(&mut self.playback_halted, &mut self.playing, || {
+            engine.pause()
+        });
     }
 
     /// 扫一圈都没有可播候选：落闸，并把本轮结论留在常驻错误位。
@@ -4240,13 +4243,17 @@ impl Root {
                         // 界面上只留下面那一句人话。
                         let context = load_failure_context(failure.stage, root.language);
                         root.log_failure(&context, &failure);
-                        root.pending_track = None;
-                        // 这次尝试失败了：它之前的「播出去」不再为它抵账。
-                        root.progress_token = None;
+                        let engine_playing = root.engine.snapshot().playing;
+                        let identity_current = clear_failed_attempt(
+                            &mut root.pending_track,
+                            &mut root.progress_token,
+                            &mut root.playing,
+                            engine_playing,
+                            root.auth_epoch == auth_epoch,
+                        );
                         // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，别用它
                         // 落闸、挂预取、写不可播集合，也别替用户跳歌。
-                        if root.auth_epoch != auth_epoch {
-                            root.playing = root.engine.snapshot().playing;
+                        if !identity_current {
                             cx.notify();
                             return;
                         }
@@ -4271,7 +4278,12 @@ impl Root {
         let decision = decide_play_failure(PlayFailureInput {
             intent: PlayIntent::Now,
             failure,
-            has_candidate: self.has_playable_ahead(),
+            has_candidate: has_playable_after_failure(
+                &self.queue,
+                &self.unplayable,
+                &track.id,
+                failure,
+            ),
             consecutive_failures: self.consecutive_failures,
             mode: self.queue.mode,
         });
@@ -4296,12 +4308,7 @@ impl Root {
         };
         let mut skipped = false;
         if decision.advance == Advance::Next {
-            let advanced = {
-                let unplayable = &self.unplayable;
-                self.queue
-                    .advance_playable(|id| unplayable.is_unavailable(id))
-                    .is_some()
-            };
+            let advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
             if !advanced {
                 if decision.record == FailureRecord::Unplayable {
                     self.halt_exhausted_round();
@@ -4345,9 +4352,9 @@ impl Root {
         match decision.halt {
             Halt::None => {}
             Halt::ExhaustedRound => return,
-            Halt::Playback => decision.halt.execute(|| self.halt_playback()),
+            Halt::Playback => self.halt_playback(),
             Halt::ConsecutiveFailures => {
-                decision.halt.execute(|| self.halt_playback());
+                self.halt_playback();
                 let halted = self.tr("连续 3 首没播出来，已暂停").to_string();
                 self.playback_error = Some(halted.clone());
                 self.notify_error_once("consecutive-stream-failures", halted);
@@ -4712,6 +4719,47 @@ fn stage_label(stage: Stage) -> &'static str {
     }
 }
 
+fn has_playable_after_failure(
+    queue: &Queue,
+    unplayable: &UnplayableTracks,
+    track_id: &str,
+    failure: &PlaybackFailure,
+) -> bool {
+    let mut after_record = unplayable.clone();
+    after_record.record_failure(track_id, failure);
+    queue
+        .next_playable(|id| after_record.is_unavailable(id))
+        .is_some()
+}
+
+fn advance_failure_queue(queue: &mut Queue, unplayable: &UnplayableTracks) -> bool {
+    queue
+        .advance_playable(|id| unplayable.is_unavailable(id))
+        .is_some()
+}
+
+fn clear_failed_attempt(
+    pending_track: &mut Option<TrackItem>,
+    progress_token: &mut Option<u64>,
+    playing: &mut bool,
+    engine_playing: bool,
+    identity_current: bool,
+) -> bool {
+    *pending_track = None;
+    *progress_token = None;
+    if identity_current {
+        return true;
+    }
+    *playing = engine_playing;
+    false
+}
+
+fn halt_playback_with(playback_halted: &mut bool, playing: &mut bool, pause: impl FnOnce()) {
+    *playback_halted = true;
+    *playing = false;
+    pause();
+}
+
 /// 日志里的装载失败上下文。阶段名也走词典：界面是什么语言，日志就是什么语言，
 /// 不必让用户（或替用户看日志的人）在英文界面里读中文阶段名。
 fn load_failure_context(stage: Stage, language: Language) -> String {
@@ -4931,6 +4979,139 @@ mod upgrade_estimate_tests {
         assert!(!estimate_result_is_current(&lossless, 2, &lossless, 1));
         assert!(!estimate_result_is_current(&highest, 2, &lossless, 2));
         assert!(!estimate_result_is_current(&lossless, 3, &lossless, 1));
+    }
+}
+
+#[cfg(test)]
+mod play_failure_flow_tests {
+    use super::*;
+    use sodam_core::failure::Retryability;
+    use sodam_core::play_failure::PlayFailureDecision;
+
+    fn per_track_failure() -> PlaybackFailure {
+        PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            "returned preview stream",
+        )
+    }
+
+    #[test]
+    fn candidate_query_uses_the_set_after_recording_and_eviction() {
+        let mut tracks = vec![TrackItem {
+            id: "current".into(),
+            ..Default::default()
+        }];
+        tracks.extend((0..UnplayableTracks::CAPACITY).map(|index| TrackItem {
+            id: format!("old-{index}"),
+            ..Default::default()
+        }));
+        let mut queue = Queue::new(tracks);
+        let mut unplayable = UnplayableTracks::default();
+        let failure = per_track_failure();
+        for index in 0..UnplayableTracks::CAPACITY {
+            unplayable.record_failure(&format!("old-{index}"), &failure);
+        }
+        assert!(queue
+            .next_playable(|id| unplayable.is_unavailable(id))
+            .is_none());
+
+        assert!(has_playable_after_failure(
+            &queue,
+            &unplayable,
+            "current",
+            &failure
+        ));
+        unplayable.record_failure("current", &failure);
+        assert_eq!(unplayable.len(), UnplayableTracks::CAPACITY);
+        assert!(advance_failure_queue(&mut queue, &unplayable));
+    }
+
+    #[test]
+    fn skipped_copy_waits_for_real_queue_movement() {
+        let failure = per_track_failure();
+        let decision = decide_play_failure(PlayFailureInput {
+            intent: PlayIntent::Now,
+            failure: &failure,
+            has_candidate: true,
+            consecutive_failures: 0,
+            mode: PlayMode::ListLoop,
+        });
+        let mut queue = Queue::new(vec![
+            TrackItem {
+                id: "current".into(),
+                ..Default::default()
+            },
+            TrackItem {
+                id: "next".into(),
+                ..Default::default()
+            },
+        ]);
+        let before = queue.current().map(|track| track.id.clone());
+        let advanced = advance_failure_queue(&mut queue, &UnplayableTracks::default());
+        let skipped = decision.advance == Advance::Next && advanced;
+        assert!(skipped);
+        assert_ne!(queue.current().map(|track| track.id.clone()), before);
+        assert!(play_failure_text(&failure, skipped).contains("已跳过"));
+
+        let mut one_track = Queue::new(vec![TrackItem {
+            id: "only".into(),
+            ..Default::default()
+        }]);
+        let advanced = advance_failure_queue(&mut one_track, &UnplayableTracks::default());
+        assert!(!advanced);
+        assert!(!play_failure_text(&failure, false).contains("已跳过"));
+    }
+
+    #[test]
+    fn stale_attempt_cleans_loading_state_before_dropping_all_conclusions() {
+        let mut pending = Some(TrackItem {
+            id: "old-account".into(),
+            ..Default::default()
+        });
+        let mut progress_token = Some(7);
+        let mut playing = true;
+        let mut prefetch_suspended = false;
+        let identity_current = clear_failed_attempt(
+            &mut pending,
+            &mut progress_token,
+            &mut playing,
+            false,
+            false,
+        );
+        if identity_current {
+            prefetch_suspended = true;
+        }
+        let decision = if identity_current {
+            decide_play_failure(PlayFailureInput {
+                intent: PlayIntent::Now,
+                failure: &per_track_failure(),
+                has_candidate: true,
+                consecutive_failures: 0,
+                mode: PlayMode::ListLoop,
+            })
+        } else {
+            PlayFailureDecision::invalidated()
+        };
+        assert!(pending.is_none());
+        assert!(progress_token.is_none());
+        assert!(!playing);
+        assert!(!prefetch_suspended);
+        assert!(!decision.has_conclusions());
+    }
+
+    #[test]
+    fn halt_updates_flags_and_calls_the_engine_pause() {
+        let mut playback_halted = false;
+        let mut playing = true;
+        let mut engine_paused = false;
+        halt_playback_with(&mut playback_halted, &mut playing, || {
+            engine_paused = true;
+        });
+        assert!(playback_halted);
+        assert!(!playing);
+        assert!(engine_paused);
     }
 }
 

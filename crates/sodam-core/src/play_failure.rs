@@ -67,15 +67,6 @@ pub enum Halt {
     ConsecutiveFailures,
 }
 
-impl Halt {
-    /// 非「不停」都必须触发调用方提供的真实停机动作。
-    pub fn execute(self, mut pause: impl FnMut()) {
-        if self != Self::None {
-            pause();
-        }
-    }
-}
-
 /// 一次失败决策的四样输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlayFailureDecision {
@@ -219,8 +210,6 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
 mod tests {
     use super::*;
     use crate::failure::{Retryability, Stage};
-    use crate::models::TrackItem;
-    use crate::queue::Queue;
 
     fn failure(action: RecoveryAction) -> PlaybackFailure {
         PlaybackFailure::new(Stage::Network, Retryability::Transient, action, "detail")
@@ -429,53 +418,6 @@ mod tests {
         for (name, actual, expected) in cases {
             assert_eq!(actual, expected, "{name}");
         }
-    }
-
-    #[test]
-    fn skipped_notice_requires_real_queue_movement() {
-        for action in [
-            RecoveryAction::TrackUnavailable,
-            RecoveryAction::PickAnother,
-            RecoveryAction::Undecodable,
-            RecoveryAction::Nothing,
-        ] {
-            let result = decide(PlayIntent::Now, action, true, 0, PlayMode::ListLoop);
-            assert_eq!(result.advance, Advance::Next, "{action:?}");
-            assert_eq!(result.notice.channel, NoticeChannel::Warning, "{action:?}");
-
-            let tracks = vec![
-                TrackItem {
-                    id: "current".into(),
-                    ..Default::default()
-                },
-                TrackItem {
-                    id: "next".into(),
-                    ..Default::default()
-                },
-            ];
-            let mut queue = Queue::new(tracks);
-            let before = queue.current().map(|track| track.id.clone());
-            let advanced = queue.advance_playable(|id| id == "current").is_some();
-            assert!(advanced, "{action:?}");
-            assert_ne!(queue.current().map(|track| track.id.clone()), before);
-        }
-    }
-
-    #[test]
-    fn every_halt_executes_the_real_pause_callback() {
-        for halt in [
-            Halt::Playback,
-            Halt::ExhaustedRound,
-            Halt::ConsecutiveFailures,
-        ] {
-            let mut paused = false;
-            halt.execute(|| paused = true);
-            assert!(paused, "{halt:?}");
-        }
-
-        let mut paused = false;
-        Halt::None.execute(|| paused = true);
-        assert!(!paused);
     }
 
     #[test]

@@ -953,6 +953,23 @@ mod tests {
     }
 
     #[test]
+    fn pause_command_is_sent_to_the_audio_thread() {
+        let (tx, rx) = channel();
+        let engine = PlaybackEngine {
+            tx,
+            snapshot: Arc::new(Mutex::new(PlaybackSnapshot {
+                playing: true,
+                ..Default::default()
+            })),
+            next_load: AtomicU64::new(1),
+        };
+
+        engine.pause();
+
+        assert!(matches!(rx.try_recv(), Ok(Command::Pause)));
+    }
+
+    #[test]
     fn seek_completion_updates_snapshot_without_replaying_finished_event() {
         let state = Arc::new(Mutex::new(PlaybackSnapshot {
             track_id: "track".into(),
