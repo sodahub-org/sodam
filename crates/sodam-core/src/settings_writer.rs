@@ -59,7 +59,7 @@ pub struct StartupFailureSlot {
 
 impl StartupFailureSlot {
     pub fn is_pending(&self) -> bool {
-        self.failure.try_lock().map_or(false, |slot| slot.is_some())
+        self.failure.try_lock().is_ok_and(|slot| slot.is_some())
     }
 
     fn take(&self) -> Option<WriteFailure> {
@@ -656,7 +656,7 @@ mod tests {
             .expect("首启要回存");
         let (mut writer, _log) = writer_with(recording(false));
         writer.note_dead_queue();
-        writer.tx = mpsc::channel().1;
+        writer.tx = mpsc::channel().0;
 
         writer.persist_startup(work);
 
