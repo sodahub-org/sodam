@@ -380,6 +380,7 @@ struct CachedInfo {
     preview: bool,
     quality_rank: Option<i64>,
     checked_rank: Option<i64>,
+    unknown_probe: Option<crate::cache::UnknownProbe>,
     /// 上次补整曲的尝试仍在退避期内；只对试听片段可能为真。
     preview_retry_blocked: bool,
 }
@@ -393,16 +394,11 @@ impl Session {
         self.inputs.quality_intent().cache_tag()
     }
 
-    /// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}`，
-    /// 与实际字节数核对后给出完整记录。
+    /// 解析 sidecar 并与实际字节数核对。字段布局见 [`crate::cache::parse_sidecar`]。
     ///
-    /// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，表现为每次都从中间开始，
-    /// 所以尺寸不符或档位为空一律 miss，重下自愈。
-    /// 第三个字段记录试听标记；更早的旧格式把试听拼在档位里（`无损 · 试听`），
-    /// 这里把它读出来、顺手洗回纯档位——已经下好的整曲不该因为多一个字段就被重下。
-    /// 第四到第七个字段后加：实际档位缺失时视为未知，不据此标记降档；
-    /// 第五、六个字段记录「已经向服务端要过哪个档位」的探测结论，第七个记录试听补整曲的最近一次尝试。
-    /// 后两者必须分开：试听不是「曲库没有更高档位」，权益一变就可能拿到整曲。
+    /// 只认「非空文件」会让被截断的半截下载永久冒充有效缓存，所以尺寸不符或档位为空一律 miss。
+    /// 实际档位缺失时视为未知，不据此标记降档；确认探测、试听补整曲和未知档探测各自记账，
+    /// 不能互相冒充。更早把试听拼在档位里的格式仍能读回。
     fn cached_info(&self, track_id: &str) -> Option<CachedInfo> {
         let safe_id = encode_track_id(track_id);
         let path = crate::audio::cache_dir().join(format!("{safe_id}-{}.m4a", self.quality_tag()));
@@ -416,6 +412,7 @@ impl Session {
         let meta = crate::cache::parse_sidecar(&text, actual)?;
         let now = crate::cache::now_epoch_secs();
         let checked = meta.fresh_checked_rank(now);
+        let unknown_probe = meta.fresh_unknown_probe(now);
         let preview_retry_blocked = meta.fresh_preview_attempt_at(now).is_some();
         Some(CachedInfo {
             path,
@@ -423,6 +420,7 @@ impl Session {
             preview: meta.preview,
             quality_rank: meta.actual_rank,
             checked_rank: checked,
+            unknown_probe,
             preview_retry_blocked,
         })
     }
@@ -442,6 +440,7 @@ impl Session {
             preview: info.preview,
             quality_rank: info.quality_rank,
             checked_rank: info.checked_rank,
+            unknown_probe: info.unknown_probe,
             preview_retry_blocked: info.preview_retry_blocked,
             lease,
         })
@@ -490,6 +489,8 @@ pub struct CachedTrack {
     ///
     /// 只用于决定是否再发起升级，不改变降档提示：曲目确实还在低档位播放。
     pub checked_rank: Option<i64>,
+    /// 完整流探测过但档位未知的独立退避记录；不是确认性 miss，也不代表旧文件已测量。
+    pub unknown_probe: Option<crate::cache::UnknownProbe>,
     /// 上次补整曲的尝试还在退避期内（见 [`crate::cache::PREVIEW_RETRY_TTL`]）。
     ///
     /// 只可能对试听片段为真。它挡的是「应用每次启动、每次命中都整曲下一遍」，
@@ -517,13 +518,14 @@ impl CachedTrack {
     /// * 试听片段（#130）：目标是整曲，不是更高档位。只要上次补整曲的尝试已过退避期
     ///   就再试一次，不看 `quality_rank`——尤其不能被认不出的 0 分挡住。试听本来只有
     ///   半条流，重下不是白跑；权益到手后拿到整曲是实打实的提升。
-    /// * 整曲：实际档位已达目标、或最近已经向服务端要过该目标档位时，都不再请求。
-    ///   没记分数的旧缓存（#89）按 sidecar 的档位标签判断：证明不了达标就重下；
-    ///   记了 0 分（认不出档位）的不重下，重下拿回的还是同一条流（#96）。
+    /// * 整曲：实际档位已达目标、最近已经向服务端要过该目标档位，或同账号范围、同目标的
+    ///   未知档探测还在退避期时，都不再请求。没记分数的旧缓存（#89）按 sidecar 的档位标签
+    ///   判断：证明不了达标就重下；记了 0 分（认不出档位）的不重下（#96）。
     pub fn needs_upgrade(
         &self,
         intent: &crate::quality::QualityIntent,
         is_vip: Option<bool>,
+        scope: Option<&str>,
     ) -> bool {
         if self.preview {
             return !self.preview_retry_blocked;
@@ -531,6 +533,7 @@ impl CachedTrack {
         let target_rank = crate::quality::target_rank(intent, is_vip);
         crate::quality::is_tier_below_selected(self.quality_rank, &self.quality, intent, is_vip)
             && !crate::cache::upgrade_check_covers(self.checked_rank, target_rank)
+            && !self.unknown_probe_covers(target_rank, scope)
     }
 
     /// 播放命中时是否值得**自动**发起后台升级。
@@ -549,12 +552,13 @@ impl CachedTrack {
         &self,
         intent: &crate::quality::QualityIntent,
         is_vip: Option<bool>,
+        scope: Option<&str>,
     ) -> bool {
         if self.preview {
-            return self.needs_upgrade(intent, is_vip)
+            return self.needs_upgrade(intent, is_vip, scope)
                 && !crate::quality::batch_upgrade_needs_confirmed_entitlement(intent, is_vip);
         }
-        if !self.needs_upgrade(intent, is_vip) {
+        if !self.needs_upgrade(intent, is_vip, scope) {
             return false;
         }
         self.quality_rank.is_some()
@@ -563,19 +567,24 @@ impl CachedTrack {
                 is_vip,
             )
     }
+
+    fn unknown_probe_covers(&self, target_rank: Option<i64>, scope: Option<&str>) -> bool {
+        target_rank.is_some_and(|target| {
+            self.unknown_probe
+                .as_ref()
+                .is_some_and(|probe| probe.covers(target, scope))
+        })
+    }
 }
 
-/// 一次升级跑完的交付物：跑完后内存里的缓存记录，加上这次有没有真的换成更好的流。
+/// 一次升级跑完的交付物：跑完后内存里的缓存记录，以及这次的真实结果。
 ///
-/// `improved` 在换文件那一刻由 `is_better_stream` 定下来，调用方据此判「升级成功」
-/// 还是「没有更高档位」，不在事后拿升级前后的两份缓存自己比分数。
+/// 结果在换文件或探测落账那一刻定下来，调用方不拿升级前后的两份缓存自己比分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完那一刻的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
-    /// sidecar，要准的值去读 sidecar。
+    /// 跑完那一刻的内存快照；没换文件时就是原来那份。探测结论要准的值去读 sidecar。
     pub track: CachedTrack,
-    /// 盘上文件有没有换成更好的流。`false` = 跑完了，但服务端没给更好的。
-    pub improved: bool,
+    pub outcome: crate::upgrade::Outcome,
 }
 
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
@@ -643,6 +652,21 @@ fn record_upgrade_check(
         checked_rank,
         crate::cache::now_epoch_secs(),
     );
+}
+
+/// 记下「完整流探测过但档位未知」；失败不影响播放，下次再探。
+fn record_unknown_probe(
+    quality_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    actual_rank: Option<i64>,
+    target_rank: i64,
+    scope: &str,
+    now: u64,
+) -> bool {
+    let lock = crate::cache::download_lock(audio_path);
+    let _guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+    crate::cache::record_unknown_probe(quality_path, actual_rank, target_rank, scope, now)
+        .unwrap_or(false)
 }
 
 /// 记下「刚为补整曲重新取过一次流」；失败不影响播放，退避没写成下次再试。
@@ -754,6 +778,69 @@ fn encode_sidecar(
         ),
         None => format!("{quality}\t{written}\t{flag}\t{actual_rank}"),
     }
+}
+
+fn probe_check_rank(
+    current: &CachedTrack,
+    info: &libresoda::soda::types::DownloadInfo,
+    target_rank: Option<i64>,
+    can_record: bool,
+) -> Option<i64> {
+    confirmed_miss_rank(
+        target_rank,
+        crate::quality::stream_rank(info),
+        info.is_preview,
+        can_record,
+    )
+    .or_else(|| legacy_probe_covers_target(current, info, target_rank, can_record))
+}
+
+fn finish_unimproved_upgrade(
+    current: &mut CachedTrack,
+    info: &libresoda::soda::types::DownloadInfo,
+    target_rank: Option<i64>,
+    can_record: bool,
+    scope: Option<&str>,
+    quality_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    now: u64,
+) -> crate::upgrade::Outcome {
+    use crate::upgrade::Outcome;
+
+    let new_rank = crate::quality::stream_rank(info);
+    if current.preview {
+        current.preview_retry_blocked |=
+            record_preview_upgrade_attempt(quality_path, audio_path, current.quality_rank);
+        return Outcome::NoHigherTier;
+    }
+    if new_rank <= 0 && current.quality_rank.is_none() {
+        if !can_record {
+            return Outcome::UnknownRank;
+        }
+        let (Some(target), Some(scope)) = (target_rank, scope) else {
+            return Outcome::UnknownRank;
+        };
+        if record_unknown_probe(
+            quality_path,
+            audio_path,
+            current.quality_rank,
+            target,
+            scope,
+            now,
+        ) {
+            current.unknown_probe = Some(crate::cache::UnknownProbe {
+                target_rank: target,
+                at: now,
+                scope: scope.to_string(),
+            });
+        }
+        return Outcome::UnknownRank;
+    }
+    let checked_rank = probe_check_rank(current, info, target_rank, can_record);
+    if let Some(checked_rank) = checked_rank {
+        record_upgrade_check(quality_path, audio_path, current.quality_rank, checked_rank);
+    }
+    Outcome::NoHigherTier
 }
 
 /// 一次进程内共享的会话（持有 `Soda` 和它要的那几样设置）。
@@ -1028,6 +1115,7 @@ impl Session {
             preview,
             quality_rank: Some(quality_rank),
             checked_rank,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease,
         })
@@ -1040,17 +1128,16 @@ impl Session {
     ///
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
     /// * 若中途失败，暂存留在 staging 子目录给下次续传（#243），绝不破坏原有缓存；
-    /// * 若新拉到的档位并不确实高于当前已有档位，清理临时文件，保留原有缓存并如实
-    ///   报「没换」（`UpgradeRun::improved == false`）；档位未知的旧三字段缓存按标签能证明的
-    ///   下限与码率比较；
-    /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
-    ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
-    ///   档位未知的旧缓存同样记得下（sidecar 第 4 字段留空），否则每轮都会重下一遍。
+    /// * 若新拉到的档位并不确实高于当前已有档位，清理临时文件，保留原有缓存；
+    ///   档位未知的旧三字段缓存按标签能证明的下限与码率比较；
+    /// * 完整流没提升时写确认探测；旧缓存拿到认不出的完整流时改写独立的未知探测退避，
+    ///   保留实际档位与确认字段，同账号范围、同目标 30 天内不重复下载。
     pub fn upgrade_cached_track(
         &self,
         track: &crate::models::TrackItem,
         target_intent: Option<&crate::quality::QualityIntent>,
         account_is_vip: Option<bool>,
+        account_user_id: Option<&str>,
     ) -> Result<UpgradeRun, crate::failure::PlaybackFailure> {
         use crate::failure::{classify, PlaybackFailure, RecoveryAction, Retryability, Stage};
 
@@ -1075,22 +1162,25 @@ impl Session {
 
         let default_intent = self.inputs.quality_intent();
         let intent = target_intent.unwrap_or(&default_intent);
-        // 明确指定 Tier 时目标分数与会员状态无关，但写探测结论需要知道权益：
-        // 非会员请求无损失败并不代表曲库没有无损，买会员后必须重新尝试。
-        let vip = match intent {
-            crate::quality::QualityIntent::Tier(_) => account_is_vip,
-            _ => self.is_vip().ok(),
-        };
+        // 调用方已经拿到账号权益时直接复用，保证探测与退避使用同一个范围；
+        // 没拿到再探一次。非会员请求无损失败不代表曲库没有无损，买会员后必须重新尝试。
+        let vip = account_is_vip.or_else(|| self.is_vip().ok());
         let target_rank = crate::quality::target_rank(intent, vip);
         // 没有会员权益时拿不到更高档位，不能据此断言曲库没有；等权益确认后再记录。
         let can_record_check = crate::quality::can_record_unavailable(target_rank, vip);
+        let scope = crate::cache::unknown_probe_scope(account_user_id, vip);
 
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
-        if !current.needs_upgrade(intent, vip) {
+        if !current.needs_upgrade(intent, vip, scope.as_deref()) {
+            let outcome = if current.unknown_probe_covers(target_rank, scope.as_deref()) {
+                crate::upgrade::Outcome::UnknownRank
+            } else {
+                crate::upgrade::Outcome::NoHigherTier
+            };
             return Ok(UpgradeRun {
                 track: current,
-                improved: false,
+                outcome,
             });
         }
 
@@ -1111,10 +1201,15 @@ impl Session {
                 ));
             }
         };
-        if !current.needs_upgrade(intent, vip) {
+        if !current.needs_upgrade(intent, vip, scope.as_deref()) {
+            let outcome = if current.unknown_probe_covers(target_rank, scope.as_deref()) {
+                crate::upgrade::Outcome::UnknownRank
+            } else {
+                crate::upgrade::Outcome::NoHigherTier
+            };
             return Ok(UpgradeRun {
                 track: current,
-                improved: false,
+                outcome,
             });
         }
 
@@ -1183,34 +1278,30 @@ impl Session {
             let _ = std::fs::remove_file(&part);
             return Ok(UpgradeRun {
                 track: current,
-                improved: false,
+                outcome: crate::upgrade::Outcome::NoHigherTier,
             });
         }
 
         let new_rank = crate::quality::stream_rank(&info);
         // 档位已知按确认性 miss 判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
         // 不换文件也要记下来，否则每轮都整曲重下。
-        let checked_rank =
-            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check).or_else(
-                || legacy_probe_covers_target(&current, &info, target_rank, can_record_check),
-            );
+        let checked_rank = probe_check_rank(&current, &info, target_rank, can_record_check);
         // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
-            // 试听：这次仍拿回试听（或更差的试听），记一次退避，别每次命中都重下。
-            // 整曲：只有「拿到完整流、档位仍没提升」才是确认性结论；试听回退与下载失败
-            // 会随会员权益或网络变化，不能写成「没有更高档位」。
-            if current.preview {
-                // 只有退避真的写进 sidecar，返回的对象才跟着标；写失败或跳过时
-                // 内存保持原样，别让两边说两套话。
-                current.preview_retry_blocked |=
-                    record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
-            } else if let Some(checked_rank) = checked_rank {
-                record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
-            }
+            let outcome = finish_unimproved_upgrade(
+                &mut current,
+                &info,
+                target_rank,
+                can_record_check,
+                scope.as_deref(),
+                &quality_path,
+                &path,
+                crate::cache::now_epoch_secs(),
+            );
             return Ok(UpgradeRun {
                 track: current,
-                improved: false,
+                outcome,
             });
         }
 
@@ -1245,10 +1336,11 @@ impl Session {
                 preview: false,
                 quality_rank: Some(new_rank),
                 checked_rank,
+                unknown_probe: None,
                 preview_retry_blocked: false,
                 lease: target_lease,
             },
-            improved: true,
+            outcome: crate::upgrade::Outcome::Upgraded,
         })
     }
 
@@ -1691,6 +1783,7 @@ mod tests {
             preview,
             quality_rank: None,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
         };
         assert!(Session::full_track_cached(Some(info(false))));
@@ -1825,6 +1918,7 @@ mod tests {
             preview: false,
             quality_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
@@ -1908,6 +2002,7 @@ mod tests {
             preview: false,
             quality_rank: Some(rank),
             checked_rank: checked,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease,
         }
@@ -1917,10 +2012,10 @@ mod tests {
     #[test]
     fn needs_upgrade_honours_confirmed_target() {
         let lossless = crate::quality::QualityIntent::parse("lossless");
-        assert!(known_rank_track(80, None).needs_upgrade(&lossless, None));
-        assert!(!known_rank_track(80, Some(100)).needs_upgrade(&lossless, None));
-        assert!(known_rank_track(80, Some(70)).needs_upgrade(&lossless, None));
-        assert!(!known_rank_track(100, None).needs_upgrade(&lossless, None));
+        assert!(known_rank_track(80, None).needs_upgrade(&lossless, None, None));
+        assert!(!known_rank_track(80, Some(100)).needs_upgrade(&lossless, None, None));
+        assert!(known_rank_track(80, Some(70)).needs_upgrade(&lossless, None, None));
+        assert!(!known_rank_track(100, None).needs_upgrade(&lossless, None, None));
     }
 
     /// 杜比 / Hi-Res 的探测结论同样要挡住下一次升级，否则每轮都整首重下一遍。
@@ -1929,12 +2024,12 @@ mod tests {
         let hires = crate::quality::QualityIntent::parse("hires");
         let dolby = crate::quality::QualityIntent::parse("dolby");
 
-        assert!(known_rank_track(100, None).needs_upgrade(&hires, Some(true)));
-        assert!(!known_rank_track(100, Some(110)).needs_upgrade(&hires, Some(true)));
-        assert!(!known_rank_track(100, Some(110)).needs_auto_upgrade(&hires, Some(true)));
+        assert!(known_rank_track(100, None).needs_upgrade(&hires, Some(true), None));
+        assert!(!known_rank_track(100, Some(110)).needs_upgrade(&hires, Some(true), None));
+        assert!(!known_rank_track(100, Some(110)).needs_auto_upgrade(&hires, Some(true), None));
         // 杜比目标没升到 88 档、但已经问过：同一目标不再重下。
-        assert!(known_rank_track(80, None).needs_upgrade(&dolby, Some(true)));
-        assert!(!known_rank_track(80, Some(88)).needs_upgrade(&dolby, Some(true)));
+        assert!(known_rank_track(80, None).needs_upgrade(&dolby, Some(true), None));
+        assert!(!known_rank_track(80, Some(88)).needs_upgrade(&dolby, Some(true), None));
     }
 
     /// #89：档位未知的旧三字段缓存也要能升级；自动路径再多一道「结论记不住就别探」的闸。
@@ -1947,6 +2042,7 @@ mod tests {
             preview: false,
             quality_rank: None,
             checked_rank: checked,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
@@ -1954,28 +2050,28 @@ mod tests {
         let hires = crate::quality::QualityIntent::parse("hires");
 
         // 未知档位且标签证明不了达标 → 重下（旧行为是恒不升级，存量缓存全废）
-        assert!(legacy("极高 320k", None).needs_upgrade(&lossless, Some(true)));
+        assert!(legacy("极高 320k", None).needs_upgrade(&lossless, Some(true), None));
         // 旧标签写明无损 → 目标不超过无损时不值得再花一遍流量
-        assert!(!legacy("无损 871k", None).needs_upgrade(&lossless, Some(true)));
+        assert!(!legacy("无损 871k", None).needs_upgrade(&lossless, Some(true), None));
         // 已确认过「无损目标没有更高流」 → 同一目标不再请求
-        assert!(!legacy("极高 320k", Some(100)).needs_upgrade(&lossless, Some(true)));
+        assert!(!legacy("极高 320k", Some(100)).needs_upgrade(&lossless, Some(true), None));
         // 目标换成 Hi-Res：那次结论不代表更高档位，仍要探
-        assert!(legacy("无损 871k", Some(100)).needs_upgrade(&hires, Some(true)));
+        assert!(legacy("无损 871k", Some(100)).needs_upgrade(&hires, Some(true), None));
 
         // 自动路径：非会员要无损，负结论写不进 sidecar（买会员后必须重探），
         // 于是每次播放都会整曲重下一遍——这种探测不自动发起。
-        assert!(!legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(false)));
+        assert!(!legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(false), None));
         // 权益确认为会员 → 结论记得住，可以自动升
-        assert!(legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(true)));
+        assert!(legacy("极高 320k", None).needs_auto_upgrade(&lossless, Some(true), None));
         // 不依赖权益的目标（较高 70）同样记得住结论
         let medium = crate::quality::QualityIntent::parse("medium");
-        assert!(legacy("流畅 128k", None).needs_auto_upgrade(&medium, Some(false)));
+        assert!(legacy("流畅 128k", None).needs_auto_upgrade(&medium, Some(false), None));
         // 档位已知的记录不受这道闸影响，保持 #78 的原行为
         let measured = CachedTrack {
             quality_rank: Some(50),
             ..legacy("流畅 128k", None)
         };
-        assert!(measured.needs_auto_upgrade(&lossless, Some(false)));
+        assert!(measured.needs_auto_upgrade(&lossless, Some(false), None));
     }
 
     /// #96：记了 0 分（认不出档位）的缓存两条升级路都不走。重下拿回的还是同一条认不出的流，
@@ -1990,19 +2086,20 @@ mod tests {
             preview: false,
             quality_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
         let lossless = crate::quality::QualityIntent::parse("lossless");
         let auto = crate::quality::QualityIntent::Auto;
         let unreadable = cached(Some(0), "未知 128k");
-        assert!(!unreadable.needs_upgrade(&lossless, Some(true)));
-        assert!(!unreadable.needs_upgrade(&auto, Some(true)));
-        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(true)));
+        assert!(!unreadable.needs_upgrade(&lossless, Some(true), None));
+        assert!(!unreadable.needs_upgrade(&auto, Some(true), None));
+        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(true), None));
         // 权益未确认时也不探：本来 `needs_auto_upgrade` 会因「结论记不住」放行已知档位的记录，
         // 0 分必须在那道闸之前就挡住。
-        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(false)));
-        assert!(cached(None, "极高 320k").needs_upgrade(&lossless, Some(true)));
+        assert!(!unreadable.needs_auto_upgrade(&lossless, Some(false), None));
+        assert!(cached(None, "极高 320k").needs_upgrade(&lossless, Some(true), None));
     }
 
     /// #130：试听补整曲有自己的出口，不被 `actual_rank`（尤其 0 分）连坐；
@@ -2024,22 +2121,22 @@ mod tests {
 
         // 认不出档位的 0 分试听：权益确认后播放命中要自动试一次。
         let unreadable = preview(Some(0), false);
-        assert!(unreadable.needs_upgrade(&lossless, Some(true)));
-        assert!(unreadable.needs_auto_upgrade(&lossless, Some(true)));
+        assert!(unreadable.needs_upgrade(&lossless, Some(true), None));
+        assert!(unreadable.needs_auto_upgrade(&lossless, Some(true), None));
 
         // 认得出档位、且已达所选（50 对 50）的试听同样要补整曲——目标是整曲，不是更高档位。
-        assert!(preview(Some(50), false).needs_upgrade(&medium, None));
-        assert!(preview(Some(50), false).needs_auto_upgrade(&medium, None));
+        assert!(preview(Some(50), false).needs_upgrade(&medium, None, None));
+        assert!(preview(Some(50), false).needs_auto_upgrade(&medium, None, None));
 
         // 上次尝试还在退避期：这次命中不再重下，等退避过了再试。
         let backed_off = preview(Some(0), true);
-        assert!(!backed_off.needs_auto_upgrade(&lossless, Some(true)));
-        assert!(!backed_off.needs_upgrade(&lossless, Some(true)));
+        assert!(!backed_off.needs_auto_upgrade(&lossless, Some(true), None));
+        assert!(!backed_off.needs_upgrade(&lossless, Some(true), None));
 
         // 需要会员的档位在确认非会员时不自动重下，避免拿回另一条试听。
-        assert!(!preview(Some(0), false).needs_auto_upgrade(&lossless, Some(false)));
+        assert!(!preview(Some(0), false).needs_auto_upgrade(&lossless, Some(false), None));
         // 不需要会员的档位不受这道闸影响。
-        assert!(preview(Some(0), false).needs_auto_upgrade(&medium, Some(false)));
+        assert!(preview(Some(0), false).needs_auto_upgrade(&medium, Some(false), None));
     }
 
     /// #130：试听流绝不覆盖已有整曲，哪怕它的档位分数更高。
@@ -2054,6 +2151,7 @@ mod tests {
             preview,
             quality_rank: Some(50),
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
@@ -2088,6 +2186,7 @@ mod tests {
             preview,
             quality_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
@@ -2173,6 +2272,92 @@ mod tests {
     }
 
     #[test]
+    fn unknown_rank_probe_records_backoff_without_forging_confirmed_miss() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song-auto.m4a");
+        let quality_path = dir.path().join("song-auto.quality");
+        std::fs::write(&path, vec![0u8; 2000]).unwrap();
+        std::fs::write(&quality_path, "极高 320k\t2000\t0").unwrap();
+        let mut current = CachedTrack {
+            path: path.clone(),
+            quality: "极高 320k".into(),
+            preview: false,
+            quality_rank: None,
+            checked_rank: None,
+            unknown_probe: None,
+            preview_retry_blocked: false,
+            lease: crate::cache::CacheLease::acquire(&path),
+        };
+        let unknown_stream = DownloadInfo {
+            quality: String::new(),
+            format: String::new(),
+            bitrate: 0,
+            is_preview: false,
+            ..Default::default()
+        };
+
+        let now = 1_700_000_000;
+        let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
+        let outcome = finish_unimproved_upgrade(
+            &mut current,
+            &unknown_stream,
+            Some(100),
+            true,
+            Some(&scope),
+            &quality_path,
+            &path,
+            now,
+        );
+
+        let lossless = crate::quality::QualityIntent::parse("lossless");
+        assert_eq!(outcome, crate::upgrade::Outcome::UnknownRank);
+        assert!(
+            !current.needs_upgrade(&lossless, Some(true), Some(&scope)),
+            "探测过但档位未知的旧缓存不能每轮再整曲重下"
+        );
+        let text = std::fs::read_to_string(&quality_path).unwrap();
+        assert!(!text.contains("user-1"), "sidecar 不落原始账号 id");
+        let fields: Vec<&str> = text.split('\t').collect();
+        assert_eq!(fields.len(), 10, "未知探测要单独落 target/time/scope");
+        assert_eq!(fields[3], "", "旧文件仍然没有实际档位");
+        assert_eq!(fields[4], "", "未知探测不能冒充确认性 miss");
+        assert_eq!(fields[7], "100");
+        assert_eq!(fields[8], "1700000000");
+        assert_eq!(fields[9], scope);
+
+        let parsed = crate::cache::parse_sidecar(&text, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, None);
+        assert_eq!(parsed.checked_rank, None);
+        let reloaded = CachedTrack {
+            path,
+            quality: parsed.quality,
+            preview: parsed.preview,
+            quality_rank: parsed.actual_rank,
+            checked_rank: parsed.fresh_checked_rank(now),
+            unknown_probe: parsed.fresh_unknown_probe(now),
+            preview_retry_blocked: false,
+            lease: crate::cache::CacheLease::acquire(std::path::Path::new("reloaded.m4a")),
+        };
+        assert!(!reloaded.needs_upgrade(&lossless, Some(true), Some(&scope)));
+        assert!(!reloaded.needs_auto_upgrade(&lossless, Some(true), Some(&scope)));
+        assert!(
+            reloaded.needs_upgrade(&lossless, Some(true), None),
+            "范围缺失时放行"
+        );
+        let other_account = crate::cache::unknown_probe_scope(Some("user-2"), Some(true)).unwrap();
+        let non_vip = crate::cache::unknown_probe_scope(Some("user-1"), Some(false)).unwrap();
+        assert!(reloaded.needs_upgrade(&lossless, Some(true), Some(&other_account)));
+        assert!(reloaded.needs_upgrade(&lossless, Some(true), Some(&non_vip)));
+        let hires = crate::quality::QualityIntent::parse("hires");
+        assert!(
+            reloaded.needs_upgrade(&hires, Some(true), Some(&scope)),
+            "目标变化后重试"
+        );
+    }
+
+    #[test]
     fn upgrade_cached_track_fails_fast_when_not_cached() {
         let session = Session::new(Settings::default());
         let track = crate::TrackItem {
@@ -2180,7 +2365,7 @@ mod tests {
             ..Default::default()
         };
         let err = session
-            .upgrade_cached_track(&track, None, None)
+            .upgrade_cached_track(&track, None, None, None)
             .unwrap_err();
         assert_eq!(err.stage, crate::failure::Stage::Input);
         assert_eq!(err.retryability, crate::failure::Retryability::Never);

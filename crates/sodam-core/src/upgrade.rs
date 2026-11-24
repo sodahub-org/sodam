@@ -2,7 +2,7 @@
 //!
 //! 应用层单首与批量共用同一段「跑一首」，两条路都从这里取判断：
 //! [`stop_reason`]（下一首之前要不要停）、[`Outcome`]（这一首落在哪一档）、
-//! [`Tally`]（批量收尾的三个数）、[`UpgradeAttempts`]（本会话试过哪几首，单首那条用）。
+//! [`Tally`]（批量收尾的四个数）、[`UpgradeAttempts`]（本会话试过哪几首，单首那条用）。
 //! 身份代数与取消标志由界面线程读出来再喂进来——后台任务碰不到 `Root`。
 //!
 //! 身份变了**不**自动拿新号接着跑：目标档位是按旧号定的，新号权益可能撑不住，替人花流量不合适。
@@ -98,12 +98,15 @@ pub enum Outcome {
     /// 跑完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
     NoHigherTier,
+    /// 完整流回来了，但档位认不出来；也可能是同一账号、同一目标的未知探测在退避期。
+    /// 这不是「已确认没有更高档」。
+    UnknownRank,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
     Failed,
 }
 
 impl Outcome {
-    /// 把「这次有没有换成更好的流」翻成对外的结论。界面上的成功与否只认这一个映射。
+    /// 把「这次有没有换成更好的流」翻成对外的结论；档位未知由升级路径单独给出。
     pub fn from_improved(improved: bool) -> Self {
         if improved {
             Self::Upgraded
@@ -113,12 +116,12 @@ impl Outcome {
     }
 }
 
-/// 一轮批量的三类计数：成功 / 失败 / 确实没换成更好的整曲。
+/// 一轮批量的计数：成功 / 失败 / 没换成更好的整曲 / 档位未知。
 ///
-/// 第三类不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里，
-/// 因为没换成更好的整曲。
+/// 没换成更好的整曲不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里。
+/// 档位未知单独记，不能写成「已确认没有更高档」。
 ///
-/// 中间那一档是「这一首没跑成」的总数，不只网络：磁盘写不进去、权益不够、曲目被删都落在这里，
+/// 失败是「这一首没跑成」的总数，不只网络：磁盘写不进去、权益不够、曲目被删都落在这里，
 /// 所以界面上的说法也是「失败」，不冒充「网络失败」。
 ///
 /// 收尾那行日志和界面小结都读它，两边不各数一遍。
@@ -127,6 +130,7 @@ pub struct Tally {
     pub upgraded: usize,
     pub failed: usize,
     pub no_higher: usize,
+    pub unknown_rank: usize,
 }
 
 impl Tally {
@@ -135,12 +139,13 @@ impl Tally {
             Outcome::Upgraded => self.upgraded += 1,
             Outcome::Failed => self.failed += 1,
             Outcome::NoHigherTier => self.no_higher += 1,
+            Outcome::UnknownRank => self.unknown_rank += 1,
         }
     }
 
     /// 这一轮真跑了几首。提前停时小于扫出来的总数。
     pub fn total(&self) -> usize {
-        self.upgraded + self.failed + self.no_higher
+        self.upgraded + self.failed + self.no_higher + self.unknown_rank
     }
 }
 
@@ -330,7 +335,7 @@ mod tests {
         assert!(attempts.begin(key), "清掉缓存后同一首要能重新试");
     }
 
-    /// 收尾的三个数分开记，总数只算真跑过的。
+    /// 收尾的四个数分开记，总数只算真跑过的。
     #[test]
     fn tally_keeps_the_three_numbers_apart() {
         let mut tally = Tally::default();
@@ -340,11 +345,13 @@ mod tests {
         tally.record(Outcome::Failed);
         tally.record(Outcome::Failed);
         tally.record(Outcome::NoHigherTier);
+        tally.record(Outcome::UnknownRank);
 
         assert_eq!(tally.upgraded, 1);
         assert_eq!(tally.failed, 2);
         assert_eq!(tally.no_higher, 1);
-        assert_eq!(tally.total(), 4);
+        assert_eq!(tally.unknown_rank, 1);
+        assert_eq!(tally.total(), 5);
     }
 
     /// 日志取值稳定：小写下划线，不随界面语言变化。
