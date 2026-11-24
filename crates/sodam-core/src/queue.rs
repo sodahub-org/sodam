@@ -301,6 +301,25 @@ impl Queue {
         }
     }
 
+    /// 丢掉随机播放里已失效的回退目标，不移动当前队列位置。
+    pub fn discard_unavailable_redo(&mut self, unavailable: impl Fn(&str) -> bool) -> bool {
+        if self.mode != PlayMode::Shuffle {
+            return false;
+        }
+        let Some(redo) = self.redo else {
+            return false;
+        };
+        let discard = self
+            .tracks
+            .get(redo)
+            .map(|track| unavailable(track.id.as_str()))
+            .unwrap_or(true);
+        if discard {
+            self.redo = None;
+        }
+        discard
+    }
+
     /// 推进到下一个可播曲目；没有候选时不动队列并返回 `None`。
     ///
     /// 随机播放按 `redo` → 本轮顺序 → 新一轮的顺序选目标，并同步待播顺序：
@@ -645,12 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_advance_discards_unavailable_redo_without_moving() {
+    fn exhausted_round_discards_unavailable_redo_without_moving() {
         let mut queue = Queue::new(tracks(2));
         queue.mode = PlayMode::Shuffle;
         queue.redo = Some(1);
 
-        assert!(queue.advance_playable(|_| true).is_none());
+        assert!(queue.discard_unavailable_redo(|_| true));
         assert!(queue.redo.is_none());
         assert_eq!(queue.index(), 0);
     }

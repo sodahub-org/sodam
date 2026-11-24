@@ -4275,6 +4275,7 @@ impl Root {
         track: &TrackItem,
         cx: &mut Context<Self>,
     ) {
+        let recorded_at = std::time::Instant::now();
         let decision = decide_play_failure(PlayFailureInput {
             intent,
             failure,
@@ -4283,6 +4284,7 @@ impl Root {
                 &self.unplayable,
                 &track.id,
                 failure,
+                recorded_at,
             ),
             consecutive_failures: self.consecutive_failures,
             mode: self.queue.mode,
@@ -4291,7 +4293,8 @@ impl Root {
         match decision.record {
             FailureRecord::None => {}
             FailureRecord::Unplayable => {
-                self.unplayable.record_failure(&track.id, failure);
+                self.unplayable
+                    .record_failure_at(&track.id, failure, recorded_at);
             }
         }
         if counts_consecutive_failure(intent, failure) {
@@ -4305,8 +4308,10 @@ impl Root {
         };
         let mut advanced = false;
         if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
-            // 整圈仍消费一次失效 redo；候选已按真实记账结果查询。
-            advance_failure_queue(&mut self.queue, &self.unplayable);
+            // 整圈只清理失效 redo，不移动队列。
+            let unplayable = &self.unplayable;
+            self.queue
+                .discard_unavailable_redo(|id| unplayable.is_unavailable(id));
         }
         if decision.advance == Advance::Next {
             advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
@@ -4731,9 +4736,12 @@ fn has_playable_after_failure(
     unplayable: &UnplayableTracks,
     track_id: &str,
     failure: &PlaybackFailure,
+    recorded_at: std::time::Instant,
 ) -> bool {
     queue
-        .next_playable(|id| unplayable.is_unavailable_after_failure(track_id, id, failure))
+        .next_playable(|id| {
+            unplayable.is_unavailable_after_failure(track_id, id, failure, recorded_at)
+        })
         .is_some()
 }
 

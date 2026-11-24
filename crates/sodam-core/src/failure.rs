@@ -267,6 +267,7 @@ impl UnplayableTracks {
         failed_track_id: &str,
         candidate_id: &str,
         failure: &PlaybackFailure,
+        recorded_at: Instant,
     ) -> bool {
         if UnplayableReason::from_action(failure.action).is_none() {
             return self.is_unavailable(candidate_id);
@@ -282,7 +283,7 @@ impl UnplayableTracks {
             &self.entries,
             failed_track_id,
             failure.retryability,
-            Instant::now(),
+            recorded_at,
         );
         if victim == Some(candidate_id) {
             return false;
@@ -329,6 +330,7 @@ impl UnplayableTracks {
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻与成因。
     ///
     /// 私有：外部只能经 [`Self::record_failure`] 进来，避免绕开「只收按曲目类」的判据。
+    #[cfg(test)]
     fn record(&mut self, track_id: &str, retryability: Retryability, reason: UnplayableReason) {
         self.record_at(track_id, retryability, reason, Instant::now());
     }
@@ -339,11 +341,21 @@ impl UnplayableTracks {
     /// 所以这条判据必须留在集合自己的入口上，而不是指望每个调用点记得先判断。
     /// 返回是否真的写入。
     pub fn record_failure(&mut self, track_id: &str, failure: &PlaybackFailure) -> bool {
+        self.record_failure_at(track_id, failure, Instant::now())
+    }
+
+    /// 用调用方给的同一时刻记账，供只读候选投影与真实写入对齐。
+    pub fn record_failure_at(
+        &mut self,
+        track_id: &str,
+        failure: &PlaybackFailure,
+        at: Instant,
+    ) -> bool {
         let Some(reason) = UnplayableReason::from_action(failure.action) else {
             return false;
         };
         self.attempted.insert(track_id.to_string());
-        self.record(track_id, failure.retryability, reason);
+        self.record_at(track_id, failure.retryability, reason, at);
         true
     }
 
@@ -1455,10 +1467,11 @@ mod tests {
                 "preview stream",
             );
             let mut actual = set.clone();
-            actual.record_failure("current", &incoming);
+            let incoming_at = Instant::now();
+            actual.record_failure_at("current", &incoming, incoming_at);
             for candidate in ["current", "oldest-permanent", "newer-transient", "new"] {
                 assert_eq!(
-                    set.is_unavailable_after_failure("current", candidate, &incoming),
+                    set.is_unavailable_after_failure("current", candidate, &incoming, incoming_at),
                     actual.is_unavailable(candidate),
                     "{retryability:?} {candidate}"
                 );
