@@ -1078,6 +1078,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         .rounded(px(theme::radius::ROW))
                         .text_size(theme::Text::Small.size())
                         .bg(theme::surface_elevated())
+                        .cursor_pointer()
                         .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
                             root.clear_cache(cx);
                         }));
@@ -1085,7 +1086,6 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         btn = btn.text_color(theme::text_faint());
                     } else {
                         btn = btn
-                            .cursor_pointer()
                             .hover(|style| style.bg(theme::surface_hover()))
                             .text_color(theme::text());
                     }
