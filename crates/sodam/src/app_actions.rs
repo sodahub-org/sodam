@@ -2600,6 +2600,9 @@ impl Root {
         self.sync_queue_cache();
 
         self.account = None;
+        if self.nav == Nav::Settings {
+            self.refresh_upgrade_estimate(cx);
+        }
         self.login = LoginState::Idle;
         self.login_modal_open = false;
         self.results = Arc::new(Vec::new());

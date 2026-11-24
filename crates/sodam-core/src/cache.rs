@@ -1057,7 +1057,6 @@ impl SidecarMeta {
         let at = self.unknown_probe_at?;
         let scope = self.unknown_probe_scope.as_deref()?;
         if self.preview
-            || self.actual_rank.is_some()
             || target_rank <= 0
             || at == 0
             || scope.trim().is_empty()
@@ -1251,10 +1250,10 @@ fn sidecar_unknown_probe_tail(fields: &[&str]) -> String {
         .collect()
 }
 
-/// 在档位未知的 sidecar 上记录一次独立探测退避，不改实际档位与确认探测字段。
+/// 在 sidecar 上记录一次独立探测退避，不改实际档位与确认探测字段。
 ///
-/// `expected_actual_rank` 的用法与 [`record_upgrade_check`] 相同；试听、已知档位
-/// 或文件已被替换时直接跳过。调用方必须持有该文件的 `download_lock`。
+/// `expected_actual_rank` 的用法与 [`record_upgrade_check`] 相同；试听或文件已被替换时
+/// 直接跳过。调用方必须持有该文件的 `download_lock`。
 pub(crate) fn record_unknown_probe(
     sidecar_path: &Path,
     expected_actual_rank: Option<i64>,
@@ -1276,7 +1275,7 @@ pub(crate) fn record_unknown_probe(
         ));
     }
     let actual_rank = parse_rank(fields.get(3).copied());
-    if expected_actual_rank.is_some() || actual_rank != expected_actual_rank {
+    if actual_rank != expected_actual_rank {
         return Ok(false);
     }
     let (quality_field, preview_field) = match fields.get(2).copied() {
@@ -2316,14 +2315,15 @@ mod tests {
             None
         );
         assert_eq!(meta.fresh_unknown_probe(at - 1), None);
+        let known = SidecarMeta {
+            actual_rank: Some(80),
+            ..meta.clone()
+        };
+        assert_eq!(known.fresh_unknown_probe(at + 1), Some(probe));
 
         for invalid in [
             SidecarMeta {
                 preview: true,
-                ..meta.clone()
-            },
-            SidecarMeta {
-                actual_rank: Some(0),
                 ..meta.clone()
             },
             SidecarMeta {
@@ -3013,16 +3013,22 @@ mod tests {
             std::fs::read_to_string(&sidecar).unwrap(),
             "极高 320k\t2000\t0\t\t70\t1600000000\t1600000100\t110\t1700000001\tscope-b"
         );
+
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        assert!(record_unknown_probe(&sidecar, Some(80), 100, "scope-a", 1_700_000_002).unwrap());
+        let parsed = parse_sidecar(&std::fs::read_to_string(&sidecar).unwrap(), 2000).unwrap();
+        assert_eq!(parsed.actual_rank, Some(80), "旧文件的实际档位原样保留");
+        assert_eq!(parsed.checked_rank, None);
+        assert_eq!(parsed.unknown_probe_target, Some(100));
     }
 
     #[test]
-    fn record_unknown_probe_skips_previews_known_or_changed_rank_and_missing_scope() {
+    fn record_unknown_probe_skips_previews_changed_rank_and_missing_scope() {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = dir.path().join("song-auto.quality");
         for (original, expected_rank, target, scope) in [
             ("未知 128k\t2000\t1", None, 100, "scope-a"),
             ("无损 · 试听\t2000", None, 100, "scope-a"),
-            ("极高 320k\t2000\t0\t80", Some(80), 100, "scope-a"),
             ("流畅 128k\t2000\t0\t50", Some(80), 100, "scope-a"),
             ("极高 320k\t2000\t0", Some(80), 100, "scope-a"),
             ("极高 320k\t2000\t0", None, 0, "scope-a"),
