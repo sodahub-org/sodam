@@ -25,9 +25,9 @@ pub const MAX_FAILURES: u8 = 2;
 /// 封面主色。
 pub type CoverRgb = (u8, u8, u8);
 
-/// 一轮封面请求的统计：新排进几张、上次读取以来挤掉几张。
+/// 一轮封面队列统计：新排进几张、上次读取以来挤掉几张。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CoverWant {
+pub struct CoverQueueStats {
     pub queued: usize,
     pub dropped: usize,
 }
@@ -187,15 +187,10 @@ struct Lane {
     /// 结果落完要立刻补排，否则重试按钮 / 歌词页大图要等下一次请求才生效。
     /// 切歌时 `retain_only` 会把非当前曲目的需求裁掉。
     requeue_after_release: HashSet<String>,
+    /// 因队列满挤掉、尚未取走的张数。
+    dropped: usize,
     max_queue: usize,
     max_inflight: usize,
-}
-
-/// 一次入队的结果：排进去了没有、有没有挤掉最旧的一张。
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Enqueued {
-    queued: bool,
-    evicted: bool,
 }
 
 impl Lane {
@@ -205,12 +200,13 @@ impl Lane {
             inflight: HashSet::new(),
             abandoned: HashSet::new(),
             requeue_after_release: HashSet::new(),
+            dropped: 0,
             max_queue,
             max_inflight,
         }
     }
 
-    /// 单张入队。返回有没有真排进去、有没有挤掉最旧的一张。
+    /// 单张入队。返回有没有真排进去；挤掉数由 Lane 自己累计。
     ///
     /// 在飞但已被 `forget` 时，把这次需求记下来，等结果回来立刻重排。
     fn enqueue(
@@ -219,29 +215,29 @@ impl Lane {
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> Enqueued {
+    ) -> bool {
         if url.is_empty() || ready.contains(url) {
-            return Enqueued::default();
+            return false;
         }
         let state = records.get_mut(url).map(|record| select(record).state);
         if !matches!(state, None | Some(State::Idle)) {
             if state == Some(State::Inflight) && self.abandoned.contains(url) {
                 self.requeue_after_release.insert(url.to_string());
             }
-            return Enqueued::default();
+            return false;
         }
         let evicted = if self.queue.len() >= self.max_queue {
             self.evict_oldest(records, select)
         } else {
             false
         };
+        if evicted {
+            self.dropped += 1;
+        }
         let record = records.entry(url.to_string()).or_default();
         select(record).state = State::Queued;
         self.queue.push_back(url.to_string());
-        Enqueued {
-            queued: true,
-            evicted,
-        }
+        true
     }
 
     /// 泵的上半截：把排队项推进在飞，最多 `max_inflight` 个。
@@ -265,14 +261,14 @@ impl Lane {
 
     /// 泵的下半截的公共记账：出在飞、处理作废。
     ///
-    /// 返回 `Some(requeued)` 表示这次结果作废，调用方不用再发布。
+    /// 返回 `true` 表示这次结果作废，调用方不用再发布。
     fn finish(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> Option<Enqueued> {
+    ) -> bool {
         self.inflight.remove(url);
         if self.abandoned.remove(url) {
             // 下载中被 forget：这次拿回来的东西不要，退回可重排。
@@ -283,25 +279,23 @@ impl Lane {
                 slot.failures = 0;
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
-            let requeued = self.requeue_if_demanded(url, ready, records, select);
+            self.requeue_if_demanded(url, ready, records, select);
             discard_empty_record(records, url);
-            return Some(requeued);
+            return true;
         }
-        None
+        false
     }
 
-    /// 有人在这张图在飞期间留了需求：结果落完立刻补排，返回本次入队结果。
+    /// 有人在这张图在飞期间留了需求：结果落完立刻补排。
     fn requeue_if_demanded(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> Enqueued {
+    ) {
         if self.requeue_after_release.remove(url) {
-            self.enqueue(url, ready, records, select)
-        } else {
-            Enqueued::default()
+            self.enqueue(url, ready, records, select);
         }
     }
 
@@ -386,8 +380,6 @@ pub struct CoverStore {
     thumbnail_paths: CoverPaths,
     original_paths: CoverPaths,
     colors: HashMap<String, CoverRgb>,
-    /// 上次 `take_dropped` 以来因队列满挤掉的缩略图张数（日志用）。
-    thumbnail_dropped: usize,
 }
 
 impl Default for CoverStore {
@@ -399,7 +391,6 @@ impl Default for CoverStore {
             thumbnail_paths: CoverPaths::default(),
             original_paths: CoverPaths::default(),
             colors: HashMap::new(),
-            thumbnail_dropped: 0,
         }
     }
 }
@@ -412,16 +403,12 @@ impl CoverStore {
         let mut queued = 0;
         for raw in urls {
             let url = raw.trim();
-            let result = self.thumbnails.enqueue(
+            if self.thumbnails.enqueue(
                 url,
                 &self.thumbnail_paths,
                 &mut self.records,
                 thumbnail_slot,
-            );
-            if result.evicted {
-                self.thumbnail_dropped += 1;
-            }
-            if result.queued {
+            ) {
                 queued += 1;
             }
         }
@@ -439,15 +426,12 @@ impl CoverStore {
         if url.is_empty() {
             return;
         }
-        if let Some(requeued) = self.thumbnails.finish(
+        if self.thumbnails.finish(
             url,
             &self.thumbnail_paths,
             &mut self.records,
             thumbnail_slot,
         ) {
-            if requeued.evicted {
-                self.thumbnail_dropped += 1;
-            }
             return;
         }
         match outcome {
@@ -491,14 +475,12 @@ impl CoverStore {
 
     /// 要一张原图；返回这次是否新排进队列。
     pub fn want_original(&mut self, url: &str) -> bool {
-        self.originals
-            .enqueue(
-                url.trim(),
-                &self.original_paths,
-                &mut self.records,
-                original_slot,
-            )
-            .queued
+        self.originals.enqueue(
+            url.trim(),
+            &self.original_paths,
+            &mut self.records,
+            original_slot,
+        )
     }
 
     /// 泵的上半截：原图最多 [`MAX_ORIGINAL_CONCURRENCY`] 个在飞。
@@ -515,7 +497,6 @@ impl CoverStore {
         if self
             .originals
             .finish(url, &self.original_paths, &mut self.records, original_slot)
-            .is_some()
         {
             return;
         }
@@ -695,7 +676,7 @@ impl CoverStore {
 
     /// 取走上次读取以来因队列满挤掉的张数，包括补排路径。
     pub fn take_dropped(&mut self) -> usize {
-        std::mem::take(&mut self.thumbnail_dropped)
+        std::mem::take(&mut self.thumbnails.dropped)
     }
 }
 
