@@ -66,16 +66,15 @@ fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
 fn cache_upgrade_log_parts<'a>(
     track_id: &'a str,
     quality: &'a str,
-    improved: bool,
     reason: Option<NotImprovedReason>,
 ) -> (&'static str, Vec<(&'a str, &'a str)>) {
-    let event = if improved {
-        "cache_upgraded"
-    } else {
+    let event = if reason.is_some() {
         "cache_upgrade_not_improved"
+    } else {
+        "cache_upgraded"
     };
     let mut fields = vec![("track_id", track_id), ("quality", quality)];
-    if let Some(reason) = reason.filter(|_| !improved) {
+    if let Some(reason) = reason {
         fields.push(("reason", reason.as_str()));
     }
     (event, fields)
@@ -2985,7 +2984,6 @@ impl Root {
                 let (event, fields) = cache_upgrade_log_parts(
                     track.id.as_str(),
                     run.track.quality.as_str(),
-                    run.improved,
                     run.not_improved_reason,
                 );
                 log_outlet::log_event(levels.success, LogTopic::Player, event, &fields);
@@ -5586,12 +5584,12 @@ mod tests {
     fn cache_upgrade_log_distinguishes_not_improved_reasons() {
         for (reason, expected) in [
             (NotImprovedReason::PreviewOnly, "preview_only"),
+            (NotImprovedReason::PreviewBackoff, "preview_backoff"),
             (NotImprovedReason::NotBetter, "not_better"),
             (NotImprovedReason::NoHigherTier, "no_higher_tier"),
             (NotImprovedReason::AlreadyChecked, "already_checked"),
         ] {
-            let (event, fields) =
-                cache_upgrade_log_parts("track-1", "极高 320k", false, Some(reason));
+            let (event, fields) = cache_upgrade_log_parts("track-1", "极高 320k", Some(reason));
             assert_eq!(event, "cache_upgrade_not_improved");
             assert_eq!(
                 fields,
@@ -5603,7 +5601,7 @@ mod tests {
             );
         }
 
-        let (event, fields) = cache_upgrade_log_parts("track-1", "无损 871k", true, None);
+        let (event, fields) = cache_upgrade_log_parts("track-1", "无损 871k", None);
         assert_eq!(event, "cache_upgraded");
         assert_eq!(
             fields,

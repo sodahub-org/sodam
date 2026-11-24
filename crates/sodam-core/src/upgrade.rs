@@ -92,7 +92,9 @@ pub fn identity_change(
 pub enum NotImprovedReason {
     /// 新流仍是试听，或试听回退被整曲缓存拦住。
     PreviewOnly,
-    /// 拿到完整流但没比旧文件好，或早退时没有更具体结论。
+    /// 试听补整曲还在退避期，这轮没有发请求。
+    PreviewBackoff,
+    /// 拿到完整流但没比旧文件好；目标未知等没有更具体结论的早退也归这里。
     NotBetter,
     /// 拿到完整流，档位可识别且低于目标，确认这次没有更高档。
     NoHigherTier,
@@ -105,6 +107,7 @@ impl NotImprovedReason {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::PreviewOnly => "preview_only",
+            Self::PreviewBackoff => "preview_backoff",
             Self::NotBetter => "not_better",
             Self::NoHigherTier => "no_higher_tier",
             Self::AlreadyChecked => "already_checked",
@@ -118,7 +121,9 @@ impl NotImprovedReason {
 /// 档位未知的旧缓存没有分数可比，「量出一个正分」并不等于真的升了一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 提升：试听换整曲；档位更高；旧档位未知先判无损，否则只认新流档位可识别且码率严格高于旧标签。
+    /// 提升分三种：
+    /// 试听换整曲；旧档位已知时新档位更高；
+    /// 旧档位未知时新流到无损，或新档位认得出且码率严格高于旧标签。
     Upgraded,
     /// 跑完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
@@ -383,6 +388,10 @@ mod tests {
     #[test]
     fn not_improved_log_values_are_stable() {
         assert_eq!(NotImprovedReason::PreviewOnly.as_str(), "preview_only");
+        assert_eq!(
+            NotImprovedReason::PreviewBackoff.as_str(),
+            "preview_backoff"
+        );
         assert_eq!(NotImprovedReason::NotBetter.as_str(), "not_better");
         assert_eq!(NotImprovedReason::NoHigherTier.as_str(), "no_higher_tier");
         assert_eq!(
