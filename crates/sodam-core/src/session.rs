@@ -2339,14 +2339,16 @@ mod tests {
         let parsed = crate::cache::parse_sidecar(&text, 2000).unwrap();
         assert_eq!(parsed.actual_rank, None);
         assert_eq!(parsed.checked_rank, None);
-        let quality = parsed.quality;
         let checked_rank = parsed.fresh_checked_rank(recorded_at);
         let unknown_probe = parsed.fresh_unknown_probe(recorded_at);
+        let quality = parsed.quality;
+        let preview = parsed.preview;
+        let quality_rank = parsed.actual_rank;
         let reloaded = CachedTrack {
             path,
             quality,
-            preview: parsed.preview,
-            quality_rank: parsed.actual_rank,
+            preview,
+            quality_rank,
             checked_rank,
             unknown_probe,
             preview_retry_blocked: false,
