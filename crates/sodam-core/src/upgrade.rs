@@ -134,15 +134,15 @@ pub enum Outcome {
     /// 判定做完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
     NoHigherTier,
-    /// 回来的完整流档位认不出来、同一账号同一目标的未知探测在退避，或缓存已记 0 分。
-    /// 这是「升级结果未知」；后两种也不代表缓存文件本身的档位未知，更不是「已确认没有更高档」。
+    /// 流档位认不出来、同账号同目标的未知探测在退避、缓存已记 0 分，都算升级结果未知。
+    /// 它与 `cache::unknown_rank_count` 的“旧缓存档位未知”不是一回事，也不表示确认没有更高档。
     UnknownRank,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
     Failed,
 }
 
 impl Outcome {
-    /// 把升级路径的原因映射成对外结果；未知结果不能落进确认性 miss。
+    /// 把升级路径的原因映射成对外结果；未知结果单独记，不能当成确认没有更高档。
     pub fn from_not_improved_reason(reason: Option<NotImprovedReason>) -> Self {
         match reason {
             None => Self::Upgraded,

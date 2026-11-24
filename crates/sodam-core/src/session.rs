@@ -581,10 +581,10 @@ impl CachedTrack {
 /// 一次升级判定的结果：返回时内存里的缓存记录，以及这次有没有换成更好的流。
 ///
 /// `not_improved_reason` 在判定结果那一刻定下来：换文件、比完流，或者决定这次不发请求。
-/// `None` 表示升级成功，`Some` 表示没换成更好的流；未知结果单独记，不混进确认性 miss。
+/// `None` 表示升级成功，`Some` 表示没换成更好的流；未知结果单独记，不当成确认没有更高档。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 返回时的内存快照；没换文件时也会带上这次新记的探测退避。持久值以 sidecar 为准。
+    /// 返回时的内存快照；可能已带上新退避，但盘上的完整记录以 sidecar 为准。
     pub track: CachedTrack,
     /// 没换成更好的流时的日志原因；成功升级时为 `None`。
     pub not_improved_reason: Option<NotImprovedReason>,
@@ -807,13 +807,7 @@ fn downloaded_not_improved_reason(
     info: &libresoda::soda::types::DownloadInfo,
     confirmed_miss: bool,
 ) -> NotImprovedReason {
-    if info.is_preview {
-        return NotImprovedReason::PreviewOnly;
-    }
-    if crate::quality::stream_rank(info) <= 0 {
-        return NotImprovedReason::UnknownRank;
-    }
-    // 这条只在 is_better_stream 已判 false 后调用；旧文件有可比依据就统一说 not_better。
+    // 调用方已挡掉试听与未知档位；这里只区分确认没有更高档和只是没换成更好的流。
     let old_quality_is_comparable = current.known_rank().is_some()
         || crate::quality::legacy_label_bitrate_kbps(&current.quality).is_some();
     if confirmed_miss && !old_quality_is_comparable {
@@ -1339,12 +1333,9 @@ impl Session {
         }
 
         let new_rank = crate::quality::stream_rank(&info);
-        // 档位已知按确认性 miss 判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
+        // 档位已知按确认没有更高档判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
         // 不换文件也要记下来，否则每轮都整曲重下。
-        let confirmed_miss =
-            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
-        let checked_rank = confirmed_miss
-            .or_else(|| legacy_probe_covers_target(&current, &info, target_rank, can_record_check));
+        let checked_rank = probe_check_rank(&current, &info, target_rank, can_record_check);
         // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
@@ -2488,11 +2479,6 @@ mod tests {
         };
 
         let full = cached("极高 320k", Some(80), false);
-        assert_eq!(
-            downloaded_not_improved_reason(&full, &info("highest", 320_000, true), false),
-            NotImprovedReason::PreviewOnly
-        );
-
         let legacy = cached("极高 320k", None, false);
         assert_eq!(
             downloaded_not_improved_reason(&legacy, &info("highest", 320_000, false), true),
@@ -2502,11 +2488,6 @@ mod tests {
             downloaded_not_improved_reason(&legacy, &info("standard", 128_000, false), true),
             NotImprovedReason::NotBetter
         );
-        assert_eq!(
-            downloaded_not_improved_reason(&legacy, &info("", 0, false), false),
-            NotImprovedReason::UnknownRank
-        );
-
         let unknown_label = cached("极高", None, false);
         assert_eq!(
             downloaded_not_improved_reason(&unknown_label, &info("highest", 320_000, false), true),

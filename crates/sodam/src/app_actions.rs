@@ -79,6 +79,7 @@ fn cache_upgrade_log_parts<'a>(
     }
     (event, fields)
 }
+
 /// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
 ///
 /// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
