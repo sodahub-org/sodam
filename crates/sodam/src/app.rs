@@ -2203,7 +2203,7 @@ mod tests {
 
     #[test]
     fn cover_mailbox_cap_evicts_oldest_and_keeps_newest() {
-        let (wake, mut rx) = futures_channel::mpsc::channel::<()>(1);
+        let (wake, mut rx) = futures_channel::mpsc::channel::<()>(0);
         let mailbox = CoverMailbox::new(wake);
 
         for index in 0..COVER_MAILBOX_CAPACITY {
@@ -2214,8 +2214,8 @@ mod tests {
 
         let pending = mailbox.take();
         assert_eq!(pending.len(), COVER_MAILBOX_CAPACITY);
-        assert_eq!(pending.front(), Some(&"cover-1".to_string()));
-        assert_eq!(pending.back(), Some(&"cover-extra".to_string()));
+        assert_eq!(pending.first(), Some(&"cover-1".to_string()));
+        assert_eq!(pending.last(), Some(&"cover-extra".to_string()));
         assert!(!pending.iter().any(|url| url == "cover-0"));
         assert!(rx.try_recv().is_ok(), "有新需求要叫醒消费循环");
         assert!(rx.try_recv().is_err(), "唤醒信号只保留一个");
