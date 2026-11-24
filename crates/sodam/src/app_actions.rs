@@ -9,9 +9,7 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
-use sodam_core::cover::{
-    cover_paths_for_removed_paths, removed_cover_path_set, CoverOutcome, CoverWant,
-};
+use sodam_core::cover::{CoverOutcome, CoverWant};
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -35,29 +33,6 @@ use super::{
 };
 use sodam_core::queue::{PlayMode, Queue};
 
-/// 按「被淘汰的文件路径」反查原图 URL。
-///
-/// 只对内存中真命中删除列表的那几条做磁盘检查——被淘汰的路径成千上万，
-/// 绝大多数根本不在内存表里，不能在主线程上挨个 stat。已被下载重建回来的
-/// 路径不算失效。缩略图那份查询在 `CoverPaths::urls_for_removed_paths`。
-fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
-    covers: &HashMap<String, PathBuf>,
-    removed: &[PathBuf],
-    is_still_missing: F,
-) -> HashSet<String> {
-    let removed_set = removed_cover_path_set(removed);
-    cover_paths_for_removed_paths(
-        covers
-            .iter()
-            .map(|(url, path)| (url.as_str(), path.as_path())),
-        &removed_set,
-    )
-    .into_iter()
-    .filter(|(_, path)| is_still_missing(path))
-    .map(|(url, _)| url)
-    .collect()
-}
-
 /// 单首 / 批量两条路各自的日志级别。
 ///
 /// 用带名字的字段而不是两个挨着的 `LogLevel`：同一个类型相邻，调用点写反了照样编译过，
@@ -74,36 +49,34 @@ struct UpgradeLogLevels {
 /// 还没进队列的那首歌也显示它。缓存清理后补原图必须同口径，否则那首歌的大图
 /// 补不回来。两处补偿共用这个函数，避免一边改了口径另一边漏掉。
 fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) -> Option<String> {
-    pending.or(queued).map(|track| track.cover.clone())
-}
-
-/// 原图下载完成后的三种落账。
-#[derive(Debug, PartialEq, Eq)]
-enum OriginalCoverSettlement {
-    /// 文件还在。
-    Published(PathBuf),
-    /// 文件已删，不发布。
-    Vanished,
-    /// 没下到，不发布。
-    Failed,
+    // `CoverStore` 里存的和查的都是 trim 过的 key；这里不 trim，淘汰反查
+    // 时当前曲目就会跟删除列表对不上，原图不会补回来。
+    pending
+        .or(queued)
+        .map(|track| track.cover.trim().to_string())
 }
 
 /// 文件在就发布；文件已删就不发布并放行重试；没下到则保留失败记号。
 ///
-/// 这条复核不能省：死路径会被 `ensure_original_cover` 当成已有封面，歌词页大图再也回不来。
+/// 这条复核不能省：死路径会被 `CoverStore` 当成已有封面，歌词页大图再也回不来。
 fn settle_original_cover(
     path: Option<PathBuf>,
     file_exists: impl FnOnce(&std::path::Path) -> bool,
-) -> OriginalCoverSettlement {
+) -> CoverOutcome {
     match path {
-        Some(path) if file_exists(&path) => OriginalCoverSettlement::Published(path),
-        Some(_) => OriginalCoverSettlement::Vanished,
-        None => OriginalCoverSettlement::Failed,
+        Some(path) if file_exists(&path) => CoverOutcome::Ready { path, color: None },
+        Some(_) => CoverOutcome::Vanished,
+        None => CoverOutcome::Failed,
     }
 }
 
-/// 文件已删时，只有不在清缓存且仍是当前曲目才立刻补排。
-fn retry_vanished_original_cover(
+/// 原图这次没成功（文件没了，或失败一次）后，要不要顺手给当前曲目再排一次。
+///
+/// 清缓存还在跑时交给 `clear_cache` 的补偿，别和它抢；淘汰删文件时
+/// `drop_removed_covers` 反查不到还没发布过的 URL，只能在这里补。
+/// 失败重试也走这里：缩略图靠渲染每帧 `want`，原图没有这个口子，
+/// 第一次失败后不主动再排，就只剩重试按钮。
+fn retry_current_original_cover(
     cache_clearing: bool,
     displayed_cover: Option<&str>,
     url: &str,
@@ -752,7 +725,7 @@ impl Root {
 
     /// 淘汰删了磁盘上的封面后，同步清掉内存里指向它们的路径映射。
     ///
-    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各自独立，
+    /// 只处理 `removed` 里的文件路径，按 value 精确反查 URL——缩略图和原图各查各的，
     /// 只删了缩略图就不动原图映射。清掉缩略图那笔账后，渲染发现缺图会重新排队；
     /// 当前曲目的原图被删时直接补一次下载，歌词页没有原图的自动入队口子，
     /// 不等它自己回来。
@@ -766,22 +739,22 @@ impl Root {
             .cover_store
             .paths_handle()
             .urls_for_removed_paths(removed, |path| !path.exists());
-        let original_urls =
-            urls_for_removed_paths(&self.original_covers, removed, |path| !path.exists());
+        let original_urls = self
+            .cover_store
+            .originals_handle()
+            .urls_for_removed_paths(removed, |path| !path.exists());
         if thumb_urls.is_empty() && original_urls.is_empty() {
             return;
         }
-        for url in &original_urls {
-            self.original_covers.remove(url);
-        }
-        if let Ok(mut attempted) = self.original_cover_attempted.lock() {
-            for url in &original_urls {
-                attempted.remove(url);
-            }
-        }
-        // 缩略图只动自己的账：清掉路径 / 颜色 / 失败次数，渲染发现缺图会重新排队。
+        // 各清各的账：缩略图靠渲染发现缺图重新 want，原图没有这个口子，
+        // 当前曲目被清到时显式补一次。
         self.cover_store
-            .forget(thumb_urls.iter().map(String::as_str));
+            .forget_thumbnail(thumb_urls.iter().map(String::as_str));
+        if original_urls.is_empty() {
+            return;
+        }
+        self.cover_store
+            .forget_original(original_urls.iter().map(String::as_str));
         // 歌词页显示的是 pending_track.or(queue.current())，补下载也得按同一个口径，
         // 不然正在装载、还没进队列的那首歌原图被淘汰后不会补回来。
         let current_cover = current_cover_url(self.pending_track.as_ref(), self.queue.current());
@@ -794,32 +767,18 @@ impl Root {
 
     /// 清缓存后补下当前曲目的原图。
     ///
-    /// 清掉原图去重状态和补下载收在一个方法里，调用方拿不到「清完但没 ensure」的
-    /// 中间态，顺序写不反。缩略图靠渲染每帧重新 want 自愈，原图没有这个口子，
-    /// 清完缓存必须显式补一次，否则歌词页大图停在占位图。口径跟歌词页一致：
+    /// 已完成结果的作废由调用方先做 `clear_completed()`；这里只负责把当前曲目
+    /// 重新排进 pump。缩略图靠渲染每帧重新 want 自愈，原图没有这个口子，清完缓存
+    /// 必须显式补一次，否则歌词页大图停在占位图。口径跟歌词页一致：
     /// `pending_track.or(queue.current())`。
+    ///
+    /// 此刻还在下载的那张不打断：完成时按文件在不在照常落账（#250），
+    /// 落完要是文件也没了再补排，不会同一张并发下两遍。
     pub(crate) fn restore_current_original_cover(&mut self, cx: &mut Context<Self>) {
-        self.original_covers.clear();
-        // 清状态放在块里：锁跟着块结束自动释放。ensure_original_cover 里还会锁
-        // original_cover_attempted，同一线程重入 std::sync::Mutex 会卡住，而这里
-        // 跑在 UI 更新回调上，卡住就是挂界面。别把 ensure 挪进这个块。
-        {
-            // 中毒也接着用，否则 attempted 清不掉，接着的 ensure 会早退，原图补不回来。
-            let mut attempted = self
-                .original_cover_attempted
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut pending = self
-                .original_cover_pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            attempted.clear();
-            pending.clear();
-        }
         let Some(url) = current_cover_url(self.pending_track.as_ref(), self.queue.current()) else {
             return;
         };
-        // 这张原图若此刻正在下载，会多下一次同一 URL（attempted 清了、inflight 没动）。
+        self.cover_store.retry_original_after_release(&url);
         self.ensure_original_cover(&url, cx);
     }
 
@@ -850,9 +809,8 @@ impl Root {
                 root.cover_store.clear_completed();
                 // 文件没了，升级去重表也跟着作废，同一首能重新跑一次。
                 root.cache_upgrade_attempted.clear();
-                // 原图没有渲染期自动入队口子，显式补一次当前曲目原图。
-                // 清去重状态和补下载都在 restore_current_original_cover 里完成，
-                // 这里拿不到中间态，顺序写不反。
+                // 已完成结果的作废由上面的 `clear_completed()` 完成；
+                // 原图没有渲染期自动入队口子，这里只补排当前曲目。
                 root.restore_current_original_cover(cx);
                 let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
                 root.notify_success_once("cache-clear", message);
@@ -1407,126 +1365,59 @@ impl Root {
         self.load_lyrics(track, false, cx);
     }
 
-    /// 原图下载的在飞上限：单张解码最坏 64 MiB（16 位图翻倍），这条路没有
-    /// CoverStore 的并发保护，用计数限流防快速切歌时瞬时内存失控。
-    const MAX_ORIGINAL_COVER_INFLIGHT: usize = 4;
-    /// 原图下载排队的上限：超过就丢最旧的（最新切进来的歌最有用）。
-    const MAX_ORIGINAL_COVER_PENDING: usize = 32;
-
+    /// 原图没有渲染期自动入队口子，调用方在切歌、进播放页、清缓存、点重试时显式要。
+    ///
+    /// 4 张在飞 / 32 张排队 / 切歌只留当前曲目，三条规则都由 `CoverStore` 管。
     pub(crate) fn ensure_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
-        use std::sync::atomic::Ordering;
-
-        let url = url.trim();
-        if url.is_empty() || self.original_covers.contains_key(url) {
-            return;
+        if self.cover_store.want_original(url) {
+            self.pump_original_covers(cx);
         }
-        // 锁中毒自恢复：宁可拿旧数据继续，也别让整条队列停摆。
-        let mut attempted = self
-            .original_cover_attempted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let first_try = attempted.insert(url.to_string());
-        if !first_try {
-            // 在飞或已失败过的 URL 不再拉起：失败后由重试按钮清标记，
-            // 队列去重见下面的 pending 检查。
-            return;
-        }
-        // 到在飞上限就把 URL 排队：不记「已尝试」，在飞位空出来后由完成
-        // 回调补上（照 CoverStore 的 pump 思路），排队的不许被丢掉；
-        // 队列有界（丢最旧），且切歌时只留当前曲目（见 load_lyrics）。
-        if self.original_cover_inflight.load(Ordering::SeqCst) >= Self::MAX_ORIGINAL_COVER_INFLIGHT
-        {
-            attempted.remove(url);
-            let mut pending = self
-                .original_cover_pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !pending.iter().any(|queued| queued == url) {
-                while pending.len() >= Self::MAX_ORIGINAL_COVER_PENDING {
-                    pending.remove(0);
-                }
-                pending.push(url.to_string());
-            }
-            return;
-        }
-        drop(attempted);
-        self.spawn_original_cover(url, cx);
     }
 
-    /// 占一个在飞位并启动原图下载；完成回调里把排队中的补上。
-    fn spawn_original_cover(&mut self, url: &str, cx: &mut Context<Self>) {
-        use std::sync::atomic::Ordering;
-
-        let max_inflight = Self::MAX_ORIGINAL_COVER_INFLIGHT;
-        self.original_cover_inflight.fetch_add(1, Ordering::SeqCst);
-        let inflight = Arc::clone(&self.original_cover_inflight);
-        let settings = self.settings.clone();
-        let fetch_url = url.to_string();
-        let work_url = fetch_url.clone();
-        let work = cx.background_spawn(async move {
-            let path = Session::new(settings).original_cover_path(&work_url);
-            inflight.fetch_sub(1, Ordering::SeqCst);
-            path
-        });
-        cx.spawn(async move |this, cx| {
-            let path = work.await;
-            let _ = this.update(cx, |root, cx| {
-                // 和缩略图一样在回调里复核文件在不在：清缓存的清表也是
-                // 同一线程的 update，后清表会把这次抢先写进去的死路径一起扫掉。
-                let settlement = settle_original_cover(path, |file| file.exists());
-                match settlement {
-                    OriginalCoverSettlement::Published(path) => {
-                        root.original_covers.insert(fetch_url.clone(), path.clone());
-                        // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
+    /// 驱动原图下载：保持最多 4 个在飞，完成一个补一个。
+    pub(crate) fn pump_original_covers(&mut self, cx: &mut Context<Self>) {
+        for url in self.cover_store.drain_original() {
+            let settings = self.settings.clone();
+            let work_url = url.clone();
+            let fetch_url = url;
+            let work = cx.background_spawn(async move {
+                Session::new(settings).original_cover_path(&work_url)
+            });
+            cx.spawn(async move |this, cx| {
+                let path = work.await;
+                let _ = this.update(cx, |root, cx| {
+                    // 和缩略图一样在回调里复核文件在不在：清缓存的清表也是
+                    // 同一线程的 update，后清表会把这次抢先写进去的死路径一起扫掉。
+                    let outcome = settle_original_cover(path, |file| file.exists());
+                    let retryable =
+                        matches!(outcome, CoverOutcome::Vanished | CoverOutcome::Failed);
+                    root.cover_store.complete_original(&fetch_url, outcome);
+                    // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
+                    if let Some(path) = root.cover_store.original_path(&fetch_url) {
                         root.cover_store.adopt_thumbnail(&fetch_url, path);
-                        cx.notify();
                     }
-                    OriginalCoverSettlement::Vanished => {
-                        // 文件没了：别把死路径记进表，放行记号，让下一次
-                        // ensure 能重排。要不要马上补见 retry_vanished_original_cover。
-                        {
-                            let mut attempted = root
-                                .original_cover_attempted
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            attempted.remove(&fetch_url);
-                        }
+                    if retryable {
+                        // 文件被清缓存 / 淘汰删掉，或下载失败：`complete_original`
+                        // 已经记了一次尝试；两次到顶就不再重排。
+                        // 清缓存进行中交给它的补偿；当前曲目在这里补一次，
+                        // 歌词页不用等下一次切歌或手动点重试。
                         let displayed_cover =
                             current_cover_url(root.pending_track.as_ref(), root.queue.current());
-                        if retry_vanished_original_cover(
+                        if retry_current_original_cover(
                             root.cache_clearing,
                             displayed_cover.as_deref(),
                             &fetch_url,
                         ) {
                             root.ensure_original_cover(&fetch_url, cx);
                         }
-                        cx.notify();
                     }
-                    OriginalCoverSettlement::Failed => {}
-                }
-            });
-            // 在飞位空出来了：把限流期间排队的原图补上，不许被丢掉。
-            let _ = this.update(cx, |root, cx| {
-                let inflight_now = root
-                    .original_cover_inflight
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                if inflight_now >= max_inflight {
-                    return;
-                }
-                let slots = max_inflight - inflight_now;
-                let mut pending = root
-                    .original_cover_pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let take = slots.min(pending.len());
-                let queued: Vec<String> = pending.drain(..take).collect();
-                drop(pending);
-                for queued_url in &queued {
-                    root.ensure_original_cover(queued_url, cx);
-                }
-            });
-        })
-        .detach();
+                    // 一个下载完成就补下一个，始终有界并发。
+                    root.pump_original_covers(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     pub(crate) fn load_lyrics(&mut self, track: TrackItem, force: bool, cx: &mut Context<Self>) {
@@ -1546,11 +1437,8 @@ impl Root {
         self.lyrics_cover = track.cover.clone();
         self.lyrics_track_id = track.id.clone();
         // 切歌了：排队里的原图多半是已经划过去的歌，只留当前曲目的封面；
-        // 被剔掉的 URL 没记「已尝试」，那些歌下次播放时会自然重新请求。
-        self.original_cover_pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|queued| queued == &track.cover);
+        // 被剔掉的退回可重排，那些歌下次播放时会自然重新请求。
+        self.cover_store.retain_original_only(&track.cover);
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         self.ensure_original_cover(&track.cover, cx);
         self.set_status("正在读取「{}」歌词…", std::slice::from_ref(&track.title));
@@ -2228,10 +2116,7 @@ impl Root {
     }
 
     pub fn retry_playback_assets(&mut self, track: TrackItem, cx: &mut Context<Self>) {
-        self.original_cover_attempted
-            .lock()
-            .ok()
-            .map(|mut attempted| attempted.remove(&track.cover));
+        // 两格一起作废：在飞的那张等结果回来再放行，不会同一张并发下两遍。
         self.cover_store.forget([track.cover.as_str()]);
         if let Some(session) = self.session.as_mut() {
             session.invalidate_original_cover(&track.cover);
@@ -3539,8 +3424,8 @@ impl Root {
                         None => CoverOutcome::Failed,
                     };
                     root.cover_store.complete(&url, outcome);
-                    // 失败 / 文件已没也要重绘一次：渲染会重新请求。失败有两次上限；
-                    // 文件已没会退回可重排，没有上限。
+                    // 失败 / 文件已没也要重绘一次：渲染会重新请求。
+                    // 两种都按 `CoverStore` 的两次上限，文件反复被删不会无限重下。
                     cx.notify();
                     // 一个下载完成就补下一个，始终有界并发
                     root.pump_covers(cx);
@@ -4241,6 +4126,8 @@ impl Root {
         self.pending_engine_load = None;
         self.progress_preview = None;
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
+        // 每次切歌都只留新曲目的原图需求；不在歌词页时也要清掉上一轮的排队和补排。
+        self.cover_store.retain_original_only(&track.cover);
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         if self.nav == Nav::Lyrics {
             self.load_lyrics(track.clone(), false, cx);
@@ -5642,96 +5529,82 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 mod tests {
     use super::{
         current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
-        lyrics_scroll_ease, retry_vanished_original_cover, settle_original_cover,
-        urls_for_removed_paths, OriginalCoverSettlement,
+        lyrics_scroll_ease, retry_current_original_cover, settle_original_cover,
     };
+    use sodam_core::cover::CoverOutcome;
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
-    /// 只按被删的文件路径反查 URL，缩略图和原图分开；只删了一侧不能连另一侧一起清。
-    #[test]
-    fn removed_paths_map_to_the_right_side_only() {
-        let path = |name: &str| PathBuf::from(name);
-        let covers = HashMap::from([
-            ("gone-thumb".to_string(), path("covers/thumb-gone.img")),
-            ("alive-thumb".to_string(), path("covers/thumb-alive.img")),
-        ]);
-        let originals = HashMap::from([
-            (
-                "gone-thumb".to_string(),
-                path("covers/original/full-gone.img"),
-            ),
-            (
-                "original-only".to_string(),
-                path("covers/original/full-only.img"),
-            ),
-        ]);
-
-        let removed = [
-            path("covers/thumb-gone.img"),
-            path("covers/original/full-only.img"),
-        ];
-        let thumbs = urls_for_removed_paths(&covers, &removed, |_| true);
-        let originals_gone = urls_for_removed_paths(&originals, &removed, |_| true);
-        assert_eq!(thumbs.len(), 1, "只有缩略图被删的那张要重下缩略图");
-        assert!(thumbs.contains("gone-thumb"));
-        assert_eq!(originals_gone.len(), 1, "只有原图被删的那张要重下原图");
-        assert!(originals_gone.contains("original-only"));
-        // gone-thumb 的原图没被删，不能因为缩略图没了就一起清掉。
-        assert!(!originals_gone.contains("gone-thumb"));
-        // alive-thumb 两侧都没被删，谁都不该动。
-        assert!(!thumbs.contains("alive-thumb"));
-
-        // 被下载重建回来的原图不算缺，映射要留住（缩略图那一侧由 core 用例覆盖）。
-        let originals2 = urls_for_removed_paths(&originals, &removed, |p| {
-            p != std::path::Path::new("covers/original/full-only.img")
-        });
-        assert!(originals2.is_empty(), "原图已被重建回来，不能再清它的映射");
-    }
-
     /// 清缓存或淘汰撞上在飞的原图：回调解析出路径但文件已经没了，
-    /// 不能写进 `original_covers`，还要放行「已尝试」，否则这首歌的
-    /// 歌词页大图整个会话都回不来。
+    /// 不能交给 `CoverStore` 发布死路径，否则这首歌的歌词页大图
+    /// 整个会话都回不来。
     #[test]
     fn vanished_original_cover_is_not_published() {
         let path = PathBuf::from("covers/original/gone.img");
         assert_eq!(
             settle_original_cover(Some(path.clone()), |_| false),
-            OriginalCoverSettlement::Vanished,
+            CoverOutcome::Vanished,
             "文件没了就不能发布死路径"
         );
         assert_eq!(
             settle_original_cover(Some(path.clone()), |_| true),
-            OriginalCoverSettlement::Published(path),
+            CoverOutcome::Ready { path, color: None },
             "文件还在就直接用"
         );
         assert_eq!(
             settle_original_cover(None, |_| true),
-            OriginalCoverSettlement::Failed,
-            "下载失败保留记号，避免每帧空转"
+            CoverOutcome::Failed,
+            "下载失败按失败记一次"
         );
     }
 
-    /// 文件没了要不要补：清缓存进行中交给它的补偿，淘汰删文件时自己补。
+    /// 原图没成功要不要补：清缓存进行中交给它的补偿，当前曲目才自己补。
     #[test]
-    fn vanished_original_cover_retries_only_outside_a_cache_clear() {
+    fn original_cover_retries_only_current_track_outside_a_cache_clear() {
         assert!(
-            retry_vanished_original_cover(false, Some("url/current"), "url/current"),
-            "淘汰删了当前曲目的原图：要补"
+            retry_current_original_cover(false, Some("url/current"), "url/current"),
+            "当前曲目的原图没成功：要补"
         );
         assert!(
-            !retry_vanished_original_cover(false, Some("url/other"), "url/current"),
+            !retry_current_original_cover(false, Some("url/other"), "url/current"),
             "不是当前曲目：不补"
         );
         assert!(
-            !retry_vanished_original_cover(false, None, "url/current"),
+            !retry_current_original_cover(false, None, "url/current"),
             "没有当前曲目：不补"
         );
         assert!(
-            !retry_vanished_original_cover(true, Some("url/current"), "url/current"),
+            !retry_current_original_cover(true, Some("url/current"), "url/current"),
             "清缓存进行中：交给 clear_cache 的补偿"
         );
+    }
+
+    /// 应用层链路：原图第一次失败后不用再点按钮，当前曲目自动排第二次并落账。
+    #[test]
+    fn current_original_retry_chain_needs_no_user_action() {
+        use sodam_core::cover::{CoverOutcome, CoverStore};
+
+        let mut store = CoverStore::default();
+        let url = "url/current";
+        assert!(store.want_original(url));
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+
+        store.complete_original(url, CoverOutcome::Failed);
+        assert!(
+            retry_current_original_cover(false, Some(url), url),
+            "第一次失败后当前曲目要自动补排"
+        );
+        assert!(store.want_original(url), "补排真的进队列");
+        assert_eq!(store.drain_original(), vec![url.to_string()]);
+
+        store.complete_original(
+            url,
+            CoverOutcome::Ready {
+                path: PathBuf::from("/tmp/current.img"),
+                color: None,
+            },
+        );
+        assert!(store.original_path(url).is_some(), "第二次成功就落账");
     }
 
     /// 清缓存/淘汰后补下载要跟歌词页显示同一首歌：pending 优先于队列当前。
@@ -5745,6 +5618,7 @@ mod tests {
         };
         let pending = make("pending", "url/pending");
         let queued = make("queued", "url/queued");
+        let padded = make("padded", "  url/queued  ");
 
         // pending 在场时歌词页显示它，补下载也得用它。
         assert_eq!(
@@ -5754,6 +5628,11 @@ mod tests {
         // 没有 pending 才退回队列当前曲目。
         assert_eq!(
             current_cover_url(None, Some(&queued)).as_deref(),
+            Some("url/queued")
+        );
+        // 跟 CoverStore 的 key 一样 trim 过，淘汰反查才对得上。
+        assert_eq!(
+            current_cover_url(None, Some(&padded)).as_deref(),
             Some("url/queued")
         );
         // 两个都没有就没有可补的封面。
