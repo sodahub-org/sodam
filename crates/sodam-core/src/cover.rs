@@ -189,18 +189,20 @@ struct Lane {
     requeue_after_release: HashSet<String>,
     /// 因队列满挤掉、尚未取走的张数。
     queue_evictions: usize,
+    track_queue_evictions: bool,
     max_queue: usize,
     max_inflight: usize,
 }
 
 impl Lane {
-    fn new(max_queue: usize, max_inflight: usize) -> Self {
+    fn new(max_queue: usize, max_inflight: usize, track_queue_evictions: bool) -> Self {
         Self {
             queue: VecDeque::new(),
             inflight: HashSet::new(),
             abandoned: HashSet::new(),
             requeue_after_release: HashSet::new(),
             queue_evictions: 0,
+            track_queue_evictions,
             max_queue,
             max_inflight,
         }
@@ -231,7 +233,9 @@ impl Lane {
         } else {
             false
         };
-        self.queue_evictions += usize::from(evicted);
+        if self.track_queue_evictions {
+            self.queue_evictions += usize::from(evicted);
+        }
         let record = records.entry(url.to_string()).or_default();
         select(record).state = State::Queued;
         self.queue.push_back(url.to_string());
@@ -388,8 +392,8 @@ impl Default for CoverStore {
     fn default() -> Self {
         Self {
             records: HashMap::new(),
-            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY),
-            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY),
+            thumbnails: Lane::new(MAX_QUEUE, MAX_CONCURRENCY, true),
+            originals: Lane::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY, false),
             thumbnail_paths: CoverPaths::default(),
             original_paths: CoverPaths::default(),
             colors: HashMap::new(),
