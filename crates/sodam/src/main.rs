@@ -106,7 +106,7 @@ fn start_tray_service(
                 single_probe.check();
                 if activations.try_recv().is_ok() {
                     while activations.try_recv().is_ok() {}
-                    tray_probe.app_entry();
+                    single_probe.app_entry();
                     cx.update(|cx| show_window(cx, &app));
                 }
             }

@@ -25,7 +25,7 @@ use sodam_core::play_failure::{
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::settings_writer::{FailureKind, SignOut};
+use sodam_core::settings_writer::{FailureKind, SignOut, WriteFailure};
 use sodam_core::upgrade::{
     identity_change, stop_reason, IdentityChange, NotImprovedReason, Outcome, StopConditions,
     StopReason, Tally,
@@ -381,6 +381,10 @@ impl Root {
         let Some(failure) = self.settings_writer.take_startup_error() else {
             return;
         };
+        self.report_settings_failure(failure, cx);
+    }
+
+    fn report_settings_failure(&mut self, failure: WriteFailure, cx: &mut Context<Self>) {
         let text = match failure.kind {
             FailureKind::Startup => STARTUP_SAVE_TEXT,
             FailureKind::QueueStopped => QUEUE_STOPPED_TEXT,
@@ -437,14 +441,7 @@ impl Root {
                     // 顺序反了会把失败取走扔掉，退出那几秒里写盘失败的提示就永远看不到了。
                     if !root.quit_gate.is_saving() {
                         if let Some(failure) = root.settings_writer.take_error() {
-                            let text = match failure.kind {
-                                FailureKind::Settings => SAVE_TEXT,
-                                FailureKind::Startup => STARTUP_SAVE_TEXT,
-                                FailureKind::QueueStopped => QUEUE_STOPPED_TEXT,
-                            };
-                            let message = root.tr(text).to_string();
-                            root.notify_error_once("settings-save-failed", message);
-                            cx.notify();
+                            root.report_settings_failure(failure, cx);
                         }
                     }
                     // 音量拖动收不到松手事件时（拖到窗口外松手、拖动中切走窗口），
