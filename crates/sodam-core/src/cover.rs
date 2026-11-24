@@ -75,15 +75,6 @@ impl CoverPaths {
             .contains_key(url.trim())
     }
 
-    /// 这张图是否已失败到顶，不再自动请求（只查内存）。
-    pub fn is_failed(&self, url: &str) -> bool {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .failed
-            .contains(url.trim())
-    }
-
     /// 查一张图的本地路径（只查内存）。
     pub fn get(&self, url: &str) -> Option<PathBuf> {
         self.inner
@@ -832,17 +823,23 @@ mod tests {
         assert_eq!(store.want(&url), 1);
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
-        assert!(!paths.is_failed("cover-a"), "失败一次还要继续请求");
+        assert!(
+            paths.lookup("cover-a").should_request,
+            "失败一次还要继续请求"
+        );
         assert_eq!(store.want(&url), 1, "失败一次还能再试");
 
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
-        assert!(paths.is_failed("cover-a"), "失败两次后停止自动请求");
+        assert!(
+            !paths.lookup("cover-a").should_request,
+            "失败两次后停止自动请求"
+        );
         assert_eq!(store.want(&url), 0, "失败两次后本会话不再自动重试");
         assert!(store.drain().is_empty());
 
         store.forget(url.iter().map(String::as_str));
-        assert!(!paths.is_failed("cover-a"), "作废后恢复请求");
+        assert!(paths.lookup("cover-a").should_request, "作废后恢复请求");
         assert_eq!(store.want(&url), 1, "清掉失败记录后能重新下");
     }
 
@@ -858,11 +855,29 @@ mod tests {
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Failed);
-        assert!(paths.is_failed("cover-a"));
+        assert!(!paths.lookup("cover-a").should_request);
         assert_eq!(store.want(&url), 0);
 
         store.clear_completed();
-        assert!(!paths.is_failed("cover-a"), "清缓存后恢复请求");
+        assert!(paths.lookup("cover-a").should_request, "清缓存后恢复请求");
+        assert_eq!(store.want(&url), 1);
+    }
+
+    #[test]
+    fn clear_completed_revives_vanished_url() {
+        let mut store = CoverStore::default();
+        let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Vanished);
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(!paths.lookup("cover-a").should_request);
+
+        store.clear_completed();
+        assert!(paths.lookup("cover-a").should_request, "清缓存后恢复请求");
         assert_eq!(store.want(&url), 1);
     }
 
@@ -1122,17 +1137,21 @@ mod tests {
     fn vanished_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(paths.lookup("cover-a").should_request, "第一次还要继续请求");
         assert_eq!(store.want(&url), 1, "第一次还能重排");
 
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(!paths.lookup("cover-a").should_request, "两次后停止请求");
         assert_eq!(store.want(&url), 0, "两次后先放弃");
         assert!(store.drain().is_empty());
 
         store.forget(["cover-a"]);
+        assert!(paths.lookup("cover-a").should_request, "作废后恢复请求");
         assert_eq!(store.want(&url), 1, "作废之后能重新下");
     }
 
@@ -1196,7 +1215,6 @@ mod tests {
             assert!(store.path("cover-a").is_none());
             assert!(store.color("cover-a").is_none());
             assert!(store.paths_handle().get("cover-a").is_none());
-            assert!(!store.paths_handle().is_failed("cover-a"));
             assert!(store.paths_handle().lookup("cover-a").should_request);
         }
         assert_eq!(store.want(&all), 0, "读口子不能放行去重");
