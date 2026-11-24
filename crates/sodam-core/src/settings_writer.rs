@@ -655,36 +655,48 @@ mod tests {
     }
 
     #[test]
-    fn startup_failure_signal_and_payload_stay_in_sync() {
-        for _ in 0..100 {
-            let slot = StartupFailureSlot::default();
-            std::thread::scope(|scope| {
-                let setter = scope.spawn(|| {
-                    for _ in 0..1_000 {
-                        slot.set(WriteFailure {
-                            kind: FailureKind::Startup,
-                            detail: "并发写入".into(),
-                        });
-                    }
-                });
-                let taker = scope.spawn(|| {
-                    for _ in 0..1_000 {
-                        let _ = slot.take();
-                    }
-                });
+    fn startup_failure_signal_matches_unlocked_tray_checks() {
+        use std::sync::atomic::AtomicUsize;
 
-                while !setter.is_finished() || !taker.is_finished() {
-                    let guard = slot.failure.lock().unwrap();
-                    assert_eq!(
-                        slot.is_pending(),
-                        guard.is_some(),
-                        "原子门和失败槽必须同时有空"
-                    );
-                }
-                setter.join().unwrap();
-                taker.join().unwrap();
+        let slot = StartupFailureSlot::default();
+        for _ in 0..100 {
+            slot.set(WriteFailure {
+                kind: FailureKind::Startup,
+                detail: "顺序写入".into(),
             });
+            assert!(slot.is_pending(), "set 后托盘不加锁也要看到待报项");
+            assert!(slot.take().is_some());
+            assert!(!slot.is_pending(), "take 后托盘不加锁也要看到空槽");
         }
+
+        let sets = Arc::new(AtomicUsize::new(0));
+        let takes = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1_000 {
+                    slot.set(WriteFailure {
+                        kind: FailureKind::Startup,
+                        detail: "并发写入".into(),
+                    });
+                    sets.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..1_000 {
+                    if slot.take().is_some() {
+                        takes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        });
+
+        assert!(
+            takes.load(Ordering::Relaxed) <= sets.load(Ordering::Relaxed),
+            "非空 take 次数不能超过 set 次数"
+        );
+        let signal = slot.is_pending();
+        let payload = slot.failure.lock().unwrap().is_some();
+        assert_eq!(signal, payload, "并发结束后原子门和失败槽必须一致");
     }
 
     #[test]

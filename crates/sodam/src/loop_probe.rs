@@ -23,14 +23,10 @@ pub(crate) struct LoopProbe {
 
 impl LoopProbe {
     pub(crate) fn new(name: &'static str) -> Self {
-        Self::with_timer(name, "independent")
+        Self::new_with_timer(name, "independent")
     }
 
-    pub(crate) fn new_shared_timer(name: &'static str) -> Self {
-        Self::with_timer(name, "shared:tray")
-    }
-
-    fn with_timer(name: &'static str, timer: &'static str) -> Self {
+    pub(crate) fn new_with_timer(name: &'static str, timer: &'static str) -> Self {
         Self {
             name,
             timer,
