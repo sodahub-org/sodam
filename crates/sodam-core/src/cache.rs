@@ -22,20 +22,25 @@ pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 档位未知时的探测退避有效期。
 pub const UNKNOWN_PROBE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// 一次完整流探测的独立退避记录；不代表缓存文件的实际档位已测出。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownProbe {
+    /// 这次探测请求的目标档位。
     pub target_rank: i64,
+    /// 探测时间（Unix 秒）。
     pub at: u64,
+    /// 账号与会员状态的稳定范围指纹。
     pub scope: String,
 }
 
 impl UnknownProbe {
+    /// 只抑制同目标、同范围的下一次探测；范围缺失时返回 `false`，宁可重试也不跨账号误挡。
     pub fn covers(&self, target_rank: i64, scope: Option<&str>) -> bool {
         scope.is_some_and(|scope| self.target_rank == target_rank && self.scope == scope)
     }
 }
 
-/// 账号与会员状态的稳定指纹；不落原始账号 ID 或 Cookie。
+/// 账号与会员状态的稳定本地区分指纹；不落原始账号 ID 或 Cookie，但可被枚举，不是匿名化或安全哈希。
 pub fn unknown_probe_scope(user_id: Option<&str>, is_vip: Option<bool>) -> Option<String> {
     let user_id = user_id?.trim();
     if user_id.is_empty() {

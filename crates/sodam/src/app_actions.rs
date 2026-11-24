@@ -2907,14 +2907,20 @@ impl Root {
         .detach();
     }
 
+    fn upgrade_account(&self) -> (Option<bool>, Option<String>) {
+        (
+            self.account.as_ref().map(|account| account.vip),
+            self.account.as_ref().map(|account| account.user_id.clone()),
+        )
+    }
+
     /// 刷新缓存批量升级预估信息（后台扫盘，不阻塞 UI）。
     pub(crate) fn refresh_upgrade_estimate(&mut self, cx: &mut Context<Self>) {
         self.batch_upgrade_estimate_request_seq =
             self.batch_upgrade_estimate_request_seq.wrapping_add(1);
         let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
-        let is_vip = self.account.as_ref().map(|a| a.vip);
-        let account_user_id = self.account.as_ref().map(|account| account.user_id.clone());
+        let (is_vip, account_user_id) = self.upgrade_account();
         let scope = sodam_core::cache::unknown_probe_scope(account_user_id.as_deref(), is_vip);
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
             Some(rank) => rank,
@@ -2963,7 +2969,7 @@ impl Root {
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
     /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功、「没换成更好整曲」和
-    /// 「档位未知」记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// 「升级结果未知」记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
     fn upgrade_one_cached_track(
         settings: Settings,
@@ -2981,20 +2987,14 @@ impl Root {
             account_user_id.as_deref(),
         ) {
             Ok(run) => {
-                let (outcome, event) = match run.outcome {
-                    Outcome::Upgraded => (Outcome::Upgraded, "cache_upgraded"),
-                    Outcome::NoHigherTier => {
-                        (Outcome::NoHigherTier, "cache_upgrade_no_higher_tier")
-                    }
-                    Outcome::UnknownRank => (Outcome::UnknownRank, "cache_upgrade_unknown_rank"),
-                    Outcome::Failed => (Outcome::Failed, "cache_upgrade_failed"),
+                let event = match run.outcome {
+                    Outcome::Upgraded => "cache_upgraded",
+                    Outcome::NoHigherTier => "cache_upgrade_no_higher_tier",
+                    Outcome::UnknownRank => "cache_upgrade_unknown_rank",
+                    Outcome::Failed => return Outcome::Failed,
                 };
                 log_outlet::log_event(
-                    if outcome == Outcome::Failed {
-                        levels.failure
-                    } else {
-                        levels.success
-                    },
+                    levels.success,
                     LogTopic::Player,
                     event,
                     &[
@@ -3002,7 +3002,7 @@ impl Root {
                         ("quality", run.track.quality.as_str()),
                     ],
                 );
-                outcome
+                run.outcome
             }
             Err(failure) => {
                 // 级别由调用方定：单首失败要用 WARN 进默认日志；批量几百首逐首记会刷屏，
@@ -3102,7 +3102,7 @@ impl Root {
         }
 
         let target_intent = self.batch_upgrade_target.clone();
-        let is_vip = self.account.as_ref().map(|a| a.vip);
+        let (is_vip, start_user_id) = self.upgrade_account();
 
         // P2 权益预检：需要会员的档位只在账号确认有权益时才放行（认不出权益也算不行）。
         if sodam_core::quality::batch_upgrade_needs_confirmed_entitlement(&target_intent, is_vip) {
@@ -3132,7 +3132,6 @@ impl Root {
         let start_epoch = self.auth_epoch;
         // 收尾文案要分清「真的换了号」和「同一账号的会员状态刷新」：两者都推进代数，
         // 但后者报「账号已变更」是撒谎。账号信息没加载出来时也不说换了号。
-        let start_user_id = self.account.as_ref().map(|account| account.user_id.clone());
         let scan_scope = sodam_core::cache::unknown_probe_scope(start_user_id.as_deref(), is_vip);
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
@@ -3176,11 +3175,10 @@ impl Root {
                     (
                         root.batch_upgrade_stop(start_epoch),
                         root.settings.clone(),
-                        root.account.as_ref().map(|a| a.vip),
-                        root.account.as_ref().map(|account| account.user_id.clone()),
+                        root.upgrade_account(),
                     )
                 });
-                let Ok((stop, mut settings, is_vip, account_user_id)) = step else {
+                let Ok((stop, mut settings, (is_vip, account_user_id))) = step else {
                     return;
                 };
                 if let Some(reason) = stop {
@@ -3294,7 +3292,7 @@ impl Root {
                         }
                         None => {
                             let message = root.localized(
-                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲，{} 首档位未知",
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲，{} 首升级结果未知",
                                 &[
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),
@@ -4229,9 +4227,7 @@ impl Root {
                         let actual_rank = cached.quality_rank;
                         let actual_quality = cached.quality.clone();
                         let intent = root.settings.quality_intent();
-                        let is_vip = root.account.as_ref().map(|a| a.vip);
-                        let account_user_id =
-                            root.account.as_ref().map(|account| account.user_id.clone());
+                        let (is_vip, account_user_id) = root.upgrade_account();
                         let scope = sodam_core::cache::unknown_probe_scope(
                             account_user_id.as_deref(),
                             is_vip,

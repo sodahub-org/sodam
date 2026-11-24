@@ -519,8 +519,8 @@ impl CachedTrack {
     ///   就再试一次，不看 `quality_rank`——尤其不能被认不出的 0 分挡住。试听本来只有
     ///   半条流，重下不是白跑；权益到手后拿到整曲是实打实的提升。
     /// * 整曲：实际档位已达目标、最近已经向服务端要过该目标档位，或同账号范围、同目标的
-    ///   未知档探测还在退避期时，都不再请求。没记分数的旧缓存（#89）按 sidecar 的档位标签
-    ///   判断：证明不了达标就重下；记了 0 分（认不出档位）的不重下（#96）。
+    ///   未知档探测还在退避期时，都不再请求。没记分数的旧缓存按 sidecar 的档位标签
+    ///   判断：证明不了达标就重下；记了 0 分的不重下。
     pub fn needs_upgrade(
         &self,
         intent: &crate::quality::QualityIntent,
@@ -595,8 +595,9 @@ impl CachedTrack {
 /// 结果在换文件或探测落账那一刻定下来，调用方不拿升级前后的两份缓存自己比分数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完那一刻的内存快照；没换文件时就是原来那份。探测结论要准的值去读 sidecar。
+    /// 跑完那一刻的内存快照；没换文件时也会带上这次新记的探测退避。持久值以 sidecar 为准。
     pub track: CachedTrack,
+    /// 只可能是 `Upgraded` / `NoHigherTier` / `UnknownRank`；失败由 `Err(PlaybackFailure)` 返回。
     pub outcome: crate::upgrade::Outcome,
 }
 
