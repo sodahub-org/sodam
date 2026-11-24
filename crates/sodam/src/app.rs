@@ -38,6 +38,8 @@ pub(crate) const SAVE_TEXT: &str = "没能保存，检查磁盘空间后重试�
 /// 启动期那次回存失败的说法：和用户刚改的设置无关，得说清。
 pub(crate) const STARTUP_SAVE_TEXT: &str =
     "启动时的配置修正没写成功，本次运行照常；检查配置文件能否写入。";
+/// 写队列自己没了（起线程失败或线程退出）：跟磁盘无关，别让用户去清磁盘。
+pub(crate) const QUEUE_STOPPED_TEXT: &str = "设置没能保存：保存通道已经停了，重启应用再试。";
 /// 既不是网络也不是写入的失败（例如本地编码出错）：不指责任何一方，只说重试。
 pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 
@@ -627,8 +629,11 @@ pub struct Root {
     /// 显式登出后的进程内记号：本次运行里不再用 `SODA_COOKIE` 把身份补回来（#192）。
     /// 扫码登录成功或外部写入非空 Cookie 后清零；重启不保留，启动仍按环境变量走。
     pub(crate) env_cookie_opted_out: bool,
-    /// 用户正拖着音量滑条：期间外部重载不得回弹音量（#185）。
-    pub(crate) volume_scrubbing: bool,
+    /// 用户正拖着音量滑条：`Some(时刻)` = 拖动着，时刻是最后一次改音量的时候。
+    ///
+    /// 两个用处：期间外部重载不得回弹音量（#185）；拖动中不排落盘，
+    /// 停手或松手时再补一次（#259）。
+    pub(crate) volume_scrub_pending: Option<std::time::Instant>,
     /// 主动退出闸门：托盘 / ⌘Q 先等设置写队列刷完再退（#198）。
     pub(crate) quit_gate: QuitGate,
 }
@@ -936,12 +941,14 @@ impl Root {
             config_reload,
             config_poll_busy: false,
             env_cookie_opted_out: false,
-            volume_scrubbing: false,
+            volume_scrub_pending: None,
             settings_writer,
             quit_gate: QuitGate::new(QUIT_PERSIST_TIMEOUT),
         };
         cx.on_app_quit(|root, _cx| {
             sodam_core::flush_global();
+            // 正在拖音量就别让这次改动停在内存里：先收尾再刷尾（#259）。
+            root.end_volume_scrub();
             // 退出只等这一条队列：启动回存、界面上排队的改动、登出摘 Cookie 都排在里头
             // （#259）。等它在后台线程里刷完，别在 UI 线程等磁盘。
             let flush = root.settings_writer.flush();
@@ -1654,6 +1661,8 @@ impl Root {
         self.set_status_text(self.tr("正在保存…"));
         cx.notify();
 
+        // 正在拖音量就先收尾，否则这次改动还没排进队列，刷尾也刷不到它（#259）。
+        self.end_volume_scrub();
         // 只等这一条队列刷完：排队中的改动、启动回存、登出摘 Cookie 都在里头（#259）。
         let flush = self.settings_writer.flush();
         let (done_tx, done_rx) = std::sync::mpsc::channel();

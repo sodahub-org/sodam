@@ -22,13 +22,15 @@ use std::time::Duration;
 /// 一批改动的静默窗口：这么久没有新改动就落盘。
 const IDLE_FLUSH_AFTER: Duration = Duration::from_millis(300);
 
-/// 失败来自哪条路：界面排队的那份，还是启动期欠下的回存。
+/// 失败来自哪条路：界面排队的那份、启动期欠下的回存，还是队列已经没了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// 界面改动排队后的整份落盘。
     Settings,
     /// 启动期欠下的那次回存。
     Startup,
+    /// 写线程已经没了，这一笔根本没排进去。
+    QueueStopped,
 }
 
 impl FailureKind {
@@ -37,6 +39,7 @@ impl FailureKind {
         match self {
             Self::Settings => "保存设置失败",
             Self::Startup => "启动配置回存失败",
+            Self::QueueStopped => "保存队列已经停了",
         }
     }
 }
@@ -121,6 +124,8 @@ pub struct SettingsWriter {
     failure: Arc<Mutex<Option<WriteFailure>>>,
     /// 强制退出：析构时不再等写线程（慢盘 / 写锁被占时 join 会把进程挂住，#198）。
     abandon_on_drop: AtomicBool,
+    /// 队列已停这件事只报一次：`note_dead_queue` 用。
+    dead_logged: AtomicBool,
 }
 
 impl SettingsWriter {
@@ -153,37 +158,46 @@ impl SettingsWriter {
             thread,
             failure,
             abandon_on_drop: AtomicBool::new(false),
+            dead_logged: AtomicBool::new(false),
         }
     }
 
     /// 排一份整份快照；300ms 内又改了只写最后那份（后到的那份盖掉先到的）。
     pub fn schedule(&self, settings: &Settings) {
         if self.tx.send(Message::Snapshot(settings.clone())).is_err() {
-            self.note_dead_queue(FailureKind::Settings);
+            self.note_dead_queue();
         }
     }
 
     /// 启动期欠下的回存，排在已经到达的改动之后执行。
     pub fn persist_startup(&self, work: StartupWriteBack) {
         if self.tx.send(Message::Startup(work)).is_err() {
-            self.note_dead_queue(FailureKind::Startup);
+            self.note_dead_queue();
         }
     }
 
     /// 写线程已经没了：这一笔排不进去，也不能装作没事。
     ///
-    /// 记一行日志，再往失败槽里塞一条——下一拍心跳会把「没能保存」写进状态行，
+    /// 记一行日志，再往失败槽里塞一条——下一拍心跳会把提示写进状态行，
     /// 用户重启时不会突然发现刚才的改动白改了。
-    fn note_dead_queue(&self, kind: FailureKind) {
+    ///
+    /// 队列死了就再也起不来：日志只记第一笔，免得连点设置刷一串一样的行。
+    fn note_dead_queue(&self) {
+        if self.dead_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let detail = "保存队列已经停了".to_string();
         log_event(
             LogLevel::Warn,
             LogTopic::App,
             "settings_queue_stopped",
-            &[("context", kind.context()), ("detail", detail.as_str())],
+            &[("detail", detail.as_str())],
         );
         if let Ok(mut slot) = self.failure.lock() {
-            *slot = Some(WriteFailure { kind, detail });
+            *slot = Some(WriteFailure {
+                kind: FailureKind::QueueStopped,
+                detail,
+            });
         }
     }
 

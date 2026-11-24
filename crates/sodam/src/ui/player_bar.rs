@@ -111,15 +111,15 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |root, event: &MouseDownEvent, _window, cx| {
-                        // 拖动期间外部配置重载不得把滑条值弹回去（#185）。
-                        root.volume_scrubbing = true;
+                        // 拖动期间外部配置重载不得把滑条值弹回去（#185），落盘等停手再说。
+                        root.begin_volume_scrub();
                         apply_down(f32::from(event.position.x), root, cx);
                     }),
                 )
                 .on_mouse_move(
                     cx.listener(move |root, event: &MouseMoveEvent, _window, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
-                            root.volume_scrubbing = true;
+                            root.begin_volume_scrub();
                             apply_move(f32::from(event.position.x), root, cx);
                         } else {
                             // 拖动期间没排落盘，松手这一下补排（#259）。
