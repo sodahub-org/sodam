@@ -1359,14 +1359,12 @@ impl Settings {
         Self::fill_slot_from_env(&mut self.login_install_id, ENV_LOGIN_INSTALL_ID);
     }
 
-    /// 会话输入字段的唯一分类表：抄进会话的字段和「变了要重建会话」的字段，
-    /// 就是这一次解构里的同一批。
+    /// 会话输入的唯一分类表：抄进会话的字段，就是「变了要重建会话」的字段。
     ///
-    /// 解构故意不写 `..`：`Settings` 加了字段而这里没表态「算不算会话输入」，
-    /// 就编译不过，不会像以前那样一号清单 15 个、二号清单 10 个，音质还同时挂在两张上。
+    /// 解构故意不写 `..`：`Settings` 加了字段而这里没表态算不算会话输入，就编译不过。
     pub fn session_inputs(&self) -> SessionInputs {
         let Settings {
-            // —— 会话输入：会话持这 10 个，变了要重建会话 ——
+            // —— 会话输入：会话持下面这几个，变了要重建会话 ——
             signer_url,
             signer_token,
             cookie,
@@ -1413,8 +1411,11 @@ impl Settings {
 
     /// 登录成功后写入 Cookie：**先落盘，写成功了才算登录**。
     ///
-    /// 写盘失败时内存里的设置一点不动，Cookie 不进去，会话也不会被当成已登录——
-    /// 半登录状态在界面上看着像登录了，重启后又掉线，比直接报错糟得多。
+    /// 写盘失败时内存一点不动，Cookie 不进去，会话也不会被当成已登录。
+    ///
+    /// 这次写是整份覆盖：内存这份把文件整个盖掉，盘上这段时间被外部手改的内容会丢。
+    /// 登出那条路（[`Self::save_signed_out`]）是先读盘、只改 Cookie，两条口径不一致；
+    /// 登录也得合并外部手改的话，要等写入口统一收成一条之后再做。
     ///
     /// 同步写：调用方是界面线程。登录成功后用户可能三秒内就退出应用，
     /// 丢给后台队列会把这枚 Cookie 一起丢掉。
@@ -2383,12 +2384,12 @@ mod tests {
         assert!(unreadable_backup.exists(), "读不出又删不掉的备份保持原样");
     }
 
-    /// 只有那 10 个字段算会话输入，其余 13 个改了都不重建会话。
+    /// 会话输入之外的字段，改了都不重建会话。
     ///
     /// 解构不写 `..`：`Settings` 加字段而这里不表态，这个用例编译不过；
     /// 每个绑定又必须在下面某一个「改一下」里用上，漏一条 `-D warnings` 就拦下了。
     #[test]
-    fn only_ten_fields_are_session_inputs() {
+    fn only_session_inputs_force_a_rebuild() {
         let base = Settings::default();
         let Settings {
             signer_url,
@@ -2554,7 +2555,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.save_to(&path).unwrap();
 
-        // 登录轮询开始时的那份设置（以前会被会话抄一份带走、再整体写回盘）
+        // 登录轮询开始时的那份设置，留作对照
         let login_start = settings.clone();
 
         // 轮询期间，用户或外部编辑把主题、详细日志改了

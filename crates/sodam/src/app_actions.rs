@@ -665,10 +665,7 @@ impl Root {
         cx.notify();
     }
 
-    /// 播放偏好的后台写。
-    ///
-    /// 队列只合并音量、静音前音量、缓存上限三项（见 `preferences.rs`）。这里以前还要
-    /// 顺手把整份设置抄进会话，登录时靠那份副本回写盘；现在会话没这些字段，没地方抄了。
+    /// 把音量、静音前音量、缓存上限交给后台写队列合并落盘；别的字段这次不动它。
     fn persist_playback_preferences(&mut self) {
         self.preferences_writer.schedule(&self.settings);
     }

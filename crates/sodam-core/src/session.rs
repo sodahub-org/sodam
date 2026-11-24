@@ -756,11 +756,10 @@ fn encode_sidecar(
     }
 }
 
-/// 一次进程内共享的会话（持有 `Soda` 和它真正用的那 10 个设置字段）。
+/// 一次进程内共享的会话（持有 `Soda` 和它要的那几样设置）。
 pub struct Session {
     pumpkin: Soda,
-    /// 会话输入：只有 [`SessionInputs`] 那 10 个。会话不持整份设置，
-    /// 所以登录时不用再手抄 15 个字段回去、界面改音量也不用通知会话。
+    /// 会话就认这一份输入：凭据、签名与设备身份、音质意图。
     inputs: SessionInputs,
 }
 
@@ -1253,8 +1252,9 @@ impl Session {
         })
     }
 
-    /// 会话输出来的一份只读视图（测试与调试用；界面那一份在 `Root.settings`）。
-    pub fn inputs(&self) -> &SessionInputs {
+    /// 测试用：看一眼会话手里那份输入（界面那份在 `Root.settings`）。
+    #[cfg(test)]
+    pub(crate) fn inputs(&self) -> &SessionInputs {
         &self.inputs
     }
 
