@@ -111,25 +111,27 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |root, event: &MouseDownEvent, _window, cx| {
-                        // 拖动期间外部配置重载不得把滑条值弹回去（#185）。
-                        root.volume_scrubbing = true;
+                        // 拖动期间外部配置重载不得把滑条值弹回去（#185），落盘等停手再说。
+                        root.begin_volume_scrub();
                         apply_down(f32::from(event.position.x), root, cx);
                     }),
                 )
                 .on_mouse_move(
                     cx.listener(move |root, event: &MouseMoveEvent, _window, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
-                            root.volume_scrubbing = true;
+                            root.begin_volume_scrub();
                             apply_move(f32::from(event.position.x), root, cx);
                         } else {
-                            root.volume_scrubbing = false;
+                            // 鼠标移到滑条上但没按着：拖动已经结束（松手多半走 up，
+                            // 这里兜「按键早就松开」的情况），补排一次落盘。
+                            root.end_volume_scrub();
                         }
                     }),
                 )
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
-                        root.volume_scrubbing = false;
+                        root.end_volume_scrub();
                     }),
                 )
                 // 拖出滑条外松手收不到 on_mouse_up，用元素外的 up 兜底，
@@ -137,7 +139,7 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
-                        root.volume_scrubbing = false;
+                        root.end_volume_scrub();
                     }),
                 ),
         )

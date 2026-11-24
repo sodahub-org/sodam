@@ -18,6 +18,7 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
+use sodam_core::settings_writer::{FailureKind, SignOut};
 use sodam_core::upgrade::{
     identity_change, stop_reason, IdentityChange, Outcome, StopConditions, StopReason, Tally,
 };
@@ -28,8 +29,8 @@ use std::sync::Arc;
 
 use super::{
     apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
-    Nav, QueueOrigin, Root, VerifyWindowState, VerifyWindowStep, REMOTE_TEXT, RETRY_TEXT,
-    ROW_BATCH, SAVE_TEXT,
+    Nav, QueueOrigin, Root, VerifyWindowState, VerifyWindowStep, QUEUE_STOPPED_TEXT, REMOTE_TEXT,
+    RETRY_TEXT, ROW_BATCH, SAVE_TEXT, STARTUP_SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -362,11 +363,26 @@ impl Root {
                     root.notify_error_once("playback-engine-failed", message);
                     cx.notify();
                 }
-                if let Some(error) = root.preferences_writer.take_error() {
-                    let message = root.failure_text("保存播放设置失败", &error, SAVE_TEXT);
-                    root.notify_error_once("preferences-save-failed", message);
-                    cx.notify();
+                // 排队落盘失败：下一拍就在这里进状态行，不憋到退出才报（#259）。
+                // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记。
+                //
+                // 正在等刷尾退出时状态行留给「正在保存…」：先判这个，再去取失败——
+                // 顺序反了会把失败取走扔掉，退出那几秒里写盘失败的提示就永远看不到了。
+                if !root.quit_gate.is_saving() {
+                    if let Some(failure) = root.settings_writer.take_error() {
+                        let text = match failure.kind {
+                            FailureKind::Settings => SAVE_TEXT,
+                            FailureKind::Startup => STARTUP_SAVE_TEXT,
+                            FailureKind::QueueStopped => QUEUE_STOPPED_TEXT,
+                        };
+                        let message = root.tr(text).to_string();
+                        root.notify_error_once("settings-save-failed", message);
+                        cx.notify();
+                    }
                 }
+                // 音量拖动收不到松手事件时（拖到窗口外松手、拖动中切走窗口），
+                // 停手一拍就当作结束：补排落盘，别让音量停在内存里（#259）。
+                root.settle_volume_scrub();
                 if snap.playing || root.pending_track.is_some() {
                     cx.notify();
                 }
@@ -549,31 +565,21 @@ impl Root {
     /// 当前这首不重载：中途断开已取到的流不划算，也与主流客户端一致。
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
         let intent = sodam_core::quality::QualityIntent::parse(quality);
-        // 先改一份副本，写盘成功了才认：失败时 `self.settings` 原样不动。会话只认
-        // 写进盘的档位，预取和点播又是拿 `self.settings` 现建会话的，两边不能一个
-        // 新档一个旧档——缓存文件按档位命名，错开就会互相找不到。
-        let mut next = self.settings.clone();
-        next.set_quality_intent_by_user(&intent);
-        let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
-        match next.save() {
-            Ok(()) => {
-                // 这一次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
-                self.settings = next;
-                if let Some(session) = self.session.as_mut() {
-                    session.adopt(&self.settings);
-                }
-                // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
-                // 不值得再弹一条抢注意力的全局提示（见 #83）。
-                let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
-                self.set_status_text(message);
-            }
-            Err(err) => {
-                // 落盘失败就只报错：再补一句「已设为」会让同屏出现「错误 + 假成功」，
-                // toast 一走就只剩那句假的。
-                let message = self.failure_text("保存音质设置失败", &err, SAVE_TEXT);
-                self.notify_error_once("quality-save-failed", message);
-            }
+        self.settings.set_quality_intent_by_user(&intent);
+        // 会话只认会话输入：换档后立刻重建会话，缓存文件按档位命名，
+        // 界面新档、会话旧档错开就会互相找不到。
+        if let Some(session) = self.session.as_mut() {
+            session.adopt(&self.settings);
         }
+        // 落盘排进后台队列：连点几档也只写一次盘（#259）。
+        // 与以前「写盘成功才算数」不同：这里先认新档位，真写失败时状态行会补一句没保存上，
+        // 本次运行照常用新档。
+        self.save_settings();
+        // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
+        // 不值得再弹一条抢注意力的全局提示（见 #83）。
+        let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
+        let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
+        self.set_status_text(message);
         // 切档后按新意图重新预取下一首（正在播的这首不受影响）
         self.spawn_prefetch(cx);
         self.quality_menu = None;
@@ -585,22 +591,15 @@ impl Root {
     pub fn set_detailed_logs(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.detailed_logs = enabled;
         log_outlet::set_global_detailed(enabled);
-        // 详细日志不算会话输入，会话不用同步；下面那次整份保存就是它的落盘。
-        match self.settings.save() {
-            Ok(()) => {
-                let message = if enabled {
-                    self.tr("已开启详细日志：六个话题都会记到 DEBUG，重启后保持")
-                } else {
-                    self.tr("已关闭详细日志：回到 INFO，环境变量仍然有效")
-                };
-                // 同上：开关就在设置页上，一句状态行确认即可，不弹全局提示。
-                self.set_status_text(message);
-            }
-            Err(err) => {
-                let message = self.failure_text("详细日志已生效，但保存失败", &err, SAVE_TEXT);
-                self.notify_error_once("detailed-logs-save-failed", message);
-            }
-        }
+        // 详细日志不算会话输入，会话不用同步；落盘排进后台队列。
+        self.save_settings();
+        let message = if enabled {
+            self.tr("已开启详细日志：六个话题都会记到 DEBUG，重启后保持")
+        } else {
+            self.tr("已关闭详细日志：回到 INFO，环境变量仍然有效")
+        };
+        // 同上：开关就在设置页上，一句状态行确认即可，不弹全局提示。
+        self.set_status_text(message);
         cx.notify();
     }
 
@@ -645,26 +644,50 @@ impl Root {
     pub fn set_volume(&mut self, volume: f32) {
         self.settings.set_volume(volume);
         self.engine.set_volume(self.settings.volume);
-        self.persist_playback_preferences();
+        // 拖滑条时每动一下就排一份整份快照太浪费：拖动中只记时刻，
+        // 松手（或停手一会儿）再补一次整份落盘。
+        if !self.volume_scrub.touch(std::time::Instant::now()) {
+            self.save_settings();
+        }
+    }
+
+    /// 音量拖动开始（按下滑条）：之后的外部重载不弹回音量，落盘等停手再说。
+    pub(crate) fn begin_volume_scrub(&mut self) {
+        self.volume_scrub.begin(std::time::Instant::now());
+    }
+
+    /// 音量拖动结束（松手 / 拖出滑条）：补排一次落盘。
+    ///
+    /// 松手事件不一定会来（拖到窗口外松手、拖动中切走窗口），所以心跳还会用
+    /// [`Self::settle_volume_scrub`] 兜一层。
+    pub(crate) fn end_volume_scrub(&mut self) {
+        if self.volume_scrub.finish() {
+            self.save_settings();
+        }
+    }
+
+    /// 停手够久就当这次拖动结束了：补排落盘、清掉记号。
+    ///
+    /// 只靠 `on_mouse_up` 收尾的话，收不到松手时会丢两样：音量没落盘（重启回到旧值），
+    /// 拖动记号一直挂着（之后外部热重载送来的音量全被忽略）。
+    pub(crate) fn settle_volume_scrub(&mut self) {
+        if self.volume_scrub.settled(std::time::Instant::now()) {
+            self.end_volume_scrub();
+        }
     }
 
     /// 静音 / 恢复。以设置中的即时值判断，快速连点不依赖音频线程的回执时机。
     pub fn toggle_mute(&mut self) {
         self.settings.toggle_mute();
         self.engine.set_volume(self.settings.volume);
-        self.persist_playback_preferences();
+        self.save_settings();
     }
 
     pub(crate) fn set_cache_limit_mb(&mut self, mb: u64, cx: &mut Context<Self>) {
         self.settings.audio_cache_limit_mb = mb.clamp(1024, 1024 * 1024);
-        self.persist_playback_preferences();
+        self.save_settings();
         self.maintain_cache(cx);
         cx.notify();
-    }
-
-    /// 把音量、静音前音量、缓存上限交给后台写队列合并落盘；别的字段这次不动它。
-    fn persist_playback_preferences(&mut self) {
-        self.preferences_writer.schedule(&self.settings);
     }
 
     pub(crate) fn maintain_cache(&mut self, cx: &mut Context<Self>) {
@@ -1071,6 +1094,9 @@ impl Root {
                                 root.invalidate_identity_conclusions();
                                 // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
                                 log_prefetch_resume(root.prefetch_gate.note_login_success());
+                                // 队列里可能还攒着登录前端改动拍的快照：拿现在这份盖掉它，
+                                // 免得 300ms 后落盘时把别的字段写回登录前的值（#259）。
+                                root.save_settings();
                                 root.set_status_text(
                                     language.text("登录成功，正在读取账号信息…").to_string(),
                                 );
@@ -1293,25 +1319,15 @@ impl Root {
     pub fn set_ui_theme(&mut self, theme: ThemeKind, cx: &mut Context<Self>) {
         self.apply_theme_state(theme.key(), cx);
         self.settings.theme = theme.key().to_string();
-        let save_result = self.settings.save();
-        match save_result {
-            Ok(()) => {
-                // 文案要过词典：状态行现在真的会显示，英文界面不能露出中文。
-                let label = if theme == ThemeKind::Light {
-                    self.tr("浅色")
-                } else {
-                    self.tr("深色")
-                };
-                let status = self.localized("主题已切换为{}", &[label.to_string()]);
-                self.set_status_text(status);
-            }
-            Err(err) => {
-                self.notify_error_once(
-                    "theme-save-failed",
-                    self.failure_text("主题已切换，但保存失败", &err, SAVE_TEXT),
-                );
-            }
-        }
+        self.save_settings();
+        // 文案要过词典：状态行现在真的会显示，英文界面不能露出中文。
+        let label = if theme == ThemeKind::Light {
+            self.tr("浅色")
+        } else {
+            self.tr("深色")
+        };
+        let status = self.localized("主题已切换为{}", &[label.to_string()]);
+        self.set_status_text(status);
         cx.notify();
     }
 
@@ -1319,16 +1335,8 @@ impl Root {
     pub fn set_ui_theme_system(&mut self, cx: &mut Context<Self>) {
         self.apply_theme_state("", cx);
         self.settings.theme = String::new();
-        let save_result = self.settings.save();
-        match save_result {
-            Ok(()) => self.set_status_text(self.tr("主题已恢复为跟随系统")),
-            Err(err) => {
-                self.notify_error_once(
-                    "theme-save-failed",
-                    self.failure_text("已切换为跟随系统，但保存失败", &err, SAVE_TEXT),
-                );
-            }
-        }
+        self.save_settings();
+        self.set_status_text(self.tr("主题已恢复为跟随系统"));
         cx.notify();
     }
 
@@ -2487,18 +2495,19 @@ impl Root {
         // 写盘在锁里读盘上最新配置、只摘 Cookie 再写回：盘上的 Cookie 已经不是
         // 点击时那个就整次跳过，不会拿旧快照盖掉换进来的新身份，也不吃掉
         // 保存期间改过的主题、音量等字段（#197）。
+        // 摘 Cookie 这一步也排进写队列：退出应用只等一个 flush，它自然包含在内（#259）。
         let expected_cookie = logout_cookie.clone();
-        let save =
-            cx.background_spawn(async move { logout_snapshot.save_signed_out(&expected_cookie) });
+        let save = self
+            .settings_writer
+            .sign_out(logout_snapshot, expected_cookie);
         self.logout_in_flight = true;
         // 慢盘时保存要等一会儿，先给一句反馈，别让点击看起来没反应。
         self.set_status_text(self.tr("正在退出登录…"));
         cx.notify();
-        // 句柄留在 `Root` 上：退出应用时 `on_app_quit` 要等它写完，
-        // 否则保存没落盘就退出，盘上还留着旧 Cookie。
-        let handle = cx.spawn(async move |this, cx| {
+        // 任务不留在 `Root` 上：落盘本身排在队列里，退出时 `flush()` 会等到它写完。
+        cx.spawn(async move |this, cx| {
             let outcome = save.await;
-            let confirm = this.update(cx, |root, cx| {
+            let _ = this.update(cx, |root, cx| {
                 root.logout_in_flight = false;
                 if root.settings.cookie != logout_cookie {
                     // 保存期间换过身份：这份结果已经过期，丢掉，不能拿来清身份。
@@ -2508,10 +2517,10 @@ impl Root {
                         root.set_status_text(root.tr("已退出登录"));
                     }
                     cx.notify();
-                    return None;
+                    return;
                 }
-                let confirm = match outcome {
-                    Ok(true) => {
+                let done = match outcome {
+                    Ok(SignOut::Done) => {
                         // 本次运行里明确登出过：热重载不能再让 `SODA_COOKIE` 把身份补回来（#192）。
                         // 记号不落盘，重启后仍按环境变量启动。
                         root.env_cookie_opted_out = true;
@@ -2522,15 +2531,15 @@ impl Root {
                         if let Some(session) = root.session.as_mut() {
                             session.adopt(root.settings.clone());
                         }
-                        // 收尾再确认一次：登出保存持锁期间，别的保存可能正在 UI 线程
-                        // 排队等锁，随后把还带旧 Cookie 的设置写回盘（#197 复审）。
-                        // 只清「盘上仍是旧 Cookie」的情况；已经空了不写，换过身份也跳过。
-                        Some((root.settings.clone(), logout_cookie.clone()))
+                        // 队列里要是还攒着登出前拍的快照，也不用在这里补一次确认写：
+                        // 排队落盘的 Cookie 一律沿用盘上那份（`Settings::save_queued_to`），
+                        // 盘上已经空了，怎么写都带不回旧身份（#259）。
+                        true
                     }
-                    Ok(false) => {
+                    Ok(SignOut::IdentityChanged) => {
                         // 盘上身份已经变了，这次写入被跳过：什么都不改，
                         // 等热重载或登录流程把它们自己的状态行发出来。
-                        None
+                        false
                     }
                     Err(err) => {
                         // 错误提示会把状态行里的「正在退出登录…」换成同一句失败文案。
@@ -2542,10 +2551,10 @@ impl Root {
                                 "退出登录失败，账号仍保持登录；检查配置文件能否写入后重试。",
                             ),
                         );
-                        None
+                        false
                     }
                 };
-                if confirm.is_some() {
+                if done {
                     root.clear_identity_state(cx);
                     // 备份不用在这里再写一次：保存本身在写锁内已经刷新过（#185）。
                     if sodam_core::config::env_cookie_present() {
@@ -2557,18 +2566,9 @@ impl Root {
                     }
                 }
                 cx.notify();
-                confirm
             });
-            // 收尾确认跑在登出这条任务链里：退出时等 `logout_save_task` 就一起等到了，
-            // 不会出现「退出流程结束、确认写入还在跑」的窗口（#197 复审）。
-            if let Ok(Some((settings, expected))) = confirm {
-                cx.background_spawn(async move {
-                    let _ = settings.save_signed_out(&expected);
-                })
-                .await;
-            }
-        });
-        self.logout_save_task = Some(handle);
+        })
+        .detach();
     }
 
     /// 旧身份的界面状态清理：播放停住、队列与账号/收藏清空、回到设置页。
@@ -3708,7 +3708,7 @@ impl Root {
         }
         self.queue.mode = sodam_core::queue::PlayMode::Shuffle;
         self.settings.play_mode = self.queue.mode;
-        self.persist_playback_preferences();
+        self.save_settings();
         let start = Queue::random_start(tracks.len());
         self.play_from(tracks.as_ref().clone(), start, cx);
         // 入队后立刻生成一轮，让抽屉马上显示真实的「接下来」。
@@ -4343,7 +4343,7 @@ impl Root {
         self.settings.play_mode = self.queue.mode;
         let label = self.tr(self.queue.mode.label());
         self.set_status("播放模式：{}", &[label.to_string()]);
-        self.persist_playback_preferences();
+        self.save_settings();
         cx.notify();
     }
 
@@ -4452,7 +4452,7 @@ impl Root {
         let old = self.settings.clone();
 
         // 防回跳：用户正拖着音量滑条时，外部重载不动音量。
-        if self.volume_scrubbing {
+        if self.volume_scrub.scrubbing() {
             incoming.volume = old.volume;
             incoming.volume_before_mute = old.volume_before_mute;
         }

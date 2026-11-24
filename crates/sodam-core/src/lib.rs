@@ -17,13 +17,14 @@ pub mod mem;
 pub mod models;
 pub mod play_report;
 pub mod playback_trace;
-pub mod preferences;
 pub mod prefetch;
 pub mod quality;
 pub mod queue;
 pub mod quit_gate;
 pub mod session;
+pub mod settings_writer;
 pub mod upgrade;
+pub mod volume_scrub;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;

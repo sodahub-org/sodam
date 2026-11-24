@@ -15,7 +15,7 @@ pub(crate) static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_SELF_WRITE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// 应用自己保存后，这段窗口内的文件变化都按「自己写的」静默处理。
-/// 覆盖整份保存与音量写线程的合并保存（两者都走 [`Self::save_to_locked`]）。
+/// 覆盖所有保存路径（登录那次同步写、写队列里的排队落盘、登出摘 Cookie）。
 const SELF_WRITE_WINDOW: Duration = Duration::from_millis(1500);
 
 /// 登录设备身份的环境变量名：启动期补全、公共合并与单测共用一份名字。
@@ -438,8 +438,8 @@ fn parse_settings_text(text: &str) -> Result<Settings, String> {
     }
 }
 
-/// 解析配置字节（音量写线程的读-改-写走这里）：与文本路径共用字段级容错，
-/// 单个字段坏了不连累整份合并写。
+/// 解析配置字节（写队列落盘前要读盘上那份 Cookie，走这里）：与文本路径共用字段级容错，
+/// 单个字段坏了不连累整份读写。
 pub(crate) fn parse_settings_bytes(bytes: &[u8]) -> Result<Settings, String> {
     let text = std::str::from_utf8(bytes).map_err(|err| format!("invalid utf-8: {err}"))?;
     parse_settings_text(text)
@@ -561,7 +561,7 @@ fn quarantine_corrupt_file_locked(path: &Path) -> Option<PathBuf> {
 
 /// 坏文件隔离的目标名：`config.json` → `config.json.bad-<毫秒时间戳>`。
 ///
-/// 只算名字、不动文件：读盘阶段先定好目标，真正改名留到首帧后的后台修正（#191）。
+/// 只算名字、不动文件：读盘阶段先定好目标，真正改名留给写队列在后台做（#191）。
 fn quarantine_target(path: &Path) -> Option<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -584,7 +584,7 @@ pub enum StartupRecovery {
     FellBackToDefaults { error: String },
 }
 
-/// 启动加载的内存结果：设置、恢复提示，以及需要在首帧后台补做的落盘修正。
+/// 启动加载的内存结果：设置、恢复提示，以及需要在后台补做的落盘修正。
 pub struct StartupLoad {
     pub settings: Settings,
     pub recovery: Option<StartupRecovery>,
@@ -614,7 +614,7 @@ fn debug_delay_persist() {
 #[cfg(not(debug_assertions))]
 fn debug_delay_persist() {}
 
-/// 启动期欠下的落盘修正：读盘阶段只收集，首帧后到后台线程执行（#191）。
+/// 启动期欠下的落盘修正：读盘阶段只收集，交给写队列的线程执行（#191）。
 ///
 /// 这几步都是有副作用的小文件操作，不能放在 UI 线程；失败只上报，不影响本次运行。
 pub struct StartupWriteBack {
@@ -683,7 +683,7 @@ impl StartupWriteBack {
 /// 启动加载：只读 + 内存修正，不写盘（#191）。
 ///
 /// 正常路径读主文件、补环境变量、生成登录设备身份并做旧格式迁移，全部只在内存里；
-/// 该落盘的修正放进 [`StartupWriteBack`]，由调用方在首帧后到后台线程执行。
+/// 该落盘的修正放进 [`StartupWriteBack`]，由调用方交给写队列在后台线程执行。
 /// 主文件损坏时先试备份——备份可用就用备份继续、坏文件改名保留；无备份则默认值
 /// 启动且绝不碰坏文件。
 pub fn load_for_startup(path: &Path) -> StartupLoad {
@@ -702,7 +702,7 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                     // 备份里没带登录身份时，环境变量仍然要先生效（#186）；
                     // 备份自带的身份优先。
                     let (backup, _) = Settings::prepare_loaded(backup, false);
-                    // 读盘阶段只算隔离目标名，不改名；坏文件等首帧后的后台修正再动。
+                    // 读盘阶段只算隔离目标名，不改名；坏文件等后台回存那一步再动。
                     let bad_path = quarantine_target(path).unwrap_or_else(|| path.to_path_buf());
                     StartupLoad {
                         write_back: Some(StartupWriteBack {
@@ -810,7 +810,7 @@ impl Settings {
     /// 读配置；文件不存在时返回默认值（不报错）。
     ///
     /// 同步读写的便捷入口（示例 / 工具用）。应用启动请走 [`load_for_startup`]：
-    /// 那条路径只读，落盘修正留给首帧后的后台任务（#191）。
+    /// 那条路径只读，落盘修正交给写队列在后台做（#191）。
     pub fn load() -> Self {
         Self::load_from(&Self::config_path())
     }
@@ -845,7 +845,7 @@ impl Settings {
 
     /// 读盘结果的内存修正：补环境变量、生成登录设备身份，返回 `(设置, 是否需要回存)`。
     ///
-    /// 不写盘：启动路径把「要不要回存」交给 [`StartupWriteBack`] 在首帧后处理（#191）。
+    /// 不写盘：启动路径把「要不要回存」交给 [`StartupWriteBack`] 在后台处理（#191）。
     fn prepare_loaded(mut settings: Self, changed: bool) -> (Self, bool) {
         // 环境变量补在身份生成之前：首启时 `SODA_LOGIN_DEVICE_ID` / `SODA_LOGIN_INSTALL_ID`
         // 才能决定这份身份，否则身份先生成落盘，环境变量永远补不进去（#186）。
@@ -875,7 +875,7 @@ impl Settings {
     /// - 数值越界由 `normalize_playback` 钳制。
     /// - 只有语法层面的损坏（连 JSON 都不是、或结构对不上）才算 [`LoadOutcome::Corrupt`]。
     /// - 旧格式迁移只改内存值；是否回存由调用方决定：[`load_for_startup`] 把落盘
-    ///   推迟到首帧后，[`Self::load_from`] 同步落盘；热重载路径拿到 `migrated`
+    ///   推迟到写队列，[`Self::load_from`] 同步落盘；热重载路径拿到 `migrated`
     ///   也不回写，避免外部编辑被立刻覆盖。
     pub fn try_load_from(path: &Path) -> LoadOutcome {
         // 与保存共用同一把写锁：轮询读文件不会被并发保存的原子替换序列读到中间态。
@@ -975,6 +975,33 @@ impl Settings {
         self.save_to_locked(path)
     }
 
+    /// 排队落盘用：整份快照照写，但 Cookie 一律沿用**盘上那份**（#259）。
+    ///
+    /// 排队的那份快照可能比盘上旧：它是在界面上改设置那一刻拍的，而登录、登出各有
+    /// 自己的写盘路径。连着 Cookie 一起写下去，就会把慢一拍落盘的新身份换回旧的。
+    ///
+    /// 盘上读不出来（没有文件 / 坏了）就按快照自己的 Cookie 写：坏原件交给
+    /// `save_to_locked` 的隔离流程处理。
+    pub fn save_queued_to(&self, path: &Path) -> anyhow::Result<()> {
+        let _guard = SETTINGS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut next = self.clone();
+        if let Some(current) = Self::read_latest_locked(path) {
+            next.cookie = current.cookie;
+        }
+        Self::debug_delay_before_write();
+        next.save_to_locked(path)
+    }
+
+    /// 盘上最新那份配置；文件不在或读不出（含坏了）时 `None`。
+    ///
+    /// 调用方必须持有 [`SETTINGS_WRITE_LOCK`]（锁不可重入）。
+    fn read_latest_locked(path: &Path) -> Option<Settings> {
+        let bytes = std::fs::read(path).ok()?;
+        parse_settings_bytes(&bytes).ok()
+    }
+
     /// 登出落盘：把**盘上最新那份配置**摘掉 Cookie 再写回去（#197）。
     ///
     /// 读盘、比对、写入在同一把写锁里完成：
@@ -993,9 +1020,7 @@ impl Settings {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         Self::debug_delay_before_write();
-        let latest = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| parse_settings_bytes(&bytes).ok());
+        let latest = Self::read_latest_locked(path);
         let outcome = latest.map(|mut current| {
             // 盘上本来就没有 Cookie（内存身份来自环境变量补全）：主文件不用改，
             // 但备份也要刷成同样的内容——备份里留着旧 Cookie 的话，
@@ -2095,7 +2120,7 @@ mod tests {
             load.settings.search_history.is_empty(),
             "关闭搜索历史后不得残留旧记录"
         );
-        // 恢复的落盘修正要在首帧后由后台执行（#191）。
+        // 恢复的落盘修正由写队列在后台做（#191）。
         load.write_back
             .expect("备份恢复应欠落盘修正")
             .persist()
@@ -2124,7 +2149,7 @@ mod tests {
             .expect("正常路径应欠一次备份刷新")
             .persist()
             .expect("后台修正应成功");
-        assert!(settings_backup_path(&path).exists(), "首帧后应补上备份");
+        assert!(settings_backup_path(&path).exists(), "回存后应补上备份");
     }
 
     /// 损坏路径：读盘阶段只算隔离目标，坏文件不动；persist 之后才改名保留并恢复主文件。
@@ -2573,6 +2598,61 @@ mod tests {
         );
         assert_eq!(reloaded.theme, "light");
         assert!(reloaded.detailed_logs);
+    }
+
+    /// 排队落盘不写回旧 Cookie：盘上刚登出（Cookie 空），队列里还攒着登出前的快照。
+    #[test]
+    fn queued_save_never_writes_a_stale_cookie_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let on_disk = Settings {
+            cookie: "sessionid_ss=old".into(),
+            ..Settings::default()
+        };
+        on_disk.save_to(&path).unwrap();
+
+        // 登出：盘上 Cookie 清掉。
+        let mut signed_out = on_disk.clone();
+        signed_out.cookie.clear();
+        assert!(
+            signed_out
+                .save_signed_out_to(&path, "sessionid_ss=old")
+                .unwrap(),
+            "盘上还是旧身份，登出该真的摘掉 Cookie"
+        );
+
+        // 界面在登出前拍的快照：Cookie 还是旧的，音量也改了。
+        let mut stale = on_disk.clone();
+        stale.set_volume(0.3);
+        stale.save_queued_to(&path).unwrap();
+
+        let reloaded = settings_on_disk(&path);
+        assert_eq!(reloaded.cookie, "", "旧 Cookie 不许写回盘");
+        assert!((reloaded.volume - 0.3).abs() < f32::EPSILON, "别的字段照写");
+    }
+
+    /// 排队落盘不盖掉刚写进去的新 Cookie（登录那次是界面线程当场写盘的）。
+    #[test]
+    fn queued_save_keeps_the_cookie_that_login_just_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let before_login = Settings::default();
+        before_login.save_to(&path).unwrap();
+
+        let mut login = before_login.clone();
+        login
+            .apply_login_cookie_to(&path, "sessionid_ss=new")
+            .unwrap();
+
+        let mut stale = before_login.clone();
+        stale.set_volume(0.25);
+        stale.save_queued_to(&path).unwrap();
+
+        let reloaded = settings_on_disk(&path);
+        assert_eq!(reloaded.cookie, "sessionid_ss=new");
+        assert!((reloaded.volume - 0.25).abs() < f32::EPSILON);
     }
 
     /// 直接读盘上 JSON，绕开环境变量补全，免得用例受外部影响。

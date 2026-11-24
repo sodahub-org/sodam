@@ -155,6 +155,10 @@ impl Language {
             "出现了一点问题，检查网络后重试。" => "Something went wrong. Check your network.",
             "出现了一点问题，请重试。" => "Something went wrong. Try again.",
             "没能保存，检查磁盘空间后重试。" => "Couldn't save. Check your disk space.",
+            "启动时的配置修正没写成功，本次运行照常；检查配置文件能否写入。" =>
+                "Couldn't save the startup config change. This session is unaffected; check that the config file is writable.",
+            "设置没法保存了，重启应用再试。" =>
+                "Your settings can't be saved right now. Restart the app.",
             "账号登录已过期，已停止播放。" => {
                 "Your account's sign-in expired. Playback stopped."
             }
@@ -963,6 +967,23 @@ mod tests {
             "英文词典缺少这些 key：\n{}",
             missing.join("\n")
         );
+    }
+
+    /// 走常量传进去的文案（`root.tr(SAVE_TEXT)` 这类）扫描扫不到，单独守一道。
+    #[test]
+    fn failure_text_constants_have_english_entries() {
+        use crate::app::{
+            QUEUE_STOPPED_TEXT, REMOTE_TEXT, RETRY_TEXT, SAVE_TEXT, STARTUP_SAVE_TEXT,
+        };
+        for key in [
+            REMOTE_TEXT,
+            RETRY_TEXT,
+            SAVE_TEXT,
+            STARTUP_SAVE_TEXT,
+            QUEUE_STOPPED_TEXT,
+        ] {
+            assert_ne!(Language::English.text(key), key, "英文词典缺少这条：{key}");
+        }
     }
 
     /// 确保音质档位的显示名都有英文翻译，避免核心层新增档位后英文界面露出中文。
