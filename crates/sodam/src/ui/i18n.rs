@@ -155,6 +155,8 @@ impl Language {
             "出现了一点问题，检查网络后重试。" => "Something went wrong. Check your network.",
             "出现了一点问题，请重试。" => "Something went wrong. Try again.",
             "没能保存，检查磁盘空间后重试。" => "Couldn't save. Check your disk space.",
+            "启动时的配置修正没写成功，本次运行照常；检查配置文件能否写入。" =>
+                "Couldn't write the startup config fix. This run is fine; check that the config file is writable.",
             "账号登录已过期，已停止播放。" => {
                 "Your account's sign-in expired. Playback stopped."
             }

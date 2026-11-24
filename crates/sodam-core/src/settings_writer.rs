@@ -158,12 +158,33 @@ impl SettingsWriter {
 
     /// 排一份整份快照；300ms 内又改了只写最后那份（后到的那份盖掉先到的）。
     pub fn schedule(&self, settings: &Settings) {
-        let _ = self.tx.send(Message::Snapshot(settings.clone()));
+        if self.tx.send(Message::Snapshot(settings.clone())).is_err() {
+            self.note_dead_queue(FailureKind::Settings);
+        }
     }
 
     /// 启动期欠下的回存，排在已经到达的改动之后执行。
     pub fn persist_startup(&self, work: StartupWriteBack) {
-        let _ = self.tx.send(Message::Startup(work));
+        if self.tx.send(Message::Startup(work)).is_err() {
+            self.note_dead_queue(FailureKind::Startup);
+        }
+    }
+
+    /// 写线程已经没了：这一笔排不进去，也不能装作没事。
+    ///
+    /// 记一行日志，再往失败槽里塞一条——下一拍心跳会把「没能保存」写进状态行，
+    /// 用户重启时不会突然发现刚才的改动白改了。
+    fn note_dead_queue(&self, kind: FailureKind) {
+        let detail = "保存队列已经停了".to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "settings_queue_stopped",
+            &[("context", kind.context()), ("detail", detail.as_str())],
+        );
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(WriteFailure { kind, detail });
+        }
     }
 
     /// 登出：排进队列摘 Cookie，写完把结果交回界面。
@@ -556,9 +577,9 @@ mod tests {
     /// 防抖：改完不立刻写，等静默窗口过去才落盘；窗口里又来一份，写的是后到的那份。
     #[test]
     fn changes_wait_for_the_idle_window() {
-        let (writer, log) = writer_with_window(recording(false), Duration::from_millis(200));
+        let (writer, log) = writer_with_window(recording(false), Duration::from_millis(400));
         writer.schedule(&settings_with_volume(0.7));
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(80));
         assert!(
             log.lock().unwrap().writes.is_empty(),
             "刚改完就落盘，没等静默窗口"

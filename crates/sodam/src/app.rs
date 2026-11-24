@@ -35,6 +35,9 @@ use std::sync::{Arc, Mutex};
 pub(crate) const REMOTE_TEXT: &str = "出现了一点问题，检查网络后重试。";
 /// 本地保存/写入类失败的统一说法：这类失败和网络无关。
 pub(crate) const SAVE_TEXT: &str = "没能保存，检查磁盘空间后重试。";
+/// 启动期那次回存失败的说法：和用户刚改的设置无关，得说清。
+pub(crate) const STARTUP_SAVE_TEXT: &str =
+    "启动时的配置修正没写成功，本次运行照常；检查配置文件能否写入。";
 /// 既不是网络也不是写入的失败（例如本地编码出错）：不指责任何一方，只说重试。
 pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 
@@ -688,8 +691,10 @@ impl Root {
             }
         }
         // 一条队列管所有设置落盘：界面线程只管改内存，写盘全在它自己的工作线程上。
+        let settings_writer = sodam_core::settings_writer::SettingsWriter::new(config_path);
         // 读盘阶段欠下的修正（隔离坏文件 / 迁移回存 / 刷备份）第一位排进去（#191 / #259）。
-        let settings_writer = sodam_core::settings_writer::SettingsWriter::new(config_path.clone());
+        // 以前这一步等首帧后才做，是怕开窗时同步写盘卡住 UI；现在写盘在写线程上，
+        // 构造期排进去也不挡开窗，那条时序约束不再需要。
         if let Some(write_back) = write_back {
             settings_writer.persist_startup(write_back);
         }

@@ -15,7 +15,7 @@ pub(crate) static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_SELF_WRITE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// 应用自己保存后，这段窗口内的文件变化都按「自己写的」静默处理。
-/// 覆盖整份保存与音量写线程的合并保存（两者都走 [`Self::save_to_locked`]）。
+/// 覆盖所有保存路径（登录那次同步写、写队列里的排队落盘、登出摘 Cookie）。
 const SELF_WRITE_WINDOW: Duration = Duration::from_millis(1500);
 
 /// 登录设备身份的环境变量名：启动期补全、公共合并与单测共用一份名字。
@@ -438,8 +438,8 @@ fn parse_settings_text(text: &str) -> Result<Settings, String> {
     }
 }
 
-/// 解析配置字节（音量写线程的读-改-写走这里）：与文本路径共用字段级容错，
-/// 单个字段坏了不连累整份合并写。
+/// 解析配置字节（写队列落盘前要读盘上那份 Cookie，走这里）：与文本路径共用字段级容错，
+/// 单个字段坏了不连累整份读写。
 pub(crate) fn parse_settings_bytes(bytes: &[u8]) -> Result<Settings, String> {
     let text = std::str::from_utf8(bytes).map_err(|err| format!("invalid utf-8: {err}"))?;
     parse_settings_text(text)
@@ -977,12 +977,11 @@ impl Settings {
 
     /// 排队落盘用：整份快照照写，但 Cookie 一律沿用**盘上那份**（#259）。
     ///
-    /// 改 Cookie 的只有两处：登录成功那次（界面线程当场写盘）和登出（队列里专门的一步）。
-    /// 界面上排队的保存要是把改之前拍的那份快照连 Cookie 一起写下去，慢一拍落盘就会
-    /// 把刚登进去的新身份换回旧的，或者把刚登出的旧身份又写回来。
+    /// 排队的那份快照可能比盘上旧：它是在界面上改设置那一刻拍的，而登录、登出各有
+    /// 自己的写盘路径。连着 Cookie 一起写下去，就会把慢一拍落盘的新身份换回旧的。
     ///
     /// 盘上读不出来（没有文件 / 坏了）就按快照自己的 Cookie 写：坏原件交给
-    /// [`Self::save_to_locked`] 的隔离流程处理。
+    /// `save_to_locked` 的隔离流程处理。
     pub fn save_queued_to(&self, path: &Path) -> anyhow::Result<()> {
         let _guard = SETTINGS_WRITE_LOCK
             .lock()

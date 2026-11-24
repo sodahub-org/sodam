@@ -122,14 +122,15 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             root.volume_scrubbing = true;
                             apply_move(f32::from(event.position.x), root, cx);
                         } else {
-                            root.volume_scrubbing = false;
+                            // 拖动期间没排落盘，松手这一下补排（#259）。
+                            root.end_volume_scrub();
                         }
                     }),
                 )
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
-                        root.volume_scrubbing = false;
+                        root.end_volume_scrub();
                     }),
                 )
                 // 拖出滑条外松手收不到 on_mouse_up，用元素外的 up 兜底，
@@ -137,7 +138,7 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                 .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(move |root, _event: &MouseUpEvent, _window, _cx| {
-                        root.volume_scrubbing = false;
+                        root.end_volume_scrub();
                     }),
                 ),
         )

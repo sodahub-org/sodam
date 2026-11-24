@@ -18,7 +18,7 @@ use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::settings_writer::SignOut;
+use sodam_core::settings_writer::{FailureKind, SignOut};
 use sodam_core::upgrade::{
     identity_change, stop_reason, IdentityChange, Outcome, StopConditions, StopReason, Tally,
 };
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::{
     apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
     Nav, QueueOrigin, Root, VerifyWindowState, VerifyWindowStep, REMOTE_TEXT, RETRY_TEXT,
-    ROW_BATCH, SAVE_TEXT,
+    ROW_BATCH, SAVE_TEXT, STARTUP_SAVE_TEXT,
 };
 use sodam_core::queue::{PlayMode, Queue};
 
@@ -364,12 +364,20 @@ impl Root {
                     cx.notify();
                 }
                 // 排队落盘失败：下一拍就在这里进状态行，不憋到退出才报（#259）。
-                // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记；
-                // 正在等刷尾退出时状态行留给「正在保存…」，这一句就不抢了。
-                if root.settings_writer.take_error().is_some() && !root.quit_gate.is_saving() {
-                    let message = root.tr(SAVE_TEXT).to_string();
-                    root.notify_error_once("settings-save-failed", message);
-                    cx.notify();
+                // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记。
+                //
+                // 正在等刷尾退出时状态行留给「正在保存…」：先判这个，再去取失败——
+                // 顺序反了会把失败取走扔掉，退出那几秒里写盘失败的提示就永远看不到了。
+                if !root.quit_gate.is_saving() {
+                    if let Some(failure) = root.settings_writer.take_error() {
+                        let text = match failure.kind {
+                            FailureKind::Settings => SAVE_TEXT,
+                            FailureKind::Startup => STARTUP_SAVE_TEXT,
+                        };
+                        let message = root.tr(text).to_string();
+                        root.notify_error_once("settings-save-failed", message);
+                        cx.notify();
+                    }
                 }
                 if snap.playing || root.pending_track.is_some() {
                     cx.notify();
@@ -632,7 +640,18 @@ impl Root {
     pub fn set_volume(&mut self, volume: f32) {
         self.settings.set_volume(volume);
         self.engine.set_volume(self.settings.volume);
-        self.save_settings();
+        // 拖滑条时每动一下就排一份整份快照太浪费：拖完松手由 `end_volume_scrub` 补一次。
+        if !self.volume_scrubbing {
+            self.save_settings();
+        }
+    }
+
+    /// 音量拖动结束（松手 / 拖出滑条）：补排一次落盘。
+    pub(crate) fn end_volume_scrub(&mut self) {
+        if self.volume_scrubbing {
+            self.volume_scrubbing = false;
+            self.save_settings();
+        }
     }
 
     /// 静音 / 恢复。以设置中的即时值判断，快速连点不依赖音频线程的回执时机。
