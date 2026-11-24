@@ -418,6 +418,7 @@ impl Queue {
     pub fn reset_shuffle_round(&mut self) {
         self.shuffle_round.clear();
         self.history.clear();
+        self.redo = None;
     }
 
     /// 立刻生成一轮随机待播顺序（随机模式下调用）。
@@ -505,6 +506,13 @@ impl Queue {
         self.shuffle_round.iter_mut().for_each(adjust);
         self.history.retain(|value| *value != removed);
         self.history.iter_mut().for_each(adjust);
+        if let Some(redo) = self.redo {
+            if redo == removed {
+                self.redo = None;
+            } else if redo > removed {
+                self.redo = Some(redo - 1);
+            }
+        }
     }
 
     /// 把一批曲目插到当前曲目的后面（歌单右键「下一首播放」）。
@@ -532,6 +540,11 @@ impl Queue {
             };
             self.shuffle_round.iter_mut().for_each(shift);
             self.history.iter_mut().for_each(shift);
+            if let Some(redo) = self.redo {
+                if redo >= insert_at {
+                    self.redo = Some(redo + inserted);
+                }
+            }
             // 「下一首播放」的语义：紧接着播新插入的这批，所以插到轮次最前。
             if self.mode == PlayMode::Shuffle {
                 let front: Vec<usize> = (insert_at..insert_at + inserted).collect();
@@ -715,6 +728,41 @@ mod tests {
         queue.redo = Some(1);
 
         queue.replace(tracks(2), 0);
+
+        assert!(queue.redo.is_none());
+    }
+
+    #[test]
+    fn remove_adjusts_or_clears_redo() {
+        let mut queue = Queue::new(tracks(4));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(3);
+        queue.remove(1);
+        assert_eq!(queue.redo, Some(2));
+
+        queue.redo = Some(1);
+        queue.remove(1);
+        assert!(queue.redo.is_none());
+    }
+
+    #[test]
+    fn insert_next_shifts_redo_after_insertion_point() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(2);
+
+        queue.insert_next(tracks(1));
+
+        assert_eq!(queue.redo, Some(3));
+    }
+
+    #[test]
+    fn reset_shuffle_round_clears_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        queue.reset_shuffle_round();
 
         assert!(queue.redo.is_none());
     }

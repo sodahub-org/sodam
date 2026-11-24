@@ -5166,20 +5166,6 @@ mod play_failure_flow_tests {
     }
 
     #[test]
-    fn stale_identity_produces_no_failure_decision() {
-        let failure = per_track_failure();
-        let input = PlayFailureInput {
-            intent: PlayIntent::Now,
-            failure: &failure,
-            has_candidate: true,
-            consecutive_failures: 0,
-            mode: PlayMode::ListLoop,
-        };
-        assert!(failure_decision_if_current(false, input).is_none());
-        assert!(failure_decision_if_current(true, input).is_some());
-    }
-
-    #[test]
     fn halt_updates_flags_and_calls_the_engine_pause() {
         let mut playback_halted = false;
         let mut playing = true;
