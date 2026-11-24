@@ -2,6 +2,7 @@
 
 use crate::cache::encode_track_id;
 use crate::config::SessionInputs;
+use crate::upgrade::NotImprovedReason;
 use libresoda::soda::signature::HttpSignature;
 use libresoda::{AppCredentials, Soda};
 use std::io::Read;
@@ -565,17 +566,33 @@ impl CachedTrack {
     }
 }
 
-/// 一次升级跑完的交付物：跑完后内存里的缓存记录，加上这次有没有真的换成更好的流。
+/// 一次升级判定的结果：返回时内存里的缓存记录，以及这次有没有换成更好的流。
 ///
-/// `improved` 在换文件那一刻由 `is_better_stream` 定下来，调用方据此判「升级成功」
-/// 还是「没有更高档位」，不在事后拿升级前后的两份缓存自己比分数。
+/// `not_improved_reason` 在判定结果那一刻定下来：换文件、比完流，或者决定这次不发请求。
+/// `None` 表示升级成功，`Some` 表示没换成更好的流。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完那一刻的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
+    /// 返回时的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
     /// sidecar，要准的值去读 sidecar。
     pub track: CachedTrack,
-    /// 盘上文件有没有换成更好的流。`false` = 跑完了，但服务端没给更好的。
-    pub improved: bool,
+    /// 没换成更好的流时的日志原因；成功升级时为 `None`。
+    pub not_improved_reason: Option<NotImprovedReason>,
+}
+
+impl UpgradeRun {
+    fn not_improved(track: CachedTrack, reason: NotImprovedReason) -> Self {
+        Self {
+            track,
+            not_improved_reason: Some(reason),
+        }
+    }
+
+    fn improved(track: CachedTrack) -> Self {
+        Self {
+            track,
+            not_improved_reason: None,
+        }
+    }
 }
 
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
@@ -727,12 +744,50 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
     if crate::quality::lossless_rank().is_some_and(|lossless| new_rank >= lossless) {
         return true;
     }
-    // 否则只能比码率，严格更高才算提升；同码率留在旧文件，如实报「没有更高档位」。
+    // 否则只能比码率，严格更高才算提升；同码率留在旧文件，如实报「没换成更好的流」。
     let Some(old_bitrate) = crate::quality::legacy_label_bitrate_kbps(&current.quality) else {
         return false;
     };
     let new_bitrate = libresoda::soda::quality::normalize_bitrate(info.bitrate.max(0));
     new_rank > 0 && new_bitrate > old_bitrate
+}
+
+fn skipped_upgrade_reason(current: &CachedTrack, target_rank: Option<i64>) -> NotImprovedReason {
+    if current.preview && current.preview_retry_blocked {
+        return NotImprovedReason::PreviewBackoff;
+    }
+    let Some(target_rank) = target_rank else {
+        // 目标档位未知，这里说不出更具体的原因，只能记 not_better。
+        return NotImprovedReason::NotBetter;
+    };
+    if current.quality_rank == Some(0) {
+        return NotImprovedReason::NotBetter;
+    }
+    if current.known_rank().is_some_and(|rank| rank >= target_rank)
+        || crate::cache::upgrade_check_covers(current.checked_rank, Some(target_rank))
+    {
+        NotImprovedReason::AlreadyChecked
+    } else {
+        NotImprovedReason::NotBetter
+    }
+}
+
+fn downloaded_not_improved_reason(
+    current: &CachedTrack,
+    info: &libresoda::soda::types::DownloadInfo,
+    confirmed_miss: bool,
+) -> NotImprovedReason {
+    if info.is_preview {
+        return NotImprovedReason::PreviewOnly;
+    }
+    // 这条只在 is_better_stream 已判 false 后调用；旧文件有可比依据就统一说 not_better。
+    let old_quality_is_comparable = current.known_rank().is_some()
+        || crate::quality::legacy_label_bitrate_kbps(&current.quality).is_some();
+    if confirmed_miss && !old_quality_is_comparable {
+        NotImprovedReason::NoHigherTier
+    } else {
+        NotImprovedReason::NotBetter
+    }
 }
 
 /// 拼出 sidecar 内容。
@@ -1041,7 +1096,7 @@ impl Session {
     /// * 升级期间持有待升级目标与临时文件的 [`crate::cache::CacheLease`]，避免被淘汰删除；
     /// * 若中途失败，暂存留在 staging 子目录给下次续传（#243），绝不破坏原有缓存；
     /// * 若新拉到的档位并不确实高于当前已有档位，清理临时文件，保留原有缓存并如实
-    ///   报「没换」（`UpgradeRun::improved == false`）；档位未知的旧三字段缓存按标签能证明的
+    ///   报「没换」（`not_improved_reason.is_some()`）；档位未知的旧三字段缓存按标签能证明的
     ///   下限与码率比较；
     /// * 只有拿到完整流且档位没有提升时，才把这次目标档位写进 sidecar 的「已探测」
     ///   字段，30 天内不再为同一目标重复请求；依赖会员权益的档位只在确认账号有权益时记录。
@@ -1088,10 +1143,8 @@ impl Session {
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
         if !current.needs_upgrade(intent, vip) {
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-            });
+            let reason = skipped_upgrade_reason(&current, target_rank);
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         // 串行化升级操作并获取租约：
@@ -1112,10 +1165,8 @@ impl Session {
             }
         };
         if !current.needs_upgrade(intent, vip) {
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-            });
+            let reason = skipped_upgrade_reason(&current, target_rank);
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         let target_lease = crate::cache::CacheLease::acquire(&path);
@@ -1181,19 +1232,19 @@ impl Session {
         // 核心安全护栏：试听流绝不允许覆盖已有非试听整曲缓存（即便试听流档位分数更高）
         if would_downgrade_to_preview(&info, &current) {
             let _ = std::fs::remove_file(&part);
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-            });
+            return Ok(UpgradeRun::not_improved(
+                current,
+                NotImprovedReason::PreviewOnly,
+            ));
         }
 
         let new_rank = crate::quality::stream_rank(&info);
         // 档位已知按确认性 miss 判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
         // 不换文件也要记下来，否则每轮都整曲重下。
-        let checked_rank =
-            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check).or_else(
-                || legacy_probe_covers_target(&current, &info, target_rank, can_record_check),
-            );
+        let confirmed_miss =
+            confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record_check);
+        let checked_rank = confirmed_miss
+            .or_else(|| legacy_probe_covers_target(&current, &info, target_rank, can_record_check));
         // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
@@ -1208,10 +1259,8 @@ impl Session {
             } else if let Some(checked_rank) = checked_rank {
                 record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
             }
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-            });
+            let reason = downloaded_not_improved_reason(&current, &info, confirmed_miss.is_some());
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         // 试听在上面已经被挡住：走到这里一定是整曲替换。
@@ -1238,18 +1287,15 @@ impl Session {
         )?;
 
         crate::mem::release_malloc_pressure();
-        Ok(UpgradeRun {
-            track: CachedTrack {
-                path,
-                quality,
-                preview: false,
-                quality_rank: Some(new_rank),
-                checked_rank,
-                preview_retry_blocked: false,
-                lease: target_lease,
-            },
-            improved: true,
-        })
+        Ok(UpgradeRun::improved(CachedTrack {
+            path,
+            quality,
+            preview: false,
+            quality_rank: Some(new_rank),
+            checked_rank,
+            preview_retry_blocked: false,
+            lease: target_lease,
+        }))
     }
 
     /// 测试用：看一眼会话手里那份输入（界面那份在 `Root.settings`）。
@@ -2170,6 +2216,88 @@ mod tests {
             &info("hires", "flac", 1_200_000, false),
             &lossless_legacy
         ));
+    }
+
+    #[test]
+    fn not_improved_reason_separates_preview_equal_and_confirmed_miss() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let lease = crate::cache::CacheLease::acquire(std::path::Path::new("reason.m4a"));
+        let cached = |quality: &str, rank: Option<i64>, preview: bool| CachedTrack {
+            path: std::path::PathBuf::new(),
+            quality: quality.into(),
+            preview,
+            quality_rank: rank,
+            checked_rank: None,
+            preview_retry_blocked: false,
+            lease: lease.clone(),
+        };
+        let info = |quality: &str, bitrate: i64, preview: bool| DownloadInfo {
+            quality: quality.into(),
+            format: "m4a".into(),
+            bitrate,
+            is_preview: preview,
+            ..Default::default()
+        };
+
+        let full = cached("极高 320k", Some(80), false);
+        assert_eq!(
+            downloaded_not_improved_reason(&full, &info("highest", 320_000, true), false),
+            NotImprovedReason::PreviewOnly
+        );
+
+        let legacy = cached("极高 320k", None, false);
+        assert_eq!(
+            downloaded_not_improved_reason(&legacy, &info("highest", 320_000, false), true),
+            NotImprovedReason::NotBetter
+        );
+        assert_eq!(
+            downloaded_not_improved_reason(&legacy, &info("standard", 128_000, false), true),
+            NotImprovedReason::NotBetter
+        );
+        assert_eq!(
+            downloaded_not_improved_reason(&legacy, &info("", 0, false), false),
+            NotImprovedReason::NotBetter
+        );
+
+        let unknown_label = cached("极高", None, false);
+        assert_eq!(
+            downloaded_not_improved_reason(&unknown_label, &info("highest", 320_000, false), true),
+            NotImprovedReason::NoHigherTier
+        );
+        assert_eq!(
+            downloaded_not_improved_reason(&unknown_label, &info("highest", 320_000, false), false),
+            NotImprovedReason::NotBetter
+        );
+
+        assert_eq!(
+            skipped_upgrade_reason(&cached("极高 320k", Some(80), false), Some(80)),
+            NotImprovedReason::AlreadyChecked
+        );
+        let checked = CachedTrack {
+            checked_rank: Some(100),
+            ..cached("极高 320k", Some(80), false)
+        };
+        assert_eq!(
+            skipped_upgrade_reason(&checked, Some(100)),
+            NotImprovedReason::AlreadyChecked
+        );
+        assert_eq!(
+            skipped_upgrade_reason(&full, None),
+            NotImprovedReason::NotBetter
+        );
+        assert_eq!(
+            skipped_upgrade_reason(&cached("未知 128k", Some(0), false), Some(100)),
+            NotImprovedReason::NotBetter
+        );
+        let backed_off_preview = CachedTrack {
+            preview_retry_blocked: true,
+            ..cached("未知 128k", Some(0), true)
+        };
+        assert_eq!(
+            skipped_upgrade_reason(&backed_off_preview, Some(100)),
+            NotImprovedReason::PreviewBackoff
+        );
     }
 
     #[test]

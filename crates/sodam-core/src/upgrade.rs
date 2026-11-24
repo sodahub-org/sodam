@@ -87,15 +87,47 @@ pub fn identity_change(
     }
 }
 
-/// 一首跑完落在哪一档。
+/// 没换成更好的流时，逐首日志用来区分原因；不参与升级统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotImprovedReason {
+    /// 新流仍是试听，或试听回退被整曲缓存拦住。
+    PreviewOnly,
+    /// 试听补整曲还在退避期，这轮没有发请求。
+    PreviewBackoff,
+    /// 拿到完整流但没比旧文件好；目标未知等没有更具体结论的早退也归这里。
+    NotBetter,
+    /// 旧文件连无损下限、档位分和码率都拿不出来；新流不是试听、档位认得出且低于目标。
+    /// 这个目标不需要会员，或账号权益已确认；结论能写进探测记录。
+    /// 而且这次确实向服务端要过流。
+    NoHigherTier,
+    /// 这次没发请求：旧缓存已达目标，或已有探测结论覆盖目标。
+    AlreadyChecked,
+}
+
+impl NotImprovedReason {
+    /// 日志字段 `reason=` 的稳定取值（小写下划线，不随界面语言变化）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PreviewOnly => "preview_only",
+            Self::PreviewBackoff => "preview_backoff",
+            Self::NotBetter => "not_better",
+            Self::NoHigherTier => "no_higher_tier",
+            Self::AlreadyChecked => "already_checked",
+        }
+    }
+}
+
+/// 一首判定完落在哪一档。
 ///
-/// 由升级那条路在换文件那一刻定下来，不在事后拿升级前后的两份缓存比分数：
+/// 由升级那条路在判定结果那一刻定下来，不在事后拿升级前后的两份缓存比分数：
 /// 档位未知的旧缓存没有分数可比，「量出一个正分」并不等于真的升了一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 提升：试听换整曲；档位更高；旧档位未知先判无损，否则只认新流档位可识别且码率严格高于旧标签。
+    /// 提升分三种：
+    /// 试听换整曲；旧档位已知时新档位更高；
+    /// 旧档位未知时新流到无损，或新档位认得出且码率严格高于旧标签。
     Upgraded,
-    /// 跑完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
+    /// 判定做完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
     NoHigherTier,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
@@ -138,7 +170,7 @@ impl Tally {
         }
     }
 
-    /// 这一轮真跑了几首。提前停时小于扫出来的总数。
+    /// 这一轮计入了几首。提前停时可能小于扫出来的总数。
     pub fn total(&self) -> usize {
         self.upgraded + self.failed + self.no_higher
     }
@@ -330,7 +362,7 @@ mod tests {
         assert!(attempts.begin(key), "清掉缓存后同一首要能重新试");
     }
 
-    /// 收尾的三个数分开记，总数只算真跑过的。
+    /// 收尾的三个数分开记，总数只算本轮计入的。
     #[test]
     fn tally_keeps_the_three_numbers_apart() {
         let mut tally = Tally::default();
@@ -353,5 +385,20 @@ mod tests {
         assert_eq!(StopReason::IdentityChanged.as_str(), "identity_changed");
         assert_eq!(StopReason::LoggingOut.as_str(), "logging_out");
         assert_eq!(StopReason::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn not_improved_log_values_are_stable() {
+        assert_eq!(NotImprovedReason::PreviewOnly.as_str(), "preview_only");
+        assert_eq!(
+            NotImprovedReason::PreviewBackoff.as_str(),
+            "preview_backoff"
+        );
+        assert_eq!(NotImprovedReason::NotBetter.as_str(), "not_better");
+        assert_eq!(NotImprovedReason::NoHigherTier.as_str(), "no_higher_tier");
+        assert_eq!(
+            NotImprovedReason::AlreadyChecked.as_str(),
+            "already_checked"
+        );
     }
 }
