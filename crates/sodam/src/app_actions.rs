@@ -4253,13 +4253,12 @@ impl Root {
                         );
                         // 尝试跨过一次登录 / 账号身份变更：结论属于旧身份，别用它
                         // 落闸、挂预取、写不可播集合，也别替用户跳歌。
-                        if !identity_current {
+                        if !run_if_identity_current(identity_current, || {
+                            root.suspend_prefetch(&failure);
+                        }) {
                             cx.notify();
                             return;
                         }
-                        // 全局故障同样挂起预取：装载这条路先看见了故障，
-                        // 预取没理由继续一轮轮重打那台共享签名服务。
-                        root.suspend_prefetch(&failure);
                         root.handle_play_failure(&failure, &track, cx);
                     }
                 }
@@ -4753,6 +4752,14 @@ fn clear_attempt_and_check_identity(
     false
 }
 
+fn run_if_identity_current(identity_current: bool, action: impl FnOnce()) -> bool {
+    if !identity_current {
+        return false;
+    }
+    action();
+    true
+}
+
 /// 状态位与暂停回调同一入口，测试可确认没有只改标志位。
 fn halt_playback_with(playback_halted: &mut bool, playing: &mut bool, pause: impl FnOnce()) {
     *playback_halted = true;
@@ -5099,6 +5106,18 @@ mod play_failure_flow_tests {
         assert!(pending.is_none());
         assert!(progress_token.is_none());
         assert!(!playing);
+    }
+
+    #[test]
+    fn stale_identity_blocks_failure_consequences() {
+        let mut consequences = [false; 5];
+        let continued = run_if_identity_current(false, || consequences.fill(true));
+        assert!(!continued);
+        assert_eq!(consequences, [false; 5]);
+
+        let continued = run_if_identity_current(true, || consequences.fill(true));
+        assert!(continued);
+        assert_eq!(consequences, [true; 5]);
     }
 
     #[test]

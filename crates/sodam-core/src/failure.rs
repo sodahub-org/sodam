@@ -268,19 +268,20 @@ impl UnplayableTracks {
         candidate_id: &str,
         failure: &PlaybackFailure,
     ) -> bool {
-        if self.is_unavailable(candidate_id) {
-            return true;
-        }
         if UnplayableReason::from_action(failure.action).is_none() {
-            return false;
+            return self.is_unavailable(candidate_id);
         }
-        if candidate_id == failed_track_id {
+        if candidate_id == failed_track_id || self.attempted.contains(candidate_id) {
             return true;
         }
+        let recorded = self.entries.contains_key(candidate_id);
         if self.entries.contains_key(failed_track_id) || self.entries.len() < Self::CAPACITY {
+            return recorded;
+        }
+        if Self::eviction_victim(&self.entries) == Some(candidate_id) {
             return false;
         }
-        Self::eviction_victim(&self.entries) == Some(candidate_id)
+        recorded
     }
 
     /// 已确认结论的成因（供显式点播不重打网络就给出原因）。
