@@ -2979,8 +2979,8 @@ impl Root {
         let session = Session::new(settings);
         match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
             Ok(run) => {
-                // 换没换文件由升级那条路自己判定；事件名和对外结论都只认 improved。
-                let outcome = Outcome::from_improved(run.improved);
+                // 换没换文件由升级那条路自己判定；日志和对外结论都只认 not_improved_reason。
+                let outcome = Outcome::from_improved(run.not_improved_reason.is_none());
                 let (event, fields) = cache_upgrade_log_parts(
                     track.id.as_str(),
                     run.track.quality.as_str(),

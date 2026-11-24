@@ -757,7 +757,7 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
 }
 
 fn skipped_upgrade_reason(current: &CachedTrack, target_rank: Option<i64>) -> NotImprovedReason {
-    if current.preview {
+    if current.preview && current.preview_retry_blocked {
         return NotImprovedReason::PreviewBackoff;
     }
     let Some(target_rank) = target_rank else {
@@ -2294,8 +2294,12 @@ mod tests {
             skipped_upgrade_reason(&cached("未知 128k", Some(0), false), Some(100)),
             NotImprovedReason::NotBetter
         );
+        let backed_off_preview = CachedTrack {
+            preview_retry_blocked: true,
+            ..cached("未知 128k", Some(0), true)
+        };
         assert_eq!(
-            skipped_upgrade_reason(&cached("未知 128k", Some(0), true), Some(100)),
+            skipped_upgrade_reason(&backed_off_preview, Some(100)),
             NotImprovedReason::PreviewBackoff
         );
     }
