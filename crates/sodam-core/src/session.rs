@@ -816,7 +816,6 @@ fn finish_unimproved_upgrade(
     scope: Option<&str>,
     quality_path: &std::path::Path,
     audio_path: &std::path::Path,
-    now: u64,
 ) -> crate::upgrade::Outcome {
     use crate::upgrade::Outcome;
 
@@ -833,6 +832,7 @@ fn finish_unimproved_upgrade(
         let (Some(target), Some(scope)) = (target_rank, scope) else {
             return Outcome::UnknownRank;
         };
+        let now = crate::cache::now_epoch_secs();
         if record_unknown_probe(
             quality_path,
             audio_path,
@@ -1300,7 +1300,6 @@ impl Session {
                 scope.as_deref(),
                 &quality_path,
                 &path,
-                crate::cache::now_epoch_secs(),
             );
             return Ok(UpgradeRun {
                 track: current,
@@ -2305,7 +2304,6 @@ mod tests {
             ..Default::default()
         };
 
-        let now = 1_700_000_000;
         let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
         let outcome = finish_unimproved_upgrade(
             &mut current,
@@ -2315,7 +2313,6 @@ mod tests {
             Some(&scope),
             &quality_path,
             &path,
-            now,
         );
 
         let lossless = crate::quality::QualityIntent::parse("lossless");
@@ -2331,7 +2328,8 @@ mod tests {
         assert_eq!(fields[3], "", "旧文件仍然没有实际档位");
         assert_eq!(fields[4], "", "未知探测不能冒充确认性 miss");
         assert_eq!(fields[7], "100");
-        assert_eq!(fields[8], "1700000000");
+        let recorded_at = fields[8].parse::<u64>().unwrap();
+        assert!(recorded_at > 0);
         assert_eq!(fields[9], scope);
 
         let parsed = crate::cache::parse_sidecar(&text, 2000).unwrap();
@@ -2342,8 +2340,8 @@ mod tests {
             quality: parsed.quality,
             preview: parsed.preview,
             quality_rank: parsed.actual_rank,
-            checked_rank: parsed.fresh_checked_rank(now),
-            unknown_probe: parsed.fresh_unknown_probe(now),
+            checked_rank: parsed.fresh_checked_rank(recorded_at),
+            unknown_probe: parsed.fresh_unknown_probe(recorded_at),
             preview_retry_blocked: false,
             lease: crate::cache::CacheLease::acquire(std::path::Path::new("reloaded.m4a")),
         };
@@ -2397,7 +2395,6 @@ mod tests {
             Some(&scope),
             &quality_path,
             &path,
-            1_700_000_000,
         );
 
         assert_eq!(outcome, crate::upgrade::Outcome::UnknownRank);
@@ -2407,7 +2404,9 @@ mod tests {
                 .unwrap();
         assert_eq!(parsed.actual_rank, Some(80));
         assert_eq!(parsed.checked_rank, None);
-        assert!(parsed.fresh_unknown_probe(1_700_000_000).is_some());
+        assert!(parsed
+            .fresh_unknown_probe(parsed.unknown_probe_at.unwrap())
+            .is_some());
         let lossless = crate::quality::QualityIntent::parse("lossless");
         assert!(!current.needs_upgrade(&lossless, Some(true), Some(&scope)));
     }
