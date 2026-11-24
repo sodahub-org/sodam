@@ -4296,15 +4296,10 @@ impl Root {
             FailureRecord::Consecutive => self.consecutive_failures += 1,
         }
 
-        if decision.halt == Halt::ExhaustedRound {
-            self.halt_exhausted_round();
-            return;
-        }
-
-        let notice_key = if decision.record == FailureRecord::Unplayable {
-            "track-unavailable"
-        } else {
-            "track-stream-failed"
+        let notice_key = match decision.halt {
+            Halt::ExhaustedRound => "round-exhausted",
+            _ if decision.record == FailureRecord::Unplayable => "track-unavailable",
+            _ => "track-stream-failed",
         };
         let mut skipped = false;
         if decision.advance == Advance::Next {
@@ -4323,7 +4318,11 @@ impl Root {
             skipped = true;
         }
 
-        let message = self.tr(play_failure_text(failure, skipped)).to_string();
+        let message = if decision.halt == Halt::ExhaustedRound {
+            self.tr("这一轮没有能播的歌了").to_string()
+        } else {
+            self.tr(play_failure_text(failure, skipped)).to_string()
+        };
         match decision.notice.slot {
             NoticeSlot::None => {
                 if decision.halt == Halt::None {
@@ -4334,7 +4333,10 @@ impl Root {
                 }
             }
             NoticeSlot::PlaybackError => self.playback_error = Some(message.clone()),
-            NoticeSlot::RoundExhausted => {}
+            NoticeSlot::RoundExhausted => {
+                self.round_exhausted = Some(message.clone());
+                self.playback_error = Some(message.clone());
+            }
         }
         match decision.notice.channel {
             NoticeChannel::None => {}
@@ -4351,8 +4353,7 @@ impl Root {
 
         match decision.halt {
             Halt::None => {}
-            Halt::ExhaustedRound => return,
-            Halt::Playback => self.halt_playback(),
+            Halt::ExhaustedRound | Halt::Playback => self.halt_playback(),
             Halt::ConsecutiveFailures => {
                 self.halt_playback();
                 let halted = self.tr("连续 3 首没播出来，已暂停").to_string();
@@ -5013,6 +5014,7 @@ mod play_failure_flow_tests {
         for index in 0..UnplayableTracks::CAPACITY {
             unplayable.record_failure(&format!("old-{index}"), &failure);
         }
+        unplayable.reset_scan();
         assert!(queue
             .next_playable(|id| unplayable.is_unavailable(id))
             .is_none());
