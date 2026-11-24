@@ -43,20 +43,37 @@ struct UpgradeLogLevels {
     failure: LogLevel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BatchUpgradeNotice {
-    Status(String),
-    Success(String),
-    Warning(String),
+trait BatchUpgradeNoticeSink {
+    fn status(&mut self, text: String);
+    fn success(&mut self, text: String);
+    fn warning(&mut self, text: String);
 }
 
-fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
+impl BatchUpgradeNoticeSink for Root {
+    fn status(&mut self, text: String) {
+        self.set_status_text(text);
+    }
+
+    fn success(&mut self, text: String) {
+        self.notify_success_once("batch-upgrade-complete", text);
+    }
+
+    fn warning(&mut self, text: String) {
+        self.notify_warning_once("batch-upgrade-complete", text);
+    }
+}
+
+fn report_batch_upgrade_notice(
+    sink: &mut impl BatchUpgradeNoticeSink,
+    tally: Tally,
+    message: String,
+) {
     if tally.failed > 0 {
-        BatchUpgradeNotice::Warning(message)
+        sink.warning(message);
     } else if tally.upgraded > 0 {
-        BatchUpgradeNotice::Success(message)
+        sink.success(message);
     } else {
-        BatchUpgradeNotice::Status(message)
+        sink.status(message);
     }
 }
 
@@ -3269,15 +3286,7 @@ impl Root {
                                     tally.no_higher.to_string(),
                                 ],
                             );
-                            match batch_upgrade_notice(tally, message) {
-                                BatchUpgradeNotice::Warning(text) => {
-                                    root.notify_warning_once("batch-upgrade-complete", text);
-                                }
-                                BatchUpgradeNotice::Success(text) => {
-                                    root.notify_success_once("batch-upgrade-complete", text);
-                                }
-                                BatchUpgradeNotice::Status(text) => root.set_status_text(text),
-                            }
+                            report_batch_upgrade_notice(root, tally, message);
                         }
                     }
                 }
@@ -4924,6 +4933,33 @@ fn prefetch_concurrency() -> usize {
 mod batch_upgrade_notice_tests {
     use super::*;
 
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct RecordingNoticeSink {
+        status: Option<String>,
+        success: Option<String>,
+        warning: Option<String>,
+    }
+
+    impl BatchUpgradeNoticeSink for RecordingNoticeSink {
+        fn status(&mut self, text: String) {
+            self.status = Some(text);
+        }
+
+        fn success(&mut self, text: String) {
+            self.success = Some(text);
+        }
+
+        fn warning(&mut self, text: String) {
+            self.warning = Some(text);
+        }
+    }
+
+    fn record_notice(tally: Tally) -> RecordingNoticeSink {
+        let mut sink = RecordingNoticeSink::default();
+        report_batch_upgrade_notice(&mut sink, tally, "summary".into());
+        sink
+    }
+
     #[test]
     fn no_higher_only_uses_normal_status() {
         let tally = Tally {
@@ -4932,16 +4968,22 @@ mod batch_upgrade_notice_tests {
             no_higher: 2,
         };
         assert_eq!(
-            batch_upgrade_notice(tally, "summary".into()),
-            BatchUpgradeNotice::Status("summary".into())
+            record_notice(tally),
+            RecordingNoticeSink {
+                status: Some("summary".into()),
+                ..Default::default()
+            }
         );
     }
 
     #[test]
     fn empty_tally_uses_status() {
         assert_eq!(
-            batch_upgrade_notice(Tally::default(), "summary".into()),
-            BatchUpgradeNotice::Status("summary".into())
+            record_notice(Tally::default()),
+            RecordingNoticeSink {
+                status: Some("summary".into()),
+                ..Default::default()
+            }
         );
     }
 
@@ -4953,8 +4995,11 @@ mod batch_upgrade_notice_tests {
             no_higher: 0,
         };
         assert_eq!(
-            batch_upgrade_notice(tally, "summary".into()),
-            BatchUpgradeNotice::Warning("summary".into())
+            record_notice(tally),
+            RecordingNoticeSink {
+                warning: Some("summary".into()),
+                ..Default::default()
+            }
         );
     }
 
@@ -4966,8 +5011,11 @@ mod batch_upgrade_notice_tests {
             no_higher: 1,
         };
         assert_eq!(
-            batch_upgrade_notice(tally, "summary".into()),
-            BatchUpgradeNotice::Success("summary".into())
+            record_notice(tally),
+            RecordingNoticeSink {
+                success: Some("summary".into()),
+                ..Default::default()
+            }
         );
     }
 }
