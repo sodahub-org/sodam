@@ -18,8 +18,8 @@ use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::play_failure::{
-    counts_consecutive_failure, decide_play_failure, failure_record, Advance, FailureRecord, Halt,
-    NoticeChannel, NoticeSlot, PlayFailureDecision, PlayFailureInput, PlayIntent,
+    counts_consecutive_failure, decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel,
+    NoticeSlot, PlayFailureDecision, PlayFailureInput, PlayIntent,
 };
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
@@ -4275,17 +4275,25 @@ impl Root {
         track: &TrackItem,
         cx: &mut Context<Self>,
     ) {
-        if failure_record(failure) == FailureRecord::Unplayable {
-            self.unplayable.record_failure(&track.id, failure);
-        }
         let decision = decide_play_failure(PlayFailureInput {
             intent,
             failure,
-            has_candidate: self.has_playable_ahead(),
+            has_candidate: has_playable_after_failure(
+                &self.queue,
+                &self.unplayable,
+                &track.id,
+                failure,
+            ),
             consecutive_failures: self.consecutive_failures,
             mode: self.queue.mode,
         });
 
+        match decision.record {
+            FailureRecord::None => {}
+            FailureRecord::Unplayable => {
+                self.unplayable.record_failure(&track.id, failure);
+            }
+        }
         if counts_consecutive_failure(intent, failure) {
             self.consecutive_failures += 1;
         }
@@ -4716,6 +4724,17 @@ fn stage_label(stage: Stage) -> &'static str {
         Stage::Input => "参数",
         Stage::Network => "网络传输",
     }
+}
+
+fn has_playable_after_failure(
+    queue: &Queue,
+    unplayable: &UnplayableTracks,
+    track_id: &str,
+    failure: &PlaybackFailure,
+) -> bool {
+    queue
+        .next_playable(|id| unplayable.is_unavailable_after_failure(track_id, id, failure))
+        .is_some()
 }
 
 fn advance_failure_queue(queue: &mut Queue, unplayable: &UnplayableTracks) -> bool {
