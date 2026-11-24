@@ -815,14 +815,14 @@ fn finish_unimproved_upgrade(
     can_record: bool,
     scope: Option<&str>,
     quality_path: &std::path::Path,
-    audio_path: &std::path::Path,
 ) -> crate::upgrade::Outcome {
     use crate::upgrade::Outcome;
 
+    let audio_path = current.path.clone();
     let new_rank = crate::quality::stream_rank(info);
     if current.preview {
         current.preview_retry_blocked |=
-            record_preview_upgrade_attempt(quality_path, audio_path, current.quality_rank);
+            record_preview_upgrade_attempt(quality_path, &audio_path, current.quality_rank);
         return Outcome::NoHigherTier;
     }
     if new_rank <= 0 {
@@ -835,7 +835,7 @@ fn finish_unimproved_upgrade(
         let now = crate::cache::now_epoch_secs();
         if record_unknown_probe(
             quality_path,
-            audio_path,
+            &audio_path,
             current.quality_rank,
             target,
             scope,
@@ -851,7 +851,12 @@ fn finish_unimproved_upgrade(
     }
     let checked_rank = probe_check_rank(current, info, target_rank, can_record);
     if let Some(checked_rank) = checked_rank {
-        record_upgrade_check(quality_path, audio_path, current.quality_rank, checked_rank);
+        record_upgrade_check(
+            quality_path,
+            &audio_path,
+            current.quality_rank,
+            checked_rank,
+        );
     }
     Outcome::NoHigherTier
 }
@@ -1299,7 +1304,6 @@ impl Session {
                 can_record_check,
                 scope.as_deref(),
                 &quality_path,
-                &path,
             );
             return Ok(UpgradeRun {
                 track: current,
@@ -2119,6 +2123,7 @@ mod tests {
             preview: true,
             quality_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: blocked,
             lease: lease.clone(),
         };
@@ -2312,7 +2317,6 @@ mod tests {
             true,
             Some(&scope),
             &quality_path,
-            &path,
         );
 
         let lossless = crate::quality::QualityIntent::parse("lossless");
@@ -2335,13 +2339,16 @@ mod tests {
         let parsed = crate::cache::parse_sidecar(&text, 2000).unwrap();
         assert_eq!(parsed.actual_rank, None);
         assert_eq!(parsed.checked_rank, None);
+        let quality = parsed.quality;
+        let checked_rank = parsed.fresh_checked_rank(recorded_at);
+        let unknown_probe = parsed.fresh_unknown_probe(recorded_at);
         let reloaded = CachedTrack {
             path,
-            quality: parsed.quality,
+            quality,
             preview: parsed.preview,
             quality_rank: parsed.actual_rank,
-            checked_rank: parsed.fresh_checked_rank(recorded_at),
-            unknown_probe: parsed.fresh_unknown_probe(recorded_at),
+            checked_rank,
+            unknown_probe,
             preview_retry_blocked: false,
             lease: crate::cache::CacheLease::acquire(std::path::Path::new("reloaded.m4a")),
         };
@@ -2394,7 +2401,6 @@ mod tests {
             true,
             Some(&scope),
             &quality_path,
-            &path,
         );
 
         assert_eq!(outcome, crate::upgrade::Outcome::UnknownRank);

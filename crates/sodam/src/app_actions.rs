@@ -1069,6 +1069,11 @@ impl Root {
                                 // `refresh_account` 里，但账号信息读取失败时拿不到
                                 // 新身份，这里先保守作废。
                                 root.invalidate_identity_conclusions();
+                                // 新 Cookie 已生效，旧账号 id 不能再和它配对；范围缺失时按放行处理。
+                                root.account = None;
+                                if root.nav == Nav::Settings {
+                                    root.refresh_upgrade_estimate(cx);
+                                }
                                 // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
                                 log_prefetch_resume(root.prefetch_gate.note_login_success());
                                 root.set_status_text(
