@@ -35,6 +35,7 @@ use sodam_core::settings_writer::StartupFailureSlot;
 /// 更紧凑的启动窗口尺寸（逻辑像素）；通过 Bounds::centered 在主屏幕居中。
 const DEFAULT_SIZE: (f32, f32) = (980.0, 640.0);
 const MIN_SIZE: (f32, f32) = (900.0, 560.0);
+const MAX_ACTIVATIONS_PER_TICK: usize = 16;
 
 fn main_window_options(cx: &mut App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx);
@@ -108,7 +109,11 @@ fn start_tray_service(
             if tick % 2 == 0 {
                 single_probe.check();
                 if activations.try_recv().is_ok() {
-                    while activations.try_recv().is_ok() {}
+                    for _ in 1..MAX_ACTIVATIONS_PER_TICK {
+                        if activations.try_recv().is_err() {
+                            break;
+                        }
+                    }
                     single_probe.app_entry();
                     cx.update(|cx| show_window(cx, &app));
                 }

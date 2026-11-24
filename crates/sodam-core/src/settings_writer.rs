@@ -656,28 +656,34 @@ mod tests {
 
     #[test]
     fn startup_failure_signal_and_payload_stay_in_sync() {
-        use std::sync::Barrier;
-
         for _ in 0..100 {
             let slot = StartupFailureSlot::default();
-            let barrier = Barrier::new(2);
             std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    barrier.wait();
-                    slot.set(WriteFailure {
-                        kind: FailureKind::Startup,
-                        detail: "并发写入".into(),
-                    });
+                let setter = scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        slot.set(WriteFailure {
+                            kind: FailureKind::Startup,
+                            detail: "并发写入".into(),
+                        });
+                    }
                 });
-                scope.spawn(|| {
-                    barrier.wait();
-                    let _ = slot.take();
+                let taker = scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        let _ = slot.take();
+                    }
                 });
-            });
 
-            let signal = slot.is_pending();
-            let payload = slot.failure.lock().unwrap().is_some();
-            assert_eq!(signal, payload, "原子门和失败槽必须同时有空");
+                while !setter.is_finished() || !taker.is_finished() {
+                    let guard = slot.failure.lock().unwrap();
+                    assert_eq!(
+                        slot.is_pending(),
+                        guard.is_some(),
+                        "原子门和失败槽必须同时有空"
+                    );
+                }
+                setter.join().unwrap();
+                taker.join().unwrap();
+            });
         }
     }
 
