@@ -2206,6 +2206,16 @@ mod tests {
         // 新流档位认不出来（0 档）不换：旧文件至少还有一个能看的标签。
         assert!(!is_better_stream(&info("", "", 0, false), &legacy));
 
+        let legacy_without_bitrate = cached("极高", None, false);
+        assert!(!is_better_stream(
+            &info("standard", "m4a", 128_000, false),
+            &legacy_without_bitrate
+        ));
+        assert!(is_better_stream(
+            &info("lossless", "flac", 871_000, false),
+            &legacy_without_bitrate
+        ));
+
         // 旧标签是无损 → 按下限比：无损换无损不算，只有 Hi-Res 才值得换。
         let lossless_legacy = cached("无损 871k", None, false);
         assert!(!is_better_stream(
