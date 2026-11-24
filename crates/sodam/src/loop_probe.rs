@@ -1,3 +1,6 @@
+//! 帧日志开关下的循环计时器唤醒、轮询、进 app 与引擎快照计数。
+//! `SODAM_FRAME_LOG=1` 时每个循环每 60 秒输出一行 `loop_counts`。
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,10 +13,10 @@ pub(crate) struct LoopProbe {
     name: &'static str,
     started: Instant,
     logging: bool,
-    wakes: u64,
-    checks: u64,
+    timer_wakes: u64,
+    polls: u64,
     app_entries: Arc<AtomicU64>,
-    idle_app_entries: u64,
+    signal_app_entries: u64,
     engine_snapshots: u64,
 }
 
@@ -23,21 +26,21 @@ impl LoopProbe {
             name,
             started: Instant::now(),
             logging: false,
-            wakes: 0,
-            checks: 0,
+            timer_wakes: 0,
+            polls: 0,
             app_entries: Arc::new(AtomicU64::new(0)),
-            idle_app_entries: 0,
+            signal_app_entries: 0,
             engine_snapshots: 0,
         }
     }
 
     pub(crate) fn tick(&mut self) {
-        self.wakes += 1;
+        self.timer_wakes += 1;
         self.report();
     }
 
     pub(crate) fn check(&mut self) {
-        self.checks += 1;
+        self.polls += 1;
         self.report();
     }
 
@@ -45,9 +48,9 @@ impl LoopProbe {
         self.app_entries.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn idle_app_entry(&mut self) {
+    pub(crate) fn signal_app_entry(&mut self) {
         self.app_entry();
-        self.idle_app_entries += 1;
+        self.signal_app_entries += 1;
     }
 
     pub(crate) fn app_entry_counter(&self) -> Arc<AtomicU64> {
@@ -78,15 +81,15 @@ impl LoopProbe {
         }
 
         let seconds = elapsed.as_secs_f64();
-        let wakes = self.wakes.to_string();
-        let wakes_per_s = rate(self.wakes, seconds);
-        let checks = self.checks.to_string();
-        let checks_per_s = rate(self.checks, seconds);
+        let timer_wakes = self.timer_wakes.to_string();
+        let timer_wakes_per_s = rate(self.timer_wakes, seconds);
+        let polls = self.polls.to_string();
+        let polls_per_s = rate(self.polls, seconds);
         let app_entries_count = self.app_entries.swap(0, Ordering::Relaxed);
         let app_entries = app_entries_count.to_string();
         let app_entries_per_s = rate(app_entries_count, seconds);
-        let idle_app_entries = self.idle_app_entries.to_string();
-        let idle_app_entries_per_s = rate(self.idle_app_entries, seconds);
+        let signal_app_entries = self.signal_app_entries.to_string();
+        let signal_app_entries_per_s = rate(self.signal_app_entries, seconds);
         let engine_snapshots = self.engine_snapshots.to_string();
         let engine_snapshots_per_s = rate(self.engine_snapshots, seconds);
         log_event(
@@ -95,14 +98,17 @@ impl LoopProbe {
             "loop_counts",
             &[
                 ("loop", self.name),
-                ("wakes", wakes.as_str()),
-                ("wakes_per_s", wakes_per_s.as_str()),
-                ("checks", checks.as_str()),
-                ("checks_per_s", checks_per_s.as_str()),
+                ("timer_wakes", timer_wakes.as_str()),
+                ("timer_wakes_per_s", timer_wakes_per_s.as_str()),
+                ("polls", polls.as_str()),
+                ("polls_per_s", polls_per_s.as_str()),
                 ("app_entries", app_entries.as_str()),
                 ("app_entries_per_s", app_entries_per_s.as_str()),
-                ("idle_app_entries", idle_app_entries.as_str()),
-                ("idle_app_entries_per_s", idle_app_entries_per_s.as_str()),
+                ("signal_app_entries", signal_app_entries.as_str()),
+                (
+                    "signal_app_entries_per_s",
+                    signal_app_entries_per_s.as_str(),
+                ),
                 ("engine_snapshots", engine_snapshots.as_str()),
                 ("engine_snapshots_per_s", engine_snapshots_per_s.as_str()),
             ],
@@ -112,9 +118,9 @@ impl LoopProbe {
     }
 
     fn clear_counts(&mut self) {
-        self.wakes = 0;
-        self.checks = 0;
-        self.idle_app_entries = 0;
+        self.timer_wakes = 0;
+        self.polls = 0;
+        self.signal_app_entries = 0;
         self.engine_snapshots = 0;
     }
 }

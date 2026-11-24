@@ -172,7 +172,8 @@ pub(crate) fn command_signal(cx: &App) -> Option<Arc<AtomicBool>> {
         .map(|attached| attached.media.borrow().commands_pending.clone())
 }
 
-/// 取走桌面媒体控件发来的命令。
+/// 取走桌面媒体控件发来的命令，并清掉托盘用的哨兵。
+/// 只在哨兵为真时调用；取命令和清哨兵必须成对，避免别处误清让命令多等一拍。
 pub fn drain_commands(cx: &App) -> Vec<Command> {
     cx.try_global::<Attached>()
         .map(|attached| {

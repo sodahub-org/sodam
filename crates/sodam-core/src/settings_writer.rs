@@ -51,6 +51,28 @@ pub struct WriteFailure {
     pub detail: String,
 }
 
+/// 启动回存失败的共享槽：托盘只查是否有待报项，界面线程取走一次。
+#[derive(Clone, Debug, Default)]
+pub struct StartupFailureSlot {
+    failure: Arc<Mutex<Option<WriteFailure>>>,
+}
+
+impl StartupFailureSlot {
+    pub fn is_pending(&self) -> bool {
+        self.failure.try_lock().map_or(false, |slot| slot.is_some())
+    }
+
+    fn take(&self) -> Option<WriteFailure> {
+        self.failure.lock().ok()?.take()
+    }
+
+    fn set(&self, failure: WriteFailure) {
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(failure);
+        }
+    }
+}
+
 /// 登出落盘的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignOut {
@@ -122,8 +144,7 @@ pub struct SettingsWriter {
     tx: mpsc::Sender<Message>,
     thread: Option<std::thread::JoinHandle<()>>,
     failure: Arc<Mutex<Option<WriteFailure>>>,
-    startup_failure: Arc<Mutex<Option<WriteFailure>>>,
-    startup_error_signal: Arc<AtomicBool>,
+    startup_failure: StartupFailureSlot,
     /// 强制退出：析构时不再等写线程（慢盘 / 写锁被占时 join 会把进程挂住，#198）。
     abandon_on_drop: AtomicBool,
     /// 只给日志去重：队列停了以后日志只记第一笔（提示每次都照塞）。
@@ -140,23 +161,12 @@ impl SettingsWriter {
         let (tx, rx) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let worker_failure = failure.clone();
-        let startup_failure = Arc::new(Mutex::new(None));
+        let startup_failure = StartupFailureSlot::default();
         let worker_startup_failure = startup_failure.clone();
-        let startup_error_signal = Arc::new(AtomicBool::new(false));
-        let worker_startup_error_signal = startup_error_signal.clone();
         let dead_logged = AtomicBool::new(false);
         let spawned = std::thread::Builder::new()
             .name("sodam-settings".into())
-            .spawn(move || {
-                run(
-                    sink,
-                    rx,
-                    worker_failure,
-                    worker_startup_failure,
-                    worker_startup_error_signal,
-                    window,
-                )
-            });
+            .spawn(move || run(sink, rx, worker_failure, worker_startup_failure, window));
         let thread = match spawned {
             Ok(thread) => Some(thread),
             Err(err) => {
@@ -184,7 +194,6 @@ impl SettingsWriter {
             thread,
             failure,
             startup_failure,
-            startup_error_signal,
             abandon_on_drop: AtomicBool::new(false),
             dead_logged,
         }
@@ -230,10 +239,7 @@ impl SettingsWriter {
             detail,
         };
         if startup {
-            if let Ok(mut slot) = self.startup_failure.lock() {
-                *slot = Some(failure);
-            }
-            self.startup_error_signal.store(true, Ordering::Release);
+            self.startup_failure.set(failure);
         } else if let Ok(mut slot) = self.failure.lock() {
             *slot = Some(failure);
         }
@@ -282,18 +288,14 @@ impl SettingsWriter {
         self.failure.lock().ok()?.take()
     }
 
-    /// 托盘循环在进 app 前先看这个信号；启动回存失败单独占一个槽。
-    pub fn startup_error_signal(&self) -> Arc<AtomicBool> {
-        self.startup_error_signal.clone()
+    /// 托盘循环在进 app 前先看这个槽；槽空了就表示没有待报的启动失败。
+    pub fn startup_failure_slot(&self) -> StartupFailureSlot {
+        self.startup_failure.clone()
     }
 
     /// 取走启动期回存失败；同一个失败只交出来一次。
     pub fn take_startup_error(&self) -> Option<WriteFailure> {
-        let failure = self.startup_failure.lock().ok()?.take();
-        if failure.is_some() {
-            self.startup_error_signal.store(false, Ordering::Release);
-        }
-        failure
+        self.startup_failure.take()
     }
 
     /// 强制退出（3 秒超时，或用户在等待期间再点一次退出）时调用：
@@ -325,8 +327,7 @@ fn run(
     mut sink: Box<dyn SettingsSink>,
     rx: mpsc::Receiver<Message>,
     failure: Arc<Mutex<Option<WriteFailure>>>,
-    startup_failure: Arc<Mutex<Option<WriteFailure>>>,
-    startup_error_signal: Arc<AtomicBool>,
+    startup_failure: StartupFailureSlot,
     window: Duration,
 ) {
     let mut pending: Option<Settings> = None;
@@ -369,7 +370,6 @@ fn run(
             record(
                 &failure,
                 &startup_failure,
-                &startup_error_signal,
                 FailureKind::Settings,
                 sink.write(snapshot),
             );
@@ -378,7 +378,6 @@ fn run(
             Some(Message::Startup(work)) => record(
                 &failure,
                 &startup_failure,
-                &startup_error_signal,
                 FailureKind::Startup,
                 sink.persist_startup(work),
             ),
@@ -416,8 +415,7 @@ fn run(
 /// 记一次失败：日志留原文，状态行那份留着给下一拍取走。
 fn record(
     failure: &Mutex<Option<WriteFailure>>,
-    startup_failure: &Mutex<Option<WriteFailure>>,
-    startup_error_signal: &AtomicBool,
+    startup_failure: &StartupFailureSlot,
     kind: FailureKind,
     outcome: Result<(), String>,
 ) {
@@ -432,10 +430,7 @@ fn record(
     );
     let write_failure = WriteFailure { kind, detail };
     if kind == FailureKind::Startup {
-        if let Ok(mut slot) = startup_failure.lock() {
-            *slot = Some(write_failure);
-        }
-        startup_error_signal.store(true, Ordering::Release);
+        startup_failure.set(write_failure);
     } else if let Ok(mut slot) = failure.lock() {
         *slot = Some(write_failure);
     }
@@ -631,15 +626,15 @@ mod tests {
             .write_back
             .expect("首启要回存");
         let (writer, log) = writer_with(recording(true));
-        let startup_signal = writer.startup_error_signal();
-        assert!(!startup_signal.load(Ordering::Acquire));
+        let startup_slot = writer.startup_failure_slot();
+        assert!(!startup_slot.is_pending());
         writer.persist_startup(work);
         block_on(writer.flush());
-        assert!(startup_signal.load(Ordering::Acquire));
+        assert!(startup_slot.is_pending());
         assert!(writer.take_error().is_none(), "启动失败不占普通保存失败槽");
         let failure = writer.take_startup_error().expect("失败要能拿到");
         assert_eq!(failure.kind, FailureKind::Startup);
-        assert!(!startup_signal.load(Ordering::Acquire));
+        assert!(!startup_slot.is_pending());
         assert!(writer.take_startup_error().is_none(), "同一个失败只报一次");
         assert_eq!(log.lock().unwrap().startups, 0);
     }

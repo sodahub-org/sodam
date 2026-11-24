@@ -373,7 +373,7 @@ impl Root {
         log_prefetch_suspension(class);
     }
 
-    /// 启动期配置回存失败由托盘拍报告，最多晚 100ms 进状态行。
+    /// 启动期配置回存失败正常情况下由托盘拍报告；退出等待期间不消费，留给退出状态。
     pub(crate) fn report_startup_persist_result(&mut self, cx: &mut Context<Self>) {
         if self.quit_gate.is_saving() {
             return;

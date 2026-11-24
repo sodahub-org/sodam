@@ -11,8 +11,9 @@ mod app_text;
 mod tray;
 mod ui;
 mod views;
-// 系统媒体控制（媒体键 / 桌面媒体挂件），见 media.rs。
+// 帧日志循环计数，见 loop_probe.rs。
 mod loop_probe;
+// 系统媒体控制（媒体键 / 桌面媒体挂件），见 media.rs。
 mod media;
 // 播放控制快捷键（可重绑），见 shortcuts.rs。
 mod shortcuts;
@@ -29,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::loop_probe::LoopProbe;
+use sodam_core::settings_writer::StartupFailureSlot;
 
 /// 更紧凑的启动窗口尺寸（逻辑像素）；通过 Bounds::centered 在主屏幕居中。
 const DEFAULT_SIZE: (f32, f32) = (980.0, 640.0);
@@ -78,10 +80,11 @@ fn native_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
 struct TraySignals {
     media_commands: Option<Arc<AtomicBool>>,
     shortcuts_dirty: Arc<AtomicBool>,
-    startup_save: Arc<AtomicBool>,
+    startup_save: StartupFailureSlot,
 }
 
-/// 托盘事件循环：把命令转发为应用动作，并周期同步播放状态到 `sync`。
+/// 100ms 托盘拍：转发托盘和媒体命令，处理单实例激活、快捷键重绑、
+/// 启动回存失败与配置巡检，并同步托盘和系统媒体状态。
 /// 双平台共用；平台差异只在 `sync` 闭包（见 tray.rs）。
 fn start_tray_service(
     rx: std::sync::mpsc::Receiver<tray::TrayCommand>,
@@ -136,7 +139,7 @@ fn start_tray_service(
                 .as_ref()
                 .is_some_and(|pending| pending.load(Ordering::Acquire))
             {
-                tray_probe.idle_app_entry();
+                tray_probe.signal_app_entry();
                 cx.update(|cx| {
                     let commands = media::drain_commands(cx);
                     app.update(cx, |root, cx| {
@@ -157,7 +160,7 @@ fn start_tray_service(
             }
 
             if signals.shortcuts_dirty.load(Ordering::Acquire) {
-                tray_probe.idle_app_entry();
+                tray_probe.signal_app_entry();
                 cx.update(|cx| {
                     let settings = app.update(cx, |root, _cx| {
                         root.shortcuts_dirty.store(false, Ordering::Release);
@@ -167,8 +170,8 @@ fn start_tray_service(
                 });
             }
 
-            if signals.startup_save.load(Ordering::Acquire) {
-                tray_probe.idle_app_entry();
+            if signals.startup_save.is_pending() {
+                tray_probe.signal_app_entry();
                 cx.update(|cx| {
                     app.update(cx, |root, cx| root.report_startup_persist_result(cx));
                 });
@@ -320,7 +323,7 @@ fn main() {
                 let signals = TraySignals {
                     media_commands: media::command_signal(cx),
                     shortcuts_dirty: app.read(cx).shortcuts_dirty.clone(),
-                    startup_save: app.read(cx).settings_writer.startup_error_signal(),
+                    startup_save: app.read(cx).settings_writer.startup_failure_slot(),
                 };
                 start_tray_service(tray_rx, activations, app.clone(), signals, cx, sync);
             }
