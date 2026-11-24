@@ -21,7 +21,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 unicode-segmentation = "1.13.3"
 # 封面需求队列：渲染提交需求，消费循环按需唤醒。
 futures-channel.workspace = true
-# 等定时器或唤醒通道，取先到的一个。
+# 组合两路 future：定时器/唤醒通道取先到的（app.rs），zip 并行等待（media/mpris.rs）。
 futures-lite.workspace = true
 
 # StatusNotifier 托盘是 Linux 桌面协议，macOS 上没有 D-Bus session bus。
