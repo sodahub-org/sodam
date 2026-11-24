@@ -3375,7 +3375,7 @@ impl Root {
     pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> CoverWant {
         let queued = self.cover_store.want(urls);
         let stats = CoverWant {
-            queued: queued.len(),
+            queued,
             dropped: self.cover_store.take_dropped(),
         };
         if stats.queued > 0 {
