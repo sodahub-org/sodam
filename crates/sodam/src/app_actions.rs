@@ -4969,6 +4969,21 @@ mod batch_upgrade_notice_tests {
             upgraded: 0,
             failed: 0,
             no_higher: 2,
+            unknown_rank: 0,
+        };
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Status("summary".into())
+        );
+    }
+
+    #[test]
+    fn unknown_rank_only_uses_normal_status() {
+        let tally = Tally {
+            upgraded: 0,
+            failed: 0,
+            no_higher: 0,
+            unknown_rank: 2,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4982,6 +4997,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 1,
             failed: 1,
             no_higher: 0,
+            unknown_rank: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4995,6 +5011,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 2,
             failed: 0,
             no_higher: 1,
+            unknown_rank: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
