@@ -166,8 +166,8 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         continue;
                     };
                     let url = &card.playlist.cover;
-                    let cached = covers.get(url);
-                    if cached.is_none() && !covers.is_failed(url) && !url.trim().is_empty() {
+                    let lookup = covers.lookup(url);
+                    if lookup.should_request {
                         cover_mailbox.request(url);
                     }
 
@@ -203,7 +203,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                                     });
                                 }
                             })
-                            .child(cover(cached, 148.0, theme::radius::CARD))
+                            .child(cover(lookup.path, 148.0, theme::radius::CARD))
                             .child(
                                 div()
                                     .w_full()

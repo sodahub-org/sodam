@@ -1,7 +1,7 @@
 //! 封面状态：一条 URL 一条记录，缩略图和原图各占一格。
 //!
 //! 取图本身不在这里：这里只回答「这张问过没有 / 排到哪一步了 / 结果是什么」。
-//! 读口子（`path` / `color` / `original_path` / `paths_handle` / `originals_handle` / `is_failed`）
+//! 读口子（`path` / `color` / `original_path` / `paths_handle` / `originals_handle` / `lookup`）
 //! 是纯内存查询，不碰磁盘也不发请求；下载由调用方泵出去，结果再用
 //! [`CoverStore::complete`] / [`CoverStore::complete_original`] 交回来。
 
@@ -58,6 +58,13 @@ struct CoverPathsInner {
     failed: HashSet<String>,
 }
 
+/// 一次读取的结果：已有路径，还是需要渲染方继续请求。
+#[derive(Debug)]
+pub struct CoverLookup {
+    pub path: Option<PathBuf>,
+    pub should_request: bool,
+}
+
 impl CoverPaths {
     /// 这张图有没有已完成路径（只查内存，不克隆）。
     pub fn contains(&self, url: &str) -> bool {
@@ -85,6 +92,25 @@ impl CoverPaths {
             .paths
             .get(url.trim())
             .cloned()
+    }
+
+    /// 一次快照同时回答“有没有路径”和“还要不要请求”，避免渲染方分两次读。
+    pub fn lookup(&self, url: &str) -> CoverLookup {
+        let url = url.trim();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(path) = inner.paths.get(url) {
+            return CoverLookup {
+                path: Some(path.clone()),
+                should_request: false,
+            };
+        }
+        CoverLookup {
+            path: None,
+            should_request: !url.is_empty() && !inner.failed.contains(url),
+        }
     }
 
     fn insert(&self, url: &str, path: PathBuf) {
@@ -1135,6 +1161,30 @@ mod tests {
         assert_eq!(paths.get(url), None);
     }
 
+    #[test]
+    fn lookup_combines_path_and_request_state() {
+        let paths = CoverPaths::default();
+        let missing = paths.lookup(" cover-a ");
+        assert!(missing.path.is_none());
+        assert!(missing.should_request);
+        assert!(!paths.lookup("   ").should_request);
+
+        paths.insert("cover-a", PathBuf::from("/tmp/a.img"));
+        let ready = paths.lookup("cover-a");
+        assert_eq!(ready.path, Some(PathBuf::from("/tmp/a.img")));
+        assert!(!ready.should_request);
+
+        paths.mark_failed("cover-a");
+        let failed = paths.lookup("cover-a");
+        assert_eq!(failed.path, Some(PathBuf::from("/tmp/a.img")));
+        assert!(!failed.should_request);
+
+        paths.remove("cover-a");
+        let retry = paths.lookup("cover-a");
+        assert!(retry.path.is_none());
+        assert!(retry.should_request);
+    }
+
     /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。
     #[test]
     fn read_ports_are_side_effect_free() {
@@ -1147,6 +1197,7 @@ mod tests {
             assert!(store.color("cover-a").is_none());
             assert!(store.paths_handle().get("cover-a").is_none());
             assert!(!store.paths_handle().is_failed("cover-a"));
+            assert!(store.paths_handle().lookup("cover-a").should_request);
         }
         assert_eq!(store.want(&all), 0, "读口子不能放行去重");
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
