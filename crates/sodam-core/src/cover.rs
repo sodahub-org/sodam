@@ -75,7 +75,7 @@ impl CoverPaths {
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.insert(url.to_string(), path);
+        paths.insert(url.trim().to_string(), path);
     }
 
     fn remove(&self, url: &str) {
@@ -83,7 +83,7 @@ impl CoverPaths {
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.remove(url);
+        paths.remove(url.trim());
     }
 
     fn clear(&self) {
@@ -698,8 +698,8 @@ impl CoverStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_ORIGINAL_CONCURRENCY, MAX_ORIGINAL_QUEUE,
-        MAX_QUEUE,
+        CoverOutcome, CoverPaths, CoverStore, MAX_CONCURRENCY, MAX_ORIGINAL_CONCURRENCY,
+        MAX_ORIGINAL_QUEUE, MAX_QUEUE,
     };
     use std::path::PathBuf;
 
@@ -996,6 +996,31 @@ mod tests {
 
         store.forget(["cover-a"]);
         assert_eq!(store.want(&url), 1, "作废之后能重新下");
+    }
+
+    #[test]
+    fn paths_normalize_url_whitespace() {
+        let paths = CoverPaths::default();
+        let url = "https://example.com/cover.jpg";
+        let raw_url = " \thttps://example.com/cover.jpg\n";
+        let padded_url = " https://example.com/cover.jpg ";
+        let path = PathBuf::from("/tmp/cover.jpg");
+
+        paths.insert(raw_url, path.clone());
+
+        assert!(paths.contains(url));
+        assert!(paths.contains(padded_url));
+        assert_eq!(paths.get(url), Some(path.clone()));
+        assert_eq!(paths.get(padded_url), Some(path.clone()));
+
+        paths.remove(url);
+        assert!(!paths.contains(padded_url));
+        assert_eq!(paths.get(padded_url), None);
+
+        paths.insert(raw_url, path);
+        paths.remove(padded_url);
+        assert!(!paths.contains(url));
+        assert_eq!(paths.get(url), None);
     }
 
     /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。

@@ -20,7 +20,8 @@ use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
 use sodam_core::settings_writer::{FailureKind, SignOut};
 use sodam_core::upgrade::{
-    identity_change, stop_reason, IdentityChange, Outcome, StopConditions, StopReason, Tally,
+    identity_change, stop_reason, IdentityChange, NotImprovedReason, Outcome, StopConditions,
+    StopReason, Tally,
 };
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +63,22 @@ fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
     }
 }
 
+fn cache_upgrade_log_parts<'a>(
+    track_id: &'a str,
+    quality: &'a str,
+    reason: Option<NotImprovedReason>,
+) -> (&'static str, Vec<(&'a str, &'a str)>) {
+    let event = if reason.is_some() {
+        "cache_upgrade_not_improved"
+    } else {
+        "cache_upgraded"
+    };
+    let mut fields = vec![("track_id", track_id), ("quality", quality)];
+    if let Some(reason) = reason {
+        fields.push(("reason", reason.as_str()));
+    }
+    (event, fields)
+}
 /// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
 ///
 /// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
@@ -2992,22 +3009,15 @@ impl Root {
             account_user_id.as_deref(),
         ) {
             Ok(run) => {
-                let (event, level) = match run.outcome {
-                    Outcome::Upgraded => ("cache_upgraded", levels.success),
-                    Outcome::NoHigherTier => ("cache_upgrade_no_higher_tier", levels.success),
-                    Outcome::UnknownRank => ("cache_upgrade_unknown_rank", levels.success),
-                    Outcome::Failed => ("cache_upgrade_failed", levels.failure),
-                };
-                log_outlet::log_event(
-                    level,
-                    LogTopic::Player,
-                    event,
-                    &[
-                        ("track_id", track.id.as_str()),
-                        ("quality", run.track.quality.as_str()),
-                    ],
+                // 换没换文件由升级那条路自己判定；日志和对外结论都只认 not_improved_reason。
+                let outcome = Outcome::from_not_improved_reason(run.not_improved_reason);
+                let (event, fields) = cache_upgrade_log_parts(
+                    track.id.as_str(),
+                    run.track.quality.as_str(),
+                    run.not_improved_reason,
                 );
-                run.outcome
+                log_outlet::log_event(levels.success, LogTopic::Player, event, &fields);
+                outcome
             }
             Err(failure) => {
                 // 级别由调用方定：单首失败要用 WARN 进默认日志；批量几百首逐首记会刷屏，
@@ -5618,12 +5628,44 @@ fn cubic_bezier_ease_out(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_cover_url, line_undergoing_reveal, lyrics_idle_wait, lyrics_near_next_line,
-        lyrics_scroll_ease, retry_current_original_cover, settle_original_cover,
+        cache_upgrade_log_parts, current_cover_url, line_undergoing_reveal, lyrics_idle_wait,
+        lyrics_near_next_line, lyrics_scroll_ease, retry_current_original_cover,
+        settle_original_cover,
     };
     use sodam_core::cover::CoverOutcome;
     use sodam_core::models::{LyricLine, LyricWord, TrackItem};
+    use sodam_core::upgrade::NotImprovedReason;
     use std::path::PathBuf;
+
+    #[test]
+    fn cache_upgrade_log_distinguishes_not_improved_reasons() {
+        for (reason, expected) in [
+            (NotImprovedReason::PreviewOnly, "preview_only"),
+            (NotImprovedReason::PreviewBackoff, "preview_backoff"),
+            (NotImprovedReason::NotBetter, "not_better"),
+            (NotImprovedReason::NoHigherTier, "no_higher_tier"),
+            (NotImprovedReason::AlreadyChecked, "already_checked"),
+            (NotImprovedReason::UnknownRank, "unknown_rank"),
+        ] {
+            let (event, fields) = cache_upgrade_log_parts("track-1", "极高 320k", Some(reason));
+            assert_eq!(event, "cache_upgrade_not_improved");
+            assert_eq!(
+                fields,
+                vec![
+                    ("track_id", "track-1"),
+                    ("quality", "极高 320k"),
+                    ("reason", expected),
+                ]
+            );
+        }
+
+        let (event, fields) = cache_upgrade_log_parts("track-1", "无损 871k", None);
+        assert_eq!(event, "cache_upgraded");
+        assert_eq!(
+            fields,
+            vec![("track_id", "track-1"), ("quality", "无损 871k")]
+        );
+    }
 
     /// 清缓存或淘汰撞上在飞的原图：回调解析出路径但文件已经没了，
     /// 不能交给 `CoverStore` 发布死路径，否则这首歌的歌词页大图
