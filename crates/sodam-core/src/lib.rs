@@ -15,6 +15,7 @@ pub mod log_outlet;
 pub mod login;
 pub mod mem;
 pub mod models;
+pub mod play_failure;
 pub mod play_report;
 pub mod playback_trace;
 pub mod prefetch;

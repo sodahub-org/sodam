@@ -15,6 +15,10 @@ use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
+use sodam_core::play_failure::{
+    decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel, NoticeSlot, PlayFailureInput,
+    PlayIntent,
+};
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
@@ -4243,93 +4247,122 @@ impl Root {
                         // 落闸、挂预取、写不可播集合，也别替用户跳歌。
                         if root.auth_epoch != auth_epoch {
                             root.playing = root.engine.snapshot().playing;
+                            cx.notify();
                             return;
                         }
                         // 全局故障同样挂起预取：装载这条路先看见了故障，
                         // 预取没理由继续一轮轮重打那台共享签名服务。
                         root.suspend_prefetch(&failure);
-
-                        if failure.is_per_track() {
-                            // 按曲目不可播：先写进会话集合，再按「扫一圈」找下一个可播候选。
-                            // 查集合发生在任何网络请求之前——命中集合的曲目不会被装载，
-                            // 同一首在本轮只会产生一次 attempt_start。
-                            root.unplayable.record_failure(&track.id, &failure);
-                            let has_candidate = {
-                                let unplayable = &root.unplayable;
-                                root.queue
-                                    .advance_playable(|id| unplayable.is_unavailable(id))
-                                    .is_some()
-                            };
-                            if has_candidate {
-                                let message =
-                                    root.tr(play_failure_text(&failure, true)).to_string();
-                                // 真的前进时撤下与这次结论无关的旧常驻错误。
-                                root.playback_error = None;
-                                root.clear_round_exhaustion();
-                                root.notify_warning_once("track-unavailable", message);
-                                root.progress_preview = None;
-                                root.sync_queue_cache();
-                                root.start_track(false, cx);
-                            } else {
-                                // 扫一圈都确认放不出来：落闸，并把本轮结论留在常驻位。
-                                root.halt_exhausted_round();
-                            }
-                        } else {
-                            // 非确定性失败（网络抖动、传输截断、签名地址过期、限流、
-                            // 服务端 5xx、解密失败）仍按连败封顶停下，别整晚静音空转。
-                            // 「已跳过」只有在真的换到下一首时才能说。封顶落闸、空队列、
-                            // 单曲循环 / 只有一首都不会前进，改由常驻错误位或非跳过文案说明。
-                            let skip = should_skip_to_next(&failure);
-                            let cap_reached =
-                                skip && root.consecutive_failures + 1 >= PLAY_FAILURE_HALT_AFTER;
-                            // 单曲循环的「跳过」是原地重试同一首，不换歌；其余模式先问
-                            // 队列有没有可播候选。只有真的能前进时文案才说「已跳过」。
-                            let in_place = root.queue.mode == PlayMode::RepeatOne;
-                            let has_candidate = in_place || root.has_playable_ahead();
-                            let skip_now = skip && !cap_reached && has_candidate;
-                            let message =
-                                root.tr(play_failure_text(&failure, skip_now)).to_string();
-                            if skip_now {
-                                // 可前进的非按曲目失败：同属一次性反馈，
-                                // 常驻错误位只留给落闸与全局故障。
-                                root.playback_error = None;
-                                root.notify_warning_once("track-stream-failed", message);
-                            } else {
-                                root.playback_error = Some(message.clone());
-                                root.notify_warning_once("track-stream-failed", message);
-                            }
-                            if skip {
-                                root.consecutive_failures += 1;
-                                if cap_reached {
-                                    root.halt_playback();
-                                    let halted = root.tr("连续 3 首没播出来，已暂停").to_string();
-                                    root.playback_error = Some(halted.clone());
-                                    root.notify_error_once("consecutive-stream-failures", halted);
-                                } else if in_place {
-                                    // 单曲循环：原地重试同一首，由连败封顶兜底。
-                                    root.advance_next(false, cx);
-                                } else if has_candidate {
-                                    // 自动跳过同样先查不可播集合，别把已知放不出来的歌
-                                    // 再装载一次。
-                                    root.auto_advance_track(cx);
-                                } else {
-                                    // 没有可播候选：保持这次网络故障的文案并停下，
-                                    // 不套用「整圈没有能播的歌」去误报成权益问题。
-                                    root.halt_playback();
-                                }
-                            } else {
-                                // 全局性故障（登录 / 签名服务 / 缺 Cookie / 磁盘）：换一首也一样失败。
-                                // 停下并把修复动作留在状态里，别用连续跳过把全局故障
-                                // 伪装成「这几首运气不好」。
-                                root.halt_playback();
-                            }
-                        }
+                        root.handle_play_failure(&failure, &track, cx);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn handle_play_failure(
+        &mut self,
+        failure: &PlaybackFailure,
+        track: &TrackItem,
+        cx: &mut Context<Self>,
+    ) {
+        let decision = decide_play_failure(PlayFailureInput {
+            intent: PlayIntent::Now,
+            failure,
+            has_candidate: self.has_playable_ahead(),
+            consecutive_failures: self.consecutive_failures,
+            mode: self.queue.mode,
+        });
+
+        match decision.record {
+            FailureRecord::None => {}
+            FailureRecord::Unplayable => {
+                self.unplayable.record_failure(&track.id, failure);
+            }
+            FailureRecord::Consecutive => self.consecutive_failures += 1,
+        }
+
+        if decision.halt == Halt::ExhaustedRound {
+            self.halt_exhausted_round();
+            return;
+        }
+
+        let notice_key = if decision.record == FailureRecord::Unplayable {
+            "track-unavailable"
+        } else {
+            "track-stream-failed"
+        };
+        let mut skipped = false;
+        if decision.advance == Advance::Next {
+            let advanced = {
+                let unplayable = &self.unplayable;
+                self.queue
+                    .advance_playable(|id| unplayable.is_unavailable(id))
+                    .is_some()
+            };
+            if !advanced {
+                if decision.record == FailureRecord::Unplayable {
+                    self.halt_exhausted_round();
+                } else {
+                    let message = self.tr(play_failure_text(failure, false)).to_string();
+                    self.playback_error = Some(message.clone());
+                    self.notify_warning_once(notice_key, message);
+                    self.halt_playback();
+                }
+                return;
+            }
+            skipped = true;
+        }
+
+        let message = self.tr(play_failure_text(failure, skipped)).to_string();
+        match decision.notice.slot {
+            NoticeSlot::None => {
+                if decision.halt == Halt::None {
+                    self.playback_error = None;
+                    if decision.record == FailureRecord::Unplayable {
+                        self.clear_round_exhaustion();
+                    }
+                }
+            }
+            NoticeSlot::PlaybackError => self.playback_error = Some(message.clone()),
+            NoticeSlot::RoundExhausted => {}
+        }
+        match decision.notice.channel {
+            NoticeChannel::None => {}
+            NoticeChannel::Warning => {
+                self.notify_warning_once(notice_key, message.clone());
+            }
+            NoticeChannel::Error => {
+                self.notify_error_once(notice_key, message.clone());
+            }
+            NoticeChannel::WarningThenError => {
+                self.notify_warning_once(notice_key, message.clone());
+            }
+        }
+
+        match decision.halt {
+            Halt::None => {}
+            Halt::ExhaustedRound => return,
+            Halt::Playback => decision.halt.execute(|| self.halt_playback()),
+            Halt::ConsecutiveFailures => {
+                decision.halt.execute(|| self.halt_playback());
+                let halted = self.tr("连续 3 首没播出来，已暂停").to_string();
+                self.playback_error = Some(halted.clone());
+                self.notify_error_once("consecutive-stream-failures", halted);
+            }
+        }
+
+        match decision.advance {
+            Advance::Stay => {}
+            Advance::RetrySame => self.advance_next(false, cx),
+            Advance::Next => {
+                self.progress_preview = None;
+                self.sync_queue_cache();
+                self.start_track(false, cx);
+            }
+        }
     }
 
     /// 切到下一个播放模式：列表循环 → 单曲循环 → 随机播放（对齐官方轮换顺序）。
@@ -4755,18 +4788,6 @@ fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
     }
 }
 
-/// 这类失败要不要换一首再试。
-///
-/// * 按曲目不可播（[`PlaybackFailure::is_per_track`]：无整曲权益 / 下架取不到 /
-///   参数不合法 / 音频解不开）与纯网络抖动（`Nothing`）→ 换，队列里还有别的歌；
-/// * 登录、签名服务、缺 Cookie、磁盘 → 换一首也一样失败，停下来把动作告诉用户，
-///   别用「跳过」把同一个全局故障伪装成单首曲目的问题。
-fn should_skip_to_next(failure: &PlaybackFailure) -> bool {
-    failure.is_per_track() || failure.action == RecoveryAction::Nothing
-}
-
-/// 连败封顶阈值：连续这么多首装载失败就停下，别再替用户往后翻。
-const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 /// 熔断复位判据：声音播到这么多秒才算「真的缓过来」。
 const PLAYBACK_RECOVER_SECONDS: f64 = 3.0;
 
@@ -5056,31 +5077,37 @@ mod failure_text_tests {
         assert_ne!(english, login, "英文词典缺少：{login}");
     }
 
-    /// 按曲目类换下一首，全局类落闸；判据是结论对象，不是可重试性。
+    /// 「已停止播放」只能给真的会落闸的点播入口；预装仍说重新登录。
     #[test]
-    fn only_per_track_failures_skip_to_next() {
-        let at = |action| {
-            PlaybackFailure::new(Stage::ResolveStream, Retryability::Never, action, "detail")
-        };
-        assert!(should_skip_to_next(&at(RecoveryAction::TrackUnavailable)));
-        assert!(should_skip_to_next(&at(RecoveryAction::PickAnother)));
-        // 解密失败是按曲目不可播：自动跳下一首。
-        assert!(should_skip_to_next(&at(RecoveryAction::Undecodable)));
-        // 网络抖动仍然换一首（既有行为）。
-        assert!(should_skip_to_next(&PlaybackFailure::new(
-            Stage::Network,
-            Retryability::Transient,
-            RecoveryAction::Nothing,
-            "timeout",
-        )));
-        // 全局故障一律落闸。
-        for action in [
+    fn stopped_playback_copy_only_when_point_playback_halts() {
+        let login = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
             RecoveryAction::Relogin,
-            RecoveryAction::CheckSigner,
-            RecoveryAction::CheckEntitlement,
-            RecoveryAction::FreeSpace,
+            "detail",
+        );
+        for (intent, expected_halt) in [
+            (PlayIntent::Now, Halt::Playback),
+            (PlayIntent::PrepareFirst, Halt::None),
         ] {
-            assert!(!should_skip_to_next(&at(action)), "{action:?}");
+            let decision = decide_play_failure(PlayFailureInput {
+                intent,
+                failure: &login,
+                has_candidate: false,
+                consecutive_failures: 0,
+                mode: PlayMode::ListLoop,
+            });
+            assert_eq!(decision.halt, expected_halt, "{intent:?}");
+            let text = if intent == PlayIntent::Now {
+                play_failure_text(&login, false)
+            } else {
+                pending_failure_text(&login)
+            };
+            assert_eq!(
+                text.contains("已停止播放"),
+                intent == PlayIntent::Now,
+                "{text}"
+            );
         }
     }
 
@@ -5407,7 +5434,7 @@ mod playback_budget_tests {
     #[test]
     fn halt_threshold_matches_the_copy() {
         let shown = Language::Chinese.text("连续 3 首没播出来，已暂停");
-        let hits = shown.contains(&PLAY_FAILURE_HALT_AFTER.to_string());
+        let hits = shown.contains(&sodam_core::play_failure::PLAY_FAILURE_HALT_AFTER.to_string());
         assert!(hits, "{shown}");
     }
 }
