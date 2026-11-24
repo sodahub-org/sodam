@@ -43,20 +43,20 @@ struct UpgradeLogLevels {
     failure: LogLevel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BatchUpgradeNotice {
-    Info,
-    Success,
-    Warning,
+    Status(String),
+    Success(String),
+    Warning(String),
 }
 
-fn batch_upgrade_notice(tally: Tally) -> BatchUpgradeNotice {
+fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
     if tally.failed > 0 {
-        BatchUpgradeNotice::Warning
+        BatchUpgradeNotice::Warning(message)
     } else if tally.upgraded > 0 {
-        BatchUpgradeNotice::Success
+        BatchUpgradeNotice::Success(message)
     } else {
-        BatchUpgradeNotice::Info
+        BatchUpgradeNotice::Status(message)
     }
 }
 
@@ -3269,14 +3269,14 @@ impl Root {
                                     tally.no_higher.to_string(),
                                 ],
                             );
-                            match batch_upgrade_notice(tally) {
-                                BatchUpgradeNotice::Warning => {
-                                    root.notify_warning_once("batch-upgrade-complete", message);
+                            match batch_upgrade_notice(tally, message) {
+                                BatchUpgradeNotice::Warning(text) => {
+                                    root.notify_warning_once("batch-upgrade-complete", text);
                                 }
-                                BatchUpgradeNotice::Success => {
-                                    root.notify_success_once("batch-upgrade-complete", message);
+                                BatchUpgradeNotice::Success(text) => {
+                                    root.notify_success_once("batch-upgrade-complete", text);
                                 }
-                                BatchUpgradeNotice::Info => root.set_status_text(message),
+                                BatchUpgradeNotice::Status(text) => root.set_status_text(text),
                             }
                         }
                     }
@@ -4931,23 +4931,17 @@ mod batch_upgrade_notice_tests {
             failed: 0,
             no_higher: 2,
         };
-        assert_eq!(batch_upgrade_notice(tally), BatchUpgradeNotice::Info);
-    }
-
-    #[test]
-    fn empty_tally_uses_info() {
         assert_eq!(
-            batch_upgrade_notice(Tally::default()),
-            BatchUpgradeNotice::Info
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Status("summary".into())
         );
     }
 
     #[test]
-    fn info_notice_is_wired_to_status_only() {
-        let source = include_str!("app_actions.rs");
-        assert!(
-            source.contains("BatchUpgradeNotice::Info => root.set_status_text(message),"),
-            "无更好整曲只能写状态行，不能重新接入全局提示"
+    fn empty_tally_uses_status() {
+        assert_eq!(
+            batch_upgrade_notice(Tally::default(), "summary".into()),
+            BatchUpgradeNotice::Status("summary".into())
         );
     }
 
@@ -4958,7 +4952,10 @@ mod batch_upgrade_notice_tests {
             failed: 1,
             no_higher: 0,
         };
-        assert_eq!(batch_upgrade_notice(tally), BatchUpgradeNotice::Warning);
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Warning("summary".into())
+        );
     }
 
     #[test]
@@ -4968,7 +4965,10 @@ mod batch_upgrade_notice_tests {
             failed: 0,
             no_higher: 1,
         };
-        assert_eq!(batch_upgrade_notice(tally), BatchUpgradeNotice::Success);
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Success("summary".into())
+        );
     }
 }
 
