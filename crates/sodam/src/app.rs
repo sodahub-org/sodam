@@ -630,7 +630,7 @@ pub struct Root {
     /// 扫码登录成功或外部写入非空 Cookie 后清零；重启不保留，启动仍按环境变量走。
     pub(crate) env_cookie_opted_out: bool,
     /// 音量滑条的拖动记账：拖动中不排落盘，停手或松手时补一次；期间外部重载不回弹音量。
-    pub(crate) volume_scrub: sodam_core::volume::VolumeScrub,
+    pub(crate) volume_scrub: sodam_core::volume_scrub::VolumeScrub,
     /// 主动退出闸门：托盘 / ⌘Q 先等设置写队列刷完再退（#198）。
     pub(crate) quit_gate: QuitGate,
 }
@@ -938,7 +938,7 @@ impl Root {
             config_reload,
             config_poll_busy: false,
             env_cookie_opted_out: false,
-            volume_scrub: sodam_core::volume::VolumeScrub::default(),
+            volume_scrub: sodam_core::volume_scrub::VolumeScrub::default(),
             settings_writer,
             quit_gate: QuitGate::new(QUIT_PERSIST_TIMEOUT),
         };

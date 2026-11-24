@@ -24,7 +24,7 @@ pub mod quit_gate;
 pub mod session;
 pub mod settings_writer;
 pub mod upgrade;
-pub mod volume;
+pub mod volume_scrub;
 
 pub use audio::{PlaybackEngine, PlaybackSnapshot};
 pub use config::Settings;

@@ -124,7 +124,7 @@ pub struct SettingsWriter {
     failure: Arc<Mutex<Option<WriteFailure>>>,
     /// 强制退出：析构时不再等写线程（慢盘 / 写锁被占时 join 会把进程挂住，#198）。
     abandon_on_drop: AtomicBool,
-    /// 队列已停这件事只报一次：`note_dead_queue` 用。
+    /// 只给日志去重：队列停了以后日志只记第一笔（提示每次都照塞）。
     dead_logged: AtomicBool,
 }
 
@@ -145,12 +145,21 @@ impl SettingsWriter {
         let thread = match spawned {
             Ok(thread) => Some(thread),
             Err(err) => {
-                // 线程起不来 = 队列从头就是死的，别说成「检查磁盘空间」。
+                // 线程起不来 = 队列从头就是死的：提示按「队列停了」说，
+                // 原因（内存紧张 / 线程数打满）只有日志能留下，绝不能闷在失败槽里——
+                // 界面只按 kind 给一句通用话，不读 detail。
+                let detail = err.to_string();
+                log_event(
+                    LogLevel::Error,
+                    LogTopic::App,
+                    "thread_spawn_failed",
+                    &[("thread", "sodam-settings"), ("detail", detail.as_str())],
+                );
                 dead_logged.store(true, Ordering::Relaxed);
                 if let Ok(mut slot) = failure.lock() {
                     *slot = Some(WriteFailure {
                         kind: FailureKind::QueueStopped,
-                        detail: err.to_string(),
+                        detail,
                     });
                 }
                 None

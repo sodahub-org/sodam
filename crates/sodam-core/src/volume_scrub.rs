@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 /// 停手这么久就算这次拖动结束了。
-pub const IDLE: Duration = Duration::from_millis(600);
+const IDLE_AFTER_STOP: Duration = Duration::from_millis(600);
 
 #[derive(Debug)]
 pub struct VolumeScrub {
@@ -20,7 +20,7 @@ pub struct VolumeScrub {
 
 impl Default for VolumeScrub {
     fn default() -> Self {
-        Self::new(IDLE)
+        Self::new(IDLE_AFTER_STOP)
     }
 }
 
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn moving_while_dragging_does_not_ask_for_a_write() {
-        let mut scrub = VolumeScrub::new(IDLE);
+        let mut scrub = VolumeScrub::new(IDLE_AFTER_STOP);
         let start = Instant::now();
         scrub.begin(start);
         assert!(
@@ -85,21 +85,21 @@ mod tests {
 
     #[test]
     fn not_dragging_writes_right_away() {
-        let mut scrub = VolumeScrub::new(IDLE);
+        let mut scrub = VolumeScrub::new(IDLE_AFTER_STOP);
         assert!(!scrub.touch(Instant::now()), "没在拖，照常落盘");
         assert!(!scrub.scrubbing());
     }
 
     #[test]
     fn idle_after_release_ends_the_drag_and_asks_for_one_write() {
-        let mut scrub = VolumeScrub::new(IDLE);
+        let mut scrub = VolumeScrub::new(IDLE_AFTER_STOP);
         let start = Instant::now();
         scrub.begin(start);
         assert!(
             !scrub.settled(start + Duration::from_millis(100)),
             "才 100ms"
         );
-        assert!(scrub.settled(start + IDLE), "停够久了该收尾");
+        assert!(scrub.settled(start + IDLE_AFTER_STOP), "停够久了该收尾");
         assert!(scrub.finish(), "这次拖动要补一次落盘");
         assert!(!scrub.finish(), "同一个拖动只补一次");
         assert!(!scrub.scrubbing(), "收尾后不再算拖动中");
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn touching_postpones_the_idle_end() {
-        let mut scrub = VolumeScrub::new(IDLE);
+        let mut scrub = VolumeScrub::new(IDLE_AFTER_STOP);
         let start = Instant::now();
         scrub.begin(start);
         let later = start + Duration::from_millis(500);
@@ -116,12 +116,12 @@ mod tests {
             !scrub.settled(later + Duration::from_millis(300)),
             "最后一次动是 300ms 前，还不算停手"
         );
-        assert!(scrub.settled(later + IDLE));
+        assert!(scrub.settled(later + IDLE_AFTER_STOP));
     }
 
     #[test]
     fn release_before_the_idle_window_still_ends_the_drag() {
-        let mut scrub = VolumeScrub::new(IDLE);
+        let mut scrub = VolumeScrub::new(IDLE_AFTER_STOP);
         scrub.begin(Instant::now());
         assert!(scrub.finish(), "松手了就立刻收尾，不等停手窗口");
         assert!(!scrub.scrubbing());
