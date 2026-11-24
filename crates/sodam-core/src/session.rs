@@ -804,7 +804,6 @@ fn skipped_upgrade_reason(
 
 fn downloaded_not_improved_reason(
     current: &CachedTrack,
-    info: &libresoda::soda::types::DownloadInfo,
     confirmed_miss: bool,
 ) -> NotImprovedReason {
     // 调用方已挡掉试听与未知档位；这里只区分确认没有更高档和只是没换成更好的流。
@@ -838,19 +837,30 @@ fn encode_sidecar(
     }
 }
 
-fn probe_check_rank(
+#[derive(Clone, Copy)]
+struct ProbeCheck {
+    checked_rank: Option<i64>,
+    confirmed_miss: bool,
+}
+
+fn probe_check(
     current: &CachedTrack,
     info: &libresoda::soda::types::DownloadInfo,
     target_rank: Option<i64>,
     can_record: bool,
-) -> Option<i64> {
-    confirmed_miss_rank(
+) -> ProbeCheck {
+    let confirmed_miss = confirmed_miss_rank(
         target_rank,
         crate::quality::stream_rank(info),
         info.is_preview,
         can_record,
-    )
-    .or_else(|| legacy_probe_covers_target(current, info, target_rank, can_record))
+    );
+    let checked_rank = confirmed_miss
+        .or_else(|| legacy_probe_covers_target(current, info, target_rank, can_record));
+    ProbeCheck {
+        checked_rank,
+        confirmed_miss: confirmed_miss.is_some(),
+    }
 }
 
 fn finish_unimproved_upgrade(
@@ -858,6 +868,7 @@ fn finish_unimproved_upgrade(
     info: &libresoda::soda::types::DownloadInfo,
     target_rank: Option<i64>,
     can_record: bool,
+    probe: ProbeCheck,
     scope: Option<&str>,
     quality_path: &std::path::Path,
 ) -> NotImprovedReason {
@@ -892,10 +903,7 @@ fn finish_unimproved_upgrade(
         }
         return NotImprovedReason::UnknownRank;
     }
-    let confirmed_miss =
-        confirmed_miss_rank(target_rank, new_rank, info.is_preview, can_record).is_some();
-    let checked_rank = probe_check_rank(current, info, target_rank, can_record);
-    if let Some(checked_rank) = checked_rank {
+    if let Some(checked_rank) = probe.checked_rank {
         record_upgrade_check(
             quality_path,
             &audio_path,
@@ -903,7 +911,7 @@ fn finish_unimproved_upgrade(
             checked_rank,
         );
     }
-    downloaded_not_improved_reason(current, info, confirmed_miss)
+    downloaded_not_improved_reason(current, probe.confirmed_miss)
 }
 
 /// 一次进程内共享的会话（持有 `Soda` 和它要的那几样设置）。
@@ -1335,7 +1343,8 @@ impl Session {
         let new_rank = crate::quality::stream_rank(&info);
         // 档位已知按确认没有更高档判；档位未知的旧缓存拿回正好到目标的完整流也算「问过」，
         // 不换文件也要记下来，否则每轮都整曲重下。
-        let checked_rank = probe_check_rank(&current, &info, target_rank, can_record_check);
+        let probe = probe_check(&current, &info, target_rank, can_record_check);
+        let checked_rank = probe.checked_rank;
         // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
@@ -1344,6 +1353,7 @@ impl Session {
                 &info,
                 target_rank,
                 can_record_check,
+                probe,
                 scope.as_deref(),
                 &quality_path,
             );
@@ -2351,6 +2361,10 @@ mod tests {
             &unknown_stream,
             Some(100),
             true,
+            ProbeCheck {
+                checked_rank: None,
+                confirmed_miss: false,
+            },
             Some(&scope),
             &quality_path,
         );
@@ -2437,6 +2451,10 @@ mod tests {
             &unknown_stream,
             Some(100),
             true,
+            ProbeCheck {
+                checked_rank: None,
+                confirmed_miss: false,
+            },
             Some(&scope),
             &quality_path,
         );
@@ -2457,8 +2475,6 @@ mod tests {
 
     #[test]
     fn not_improved_reason_separates_preview_equal_and_confirmed_miss() {
-        use libresoda::soda::types::DownloadInfo;
-
         let lease = crate::cache::CacheLease::acquire(std::path::Path::new("reason.m4a"));
         let cached = |quality: &str, rank: Option<i64>, preview: bool| CachedTrack {
             path: std::path::PathBuf::new(),
@@ -2470,31 +2486,19 @@ mod tests {
             preview_retry_blocked: false,
             lease: lease.clone(),
         };
-        let info = |quality: &str, bitrate: i64, preview: bool| DownloadInfo {
-            quality: quality.into(),
-            format: "m4a".into(),
-            bitrate,
-            is_preview: preview,
-            ..Default::default()
-        };
-
         let full = cached("极高 320k", Some(80), false);
         let legacy = cached("极高 320k", None, false);
         assert_eq!(
-            downloaded_not_improved_reason(&legacy, &info("highest", 320_000, false), true),
-            NotImprovedReason::NotBetter
-        );
-        assert_eq!(
-            downloaded_not_improved_reason(&legacy, &info("standard", 128_000, false), true),
+            downloaded_not_improved_reason(&legacy, true),
             NotImprovedReason::NotBetter
         );
         let unknown_label = cached("极高", None, false);
         assert_eq!(
-            downloaded_not_improved_reason(&unknown_label, &info("highest", 320_000, false), true),
+            downloaded_not_improved_reason(&unknown_label, true),
             NotImprovedReason::NoHigherTier
         );
         assert_eq!(
-            downloaded_not_improved_reason(&unknown_label, &info("highest", 320_000, false), false),
+            downloaded_not_improved_reason(&unknown_label, false),
             NotImprovedReason::NotBetter
         );
 
