@@ -65,11 +65,8 @@ impl StartupFailureSlot {
     }
 
     fn take(&self) -> Option<WriteFailure> {
-        let failure = self
-            .failure
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .take();
+        let mut slot = self.failure.lock().unwrap_or_else(|err| err.into_inner());
+        let failure = slot.take();
         if failure.is_some() {
             self.pending.store(false, Ordering::Release);
         }
@@ -77,7 +74,8 @@ impl StartupFailureSlot {
     }
 
     fn set(&self, failure: WriteFailure) {
-        *self.failure.lock().unwrap_or_else(|err| err.into_inner()) = Some(failure);
+        let mut slot = self.failure.lock().unwrap_or_else(|err| err.into_inner());
+        *slot = Some(failure);
         self.pending.store(true, Ordering::Release);
     }
 }
@@ -654,6 +652,33 @@ mod tests {
         assert!(!startup_slot.is_pending());
         assert!(writer.take_startup_error().is_none(), "同一个失败只报一次");
         assert_eq!(log.lock().unwrap().startups, 0);
+    }
+
+    #[test]
+    fn startup_failure_signal_and_payload_stay_in_sync() {
+        use std::sync::Barrier;
+
+        for _ in 0..100 {
+            let slot = StartupFailureSlot::default();
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    slot.set(WriteFailure {
+                        kind: FailureKind::Startup,
+                        detail: "并发写入".into(),
+                    });
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    let _ = slot.take();
+                });
+            });
+
+            let signal = slot.is_pending();
+            let payload = slot.failure.lock().unwrap().is_some();
+            assert_eq!(signal, payload, "原子门和失败槽必须同时有空");
+        }
     }
 
     #[test]
