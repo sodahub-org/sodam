@@ -2,7 +2,7 @@
 //!
 //! 应用层单首与批量共用同一段「跑一首」，两条路都从这里取判断：
 //! [`stop_reason`]（下一首之前要不要停）、[`Outcome`]（这一首落在哪一档）、
-//! [`Tally`]（批量收尾的三个数）、[`UpgradeAttempts`]（本会话试过哪几首，单首那条用）。
+//! [`Tally`]（批量收尾的四个数）、[`UpgradeAttempts`]（本会话试过哪几首，单首那条用）。
 //! 身份代数与取消标志由界面线程读出来再喂进来——后台任务碰不到 `Root`。
 //!
 //! 身份变了**不**自动拿新号接着跑：目标档位是按旧号定的，新号权益可能撑不住，替人花流量不合适。
@@ -87,7 +87,7 @@ pub fn identity_change(
     }
 }
 
-/// 没换成更好的流时，逐首日志用来区分原因；不参与升级统计。
+/// 没换成更好的流时，逐首日志用来区分原因；`UnknownRank` 会映射成单独的升级结果统计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotImprovedReason {
     /// 新流仍是试听，或试听回退被整曲缓存拦住。
@@ -102,6 +102,9 @@ pub enum NotImprovedReason {
     NoHigherTier,
     /// 这次没发请求：旧缓存已达目标，或已有探测结论覆盖目标。
     AlreadyChecked,
+    /// 完整流档位认不出来，或同账号范围、同目标的未知探测正在退避；
+    /// 已有缓存记了 0 分、早退时也归这里。
+    UnknownRank,
 }
 
 impl NotImprovedReason {
@@ -113,6 +116,7 @@ impl NotImprovedReason {
             Self::NotBetter => "not_better",
             Self::NoHigherTier => "no_higher_tier",
             Self::AlreadyChecked => "already_checked",
+            Self::UnknownRank => "unknown_rank",
         }
     }
 }
@@ -130,27 +134,30 @@ pub enum Outcome {
     /// 判定做完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
     NoHigherTier,
+    /// 流档位认不出来、同账号同目标的未知探测在退避、缓存已记 0 分，都算升级结果未知。
+    /// 它与 `cache::unknown_rank_count` 的“旧缓存档位未知”不是一回事，也不表示确认没有更高档。
+    UnknownRank,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
     Failed,
 }
 
 impl Outcome {
-    /// 把「这次有没有换成更好的流」翻成对外的结论。界面上的成功与否只认这一个映射。
-    pub fn from_improved(improved: bool) -> Self {
-        if improved {
-            Self::Upgraded
-        } else {
-            Self::NoHigherTier
+    /// 把升级路径的原因映射成对外结果；未知结果单独记，不能当成确认没有更高档。
+    pub fn from_not_improved_reason(reason: Option<NotImprovedReason>) -> Self {
+        match reason {
+            None => Self::Upgraded,
+            Some(NotImprovedReason::UnknownRank) => Self::UnknownRank,
+            Some(_) => Self::NoHigherTier,
         }
     }
 }
 
-/// 一轮批量的三类计数：成功 / 失败 / 确实没换成更好的整曲。
+/// 一轮批量的计数：成功 / 失败 / 没换成更好的整曲 / 升级结果未知。
 ///
-/// 第三类不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里，
-/// 因为没换成更好的整曲。
+/// 没换成更好的整曲不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里。
+/// 升级结果未知单独记，不能写成「已确认没有更高档」，也不代表缓存文件本身的档位未知。
 ///
-/// 中间那一档是「这一首没跑成」的总数，不只网络：磁盘写不进去、权益不够、曲目被删都落在这里，
+/// 失败是「这一首没跑成」的总数，不只网络：磁盘写不进去、权益不够、曲目被删都落在这里，
 /// 所以界面上的说法也是「失败」，不冒充「网络失败」。
 ///
 /// 收尾那行日志和界面小结都读它，两边不各数一遍。
@@ -159,6 +166,8 @@ pub struct Tally {
     pub upgraded: usize,
     pub failed: usize,
     pub no_higher: usize,
+    /// 升级结果未知的首数。
+    pub unknown_result: usize,
 }
 
 impl Tally {
@@ -167,12 +176,13 @@ impl Tally {
             Outcome::Upgraded => self.upgraded += 1,
             Outcome::Failed => self.failed += 1,
             Outcome::NoHigherTier => self.no_higher += 1,
+            Outcome::UnknownRank => self.unknown_result += 1,
         }
     }
 
     /// 这一轮计入了几首。提前停时可能小于扫出来的总数。
     pub fn total(&self) -> usize {
-        self.upgraded + self.failed + self.no_higher
+        self.upgraded + self.failed + self.no_higher + self.unknown_result
     }
 }
 
@@ -328,13 +338,6 @@ mod tests {
         );
     }
 
-    /// 「有没有换成更好的流」是界面报成功的唯一出口，钉住它别被改宽。
-    #[test]
-    fn improved_maps_to_the_reported_outcome() {
-        assert_eq!(Outcome::from_improved(true), Outcome::Upgraded);
-        assert_eq!(Outcome::from_improved(false), Outcome::NoHigherTier);
-    }
-
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
     #[test]
     fn identity_change_voids_the_attempt_table() {
@@ -362,9 +365,9 @@ mod tests {
         assert!(attempts.begin(key), "清掉缓存后同一首要能重新试");
     }
 
-    /// 收尾的三个数分开记，总数只算本轮计入的。
+    /// 收尾的四个数分开记，总数只算本轮计入的。
     #[test]
-    fn tally_keeps_the_three_numbers_apart() {
+    fn tally_keeps_the_four_numbers_apart() {
         let mut tally = Tally::default();
         assert_eq!(tally.total(), 0);
 
@@ -372,11 +375,13 @@ mod tests {
         tally.record(Outcome::Failed);
         tally.record(Outcome::Failed);
         tally.record(Outcome::NoHigherTier);
+        tally.record(Outcome::UnknownRank);
 
         assert_eq!(tally.upgraded, 1);
         assert_eq!(tally.failed, 2);
         assert_eq!(tally.no_higher, 1);
-        assert_eq!(tally.total(), 4);
+        assert_eq!(tally.unknown_result, 1);
+        assert_eq!(tally.total(), 5);
     }
 
     /// 日志取值稳定：小写下划线，不随界面语言变化。
@@ -400,5 +405,19 @@ mod tests {
             NotImprovedReason::AlreadyChecked.as_str(),
             "already_checked"
         );
+        assert_eq!(NotImprovedReason::UnknownRank.as_str(), "unknown_rank");
+    }
+
+    #[test]
+    fn unknown_result_is_not_a_confirmed_miss() {
+        assert_eq!(
+            Outcome::from_not_improved_reason(Some(NotImprovedReason::UnknownRank)),
+            Outcome::UnknownRank
+        );
+        assert_eq!(
+            Outcome::from_not_improved_reason(Some(NotImprovedReason::NoHigherTier)),
+            Outcome::NoHigherTier
+        );
+        assert_eq!(Outcome::from_not_improved_reason(None), Outcome::Upgraded);
     }
 }

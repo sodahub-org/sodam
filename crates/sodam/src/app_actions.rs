@@ -79,6 +79,7 @@ fn cache_upgrade_log_parts<'a>(
     }
     (event, fields)
 }
+
 /// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
 ///
 /// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
@@ -1127,6 +1128,11 @@ impl Root {
                                 // `refresh_account` 里，但账号信息读取失败时拿不到
                                 // 新身份，这里先保守作废。
                                 root.invalidate_identity_conclusions();
+                                // 新 Cookie 已生效，旧账号 id 不能再和它配对；范围缺失时按放行处理。
+                                root.account = None;
+                                if root.nav == Nav::Settings {
+                                    root.refresh_upgrade_estimate(cx);
+                                }
                                 // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
                                 log_prefetch_resume(root.prefetch_gate.note_login_success());
                                 // 队列里可能还攒着登录前端改动拍的快照：拿现在这份盖掉它，
@@ -1297,6 +1303,9 @@ impl Root {
                         root.account = Some(info.clone());
                         root.play_reporter.set_user_id(info.user_id.clone());
                         root.login = LoginState::LoggedIn(info.clone());
+                        if root.nav == Nav::Settings {
+                            root.refresh_upgrade_estimate(cx);
+                        }
                         // 账号请求成功说明网络就绪；若收藏 ids 此前拉取失败，自动重试。
                         if root.liked_ids_failed {
                             root.load_liked_ids(cx);
@@ -2632,6 +2641,9 @@ impl Root {
         self.sync_queue_cache();
 
         self.account = None;
+        if self.nav == Nav::Settings {
+            self.refresh_upgrade_estimate(cx);
+        }
         self.login = LoginState::Idle;
         self.login_modal_open = false;
         self.results = Arc::new(Vec::new());
@@ -2913,13 +2925,26 @@ impl Root {
         .detach();
     }
 
+    fn upgrade_account(&self) -> (Option<bool>, Option<String>) {
+        (
+            self.account.as_ref().map(|account| account.vip),
+            self.account.as_ref().map(|account| account.user_id.clone()),
+        )
+    }
+
+    fn upgrade_scope(&self) -> Option<String> {
+        let (is_vip, account_user_id) = self.upgrade_account();
+        sodam_core::cache::unknown_probe_scope(account_user_id.as_deref(), is_vip)
+    }
+
     /// 刷新缓存批量升级预估信息（后台扫盘，不阻塞 UI）。
     pub(crate) fn refresh_upgrade_estimate(&mut self, cx: &mut Context<Self>) {
         self.batch_upgrade_estimate_request_seq =
             self.batch_upgrade_estimate_request_seq.wrapping_add(1);
         let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
-        let is_vip = self.account.as_ref().map(|a| a.vip);
+        let (is_vip, _) = self.upgrade_account();
+        let scope = self.upgrade_scope();
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
             Some(rank) => rank,
             None => {
@@ -2931,7 +2956,7 @@ impl Root {
         let work = cx.background_spawn(async move {
             let dir = sodam_core::audio::cache_dir();
             let records = sodam_core::cache::list_cached_audio(&dir);
-            sodam_core::cache::estimate_upgrade(&records, target_rank)
+            sodam_core::cache::estimate_upgrade(&records, target_rank, scope.as_deref())
         });
         cx.spawn(async move |this, cx| {
             let estimate = work.await;
@@ -2966,21 +2991,27 @@ impl Root {
     /// 单首升级和批量升级共用这一段，改一处两边同时生效。同步函数：调用方自己
     /// 决定放进哪个后台任务；这里只碰磁盘和网络，不碰 `Root`。
     ///
-    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功和「没换成更好整曲」
-    /// 记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
+    /// `levels` 决定逐首日志：单首默认日志要看得见，升级成功、「没换成更好整曲」和
+    /// 「升级结果未知」记 INFO、失败记 WARN；批量几百首逐首记会刷屏，只留开跑和收尾两行汇总，
     /// 所以这几种逐首日志都降到 DEBUG。
     fn upgrade_one_cached_track(
         settings: Settings,
         track: TrackItem,
         target_intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
+        account_user_id: Option<String>,
         levels: UpgradeLogLevels,
     ) -> Outcome {
         let session = Session::new(settings);
-        match session.upgrade_cached_track(&track, Some(&target_intent), account_is_vip) {
+        match session.upgrade_cached_track(
+            &track,
+            Some(&target_intent),
+            account_is_vip,
+            account_user_id.as_deref(),
+        ) {
             Ok(run) => {
                 // 换没换文件由升级那条路自己判定；日志和对外结论都只认 not_improved_reason。
-                let outcome = Outcome::from_improved(run.not_improved_reason.is_none());
+                let outcome = Outcome::from_not_improved_reason(run.not_improved_reason);
                 let (event, fields) = cache_upgrade_log_parts(
                     track.id.as_str(),
                     run.track.quality.as_str(),
@@ -3012,6 +3043,7 @@ impl Root {
         track: TrackItem,
         intent: sodam_core::quality::QualityIntent,
         account_is_vip: Option<bool>,
+        account_user_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let max_inflight = prefetch_concurrency().max(1);
@@ -3037,6 +3069,7 @@ impl Root {
                 track,
                 intent,
                 account_is_vip,
+                account_user_id,
                 UpgradeLogLevels {
                     success: LogLevel::Info,
                     failure: LogLevel::Warn,
@@ -3049,8 +3082,7 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 root.cache_upgrade_running = root.cache_upgrade_running.saturating_sub(1);
                 // 单首升级跑完了，盘上文件或记录可能变了，设置页正开着就不能还拿打开那一刻的数字说话（#248）。
-                // `Upgraded` 一定换了文件；`NoHigherTier` 表示没换成更好整曲。
-                // 它可能只写了 sidecar 探测记录，也可能什么都没写。
+                // `Upgraded` 一定换了文件；`NoHigherTier` 与 `UnknownRank` 可能只写了 sidecar 记录。
                 // 统计也一起刷：字节数可能变，同一屏不能一新一旧。
                 // `Failed` 不动正式缓存；批量跑着时卡片显示的是进度，收尾那条路自己会重算，这里不白扫一遍。
                 if outcome != Outcome::Failed && root.nav == Nav::Settings && !root.batch_upgrading
@@ -3086,7 +3118,7 @@ impl Root {
         }
 
         let target_intent = self.batch_upgrade_target.clone();
-        let is_vip = self.account.as_ref().map(|a| a.vip);
+        let (is_vip, start_user_id) = self.upgrade_account();
 
         // P2 权益预检：需要会员的档位只在账号确认有权益时才放行（认不出权益也算不行）。
         if sodam_core::quality::batch_upgrade_needs_confirmed_entitlement(&target_intent, is_vip) {
@@ -3116,7 +3148,7 @@ impl Root {
         let start_epoch = self.auth_epoch;
         // 收尾文案要分清「真的换了号」和「同一账号的会员状态刷新」：两者都推进代数，
         // 但后者报「账号已变更」是撒谎。账号信息没加载出来时也不说换了号。
-        let start_user_id = self.account.as_ref().map(|account| account.user_id.clone());
+        let scan_scope = self.upgrade_scope();
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
@@ -3124,7 +3156,7 @@ impl Root {
             let records = sodam_core::cache::list_cached_audio(&dir);
             records
                 .into_iter()
-                .filter(|r| r.is_upgradeable_to(target_rank))
+                .filter(|r| r.is_upgradeable_to(target_rank, scan_scope.as_deref()))
                 .collect::<Vec<_>>()
         });
 
@@ -3159,10 +3191,10 @@ impl Root {
                     (
                         root.batch_upgrade_stop(start_epoch),
                         root.settings.clone(),
-                        root.account.as_ref().map(|a| a.vip),
+                        root.upgrade_account(),
                     )
                 });
-                let Ok((stop, mut settings, is_vip)) = step else {
+                let Ok((stop, mut settings, (is_vip, account_user_id))) = step else {
                     return;
                 };
                 if let Some(reason) = stop {
@@ -3188,6 +3220,7 @@ impl Root {
                             track,
                             target_clone,
                             is_vip,
+                            account_user_id,
                             UpgradeLogLevels {
                                 success: LogLevel::Debug,
                                 failure: LogLevel::Debug,
@@ -3220,6 +3253,7 @@ impl Root {
             let upgraded_text = tally.upgraded.to_string();
             let failed_text = tally.failed.to_string();
             let no_higher_text = tally.no_higher.to_string();
+            let unknown_result_text = tally.unknown_result.to_string();
             let stop_text = stopped.map_or("done", |reason| reason.as_str());
             log_event(
                 LogLevel::Info,
@@ -3231,6 +3265,7 @@ impl Root {
                     ("upgraded", upgraded_text.as_str()),
                     ("failed", failed_text.as_str()),
                     ("no_higher", no_higher_text.as_str()),
+                    ("unknown_result", unknown_result_text.as_str()),
                     ("stop", stop_text),
                 ],
             );
@@ -3273,11 +3308,12 @@ impl Root {
                         }
                         None => {
                             let message = root.localized(
-                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲",
+                                "缓存升级完成：成功升级 {} 首，{} 首失败，{} 首无更好整曲，{} 首升级结果未知",
                                 &[
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),
                                     tally.no_higher.to_string(),
+                                    tally.unknown_result.to_string(),
                                 ],
                             );
                             match batch_upgrade_notice(tally, message) {
@@ -4207,9 +4243,10 @@ impl Root {
                         let actual_rank = cached.quality_rank;
                         let actual_quality = cached.quality.clone();
                         let intent = root.settings.quality_intent();
-                        let is_vip = root.account.as_ref().map(|a| a.vip);
-                        let needs_upgrade =
-                            was_cached && cached.needs_auto_upgrade(&intent, is_vip);
+                        let (is_vip, account_user_id) = root.upgrade_account();
+                        let scope = root.upgrade_scope();
+                        let needs_upgrade = was_cached
+                            && cached.needs_auto_upgrade(&intent, is_vip, scope.as_deref());
                         let sequence = root.engine.load(track.clone(), cached);
                         root.pending_engine_load = Some(sequence);
                         root.progress_token = Some(sequence);
@@ -4231,6 +4268,7 @@ impl Root {
                                 track.clone(),
                                 intent.clone(),
                                 is_vip,
+                                account_user_id,
                                 cx,
                             );
                         }
@@ -4552,6 +4590,9 @@ impl Root {
                 // A 的账号信息（昵称/VIP）不再代表当前身份：先清空，刷新成功写入
                 // B 的信息；刷新失败时 VIP 状态按未知处理，不按 A 的算（#185 审计）。
                 self.account = None;
+                if self.nav == Nav::Settings {
+                    self.refresh_upgrade_estimate(cx);
+                }
                 // 旧账号的歌单/收藏缓存是身份私有数据：换号不清，新账号会直接
                 // 看到旧账号的列表（加载守卫会拦住重拉）。保留当前播放。
                 self.playlists.clear();
@@ -4937,6 +4978,21 @@ mod batch_upgrade_notice_tests {
             upgraded: 0,
             failed: 0,
             no_higher: 2,
+            unknown_result: 0,
+        };
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Status("summary".into())
+        );
+    }
+
+    #[test]
+    fn unknown_result_only_uses_normal_status() {
+        let tally = Tally {
+            upgraded: 0,
+            failed: 0,
+            no_higher: 0,
+            unknown_result: 2,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4950,6 +5006,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 1,
             failed: 1,
             no_higher: 0,
+            unknown_result: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4963,6 +5020,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 2,
             failed: 0,
             no_higher: 1,
+            unknown_result: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -5588,6 +5646,7 @@ mod tests {
             (NotImprovedReason::NotBetter, "not_better"),
             (NotImprovedReason::NoHigherTier, "no_higher_tier"),
             (NotImprovedReason::AlreadyChecked, "already_checked"),
+            (NotImprovedReason::UnknownRank, "unknown_rank"),
         ] {
             let (event, fields) = cache_upgrade_log_parts("track-1", "极高 320k", Some(reason));
             assert_eq!(event, "cache_upgrade_not_improved");

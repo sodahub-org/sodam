@@ -1091,6 +1091,7 @@ mod tests {
                 preview: false,
                 quality_rank: None,
                 checked_rank: None,
+                unknown_probe: None,
                 preview_retry_blocked: false,
                 lease: crate::cache::CacheLease::acquire(&path),
             };
@@ -1133,6 +1134,7 @@ mod tests {
             preview: false,
             quality_rank: None,
             checked_rank: None,
+            unknown_probe: None,
             preview_retry_blocked: false,
         };
         let seq = engine.load(

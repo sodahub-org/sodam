@@ -19,6 +19,55 @@ const PART_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// 分不清它们更高的权益等级，高档位记下的「没拿到更高流」可能只是当时权益不够。
 pub const UPGRADE_CHECK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// 档位未知时的探测退避有效期。
+pub const UNKNOWN_PROBE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// 一次完整流探测的独立退避记录；不代表缓存文件的实际档位已测出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownProbe {
+    /// 这次探测请求的目标档位。
+    pub target_rank: i64,
+    /// 探测时间（Unix 秒）。
+    pub at: u64,
+    /// 账号与会员状态的稳定范围指纹。
+    pub scope: String,
+}
+
+impl UnknownProbe {
+    /// 只抑制同目标、同范围的下一次探测；范围缺失时返回 `false`，宁可重试也不跨账号误挡。
+    pub fn covers(&self, target_rank: i64, scope: Option<&str>) -> bool {
+        scope.is_some_and(|scope| self.target_rank == target_rank && self.scope == scope)
+    }
+}
+
+/// 账号与会员状态的稳定本地区分指纹；不落原始账号 ID 或 Cookie，但可被枚举，不是匿名化或安全哈希。
+pub fn unknown_probe_scope(user_id: Option<&str>, is_vip: Option<bool>) -> Option<String> {
+    let user_id = user_id?.trim();
+    if user_id.is_empty() {
+        return None;
+    }
+    let vip = match is_vip {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => 2,
+    };
+    let mut lanes = [
+        (0xcbf29ce484222325u64, 0x100000001b3u64),
+        (0x9e3779b97f4a7c15u64, 0x100000001b3u64),
+    ];
+    for byte in b"sodam-unknown-probe-v1\0"
+        .iter()
+        .chain((user_id.len() as u64).to_le_bytes().iter())
+        .chain(user_id.as_bytes())
+        .chain(std::iter::once(&vip))
+    {
+        for (hash, prime) in &mut lanes {
+            *hash = (*hash ^ u64::from(*byte)).wrapping_mul(*prime);
+        }
+    }
+    Some(format!("{:016x}{:016x}", lanes[0].0, lanes[1].0))
+}
+
 /// 「上次为补整曲重新取流」记录的有效期。
 ///
 /// 试听不是「没有更高档位」的结论：权益变化或签名服务恢复后同一首歌就能拿到整曲，
@@ -914,11 +963,11 @@ pub fn parse_audio_cache_stem(stem: &str) -> Option<(String, String)> {
     Some((decode_track_id(track_id), tag.to_string()))
 }
 
-/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}`，
+/// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}\t{未知档探测目标}\t{探测时间}\t{账号范围}`，
 /// 与实际字节数核对后给出完整记录。
 ///
 /// 尺寸不符或档位为空一律返回 `None`。
-/// 第四到第七个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
+/// 第四到第十个字段都是后加的：旧格式缺少哪个，对应字段就是 `None`，
 /// 不影响前三字段的命中判定。第 4 字段也可能是空串——档位未知的旧缓存
 /// 记下「已探测」结论之后就是这个样子，读回来仍然是「档位未知」。
 /// 第 7 字段只对试听片段有意义：它记的是「上次为补整曲重新取流的时间」，
@@ -944,6 +993,15 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
     let preview_attempt_at = fields
         .next()
         .and_then(|value| value.trim().parse::<u64>().ok());
+    let unknown_probe_target = parse_rank(fields.next());
+    let unknown_probe_at = fields
+        .next()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let unknown_probe_scope = fields
+        .next()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string);
     // 只改显示名，不动文件与分数：50 分档曾经叫「标准」，与 libresoda 的 standard(70) 撞名。
     let quality = normalize_quality_label(&quality, actual_rank);
     Some(SidecarMeta {
@@ -953,6 +1011,9 @@ pub fn parse_sidecar(text: &str, actual: u64) -> Option<SidecarMeta> {
         checked_rank,
         checked_at,
         preview_attempt_at,
+        unknown_probe_target,
+        unknown_probe_at,
+        unknown_probe_scope,
     })
 }
 
@@ -970,9 +1031,8 @@ fn strip_preview_marker(quality: &str) -> String {
     quality.replace(" · 试听", "")
 }
 
-/// 一条 sidecar 记录。前四个字段是旧格式，后三个记录升级探测结果：
-/// 曾经向服务端要过哪个目标档位、什么时候要的，以及上次为补整曲
-/// 重新取流的时间（只对试听片段）。后两件事不能混：试听不是曲库结论。
+/// 一条 sidecar 记录。前四个字段是旧格式，后面分别记录确认探测、
+/// 试听补整曲尝试，以及档位未知时的独立探测退避。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarMeta {
     /// 档位显示文本（含码率，不含试听标记）
@@ -987,9 +1047,36 @@ pub struct SidecarMeta {
     pub checked_at: Option<u64>,
     /// 上次为补整曲重新取流的时间（Unix 秒）；整曲不用这个字段
     pub preview_attempt_at: Option<u64>,
+    /// 档位未知时探测的目标档位
+    pub unknown_probe_target: Option<i64>,
+    /// 档位未知时的探测时间（Unix 秒）
+    pub unknown_probe_at: Option<u64>,
+    /// 档位未知时的账号与会员范围指纹
+    pub unknown_probe_scope: Option<String>,
 }
 
 impl SidecarMeta {
+    /// 档位未知时仍有效的探测退避；字段缺失、过期或时钟回拨时返回 `None`。
+    pub fn fresh_unknown_probe(&self, now: u64) -> Option<UnknownProbe> {
+        let target_rank = self.unknown_probe_target?;
+        let at = self.unknown_probe_at?;
+        let scope = self.unknown_probe_scope.as_deref()?;
+        if self.preview
+            || target_rank <= 0
+            || at == 0
+            || scope.trim().is_empty()
+            || now < at
+            || now - at >= UNKNOWN_PROBE_TTL.as_secs()
+        {
+            return None;
+        }
+        Some(UnknownProbe {
+            target_rank,
+            at,
+            scope: scope.to_string(),
+        })
+    }
+
     /// 仍然有效的「已探测过该目标档位」分数；没记录、过期或时钟回拨时返回 `None`。
     ///
     /// 过期后重新探测，避免服务端补档或会员权益变化后客户端永久不再尝试升级。
@@ -1084,14 +1171,20 @@ pub(crate) fn record_upgrade_check(
         .copied()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let unknown_probe_tail = sidecar_unknown_probe_tail(&fields);
     let content = match preview_attempt {
         Some(attempted_at) => format!(
-            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}\t{attempted_at}",
+            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}\t{attempted_at}{unknown_probe_tail}",
+            quality_field,
+            fields[1].trim(),
+        ),
+        None if unknown_probe_tail.is_empty() => format!(
+            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}",
             quality_field,
             fields[1].trim(),
         ),
         None => format!(
-            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}",
+            "{}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{now}\t{unknown_probe_tail}",
             quality_field,
             fields[1].trim(),
         ),
@@ -1144,12 +1237,75 @@ pub(crate) fn record_preview_attempt(
     let checked_rank = fields.get(4).copied().unwrap_or("").trim();
     let checked_at = fields.get(5).copied().unwrap_or("").trim();
     // 第 4、5 字段可能为空，但位置必须留着，后面的时间才不会错位。
+    let unknown_probe_tail = sidecar_unknown_probe_tail(&fields);
     let content = format!(
-        "{}\t{}\t1\t{rank_field}\t{checked_rank}\t{checked_at}\t{now}",
+        "{}\t{}\t1\t{rank_field}\t{checked_rank}\t{checked_at}\t{now}{unknown_probe_tail}",
         quality_field,
         fields[1].trim(),
     );
     replace_sidecar_file(sidecar_path, &content).map(|()| true)
+}
+
+fn sidecar_unknown_probe_tail(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .skip(7)
+        .take(3)
+        .map(|field| format!("\t{field}"))
+        .collect()
+}
+
+/// 在 sidecar 上记录一次独立探测退避，不改实际档位与确认探测字段。
+///
+/// `expected_actual_rank` 的用法与 [`record_upgrade_check`] 相同；试听或文件已被替换时
+/// 直接跳过。调用方必须持有该文件的 `download_lock`。
+pub(crate) fn record_unknown_probe(
+    sidecar_path: &Path,
+    expected_actual_rank: Option<i64>,
+    target_rank: i64,
+    scope: &str,
+    now: u64,
+) -> std::io::Result<bool> {
+    let scope = scope.trim();
+    if target_rank <= 0 || scope.is_empty() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(sidecar_path)?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let fields: Vec<&str> = trimmed.split('\t').collect();
+    if fields.len() < 2 || fields[1].trim().parse::<u64>().is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sidecar is missing the quality or size field",
+        ));
+    }
+    let actual_rank = parse_rank(fields.get(3).copied());
+    if actual_rank != expected_actual_rank {
+        return Ok(false);
+    }
+    let (quality_field, preview_field) = match fields.get(2).copied() {
+        Some(flag) => (fields[0].trim().to_string(), flag.trim().to_string()),
+        None => {
+            let raw = fields[0].trim();
+            (
+                strip_preview_marker(raw),
+                u8::from(preview_from_label(raw)).to_string(),
+            )
+        }
+    };
+    if preview_field == "1" {
+        return Ok(false);
+    }
+    let rank_field = fields.get(3).copied().unwrap_or("");
+    let checked_rank = fields.get(4).copied().unwrap_or("");
+    let checked_at = fields.get(5).copied().unwrap_or("");
+    let preview_attempt_at = fields.get(6).copied().unwrap_or("").trim();
+    let content = format!(
+        "{quality_field}\t{}\t{preview_field}\t{rank_field}\t{checked_rank}\t{checked_at}\t{preview_attempt_at}\t{target_rank}\t{now}\t{scope}",
+        fields[1].trim(),
+    );
+    replace_sidecar_file(sidecar_path, &content)?;
+    Ok(true)
 }
 
 /// 先写临时文件再备份替换；失败回滚，绝不把有效的缓存元数据删掉换一条记录。
@@ -1216,6 +1372,8 @@ pub struct CachedAudioRecord {
     pub actual_rank: Option<i64>,
     /// 仍在有效期内、已探测过的目标档位分数；过期记录不入此字段
     pub checked_rank: Option<i64>,
+    /// 档位未知时仍在有效期内的探测退避
+    pub unknown_probe: Option<UnknownProbe>,
     /// 本地文件字节数
     pub file_size: u64,
 }
@@ -1242,7 +1400,7 @@ impl CachedAudioRecord {
     /// 当前记录是否允许批量升级至目标档位。
     ///
     /// 排除试听片段、已达到或超过目标的记录，以及最近已经探测过该目标档位的记录：
-    /// 最后一条避免每次批量升级都重新拉取同一批无更高流的曲目。
+    /// 档位未知时还排除同账号范围、同目标的独立退避，避免每轮批量都重新探测。
     /// 试听片段仍不纳入批量升级（#130）：补整曲由播放命中时的自动路径负责，
     /// 并有自己的退避记录；批量升级纳入与否是单独的产品决定，不能在这里悄悄扩大流量。
     /// 档位未知的旧缓存计入可升级——它证明不了自己达标；其中标签已证明达标的
@@ -1250,7 +1408,7 @@ impl CachedAudioRecord {
     /// 同时受该缓存文件自身的 quality_tag 意图上限约束：
     /// 例如用户在省流模式下缓存的 `-low.m4a`（上限 50），不会被冲高为无损（100），
     /// 以免后续省流播放时命中数十兆的庞大文件破坏省流意图。
-    pub fn is_upgradeable_to(&self, target_rank: i64) -> bool {
+    pub fn is_upgradeable_to(&self, target_rank: i64, scope: Option<&str>) -> bool {
         let within_cap = crate::quality::QualityIntent::parse(&self.quality_tag)
             .max_rank()
             .is_none_or(|cap| target_rank <= cap);
@@ -1258,6 +1416,10 @@ impl CachedAudioRecord {
             && within_cap
             && self.needs_higher_stream(target_rank)
             && !upgrade_check_covers(self.checked_rank, Some(target_rank))
+            && !self
+                .unknown_probe
+                .as_ref()
+                .is_some_and(|probe| probe.covers(target_rank, scope))
     }
 }
 
@@ -1276,7 +1438,9 @@ pub fn read_cache_record(m4a_path: &Path) -> Option<CachedAudioRecord> {
     let quality_path = m4a_path.with_extension("quality");
     let text = std::fs::read_to_string(&quality_path).ok()?;
     let meta = parse_sidecar(&text, file_size)?;
-    let checked_rank = meta.fresh_checked_rank(now_epoch_secs());
+    let now = now_epoch_secs();
+    let checked_rank = meta.fresh_checked_rank(now);
+    let unknown_probe = meta.fresh_unknown_probe(now);
     Some(CachedAudioRecord {
         track_id,
         quality_tag,
@@ -1285,6 +1449,7 @@ pub fn read_cache_record(m4a_path: &Path) -> Option<CachedAudioRecord> {
         preview: meta.preview,
         actual_rank: meta.actual_rank,
         checked_rank,
+        unknown_probe,
         file_size,
     })
 }
@@ -1355,7 +1520,11 @@ pub fn estimated_single_track_bytes(target_rank: i64) -> u64 {
 /// `unknown_rank_count` 统计的是**档位未知的旧缓存有多少**，与本轮能不能升无关：
 /// 界面要把「有 X 首缓存根本不知道是什么档」如实报出来，不能在它们被目标档位或探测记录
 /// 抑制之后就当作不存在（#89）。试听片段不报——它本来就不参与升级，报了也没法处理。
-pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> UpgradeEstimate {
+pub fn estimate_upgrade(
+    records: &[CachedAudioRecord],
+    target_rank: i64,
+    scope: Option<&str>,
+) -> UpgradeEstimate {
     let mut count = 0usize;
     let mut unknown_rank_count = 0usize;
     let mut current_bytes = 0u64;
@@ -1367,8 +1536,8 @@ pub fn estimate_upgrade(records: &[CachedAudioRecord], target_rank: i64) -> Upgr
         if record.actual_rank.is_none() && !record.preview {
             unknown_rank_count += 1;
         }
-        // 试听片段、超出意图上限、以及最近已探测过该目标档位的记录都不计入升级。
-        if record.is_upgradeable_to(target_rank) {
+        // 试听片段、超出意图上限，以及同目标的确认探测或未知档退避都不计入升级。
+        if record.is_upgradeable_to(target_rank, scope) {
             count += 1;
             current_bytes = current_bytes.saturating_add(record.file_size);
             estimated_new_bytes = estimated_new_bytes.saturating_add(single_est);
@@ -2066,10 +2235,181 @@ mod tests {
         assert_eq!(checked.checked_at, Some(1_700_000_000));
     }
 
+    #[test]
+    fn parse_sidecar_supports_legacy_and_unknown_probe_layouts() {
+        for (text, size) in [
+            ("无损 · 试听\t9000", 9000),
+            ("无损 871k\t9000\t0", 9000),
+            ("无损 871k\t9000\t0\t100", 9000),
+            ("未知 128k\t9000\t1\t0\t\t\t1700000000", 9000),
+        ] {
+            let parsed = parse_sidecar(text, size).unwrap();
+            assert_eq!(parsed.unknown_probe_target, None, "{text}");
+            assert_eq!(parsed.unknown_probe_at, None, "{text}");
+            assert_eq!(parsed.unknown_probe_scope, None, "{text}");
+        }
+
+        let parsed =
+            parse_sidecar("极高 320k\t2000\t0\t\t\t\t\t100\t1700000000\tscope-a", 2000).unwrap();
+        assert_eq!(parsed.actual_rank, None);
+        assert_eq!(parsed.checked_rank, None);
+        assert_eq!(parsed.unknown_probe_target, Some(100));
+        assert_eq!(parsed.unknown_probe_at, Some(1_700_000_000));
+        assert_eq!(parsed.unknown_probe_scope.as_deref(), Some("scope-a"));
+        assert_eq!(
+            parsed.fresh_unknown_probe(1_700_000_001),
+            Some(UnknownProbe {
+                target_rank: 100,
+                at: 1_700_000_000,
+                scope: "scope-a".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_probe_scope_is_stable_scoped_and_does_not_leak_account() {
+        assert_eq!(unknown_probe_scope(None, Some(true)), None);
+        assert_eq!(unknown_probe_scope(Some(" \t"), Some(true)), None);
+
+        let scope = unknown_probe_scope(Some(" private-account "), Some(true)).unwrap();
+        assert_eq!(scope.len(), 32);
+        assert!(scope
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)));
+        assert!(!scope.contains("private-account"));
+        assert_eq!(
+            unknown_probe_scope(Some("private-account"), Some(true)),
+            Some(scope.clone())
+        );
+
+        let non_vip = unknown_probe_scope(Some("private-account"), Some(false)).unwrap();
+        let unknown_vip = unknown_probe_scope(Some("private-account"), None).unwrap();
+        let other_account = unknown_probe_scope(Some("private-account-2"), Some(true)).unwrap();
+        assert_ne!(scope, non_vip);
+        assert_ne!(scope, unknown_vip);
+        assert_ne!(non_vip, unknown_vip);
+        assert_ne!(scope, other_account);
+    }
+
+    #[test]
+    fn unknown_probe_freshness_checks_ttl_rollback_and_required_fields() {
+        let at = 1_700_000_000;
+        let meta = SidecarMeta {
+            quality: "极高 320k".into(),
+            preview: false,
+            actual_rank: None,
+            checked_rank: None,
+            checked_at: None,
+            preview_attempt_at: None,
+            unknown_probe_target: Some(100),
+            unknown_probe_at: Some(at),
+            unknown_probe_scope: Some("scope-a".into()),
+        };
+        let probe = UnknownProbe {
+            target_rank: 100,
+            at,
+            scope: "scope-a".into(),
+        };
+        assert_eq!(meta.fresh_unknown_probe(at), Some(probe.clone()));
+        assert_eq!(
+            meta.fresh_unknown_probe(at + UNKNOWN_PROBE_TTL.as_secs() - 1),
+            Some(probe.clone())
+        );
+        assert_eq!(
+            meta.fresh_unknown_probe(at + UNKNOWN_PROBE_TTL.as_secs()),
+            None
+        );
+        assert_eq!(meta.fresh_unknown_probe(at - 1), None);
+        let known = SidecarMeta {
+            actual_rank: Some(80),
+            ..meta.clone()
+        };
+        assert_eq!(known.fresh_unknown_probe(at + 1), Some(probe));
+
+        for invalid in [
+            SidecarMeta {
+                preview: true,
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_target: Some(0),
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_target: Some(-1),
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_target: None,
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_at: Some(0),
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_at: None,
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_scope: Some(String::new()),
+                ..meta.clone()
+            },
+            SidecarMeta {
+                unknown_probe_scope: None,
+                ..meta.clone()
+            },
+        ] {
+            assert!(invalid.fresh_unknown_probe(at + 1).is_none());
+        }
+    }
+
     /// 写一对缓存文件（音频 + sidecar）。sidecar 内容原样落盘。
     fn write_cached(dir: &Path, stem: &str, sidecar: &str, bytes: usize) {
         std::fs::write(dir.join(format!("{stem}.m4a")), vec![0u8; bytes]).unwrap();
         std::fs::write(dir.join(format!("{stem}.quality")), sidecar).unwrap();
+    }
+
+    #[test]
+    fn read_cache_record_loads_only_fresh_unknown_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_epoch_secs();
+        write_cached(
+            dir.path(),
+            "7005-auto",
+            &format!("极高 320k\t3000\t0\t\t\t\t\t100\t{now}\tscope-a"),
+            3000,
+        );
+        write_cached(
+            dir.path(),
+            "7006-auto",
+            &format!(
+                "极高 320k\t3000\t0\t\t\t\t\t100\t{}\tscope-a",
+                now + UNKNOWN_PROBE_TTL.as_secs()
+            ),
+            3000,
+        );
+
+        let records = list_cached_audio(dir.path());
+        let fresh = records
+            .iter()
+            .find(|record| record.track_id == "7005")
+            .unwrap();
+        assert_eq!(fresh.actual_rank, None);
+        assert_eq!(fresh.checked_rank, None);
+        assert_eq!(
+            fresh.unknown_probe,
+            Some(UnknownProbe {
+                target_rank: 100,
+                at: now,
+                scope: "scope-a".into(),
+            })
+        );
+        let rolled_back = records
+            .iter()
+            .find(|record| record.track_id == "7006")
+            .unwrap();
+        assert_eq!(rolled_back.unknown_probe, None);
     }
 
     /// #89：旧三字段缓存（没有档位分数）要计入批量升级，标签已证明达标的除外。
@@ -2105,7 +2445,7 @@ mod tests {
         assert_eq!(checked.checked_rank, Some(100));
 
         // 目标无损（100）：只有证明不了达标、也没确认过的那首进入升级。
-        let est = estimate_upgrade(&records, 100);
+        let est = estimate_upgrade(&records, 100, None);
         assert_eq!(est.upgradeable_count, 1);
         assert_eq!(
             est.unknown_rank_count, 3,
@@ -2114,7 +2454,7 @@ mod tests {
         assert_eq!(est.current_bytes, 3000);
 
         // 目标 Hi-Res 无损（110）：无损标签只证明到 100，三首都要重新探。
-        let est_hires = estimate_upgrade(&records, 110);
+        let est_hires = estimate_upgrade(&records, 110, None);
         assert_eq!(est_hires.upgradeable_count, 3);
         assert_eq!(est_hires.unknown_rank_count, 3);
     }
@@ -2153,7 +2493,7 @@ mod tests {
         assert!(!song2.needs_higher_stream(100));
 
         // 目标为无损（100）：song1 可升级，song2 不需升级
-        let est_lossless = estimate_upgrade(&records, 100);
+        let est_lossless = estimate_upgrade(&records, 100, None);
         assert_eq!(est_lossless.upgradeable_count, 1);
         assert_eq!(est_lossless.current_bytes, 1000);
         assert_eq!(est_lossless.estimated_traffic_bytes, 35 * 1024 * 1024);
@@ -2163,7 +2503,7 @@ mod tests {
         );
 
         // 目标为流畅（50）：两者都已达到，没有可升级
-        let est_standard = estimate_upgrade(&records, 50);
+        let est_standard = estimate_upgrade(&records, 50, None);
         assert_eq!(est_standard.upgradeable_count, 0);
         assert_eq!(est_standard.current_bytes, 0);
     }
@@ -2309,6 +2649,7 @@ mod tests {
                 preview: false,
                 actual_rank: Some(50),
                 checked_rank: None,
+                unknown_probe: None,
                 file_size: 4 * 1024 * 1024,
             },
             CachedAudioRecord {
@@ -2319,6 +2660,7 @@ mod tests {
                 preview: true,
                 actual_rank: Some(50),
                 checked_rank: None,
+                unknown_probe: None,
                 file_size: 1024 * 1024,
             },
             // #130 的两种试听：认得出档位与认不出（0 分）都不进批量升级。
@@ -2330,6 +2672,7 @@ mod tests {
                 preview: true,
                 actual_rank: Some(0),
                 checked_rank: None,
+                unknown_probe: None,
                 file_size: 1024 * 1024,
             },
             // 旧格式试听没有档位分数：同样不能报成「档位未知的旧缓存」，
@@ -2342,17 +2685,18 @@ mod tests {
                 preview: true,
                 actual_rank: None,
                 checked_rank: None,
+                unknown_probe: None,
                 file_size: 1024 * 1024,
             },
         ];
-        let est = estimate_upgrade(&records, 100);
+        let est = estimate_upgrade(&records, 100, None);
         // preview 试听文件不应被计入升级，也不该被报成「档位未知的旧缓存」。
         assert_eq!(est.upgradeable_count, 1);
         assert_eq!(est.unknown_rank_count, 0);
         assert_eq!(est.current_bytes, 4 * 1024 * 1024);
-        assert!(!records[1].is_upgradeable_to(100));
-        assert!(!records[2].is_upgradeable_to(100));
-        assert!(!records[3].is_upgradeable_to(100));
+        assert!(!records[1].is_upgradeable_to(100, None));
+        assert!(!records[2].is_upgradeable_to(100, None));
+        assert!(!records[3].is_upgradeable_to(100, None));
     }
 
     /// #96：sidecar 记了 0 分（认不出档位）的缓存不计入批量升级——重下拿回的还是同一条
@@ -2367,19 +2711,20 @@ mod tests {
             preview: false,
             actual_rank: rank,
             checked_rank: None,
+            unknown_probe: None,
             file_size: 4 * 1024 * 1024,
         };
         let unreadable = record("1", "未知 128k", Some(0));
         assert_eq!(unreadable.actual_tier(), Some("未知"));
         assert!(!unreadable.needs_higher_stream(100));
-        assert!(!unreadable.is_upgradeable_to(100));
+        assert!(!unreadable.is_upgradeable_to(100, None));
 
         let records = vec![
             unreadable,
             record("2", "极高 320k", None),
             record("3", "流畅 128k", Some(50)),
         ];
-        let est = estimate_upgrade(&records, 100);
+        let est = estimate_upgrade(&records, 100, None);
         assert_eq!(est.upgradeable_count, 2, "0 分那首不进批量升级");
         assert_eq!(est.current_bytes, 8 * 1024 * 1024);
     }
@@ -2394,10 +2739,11 @@ mod tests {
             preview: false,
             actual_rank: Some(50),
             checked_rank: None,
+            unknown_probe: None,
             file_size: 4 * 1024 * 1024,
         };
         // auto 无上限，actual 50 可以升级至 100
-        assert!(auto_record.is_upgradeable_to(100));
+        assert!(auto_record.is_upgradeable_to(100, None));
 
         let low_record = CachedAudioRecord {
             track_id: "2".into(),
@@ -2407,15 +2753,16 @@ mod tests {
             preview: false,
             actual_rank: Some(20),
             checked_rank: None,
+            unknown_probe: None,
             file_size: 4 * 1024 * 1024,
         };
         // low 标签上限为 50，不允许越级升级至 100（无损）或 80（极高）
-        assert!(!low_record.is_upgradeable_to(100));
-        assert!(!low_record.is_upgradeable_to(80));
+        assert!(!low_record.is_upgradeable_to(100, None));
+        assert!(!low_record.is_upgradeable_to(80, None));
         // 目标为 50 且实际为 20 时，在 low 上限内，允许升级至 50
-        assert!(low_record.is_upgradeable_to(50));
+        assert!(low_record.is_upgradeable_to(50, None));
         // 目标为 20 时实际已达 20，不允许升级
-        assert!(!low_record.is_upgradeable_to(20));
+        assert!(!low_record.is_upgradeable_to(20, None));
 
         let lossless_downgraded = CachedAudioRecord {
             track_id: "3".into(),
@@ -2425,10 +2772,11 @@ mod tests {
             preview: false,
             actual_rank: Some(50),
             checked_rank: None,
+            unknown_probe: None,
             file_size: 10 * 1024 * 1024,
         };
         // lossless 标签上限为 100，实际为 50（曾发生降档），允许升级至 100
-        assert!(lossless_downgraded.is_upgradeable_to(100));
+        assert!(lossless_downgraded.is_upgradeable_to(100, None));
     }
 
     /// #90：探测过「该目标没有更高流」的档位不再计入升级与预估，但更高目标仍可探测。
@@ -2442,12 +2790,13 @@ mod tests {
             preview: false,
             actual_rank: Some(80),
             checked_rank: Some(100),
+            unknown_probe: None,
             file_size: 10 * 1024 * 1024,
         };
         // 已经问过无损、没拿到更高流：同一个目标不再计入
-        assert!(!confirmed.is_upgradeable_to(100));
+        assert!(!confirmed.is_upgradeable_to(100, None));
         // 更高目标还没问过，仍要允许探测：历史结论不能代表更高档位
-        assert!(confirmed.is_upgradeable_to(110));
+        assert!(confirmed.is_upgradeable_to(110, None));
 
         let low_confirmed = CachedAudioRecord {
             actual_rank: Some(50),
@@ -2455,16 +2804,56 @@ mod tests {
             ..confirmed.clone()
         };
         // 只确认过 70 档：再问 70 没有意义，问 80 仍应尝试
-        assert!(!low_confirmed.is_upgradeable_to(70));
-        assert!(low_confirmed.is_upgradeable_to(80));
+        assert!(!low_confirmed.is_upgradeable_to(70, None));
+        assert!(low_confirmed.is_upgradeable_to(80, None));
 
-        let estimate = estimate_upgrade(&[confirmed], 100);
+        let estimate = estimate_upgrade(&[confirmed], 100, None);
         assert_eq!(estimate.upgradeable_count, 0);
 
         assert!(upgrade_check_covers(Some(100), Some(100)));
         assert!(!upgrade_check_covers(Some(70), Some(80)));
         assert!(!upgrade_check_covers(None, Some(80)));
         assert!(!upgrade_check_covers(Some(80), None));
+    }
+
+    #[test]
+    fn unknown_probe_suppresses_only_the_same_target_and_scope() {
+        let record = CachedAudioRecord {
+            track_id: "1".into(),
+            quality_tag: "auto".into(),
+            path: PathBuf::from("1-auto.m4a"),
+            quality_label: "极高 320k".into(),
+            preview: false,
+            actual_rank: None,
+            checked_rank: None,
+            unknown_probe: Some(UnknownProbe {
+                target_rank: 100,
+                at: 1_700_000_000,
+                scope: "scope-a".into(),
+            }),
+            file_size: 10 * 1024 * 1024,
+        };
+        let probe = record.unknown_probe.as_ref().unwrap();
+        assert!(probe.covers(100, Some("scope-a")));
+        assert!(!probe.covers(100, None));
+        assert!(!probe.covers(110, Some("scope-a")));
+        assert!(!probe.covers(100, Some("scope-b")));
+
+        assert!(!record.is_upgradeable_to(100, Some("scope-a")));
+        assert!(record.is_upgradeable_to(110, Some("scope-a")));
+        assert!(record.is_upgradeable_to(100, Some("scope-b")));
+        assert!(record.is_upgradeable_to(100, None));
+
+        let suppressed = estimate_upgrade(std::slice::from_ref(&record), 100, Some("scope-a"));
+        assert_eq!(suppressed.upgradeable_count, 0);
+        assert_eq!(suppressed.unknown_rank_count, 1);
+        assert_eq!(suppressed.current_bytes, 0);
+        for (target, scope) in [(110, Some("scope-a")), (100, Some("scope-b")), (100, None)] {
+            let estimate = estimate_upgrade(std::slice::from_ref(&record), target, scope);
+            assert_eq!(estimate.upgradeable_count, 1);
+            assert_eq!(estimate.unknown_rank_count, 1);
+            assert_eq!(estimate.current_bytes, 10 * 1024 * 1024);
+        }
     }
 
     /// 杜比 / Hi-Res 的探测结论也要挡住批量与预估，不能再整首重下一遍。
@@ -2478,10 +2867,11 @@ mod tests {
             preview: false,
             actual_rank: Some(100),
             checked_rank: Some(110),
+            unknown_probe: None,
             file_size: 10 * 1024 * 1024,
         };
-        assert!(!confirmed.is_upgradeable_to(110));
-        let estimate = estimate_upgrade(std::slice::from_ref(&confirmed), 110);
+        assert!(!confirmed.is_upgradeable_to(110, None));
+        let estimate = estimate_upgrade(std::slice::from_ref(&confirmed), 110, None);
         assert_eq!(estimate.upgradeable_count, 0);
 
         // 记录到期后（`fresh_checked_rank` 返回 None）重新算作可升级。
@@ -2489,8 +2879,8 @@ mod tests {
             checked_rank: None,
             ..confirmed
         };
-        assert!(expired.is_upgradeable_to(110));
-        assert_eq!(estimate_upgrade(&[expired], 110).upgradeable_count, 1);
+        assert!(expired.is_upgradeable_to(110, None));
+        assert_eq!(estimate_upgrade(&[expired], 110, None).upgradeable_count, 1);
     }
 
     /// 探测结论只在 30 天内有效，过期后重新探测。
@@ -2503,6 +2893,9 @@ mod tests {
             checked_rank: Some(100),
             checked_at: Some(1_700_000_000),
             preview_attempt_at: None,
+            unknown_probe_target: None,
+            unknown_probe_at: None,
+            unknown_probe_scope: None,
         };
         assert_eq!(meta.fresh_checked_rank(1_700_000_001), Some(100));
         let edge = 1_700_000_000 + UPGRADE_CHECK_TTL.as_secs() - 1;
@@ -2529,6 +2922,9 @@ mod tests {
             checked_rank: None,
             checked_at: None,
             preview_attempt_at: Some(1_700_000_000),
+            unknown_probe_target: None,
+            unknown_probe_at: None,
+            unknown_probe_scope: None,
         };
         assert_eq!(
             meta.fresh_preview_attempt_at(1_700_000_001),
@@ -2597,6 +2993,112 @@ mod tests {
             "极高 320k\t2000\t0",
             "档位未知的记录不被声称知道分数的结论覆盖"
         );
+    }
+
+    #[test]
+    fn record_unknown_probe_writes_backoff_without_claiming_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(&sidecar, "极高 320k\t2000\t0").unwrap();
+
+        assert!(record_unknown_probe(&sidecar, None, 100, "scope-a", 1_700_000_000).unwrap());
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(text, "极高 320k\t2000\t0\t\t\t\t\t100\t1700000000\tscope-a");
+        let parsed = parse_sidecar(&text, 2000).unwrap();
+        assert_eq!(parsed.actual_rank, None);
+        assert_eq!(parsed.checked_rank, None);
+        assert_eq!(parsed.checked_at, None);
+        assert_eq!(parsed.unknown_probe_target, Some(100));
+        assert_eq!(parsed.unknown_probe_at, Some(1_700_000_000));
+        assert_eq!(parsed.unknown_probe_scope.as_deref(), Some("scope-a"));
+
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t\t70\t1600000000\t1600000100").unwrap();
+        assert!(record_unknown_probe(&sidecar, None, 110, "scope-b", 1_700_000_001).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "极高 320k\t2000\t0\t\t70\t1600000000\t1600000100\t110\t1700000001\tscope-b"
+        );
+
+        std::fs::write(&sidecar, "极高 320k\t2000\t0\t80").unwrap();
+        assert!(record_unknown_probe(&sidecar, Some(80), 100, "scope-a", 1_700_000_002).unwrap());
+        let parsed = parse_sidecar(&std::fs::read_to_string(&sidecar).unwrap(), 2000).unwrap();
+        assert_eq!(parsed.actual_rank, Some(80), "旧文件的实际档位原样保留");
+        assert_eq!(parsed.checked_rank, None);
+        assert_eq!(parsed.unknown_probe_target, Some(100));
+    }
+
+    #[test]
+    fn record_unknown_probe_skips_previews_changed_rank_and_missing_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        for (original, expected_rank, target, scope) in [
+            ("未知 128k\t2000\t1", None, 100, "scope-a"),
+            ("无损 · 试听\t2000", None, 100, "scope-a"),
+            ("流畅 128k\t2000\t0\t50", Some(80), 100, "scope-a"),
+            ("极高 320k\t2000\t0", Some(80), 100, "scope-a"),
+            ("极高 320k\t2000\t0", None, 0, "scope-a"),
+            ("极高 320k\t2000\t0", None, 100, ""),
+            ("极高 320k\t2000\t0", None, 100, " \t"),
+        ] {
+            std::fs::write(&sidecar, original).unwrap();
+            let recorded =
+                record_unknown_probe(&sidecar, expected_rank, target, scope, 1_700_000_000)
+                    .unwrap();
+            assert!(!recorded);
+            assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), original);
+        }
+
+        let missing = dir.path().join("missing.quality");
+        assert!(!record_unknown_probe(&missing, None, 0, "scope-a", 1).unwrap());
+        assert!(!record_unknown_probe(&missing, None, 100, "", 1).unwrap());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn other_sidecar_writers_preserve_unknown_probe_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("song-auto.quality");
+        std::fs::write(
+            &sidecar,
+            "未知 128k\t9000\t1\t0\t\t\t1700000000\t100\t1700000100\tscope-a",
+        )
+        .unwrap();
+
+        assert!(record_preview_attempt(&sidecar, Some(0), 1_700_000_200).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "未知 128k\t9000\t1\t0\t\t\t1700000200\t100\t1700000100\tscope-a"
+        );
+
+        record_upgrade_check(&sidecar, Some(0), 110, 1_700_000_300).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            text,
+            "未知 128k\t9000\t1\t0\t110\t1700000300\t1700000200\t100\t1700000100\tscope-a"
+        );
+        let parsed = parse_sidecar(&text, 9000).unwrap();
+        assert_eq!(parsed.preview_attempt_at, Some(1_700_000_200));
+        assert_eq!(parsed.unknown_probe_target, Some(100));
+        assert_eq!(parsed.unknown_probe_at, Some(1_700_000_100));
+        assert_eq!(parsed.unknown_probe_scope.as_deref(), Some("scope-a"));
+
+        // 第 7 字段为空时也要留位，不能把后面的未知档退避整体左移。
+        std::fs::write(
+            &sidecar,
+            "极高 320k\t9000\t0\t\t\t\t\t100\t1700000100\tscope-a",
+        )
+        .unwrap();
+        record_upgrade_check(&sidecar, None, 110, 1_700_000_300).unwrap();
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            text,
+            "极高 320k\t9000\t0\t\t110\t1700000300\t\t100\t1700000100\tscope-a"
+        );
+        let parsed = parse_sidecar(&text, 9000).unwrap();
+        assert_eq!(parsed.preview_attempt_at, None);
+        assert_eq!(parsed.unknown_probe_target, Some(100));
+        assert_eq!(parsed.unknown_probe_at, Some(1_700_000_100));
+        assert_eq!(parsed.unknown_probe_scope.as_deref(), Some("scope-a"));
     }
 
     /// 写回失败或字段不完整时只报错，不碰原 sidecar。
