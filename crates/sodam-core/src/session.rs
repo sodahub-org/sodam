@@ -2356,15 +2356,13 @@ mod tests {
         };
 
         let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
+        let probe = probe_check(&current, &unknown_stream, Some(100), true);
         let outcome = finish_unimproved_upgrade(
             &mut current,
             &unknown_stream,
             Some(100),
             true,
-            ProbeCheck {
-                checked_rank: None,
-                confirmed_miss: false,
-            },
+            probe,
             Some(&scope),
             &quality_path,
         );
@@ -2446,15 +2444,13 @@ mod tests {
         };
         let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
 
+        let probe = probe_check(&current, &unknown_stream, Some(100), true);
         let outcome = finish_unimproved_upgrade(
             &mut current,
             &unknown_stream,
             Some(100),
             true,
-            ProbeCheck {
-                checked_rank: None,
-                confirmed_miss: false,
-            },
+            probe,
             Some(&scope),
             &quality_path,
         );
@@ -2474,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn not_improved_reason_separates_preview_equal_and_confirmed_miss() {
+    fn not_improved_reason_separates_confirmed_miss_from_not_better() {
         let lease = crate::cache::CacheLease::acquire(std::path::Path::new("reason.m4a"));
         let cached = |quality: &str, rank: Option<i64>, preview: bool| CachedTrack {
             path: std::path::PathBuf::new(),
@@ -2490,6 +2486,11 @@ mod tests {
         let legacy = cached("极高 320k", None, false);
         assert_eq!(
             downloaded_not_improved_reason(&legacy, true),
+            NotImprovedReason::NotBetter
+        );
+        let scored_without_bitrate = cached("极高", Some(80), false);
+        assert_eq!(
+            downloaded_not_improved_reason(&scored_without_bitrate, true),
             NotImprovedReason::NotBetter
         );
         let unknown_label = cached("极高", None, false);
