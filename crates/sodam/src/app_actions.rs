@@ -2914,14 +2914,19 @@ impl Root {
         )
     }
 
+    fn upgrade_scope(&self) -> Option<String> {
+        let (is_vip, account_user_id) = self.upgrade_account();
+        sodam_core::cache::unknown_probe_scope(account_user_id.as_deref(), is_vip)
+    }
+
     /// 刷新缓存批量升级预估信息（后台扫盘，不阻塞 UI）。
     pub(crate) fn refresh_upgrade_estimate(&mut self, cx: &mut Context<Self>) {
         self.batch_upgrade_estimate_request_seq =
             self.batch_upgrade_estimate_request_seq.wrapping_add(1);
         let seq = self.batch_upgrade_estimate_request_seq;
         let target_intent = self.batch_upgrade_target.clone();
-        let (is_vip, account_user_id) = self.upgrade_account();
-        let scope = sodam_core::cache::unknown_probe_scope(account_user_id.as_deref(), is_vip);
+        let (is_vip, _) = self.upgrade_account();
+        let scope = self.upgrade_scope();
         let target_rank = match sodam_core::quality::target_rank(&target_intent, is_vip) {
             Some(rank) => rank,
             None => {
@@ -2987,14 +2992,14 @@ impl Root {
             account_user_id.as_deref(),
         ) {
             Ok(run) => {
-                let event = match run.outcome {
-                    Outcome::Upgraded => "cache_upgraded",
-                    Outcome::NoHigherTier => "cache_upgrade_no_higher_tier",
-                    Outcome::UnknownRank => "cache_upgrade_unknown_rank",
-                    Outcome::Failed => return Outcome::Failed,
+                let (event, level) = match run.outcome {
+                    Outcome::Upgraded => ("cache_upgraded", levels.success),
+                    Outcome::NoHigherTier => ("cache_upgrade_no_higher_tier", levels.success),
+                    Outcome::UnknownRank => ("cache_upgrade_unknown_rank", levels.success),
+                    Outcome::Failed => ("cache_upgrade_failed", levels.failure),
                 };
                 log_outlet::log_event(
-                    levels.success,
+                    level,
                     LogTopic::Player,
                     event,
                     &[
@@ -3132,7 +3137,7 @@ impl Root {
         let start_epoch = self.auth_epoch;
         // 收尾文案要分清「真的换了号」和「同一账号的会员状态刷新」：两者都推进代数，
         // 但后者报「账号已变更」是撒谎。账号信息没加载出来时也不说换了号。
-        let scan_scope = sodam_core::cache::unknown_probe_scope(start_user_id.as_deref(), is_vip);
+        let scan_scope = self.upgrade_scope();
 
         // 后台扫盘读取待升级记录（排除试听文件并遵循意图上限），不阻塞主渲染线程
         let scan_work = cx.background_spawn(async move {
@@ -3237,7 +3242,7 @@ impl Root {
             let upgraded_text = tally.upgraded.to_string();
             let failed_text = tally.failed.to_string();
             let no_higher_text = tally.no_higher.to_string();
-            let unknown_rank_text = tally.unknown_rank.to_string();
+            let unknown_result_text = tally.unknown_result.to_string();
             let stop_text = stopped.map_or("done", |reason| reason.as_str());
             log_event(
                 LogLevel::Info,
@@ -3249,7 +3254,7 @@ impl Root {
                     ("upgraded", upgraded_text.as_str()),
                     ("failed", failed_text.as_str()),
                     ("no_higher", no_higher_text.as_str()),
-                    ("unknown_rank", unknown_rank_text.as_str()),
+                    ("unknown_result", unknown_result_text.as_str()),
                     ("stop", stop_text),
                 ],
             );
@@ -3297,7 +3302,7 @@ impl Root {
                                     tally.upgraded.to_string(),
                                     tally.failed.to_string(),
                                     tally.no_higher.to_string(),
-                                    tally.unknown_rank.to_string(),
+                                    tally.unknown_result.to_string(),
                                 ],
                             );
                             match batch_upgrade_notice(tally, message) {
@@ -4228,10 +4233,7 @@ impl Root {
                         let actual_quality = cached.quality.clone();
                         let intent = root.settings.quality_intent();
                         let (is_vip, account_user_id) = root.upgrade_account();
-                        let scope = sodam_core::cache::unknown_probe_scope(
-                            account_user_id.as_deref(),
-                            is_vip,
-                        );
+                        let scope = root.upgrade_scope();
                         let needs_upgrade = was_cached
                             && cached.needs_auto_upgrade(&intent, is_vip, scope.as_deref());
                         let sequence = root.engine.load(track.clone(), cached);
@@ -4965,7 +4967,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 0,
             failed: 0,
             no_higher: 2,
-            unknown_rank: 0,
+            unknown_result: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4974,12 +4976,12 @@ mod batch_upgrade_notice_tests {
     }
 
     #[test]
-    fn unknown_rank_only_uses_normal_status() {
+    fn unknown_result_only_uses_normal_status() {
         let tally = Tally {
             upgraded: 0,
             failed: 0,
             no_higher: 0,
-            unknown_rank: 2,
+            unknown_result: 2,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -4993,7 +4995,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 1,
             failed: 1,
             no_higher: 0,
-            unknown_rank: 0,
+            unknown_result: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),
@@ -5007,7 +5009,7 @@ mod batch_upgrade_notice_tests {
             upgraded: 2,
             failed: 0,
             no_higher: 1,
-            unknown_rank: 0,
+            unknown_result: 0,
         };
         assert_eq!(
             batch_upgrade_notice(tally, "summary".into()),

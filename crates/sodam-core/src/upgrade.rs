@@ -105,10 +105,10 @@ pub enum Outcome {
     Failed,
 }
 
-/// 一轮批量的计数：成功 / 失败 / 没换成更好的整曲 / 档位未知。
+/// 一轮批量的计数：成功 / 失败 / 没换成更好的整曲 / 升级结果未知。
 ///
 /// 没换成更好的整曲不只在服务端没有更高档位时出现：升级后仍然只拿到试听片段也落这里。
-/// 档位未知单独记，不能写成「已确认没有更高档」。
+/// 升级结果未知单独记，不能写成「已确认没有更高档」，也不代表缓存文件本身的档位未知。
 ///
 /// 失败是「这一首没跑成」的总数，不只网络：磁盘写不进去、权益不够、曲目被删都落在这里，
 /// 所以界面上的说法也是「失败」，不冒充「网络失败」。
@@ -119,7 +119,8 @@ pub struct Tally {
     pub upgraded: usize,
     pub failed: usize,
     pub no_higher: usize,
-    pub unknown_rank: usize,
+    /// 升级结果未知的首数。
+    pub unknown_result: usize,
 }
 
 impl Tally {
@@ -128,13 +129,13 @@ impl Tally {
             Outcome::Upgraded => self.upgraded += 1,
             Outcome::Failed => self.failed += 1,
             Outcome::NoHigherTier => self.no_higher += 1,
-            Outcome::UnknownRank => self.unknown_rank += 1,
+            Outcome::UnknownRank => self.unknown_result += 1,
         }
     }
 
     /// 这一轮真跑了几首。提前停时小于扫出来的总数。
     pub fn total(&self) -> usize {
-        self.upgraded + self.failed + self.no_higher + self.unknown_rank
+        self.upgraded + self.failed + self.no_higher + self.unknown_result
     }
 }
 
@@ -332,7 +333,7 @@ mod tests {
         assert_eq!(tally.upgraded, 1);
         assert_eq!(tally.failed, 2);
         assert_eq!(tally.no_higher, 1);
-        assert_eq!(tally.unknown_rank, 1);
+        assert_eq!(tally.unknown_result, 1);
         assert_eq!(tally.total(), 5);
     }
 
