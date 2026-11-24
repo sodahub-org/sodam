@@ -44,6 +44,24 @@ struct UpgradeLogLevels {
     failure: LogLevel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchUpgradeNotice {
+    Status(String),
+    Success(String),
+    Warning(String),
+}
+
+// 失败优先于成功：有失败就让用户看见；全零只走普通状态兜底。
+fn batch_upgrade_notice(tally: Tally, message: String) -> BatchUpgradeNotice {
+    if tally.failed > 0 {
+        BatchUpgradeNotice::Warning(message)
+    } else if tally.upgraded > 0 {
+        BatchUpgradeNotice::Success(message)
+    } else {
+        BatchUpgradeNotice::Status(message)
+    }
+}
+
 /// 歌词页显示哪首歌的封面，补下载就按哪首取 URL。
 ///
 /// 歌词页用的是 `pending_track.or(queue.current())`（views/lyrics.rs），正在装载、
@@ -3252,11 +3270,14 @@ impl Root {
                                     tally.no_higher.to_string(),
                                 ],
                             );
-                            // 一首都没升级成功：别弹绿色成功，全落在「无更好整曲」也一样。
-                            if tally.upgraded == 0 {
-                                root.notify_warning_once("batch-upgrade-complete", message);
-                            } else {
-                                root.notify_success_once("batch-upgrade-complete", message);
+                            match batch_upgrade_notice(tally, message) {
+                                BatchUpgradeNotice::Warning(text) => {
+                                    root.notify_warning_once("batch-upgrade-complete", text);
+                                }
+                                BatchUpgradeNotice::Success(text) => {
+                                    root.notify_success_once("batch-upgrade-complete", text);
+                                }
+                                BatchUpgradeNotice::Status(text) => root.set_status_text(text),
                             }
                         }
                     }
@@ -4894,6 +4915,50 @@ fn prefetch_concurrency() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|count| *count > 0)
         .unwrap_or(2)
+}
+
+#[cfg(test)]
+mod batch_upgrade_notice_tests {
+    use super::*;
+
+    #[test]
+    fn no_higher_only_uses_normal_status() {
+        let tally = Tally {
+            upgraded: 0,
+            failed: 0,
+            no_higher: 2,
+        };
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Status("summary".into())
+        );
+    }
+
+    #[test]
+    fn any_failure_uses_warning() {
+        let tally = Tally {
+            upgraded: 1,
+            failed: 1,
+            no_higher: 0,
+        };
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Warning("summary".into())
+        );
+    }
+
+    #[test]
+    fn upgrades_without_failures_use_success() {
+        let tally = Tally {
+            upgraded: 2,
+            failed: 0,
+            no_higher: 1,
+        };
+        assert_eq!(
+            batch_upgrade_notice(tally, "summary".into()),
+            BatchUpgradeNotice::Success("summary".into())
+        );
+    }
 }
 
 #[cfg(test)]
