@@ -289,12 +289,21 @@ impl Queue {
             *index != self.index && *index < len && !unavailable(self.tracks[*index].id.as_str())
         };
         match self.mode {
-            PlayMode::Shuffle => self
-                .shuffle_round
-                .iter()
-                .copied()
-                .find(|index| playable(index))
-                .or_else(|| (0..len).find(|index| playable(index))),
+            PlayMode::Shuffle => {
+                if let Some(redo) = self.redo {
+                    if redo < len
+                        && redo != self.index
+                        && !unavailable(self.tracks[redo].id.as_str())
+                    {
+                        return Some(redo);
+                    }
+                }
+                self.shuffle_round
+                    .iter()
+                    .copied()
+                    .find(|index| playable(index))
+                    .or_else(|| (0..len).find(|index| playable(index)))
+            }
             PlayMode::ListLoop | PlayMode::RepeatOne => (1..len)
                 .map(|step| (self.index + step) % len)
                 .find(|index| playable(index)),
@@ -661,6 +670,16 @@ mod tests {
         assert_eq!(queue.rewind().unwrap().title, "t0");
         assert_eq!(queue.rewind().unwrap().title, "t2");
         assert_eq!(queue.jump(1).unwrap().title, "t1");
+    }
+
+    #[test]
+    fn shuffle_candidate_query_prioritizes_playable_redo() {
+        let mut queue = Queue::new(tracks(2));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        assert_eq!(queue.next_playable(|id| id == "0"), Some(1));
+        assert_eq!(queue.advance_playable(|id| id == "0").unwrap().id, "1");
     }
 
     #[test]

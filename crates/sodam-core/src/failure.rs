@@ -1467,7 +1467,7 @@ mod tests {
                 "preview stream",
             );
             let mut actual = set.clone();
-            let incoming_at = Instant::now();
+            let incoming_at = base + Duration::from_millis(1);
             actual.record_failure_at("current", &incoming, incoming_at);
             for candidate in ["current", "oldest-permanent", "newer-transient", "new"] {
                 assert_eq!(
