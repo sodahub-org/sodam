@@ -53,6 +53,7 @@ pub(crate) struct CoverMailbox {
 struct CoverMailboxInner {
     queue: VecDeque<String>,
     pending: HashSet<String>,
+    dropped: usize,
     wake: futures_channel::mpsc::Sender<()>,
     /// 消费循环已退出只记一次，别让每次推需求都刷一条日志。
     wake_closed_logged: bool,
@@ -64,6 +65,7 @@ impl CoverMailbox {
             inner: Mutex::new(CoverMailboxInner {
                 queue: VecDeque::new(),
                 pending: HashSet::new(),
+                dropped: 0,
                 wake,
                 wake_closed_logged: false,
             }),
@@ -86,6 +88,7 @@ impl CoverMailbox {
         if inner.queue.len() >= COVER_MAILBOX_CAPACITY {
             if let Some(evicted) = inner.queue.pop_front() {
                 inner.pending.remove(&evicted);
+                inner.dropped += 1;
             }
         }
         let url = url.to_string();
@@ -108,6 +111,14 @@ impl CoverMailbox {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.pending.clear();
         inner.queue.drain(..).collect()
+    }
+
+    fn take_dropped(&self) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut inner.dropped)
     }
 }
 
@@ -1102,13 +1113,14 @@ impl Root {
             let mailbox = root.cover_mailbox.clone();
             cx.spawn(async move |this, cx| loop {
                 let pending = mailbox.take();
+                let mailbox_dropped = mailbox.take_dropped();
                 let had_demand = !pending.is_empty();
                 let stats = if had_demand {
                     match this.update(cx, |root, cx| {
                         let queued = root.ensure_covers(&pending, cx);
                         CoverWant {
                             queued,
-                            dropped: root.cover_store.take_dropped(),
+                            dropped: root.cover_store.take_dropped() + mailbox_dropped,
                         }
                     }) {
                         Ok(stats) => stats,
@@ -2219,6 +2231,8 @@ mod tests {
         assert!(!pending.iter().any(|url| url == "cover-0"));
         assert!(rx.try_recv().is_ok(), "有新需求要叫醒消费循环");
         assert!(rx.try_recv().is_err(), "唤醒信号只保留一个");
+        assert_eq!(mailbox.take_dropped(), 1, "邮箱挤掉也要记账");
+        assert_eq!(mailbox.take_dropped(), 0, "日志计数取走一次就清零");
 
         mailbox.request("cover-0");
         assert_eq!(mailbox.take(), vec!["cover-0".to_string()]);
