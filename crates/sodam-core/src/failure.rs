@@ -261,6 +261,36 @@ impl UnplayableTracks {
         self.entries.contains_key(track_id) || self.attempted.contains(track_id)
     }
 
+    /// 只读预测：记录这次失败后，候选曲目是否仍不可用。
+    pub fn is_unavailable_after_failure(
+        &self,
+        failed_track_id: &str,
+        candidate_id: &str,
+        failure: &PlaybackFailure,
+        recorded_at: Instant,
+    ) -> bool {
+        if UnplayableReason::from_action(failure.action).is_none() {
+            return self.is_unavailable(candidate_id);
+        }
+        if candidate_id == failed_track_id || self.attempted.contains(candidate_id) {
+            return true;
+        }
+        let recorded = self.entries.contains_key(candidate_id);
+        if self.entries.contains_key(failed_track_id) || self.entries.len() < Self::CAPACITY {
+            return recorded;
+        }
+        let victim = Self::eviction_victim_with_incoming(
+            &self.entries,
+            failed_track_id,
+            failure.retryability,
+            recorded_at,
+        );
+        if victim == Some(candidate_id) {
+            return false;
+        }
+        recorded
+    }
+
     /// 已确认结论的成因（供显式点播不重打网络就给出原因）。
     ///
     /// 只认结论集合，不含「本轮试过但结论已被容量淘汰」的扫描游标——
@@ -300,6 +330,7 @@ impl UnplayableTracks {
     /// 记下「这首当前账号放不出来」。重复确认同一首会刷新失败时刻与成因。
     ///
     /// 私有：外部只能经 [`Self::record_failure`] 进来，避免绕开「只收按曲目类」的判据。
+    #[cfg(test)]
     fn record(&mut self, track_id: &str, retryability: Retryability, reason: UnplayableReason) {
         self.record_at(track_id, retryability, reason, Instant::now());
     }
@@ -310,12 +341,21 @@ impl UnplayableTracks {
     /// 所以这条判据必须留在集合自己的入口上，而不是指望每个调用点记得先判断。
     /// 返回是否真的写入。
     pub fn record_failure(&mut self, track_id: &str, failure: &PlaybackFailure) -> bool {
+        self.record_failure_at(track_id, failure, Instant::now())
+    }
+
+    /// 用调用方给的同一时刻记账，供只读候选投影与真实写入对齐。
+    pub fn record_failure_at(
+        &mut self,
+        track_id: &str,
+        failure: &PlaybackFailure,
+        at: Instant,
+    ) -> bool {
         let Some(reason) = UnplayableReason::from_action(failure.action) else {
             return false;
         };
         self.attempted.insert(track_id.to_string());
-        self.record(track_id, failure.retryability, reason);
-        true
+        self.record_at(track_id, failure.retryability, reason, at)
     }
 
     fn record_at(
@@ -324,7 +364,18 @@ impl UnplayableTracks {
         retryability: Retryability,
         reason: UnplayableReason,
         at: Instant,
-    ) {
+    ) -> bool {
+        let victim = (self.entries.len() >= Self::CAPACITY && !self.entries.contains_key(track_id))
+            .then(|| Self::eviction_victim_with_incoming(&self.entries, track_id, retryability, at))
+            .flatten()
+            .map(str::to_string);
+        if victim.as_deref() == Some(track_id) {
+            // 按淘汰规则应先淘汰新结论，不占位。
+            return false;
+        }
+        if let Some(victim) = victim {
+            Arc::make_mut(&mut self.entries).remove(&victim);
+        }
         Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
             UnplayableEntry {
@@ -334,6 +385,7 @@ impl UnplayableTracks {
             },
         );
         self.evict_over_capacity();
+        true
     }
 
     /// 账号 id 或会员状态任一变化 → 整份作废。返回是否真的作废过。
@@ -357,21 +409,60 @@ impl UnplayableTracks {
     /// 确定性的按曲目结论留得久一点，避免刚确认过又去白打一次网络。
     fn evict_over_capacity(&mut self) {
         while self.entries.len() > Self::CAPACITY {
-            let entries = Arc::make_mut(&mut self.entries);
-            let transient = entries
-                .iter()
-                .filter(|(_, entry)| entry.retryability != Retryability::Never)
-                .min_by_key(|(_, entry)| entry.recorded_at)
-                .map(|(track_id, _)| track_id.clone());
-            let oldest = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.recorded_at)
-                .map(|(track_id, _)| track_id.clone());
-            let Some(victim) = transient.or(oldest) else {
+            let Some(victim) = Self::eviction_victim(&self.entries).map(str::to_string) else {
                 break;
             };
-            entries.remove(&victim);
+            Arc::make_mut(&mut self.entries).remove(&victim);
         }
+    }
+
+    fn eviction_victim(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
+        Self::oldest_transient(entries).or_else(|| Self::oldest(entries))
+    }
+
+    fn eviction_victim_with_incoming<'a>(
+        entries: &'a HashMap<String, UnplayableEntry>,
+        incoming_id: &'a str,
+        incoming_retryability: Retryability,
+        incoming_at: Instant,
+    ) -> Option<&'a str> {
+        let incoming_key = (incoming_at, incoming_id);
+        if incoming_retryability != Retryability::Never {
+            return match Self::oldest_transient(entries) {
+                Some(track_id) if (entries[track_id].recorded_at, track_id) <= incoming_key => {
+                    Some(track_id)
+                }
+                _ => Some(incoming_id),
+            };
+        }
+        if let Some(track_id) = Self::oldest_transient(entries) {
+            return Some(track_id);
+        }
+        match Self::oldest(entries) {
+            Some(track_id) if (entries[track_id].recorded_at, track_id) <= incoming_key => {
+                Some(track_id)
+            }
+            _ => Some(incoming_id),
+        }
+    }
+
+    fn oldest_transient(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
+        entries
+            .iter()
+            .filter(|(_, entry)| entry.retryability != Retryability::Never)
+            .min_by(|(left_id, left), (right_id, right)| {
+                (left.recorded_at, left_id).cmp(&(right.recorded_at, right_id))
+            })
+            .map(|(track_id, _)| track_id.as_str())
+    }
+
+    fn oldest(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
+        entries
+            .iter()
+            .min_by(|(left_id, left), (right_id, right)| {
+                (left.recorded_at, left_id).cmp(&(right.recorded_at, right_id))
+            })
+            .map(|(track_id, _)| track_id.as_str())
     }
 }
 
@@ -1341,6 +1432,56 @@ mod tests {
         );
         assert!(!set.invalidate_if_account_changed(None, ("user-b", false)));
         assert!(set.contains("track-3"));
+    }
+
+    /// 预测与真实记录共用淘汰规则，且预测本身不修改集合。
+    #[test]
+    fn failure_projection_matches_real_recording_without_mutating() {
+        let base = Instant::now();
+        let mut set = UnplayableTracks::default();
+        set.record_at(
+            "oldest-permanent",
+            Retryability::Never,
+            UnplayableReason::NoFullTrack,
+            base,
+        );
+        set.record_at(
+            "newer-transient",
+            Retryability::Transient,
+            UnplayableReason::NoFullTrack,
+            base + Duration::from_millis(1),
+        );
+        for index in 2..UnplayableTracks::CAPACITY {
+            set.record_at(
+                &format!("permanent-{index}"),
+                Retryability::Never,
+                UnplayableReason::NoFullTrack,
+                base + Duration::from_millis(index as u64 + 1),
+            );
+        }
+        set.reset_scan();
+        let before_len = set.len();
+
+        for retryability in [Retryability::Never, Retryability::Transient] {
+            let incoming = PlaybackFailure::new(
+                Stage::ResolveStream,
+                retryability,
+                RecoveryAction::TrackUnavailable,
+                "preview stream",
+            );
+            let mut actual = set.clone();
+            let incoming_at = base + Duration::from_millis(1);
+            let recorded = actual.record_failure_at("current", &incoming, incoming_at);
+            assert_eq!(recorded, actual.contains("current"));
+            for candidate in ["current", "oldest-permanent", "newer-transient", "new"] {
+                assert_eq!(
+                    set.is_unavailable_after_failure("current", candidate, &incoming, incoming_at),
+                    actual.is_unavailable(candidate),
+                    "{retryability:?} {candidate}"
+                );
+            }
+        }
+        assert_eq!(set.len(), before_len);
     }
 
     /// 超界时先清瞬时类，再按失败时刻先进先出。

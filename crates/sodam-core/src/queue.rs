@@ -167,6 +167,7 @@ impl Queue {
         self.index = start.min(self.tracks.len().saturating_sub(1));
         self.history.clear();
         self.shuffle_round.clear();
+        self.redo = None;
     }
 
     /// 用种子做 Fisher-Yates 洗牌（测试可复现）。
@@ -276,8 +277,8 @@ impl Queue {
     /// 按播放模式扫描：
     /// * 列表循环 / 单曲循环：沿列表前进并绕回；绕完整圈仍无候选即 `None`。
     ///   单曲循环同样按列表前进——这是「取不到的前进」，与「播完重播」的循环语义是两件事；
-    /// * 随机播放：先按本轮待播顺序找；本轮没有可播项时再扫完整圈——有可播项
-    ///   就说明可以开新一轮，不能因为本轮播完就误报「没有能播的歌」。
+    /// * 随机播放：先找可用的 `redo` 回退目标，再按本轮待播顺序找；本轮没有可播项时
+    ///   再扫完整圈——有可播项就说明可以开新一轮，不能因为本轮播完就误报「没有能播的歌」。
     ///
     /// 返回值是队列下标，调用方用 [`Queue::advance_playable`] 真正推进。
     pub fn next_playable(&self, unavailable: impl Fn(&str) -> bool) -> Option<usize> {
@@ -289,16 +290,44 @@ impl Queue {
             *index != self.index && *index < len && !unavailable(self.tracks[*index].id.as_str())
         };
         match self.mode {
-            PlayMode::Shuffle => self
-                .shuffle_round
-                .iter()
-                .copied()
-                .find(|index| playable(index))
-                .or_else(|| (0..len).find(|index| playable(index))),
+            PlayMode::Shuffle => {
+                if let Some(redo) = self.redo {
+                    if redo < len
+                        && redo != self.index
+                        && !unavailable(self.tracks[redo].id.as_str())
+                    {
+                        return Some(redo);
+                    }
+                }
+                self.shuffle_round
+                    .iter()
+                    .copied()
+                    .find(|index| playable(index))
+                    .or_else(|| (0..len).find(|index| playable(index)))
+            }
             PlayMode::ListLoop | PlayMode::RepeatOne => (1..len)
                 .map(|step| (self.index + step) % len)
                 .find(|index| playable(index)),
         }
+    }
+
+    /// 丢掉随机播放里已失效的回退目标，不移动当前队列位置。
+    pub fn discard_unavailable_redo(&mut self, unavailable: impl Fn(&str) -> bool) -> bool {
+        if self.mode != PlayMode::Shuffle {
+            return false;
+        }
+        let Some(redo) = self.redo else {
+            return false;
+        };
+        let discard = self
+            .tracks
+            .get(redo)
+            .map(|track| unavailable(track.id.as_str()))
+            .unwrap_or(true);
+        if discard {
+            self.redo = None;
+        }
+        discard
     }
 
     /// 推进到下一个可播曲目；没有候选时不动队列并返回 `None`。
@@ -389,6 +418,7 @@ impl Queue {
     pub fn reset_shuffle_round(&mut self) {
         self.shuffle_round.clear();
         self.history.clear();
+        self.redo = None;
     }
 
     /// 立刻生成一轮随机待播顺序（随机模式下调用）。
@@ -465,7 +495,7 @@ impl Queue {
         Some(removed)
     }
 
-    /// 移除第 `removed` 项后，同步 `shuffle_round` 与 `history` 里的下标。
+    /// 移除第 `removed` 项后，同步 `shuffle_round`、`history` 与 `redo` 里的下标。
     fn shift_indices_for_removal(&mut self, removed: usize) {
         let adjust = |value: &mut usize| {
             if *value > removed {
@@ -476,6 +506,13 @@ impl Queue {
         self.shuffle_round.iter_mut().for_each(adjust);
         self.history.retain(|value| *value != removed);
         self.history.iter_mut().for_each(adjust);
+        if let Some(redo) = self.redo {
+            if redo == removed {
+                self.redo = None;
+            } else if redo > removed {
+                self.redo = Some(redo - 1);
+            }
+        }
     }
 
     /// 把一批曲目插到当前曲目的后面（歌单右键「下一首播放」）。
@@ -494,7 +531,7 @@ impl Queue {
             let insert_at = self.index + 1;
             let inserted = tracks.len();
             self.tracks.splice(insert_at..insert_at, tracks);
-            // 插入点之后的曲目整体右移，轮次与历史里的下标要跟着 +1，
+            // 插入点之后的曲目整体右移，轮次、历史和 redo 里的下标要跟着 +1，
             // 否则它们会指向错位的歌（「下一首播放」在随机模式下会失效）。
             let shift = |value: &mut usize| {
                 if *value >= insert_at {
@@ -503,6 +540,11 @@ impl Queue {
             };
             self.shuffle_round.iter_mut().for_each(shift);
             self.history.iter_mut().for_each(shift);
+            if let Some(redo) = self.redo {
+                if redo >= insert_at {
+                    self.redo = Some(redo + inserted);
+                }
+            }
             // 「下一首播放」的语义：紧接着播新插入的这批，所以插到轮次最前。
             if self.mode == PlayMode::Shuffle {
                 let front: Vec<usize> = (insert_at..insert_at + inserted).collect();
@@ -642,6 +684,87 @@ mod tests {
         assert_eq!(queue.rewind().unwrap().title, "t0");
         assert_eq!(queue.rewind().unwrap().title, "t2");
         assert_eq!(queue.jump(1).unwrap().title, "t1");
+    }
+
+    #[test]
+    fn shuffle_candidate_query_prioritizes_playable_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.shuffle_round = vec![2];
+        queue.redo = Some(1);
+
+        assert_eq!(queue.next_playable(|_| false), Some(1));
+        assert_eq!(queue.advance_playable(|_| false).unwrap().id, "1");
+    }
+
+    #[test]
+    fn discard_unavailable_redo_keeps_playable_redo_and_ignores_other_modes() {
+        let mut queue = Queue::new(tracks(2));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+        assert!(!queue.discard_unavailable_redo(|_| false));
+        assert_eq!(queue.redo, Some(1));
+
+        queue.mode = PlayMode::ListLoop;
+        assert!(!queue.discard_unavailable_redo(|_| true));
+        assert_eq!(queue.redo, Some(1));
+    }
+
+    #[test]
+    fn exhausted_round_discards_unavailable_redo_without_moving() {
+        let mut queue = Queue::new(tracks(2));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        assert!(queue.discard_unavailable_redo(|_| true));
+        assert!(queue.redo.is_none());
+        assert_eq!(queue.index(), 0);
+    }
+
+    #[test]
+    fn replace_clears_stale_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        queue.replace(tracks(2), 0);
+
+        assert!(queue.redo.is_none());
+    }
+
+    #[test]
+    fn remove_adjusts_or_clears_redo() {
+        let mut queue = Queue::new(tracks(4));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(3);
+        queue.remove(1);
+        assert_eq!(queue.redo, Some(2));
+
+        queue.redo = Some(1);
+        queue.remove(1);
+        assert!(queue.redo.is_none());
+    }
+
+    #[test]
+    fn insert_next_shifts_redo_after_insertion_point() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(2);
+
+        queue.insert_next(tracks(1));
+
+        assert_eq!(queue.redo, Some(3));
+    }
+
+    #[test]
+    fn reset_shuffle_round_clears_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        queue.reset_shuffle_round();
+
+        assert!(queue.redo.is_none());
     }
 
     #[test]
