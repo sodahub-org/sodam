@@ -268,10 +268,11 @@ mod tests {
     }
 
     #[test]
-    fn thirteen_row_acceptance_table_matches_current_behavior() {
+    fn policy_rows_match_current_behavior() {
         let per_track = RecoveryAction::TrackUnavailable;
         let global = RecoveryAction::Relogin;
         let transient = RecoveryAction::Nothing;
+        // 第 13 行身份变化由调用门测试覆盖，纯决策不接身份。
         let cases = [
             (
                 "点播·按曲目·有候选",
@@ -428,11 +429,6 @@ mod tests {
                     Advance::Stay,
                     Halt::None,
                 ),
-            ),
-            (
-                "任意·身份变了",
-                decide(PlayIntent::Now, per_track, true, 0, PlayMode::ListLoop),
-                PlayFailureDecision::invalidated(),
             ),
         ];
 

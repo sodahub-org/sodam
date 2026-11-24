@@ -281,7 +281,7 @@ impl UnplayableTracks {
         let victim = if failure.retryability != Retryability::Never {
             Self::oldest_transient(&self.entries).or(Some(failed_track_id))
         } else {
-            Self::oldest(&self.entries)
+            Self::eviction_victim(&self.entries)
         };
         if victim == Some(candidate_id) {
             return false;
@@ -1430,6 +1430,46 @@ mod tests {
                 "{candidate}"
             );
         }
+    }
+
+    #[test]
+    fn permanent_failure_projection_prefers_the_transient_victim() {
+        let base = Instant::now();
+        let mut set = UnplayableTracks::default();
+        set.record_at(
+            "oldest-permanent",
+            Retryability::Never,
+            UnplayableReason::NoFullTrack,
+            base,
+        );
+        set.record_at(
+            "newer-transient",
+            Retryability::Transient,
+            UnplayableReason::NoFullTrack,
+            base + Duration::from_millis(1),
+        );
+        for index in 2..UnplayableTracks::CAPACITY {
+            set.record_at(
+                &format!("permanent-{index}"),
+                Retryability::Never,
+                UnplayableReason::NoFullTrack,
+                base + Duration::from_millis(index as u64 + 1),
+            );
+        }
+        set.reset_scan();
+        let incoming = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Never,
+            RecoveryAction::TrackUnavailable,
+            "preview stream",
+        );
+        let mut actual = set.clone();
+        actual.record_failure("current", &incoming);
+
+        assert!(actual.is_unavailable("oldest-permanent"));
+        assert!(!actual.is_unavailable("newer-transient"));
+        assert!(set.is_unavailable_after_failure("current", "oldest-permanent", &incoming));
+        assert!(!set.is_unavailable_after_failure("current", "newer-transient", &incoming));
     }
 
     #[test]
