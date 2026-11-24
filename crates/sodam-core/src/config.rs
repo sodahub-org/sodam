@@ -135,14 +135,13 @@ pub struct Settings {
     pub detailed_logs: bool,
 }
 
-/// 会话初始化真正要的字段：只有这 10 个。
+/// 会话初始化要用的那几样东西：登录凭据、签名与设备身份、音质意图。
 ///
-/// 会话只持这一小份，不再持整份设置，所以「登录要把整份副本写回盘」那套补丁没了；
-/// 其余设置（音量、缓存上限、播放模式、主题、语言、标题栏、快捷键、搜索历史、
-/// 详细日志）会话根本不看，界面上改完当场生效，不用重建会话。
+/// 会话只认这一份，别的设置（音量、缓存上限、播放模式、主题、语言、标题栏、
+/// 快捷键、搜索历史、详细日志）改了就当场生效，不用重建会话。
 ///
-/// 「哪些字段算会话输入」只有一张表：[`Settings::session_inputs`]。那边解构
-/// `Settings` 不写 `..`，加了设置字段却不表态算不算会话输入，就编译不过。
+/// 哪些字段算会话输入，边界只在 [`Settings::session_inputs`] 那一张表里；
+/// 那边解构 `Settings` 不写 `..`，加了字段不表态算不算，就编译不过。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionInputs {
     /// 登录 Cookie。
@@ -158,8 +157,9 @@ pub struct SessionInputs {
     /// 扫码登录用的设备身份（passport），与上面的签名设备是两套东西。
     pub login_device_id: String,
     pub login_install_id: String,
-    /// 音质**意图**（`auto` 或某个具体档位）与它的来源。
+    /// 音质**意图**（`auto` 或某个具体档位）。
     pub quality: String,
+    /// 意图的来源。会话自己不读它，但它和档位是一对：只改来源同样算换了会话输入。
     pub quality_source: crate::quality::QualitySource,
 }
 
@@ -188,8 +188,34 @@ impl From<&Settings> for SessionInputs {
 }
 
 impl From<Settings> for SessionInputs {
+    /// 已经拿到所有权，字段直接搬走：会话是每个后台请求都新建一份的，
+    /// 没必要为了这一步再 clone 十个 `String`。
     fn from(settings: Settings) -> Self {
-        settings.session_inputs()
+        let Settings {
+            signer_url,
+            signer_token,
+            cookie,
+            device_id,
+            iid,
+            fp,
+            login_device_id,
+            login_install_id,
+            quality,
+            quality_source,
+            ..
+        } = settings;
+        Self {
+            cookie,
+            signer_url,
+            signer_token,
+            device_id,
+            iid,
+            fp,
+            login_device_id,
+            login_install_id,
+            quality,
+            quality_source,
+        }
     }
 }
 
@@ -2519,8 +2545,8 @@ mod tests {
 
     /// 登录轮询期间改过主题：登录写回之后主题还是新值。
     ///
-    /// 写回的是当前这份设置，不是登录开始那一刻的旧快照——旧快照还留着老主题，
-    /// 谁要把它写回去，下面这几条断言就会红（#185 / #256）。
+    /// 写回的是内存里当前那份设置，不是登录开始那一刻的旧快照，所以这期间改的
+    /// 主题、详细日志不会被盖掉。
     #[test]
     fn login_write_back_keeps_theme_changed_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
