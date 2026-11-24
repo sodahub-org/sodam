@@ -355,8 +355,7 @@ impl UnplayableTracks {
             return false;
         };
         self.attempted.insert(track_id.to_string());
-        self.record_at(track_id, failure.retryability, reason, at);
-        true
+        self.record_at(track_id, failure.retryability, reason, at)
     }
 
     fn record_at(
@@ -365,15 +364,17 @@ impl UnplayableTracks {
         retryability: Retryability,
         reason: UnplayableReason,
         at: Instant,
-    ) {
+    ) -> bool {
         let victim = (self.entries.len() >= Self::CAPACITY && !self.entries.contains_key(track_id))
             .then(|| Self::eviction_victim_with_incoming(&self.entries, track_id, retryability, at))
             .flatten()
             .map(str::to_string);
-        if let Some(victim) = victim.as_deref() {
-            if victim != track_id {
-                Arc::make_mut(&mut self.entries).remove(victim);
-            }
+        if victim.as_deref() == Some(track_id) {
+            // 按淘汰规则应先淘汰新结论，不占位。
+            return false;
+        }
+        if let Some(victim) = victim {
+            Arc::make_mut(&mut self.entries).remove(&victim);
         }
         Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
@@ -383,10 +384,8 @@ impl UnplayableTracks {
                 reason,
             },
         );
-        if victim.as_deref() == Some(track_id) {
-            Arc::make_mut(&mut self.entries).remove(track_id);
-        }
         self.evict_over_capacity();
+        true
     }
 
     /// 账号 id 或会员状态任一变化 → 整份作废。返回是否真的作废过。
@@ -1472,7 +1471,8 @@ mod tests {
             );
             let mut actual = set.clone();
             let incoming_at = base + Duration::from_millis(1);
-            actual.record_failure_at("current", &incoming, incoming_at);
+            let recorded = actual.record_failure_at("current", &incoming, incoming_at);
+            assert_eq!(recorded, actual.contains("current"));
             for candidate in ["current", "oldest-permanent", "newer-transient", "new"] {
                 assert_eq!(
                     set.is_unavailable_after_failure("current", candidate, &incoming, incoming_at),

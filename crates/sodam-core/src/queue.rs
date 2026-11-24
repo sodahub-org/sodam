@@ -167,6 +167,7 @@ impl Queue {
         self.index = start.min(self.tracks.len().saturating_sub(1));
         self.history.clear();
         self.shuffle_round.clear();
+        self.redo = None;
     }
 
     /// 用种子做 Fisher-Yates 洗牌（测试可复现）。
@@ -276,8 +277,8 @@ impl Queue {
     /// 按播放模式扫描：
     /// * 列表循环 / 单曲循环：沿列表前进并绕回；绕完整圈仍无候选即 `None`。
     ///   单曲循环同样按列表前进——这是「取不到的前进」，与「播完重播」的循环语义是两件事；
-    /// * 随机播放：先按本轮待播顺序找；本轮没有可播项时再扫完整圈——有可播项
-    ///   就说明可以开新一轮，不能因为本轮播完就误报「没有能播的歌」。
+    /// * 随机播放：先找可用的 `redo` 回退目标，再按本轮待播顺序找；本轮没有可播项时
+    ///   再扫完整圈——有可播项就说明可以开新一轮，不能因为本轮播完就误报「没有能播的歌」。
     ///
     /// 返回值是队列下标，调用方用 [`Queue::advance_playable`] 真正推进。
     pub fn next_playable(&self, unavailable: impl Fn(&str) -> bool) -> Option<usize> {
@@ -674,12 +675,26 @@ mod tests {
 
     #[test]
     fn shuffle_candidate_query_prioritizes_playable_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.shuffle_round = vec![2];
+        queue.redo = Some(1);
+
+        assert_eq!(queue.next_playable(|_| false), Some(1));
+        assert_eq!(queue.advance_playable(|_| false).unwrap().id, "1");
+    }
+
+    #[test]
+    fn discard_unavailable_redo_keeps_playable_redo_and_ignores_other_modes() {
         let mut queue = Queue::new(tracks(2));
         queue.mode = PlayMode::Shuffle;
         queue.redo = Some(1);
+        assert!(!queue.discard_unavailable_redo(|_| false));
+        assert_eq!(queue.redo, Some(1));
 
-        assert_eq!(queue.next_playable(|id| id == "0"), Some(1));
-        assert_eq!(queue.advance_playable(|id| id == "0").unwrap().id, "1");
+        queue.mode = PlayMode::ListLoop;
+        assert!(!queue.discard_unavailable_redo(|_| true));
+        assert_eq!(queue.redo, Some(1));
     }
 
     #[test]
@@ -691,6 +706,17 @@ mod tests {
         assert!(queue.discard_unavailable_redo(|_| true));
         assert!(queue.redo.is_none());
         assert_eq!(queue.index(), 0);
+    }
+
+    #[test]
+    fn replace_clears_stale_redo() {
+        let mut queue = Queue::new(tracks(3));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        queue.replace(tracks(2), 0);
+
+        assert!(queue.redo.is_none());
     }
 
     #[test]

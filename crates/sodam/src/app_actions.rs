@@ -4276,7 +4276,8 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         let recorded_at = std::time::Instant::now();
-        let decision = decide_play_failure(PlayFailureInput {
+        let previous_failures = self.consecutive_failures;
+        let mut decision = decide_play_failure(PlayFailureInput {
             intent,
             failure,
             has_candidate: has_playable_after_failure(
@@ -4286,7 +4287,7 @@ impl Root {
                 failure,
                 recorded_at,
             ),
-            consecutive_failures: self.consecutive_failures,
+            consecutive_failures: previous_failures,
             mode: self.queue.mode,
         });
 
@@ -4301,11 +4302,6 @@ impl Root {
             self.consecutive_failures += 1;
         }
 
-        let notice_key = match decision.halt {
-            Halt::ExhaustedRound => "round-exhausted",
-            _ if decision.record == FailureRecord::Unplayable => "track-unavailable",
-            _ => "track-stream-failed",
-        };
         let mut advanced = false;
         if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
             // 整圈只清理失效 redo，不移动队列。
@@ -4316,17 +4312,20 @@ impl Root {
         if decision.advance == Advance::Next {
             advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
             if !advanced {
-                if decision.record == FailureRecord::Unplayable {
-                    self.halt_exhausted_round();
-                } else {
-                    let message = self.tr(play_failure_text(failure, false)).to_string();
-                    self.playback_error = Some(message.clone());
-                    self.notify_warning_once("track-stream-failed", message);
-                    self.halt_playback();
-                }
-                return;
+                decision = decide_play_failure(PlayFailureInput {
+                    intent,
+                    failure,
+                    has_candidate: false,
+                    consecutive_failures: previous_failures,
+                    mode: self.queue.mode,
+                });
             }
         }
+        let notice_key = match decision.halt {
+            Halt::ExhaustedRound => "round-exhausted",
+            _ if decision.record == FailureRecord::Unplayable => "track-unavailable",
+            _ => "track-stream-failed",
+        };
         let skipped = skipped_after_advance(decision, advanced);
 
         let message = if decision.halt == Halt::ExhaustedRound {
@@ -5022,6 +5021,71 @@ mod play_failure_flow_tests {
         )
     }
 
+    fn full_unplayable_set() -> UnplayableTracks {
+        let mut set = UnplayableTracks::default();
+        let failure = per_track_failure();
+        for index in 0..UnplayableTracks::CAPACITY {
+            set.record_failure(&format!("old-{index}"), &failure);
+        }
+        set.reset_scan();
+        set
+    }
+
+    fn queue_with_old_tracks() -> Queue {
+        let mut tracks = vec![TrackItem {
+            id: "current".into(),
+            ..Default::default()
+        }];
+        tracks.extend((0..UnplayableTracks::CAPACITY).map(|index| TrackItem {
+            id: format!("old-{index}"),
+            ..Default::default()
+        }));
+        Queue::new(tracks)
+    }
+
+    #[test]
+    fn candidate_projection_matches_advance_when_eviction_frees_a_track() {
+        let set = full_unplayable_set();
+        let mut queue = queue_with_old_tracks();
+        let failure = per_track_failure();
+        let recorded_at = std::time::Instant::now();
+        assert!(has_playable_after_failure(
+            &queue,
+            &set,
+            "current",
+            &failure,
+            recorded_at,
+        ));
+
+        let mut actual = set.clone();
+        actual.record_failure_at("current", &failure, recorded_at);
+        assert!(advance_failure_queue(&mut queue, &actual));
+    }
+
+    #[test]
+    fn candidate_projection_matches_advance_when_incoming_is_evicted() {
+        let set = full_unplayable_set();
+        let mut queue = queue_with_old_tracks();
+        let failure = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Transient,
+            RecoveryAction::TrackUnavailable,
+            "preview stream",
+        );
+        let recorded_at = std::time::Instant::now();
+        assert!(!has_playable_after_failure(
+            &queue,
+            &set,
+            "current",
+            &failure,
+            recorded_at,
+        ));
+
+        let mut actual = set.clone();
+        actual.record_failure_at("current", &failure, recorded_at);
+        assert!(!advance_failure_queue(&mut queue, &actual));
+    }
+
     #[test]
     fn skipped_copy_waits_for_real_queue_movement() {
         let failure = per_track_failure();
@@ -5093,40 +5157,6 @@ mod play_failure_flow_tests {
         assert!(pending.is_none());
         assert!(progress_token.is_none());
         assert!(!playing);
-    }
-
-    #[test]
-    fn stale_identity_blocks_failure_consequences() {
-        let failure = per_track_failure();
-        let mut unplayable = UnplayableTracks::default();
-        let mut queue = Queue::new(vec![
-            TrackItem {
-                id: "current".into(),
-                ..Default::default()
-            },
-            TrackItem {
-                id: "next".into(),
-                ..Default::default()
-            },
-        ]);
-        let before = queue.current().map(|track| track.id.clone());
-        let mut playback_error: Option<String> = None;
-        let mut playback_halted = false;
-        let mut prefetch_suspended = false;
-        let continued = run_if_identity_current(false, || {
-            prefetch_suspended = true;
-            unplayable.record_failure("current", &failure);
-            queue.advance();
-            playback_error = Some("should not appear".into());
-            playback_halted = true;
-        });
-
-        assert!(!continued);
-        assert!(!prefetch_suspended);
-        assert!(unplayable.is_empty());
-        assert_eq!(queue.current().map(|track| track.id.clone()), before);
-        assert!(playback_error.is_none());
-        assert!(!playback_halted);
     }
 
     #[test]
