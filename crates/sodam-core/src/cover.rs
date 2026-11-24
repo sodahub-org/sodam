@@ -189,7 +189,7 @@ struct Lane {
     requeue_after_release: HashSet<String>,
     /// 因队列满挤掉、尚未取走的张数。
     queue_evictions: usize,
-    /// 只有缩略图需要把挤压数交给 `cover_queue`；原图保持关闭。
+    /// 原图挤掉数目前没有消费方；只有缩略图需要交给 `cover_queue`。
     track_queue_evictions: bool,
     max_queue: usize,
     max_inflight: usize,
@@ -217,7 +217,7 @@ impl Lane {
         Self::new(MAX_ORIGINAL_QUEUE, MAX_ORIGINAL_CONCURRENCY, false)
     }
 
-    /// 单张入队。返回有没有真排进去；启用计数的 Lane 自己累计挤压数。
+    /// 单张入队。返回有没有真排进去；启用计数的 Lane 自己累计挤掉数。
     ///
     /// 在飞但已被 `forget` 时，把这次需求记下来，等结果回来立刻重排。
     fn enqueue(
