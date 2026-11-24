@@ -240,6 +240,14 @@ impl SettingsWriter {
         };
         if startup {
             self.startup_failure.set(failure);
+            if let Ok(mut slot) = self.failure.lock() {
+                if slot
+                    .as_ref()
+                    .is_some_and(|pending| pending.kind == FailureKind::QueueStopped)
+                {
+                    *slot = None;
+                }
+            }
         } else if let Ok(mut slot) = self.failure.lock() {
             *slot = Some(failure);
         }
@@ -637,6 +645,24 @@ mod tests {
         assert!(!startup_slot.is_pending());
         assert!(writer.take_startup_error().is_none(), "同一个失败只报一次");
         assert_eq!(log.lock().unwrap().startups, 0);
+    }
+
+    #[test]
+    fn startup_queue_failure_does_not_duplicate_general_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let work = crate::config::load_for_startup(&path)
+            .write_back
+            .expect("首启要回存");
+        let (mut writer, _log) = writer_with(recording(false));
+        writer.note_dead_queue();
+        writer.tx = mpsc::channel().1;
+
+        writer.persist_startup(work);
+
+        let failure = writer.take_startup_error().expect("启动入队失败要能拿到");
+        assert_eq!(failure.kind, FailureKind::QueueStopped);
+        assert!(writer.take_error().is_none(), "同一个队列停止只报一次");
     }
 
     #[test]
