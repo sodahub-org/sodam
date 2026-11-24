@@ -1,8 +1,7 @@
-//! 会话层：把 [`Settings`] 变成可用的 libresoda 客户端。
+//! 会话层：把 [`SessionInputs`] 变成可用的 libresoda 客户端。
 
 use crate::cache::encode_track_id;
-use crate::config::Settings;
-use anyhow::Context;
+use crate::config::SessionInputs;
 use libresoda::soda::signature::HttpSignature;
 use libresoda::{AppCredentials, Soda};
 use std::io::Read;
@@ -391,7 +390,7 @@ impl Session {
     /// 缓存按意图命名，所以「自动」下同一首歌始终命中同一个文件：
     /// 权益升级后仍会先播到非会员时期缓存下来的档位，直到清空缓存或换意图。
     fn quality_tag(&self) -> String {
-        self.settings.quality_intent().cache_tag()
+        self.inputs.quality_intent().cache_tag()
     }
 
     /// 解析 sidecar `{档位}\t{字节}\t{0|1}\t{档位分数}\t{已探测目标档位}\t{探测时间}\t{补整曲尝试时间}`，
@@ -757,36 +756,41 @@ fn encode_sidecar(
     }
 }
 
-/// 一次进程内共享的会话（持有 `Soda` 与当前设置）。
+/// 一次进程内共享的会话（持有 `Soda` 和它要的那几样设置）。
 pub struct Session {
     pumpkin: Soda,
-    settings: Settings,
+    /// 会话就认这一份输入：凭据、签名与设备身份、音质意图。
+    inputs: SessionInputs,
 }
 
 impl Session {
     /// 用给定设置构建会话：注入 Cookie、设备指纹、签名器与音质偏好。
-    pub fn new(settings: Settings) -> Self {
-        let pumpkin = Soda::new(settings.cookie.clone());
+    ///
+    /// 收 `impl Into<SessionInputs>`：`Settings` / `&Settings` 都能直接给，
+    /// 现有构造点一处不用改。会话只认会话输入那几个字段，别的拿不进来。
+    pub fn new(inputs: impl Into<SessionInputs>) -> Self {
+        let inputs = inputs.into();
+        let pumpkin = Soda::new(inputs.cookie.clone());
         pumpkin.set_app_credentials(AppCredentials {
-            device_id: settings.device_id.clone(),
-            iid: settings.iid.clone(),
-            fp: settings.fp.clone(),
+            device_id: inputs.device_id.clone(),
+            iid: inputs.iid.clone(),
+            fp: inputs.fp.clone(),
             ..Default::default()
         });
         // 登录设备身份由 sodam 配置持有；libresoda 只接收，不替应用决定存哪里。
         // 配置异常时兜底生成一份，避免整次登录直接失败（下一次配置保存会修正）。
-        if pumpkin.set_qr_device(settings.login_device()).is_err() {
+        if pumpkin.set_qr_device(inputs.login_device()).is_err() {
             let _ = pumpkin.set_qr_device(libresoda::soda::qr_login::QrDevice::generate());
         }
 
-        let url = settings.signer_url.trim();
+        let url = inputs.signer_url.trim();
         if !url.is_empty() {
-            let provider = HttpSignature::new(url).with_token(settings.signer_token.trim());
+            let provider = HttpSignature::new(url).with_token(inputs.signer_token.trim());
             pumpkin.set_signature_provider(Arc::new(provider));
         }
         // 「自动」= 不设上限，交给服务端按权益与曲目可用性收敛；
         // 只有具体档位才需要把上限告诉 libresoda。
-        if let crate::quality::QualityIntent::Tier(tier) = settings.quality_intent() {
+        if let crate::quality::QualityIntent::Tier(tier) = inputs.quality_intent() {
             pumpkin.set_quality_preference(tier);
         }
         // 登录走 libresoda 的纯 HTTP 实现：passport 请求由本进程直接发出，Cookie 由本进程
@@ -794,7 +798,7 @@ impl Session {
         // libresoda 的本地桥接代发。不依赖 Chromium / CDP。
         pumpkin.enable_http_login();
 
-        Self { pumpkin, settings }
+        Self { pumpkin, inputs }
     }
 
     /// 创建扫码登录二维码（`scan_url` 由 UI 渲染成二维码）。
@@ -883,13 +887,6 @@ impl Session {
         })
     }
 
-    /// 登录成功后写入 Cookie（落盘 + 重建会话）。
-    pub fn apply_login_cookie(&mut self, cookie: &str) -> anyhow::Result<()> {
-        let mut settings = self.settings.clone();
-        settings.cookie = cookie.trim().to_string();
-        self.apply(settings)
-    }
-
     /// 把曲目下载并**解密**到本地缓存，返回文件路径（已存在则直接复用）。
     ///
     /// 走 libresoda 的可续传路径 [`Soda::download_resumable`]：密文先暂存到
@@ -937,7 +934,7 @@ impl Session {
         if let Some(cached) = self.cached_track(&track.id) {
             return Ok(cached);
         }
-        let intent = self.settings.quality_intent();
+        let intent = self.inputs.quality_intent();
         let target_rank = crate::quality::target_rank(&intent, account_is_vip);
         let can_record_check = crate::quality::can_record_unavailable(target_rank, account_is_vip);
         let lease = crate::cache::CacheLease::acquire(&path);
@@ -1076,7 +1073,7 @@ impl Session {
             }
         };
 
-        let default_intent = self.settings.quality_intent();
+        let default_intent = self.inputs.quality_intent();
         let intent = target_intent.unwrap_or(&default_intent);
         // 明确指定 Tier 时目标分数与会员状态无关，但写探测结论需要知道权益：
         // 非会员请求无损失败并不代表曲库没有无损，买会员后必须重新尝试。
@@ -1146,9 +1143,9 @@ impl Session {
         // 可续传路径，失败不清暂存：升级被掐断后，下次升级从缺口接着补（#243）。
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
         let report = if let crate::quality::QualityIntent::Tier(tier) = intent {
-            let mut upgrade_settings = self.settings.clone();
-            upgrade_settings.quality = tier.clone();
-            let upgrade_session = Session::new(upgrade_settings);
+            let mut upgrade_inputs = self.inputs.clone();
+            upgrade_inputs.quality = tier.clone();
+            let upgrade_session = Session::new(upgrade_inputs);
             upgrade_session.pumpkin.download_resumable(&song, &part)
         } else {
             self.pumpkin.download_resumable(&song, &part)
@@ -1255,51 +1252,17 @@ impl Session {
         })
     }
 
-    /// 本地播放偏好不需要重建 API 客户端，但会话后续保存音质/登录时必须带上最新值。
-    pub fn update_playback_preferences(&mut self, settings: &Settings) {
-        self.settings.volume = settings.volume;
-        self.settings.volume_before_mute = settings.volume_before_mute;
-        self.settings.audio_cache_limit_mb = settings.audio_cache_limit_mb;
-        // 播放模式也要同步：登录成功、改音质都会用 `settings()` 整体回填
-        // `root.settings`，漏掉这一项就会把用户刚切的模式覆盖回旧值。
-        self.settings.play_mode = settings.play_mode;
-        // 详细日志同理：登录走 `apply_login_cookie` → `apply` 会把会话里的副本整体落盘，
-        // 副本漏掉这一项就会把用户刚打开的开关写回 false，重启后失效。
-        self.settings.detailed_logs = settings.detailed_logs;
-        // 音质与偏好来源同步：主路径 `set_quality` 已整体 `session.apply`，此处做防御性
-        // 冗余兜底，确保在其他触发偏好落盘的分支上会话副本也与外部一致。
-        self.settings.quality = settings.quality.clone();
-        self.settings.quality_source = settings.quality_source;
-        // 界面类字段同步：热重载改了主题/语言/快捷键/搜索历史时不会重建会话，
-        // 而登录的 `apply_login_cookie` 会把会话副本整体落盘——不同步就会把
-        // 用户（或外部编辑）刚改的值写回旧值（#185）。
-        self.settings.theme = settings.theme.clone();
-        self.settings.language = settings.language.clone();
-        self.settings.titlebar = settings.titlebar.clone();
-        self.settings.shortcut_toggle = settings.shortcut_toggle.clone();
-        self.settings.shortcut_previous = settings.shortcut_previous.clone();
-        self.settings.shortcut_next = settings.shortcut_next.clone();
-        self.settings.search_history_enabled = settings.search_history_enabled;
-        self.settings.search_history = settings.search_history.clone();
+    /// 测试用：看一眼会话手里那份输入（界面那份在 `Root.settings`）。
+    #[cfg(test)]
+    pub(crate) fn inputs(&self) -> &SessionInputs {
+        &self.inputs
     }
 
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
-    /// 换设置（例如登录后写入 Cookie、改签名器/音质）——重建会话以应用全部改动。
-    pub fn apply(&mut self, settings: Settings) -> anyhow::Result<()> {
-        settings.save().context("保存配置失败")?;
-        *self = Self::new(settings);
-        Ok(())
-    }
-
-    /// 换设置但**不落盘**：只重建会话，盘由调用方负责写，这里不写第二次。
+    /// 换一份会话输入，重建会话：凭据、签名、设备身份、音质这些改了，都得走这里才生效。
     ///
-    /// 两个用途：热重载（外部改动刚落进来就被回写一遍，会把用户编辑器里还没保存的
-    /// 内容覆盖掉，#185）；登出在后台落盘成功后的收尾（#197）。
-    pub fn adopt(&mut self, settings: Settings) {
-        *self = Self::new(settings);
+    /// 只重建会话，不碰磁盘——要不要写盘、什么时候写，由调用方决定。
+    pub fn adopt(&mut self, inputs: impl Into<SessionInputs>) {
+        *self = Self::new(inputs);
     }
 
     /// 获取歌词，并保留原始增强 LRC 中的逐字时间轴。
@@ -1322,7 +1285,7 @@ impl Session {
     }
 
     pub fn has_cookie(&self) -> bool {
-        !self.settings.cookie.trim().is_empty()
+        self.inputs.has_cookie()
     }
 
     /// 简单搜索（同步；UI 侧应放到后台线程执行）。
@@ -1467,6 +1430,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Settings;
 
     #[test]
     fn session_builds_without_network() {
@@ -1480,7 +1444,7 @@ mod tests {
         };
         let session = Session::new(settings);
         assert!(session.has_cookie());
-        assert_eq!(session.settings().quality, "lossless");
+        assert_eq!(session.inputs().quality, "lossless");
     }
 
     /// 0 字节、或者目标根本不是个普通文件，都算没缓存：这种文件解码不出来，得重新下。
@@ -1742,17 +1706,17 @@ mod tests {
         let path = dir.path().join("config.json");
         Settings::default().save_to(&path).unwrap();
 
-        // 模拟「读配置 → 建会话 → 登录后回填设置 → 再建会话」这一整圈
-        let loaded = Settings::load_from(&path);
-        assert_eq!(loaded.quality, crate::quality::AUTO);
-        let mut session = Session::new(loaded);
-        let mut after_login = session.settings().clone();
-        after_login.cookie = "sessionid_ss=x".into();
-        session.update_playback_preferences(&after_login);
-        let rebuilt = Session::new(session.settings().clone());
+        // 走一遍真实顺序：读配置 → 建会话 → 登录写盘 → 按新设置重建会话
+        let mut settings = Settings::load_from(&path);
+        assert_eq!(settings.quality, crate::quality::AUTO);
+        let mut session = Session::new(&settings);
+        settings
+            .apply_login_cookie_to(&path, "sessionid_ss=x")
+            .unwrap();
+        session.adopt(&settings);
 
         assert_eq!(
-            rebuilt.settings().quality,
+            session.inputs().quality,
             crate::quality::AUTO,
             "登录后不得被固化成具体档位"
         );
@@ -1761,26 +1725,6 @@ mod tests {
             text.contains(r#""quality": "auto""#),
             "配置文件里的自动是 auto 这一种写法：{text}"
         );
-    }
-
-    /// 偏好同步带上详细日志，并防御性同步音质意图与来源，确保会话副本时刻一致。
-    #[test]
-    fn playback_preferences_sync_carries_detailed_logs_and_defensively_syncs_quality() {
-        use crate::quality::QualitySource;
-
-        let mut session = Session::new(Settings::default());
-        let mut current = session.settings().clone();
-        current.detailed_logs = true;
-        current.quality = "lossless".into();
-        current.quality_source = QualitySource::User;
-        session.update_playback_preferences(&current);
-
-        assert!(
-            session.settings().detailed_logs,
-            "同步后会话副本要带上用户刚打开的详细日志开关"
-        );
-        assert_eq!(session.settings().quality, "lossless");
-        assert_eq!(session.settings().quality_source, QualitySource::User);
     }
 
     /// 缓存标签按意图取：自动与空串同一个文件，换档位就换路径。

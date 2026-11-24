@@ -549,10 +549,19 @@ impl Root {
     /// 当前这首不重载：中途断开已取到的流不划算，也与主流客户端一致。
     pub fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
         let intent = sodam_core::quality::QualityIntent::parse(quality);
-        self.settings.set_quality_intent_by_user(&intent);
+        // 先改一份副本，写盘成功了才认：失败时 `self.settings` 原样不动。会话只认
+        // 写进盘的档位，预取和点播又是拿 `self.settings` 现建会话的，两边不能一个
+        // 新档一个旧档——缓存文件按档位命名，错开就会互相找不到。
+        let mut next = self.settings.clone();
+        next.set_quality_intent_by_user(&intent);
         let label = crate::ui::player_bar::quality_label(intent.as_setting(), self.language);
-        match self.settings.save() {
+        match next.save() {
             Ok(()) => {
+                // 这一次 `save()` 就是唯一一次写盘：会话不自己存盘，重建只是换上新的档位。
+                self.settings = next;
+                if let Some(session) = self.session.as_mut() {
+                    session.adopt(&self.settings);
+                }
                 // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
                 // 不值得再弹一条抢注意力的全局提示（见 #83）。
                 let message = self.localized("音质已设为 {}，从下一首生效", &[label]);
@@ -565,9 +574,6 @@ impl Root {
                 self.notify_error_once("quality-save-failed", message);
             }
         }
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.apply(self.settings.clone());
-        }
         // 切档后按新意图重新预取下一首（正在播的这首不受影响）
         self.spawn_prefetch(cx);
         self.quality_menu = None;
@@ -579,8 +585,7 @@ impl Root {
     pub fn set_detailed_logs(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.detailed_logs = enabled;
         log_outlet::set_global_detailed(enabled);
-        // 会话持有一份设置副本，登录时会被整体落盘；不同步就会把这里的选择写回旧值。
-        self.persist_playback_preferences();
+        // 详细日志不算会话输入，会话不用同步；下面那次整份保存就是它的落盘。
         match self.settings.save() {
             Ok(()) => {
                 let message = if enabled {
@@ -657,10 +662,8 @@ impl Root {
         cx.notify();
     }
 
+    /// 把音量、静音前音量、缓存上限交给后台写队列合并落盘；别的字段这次不动它。
     fn persist_playback_preferences(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            session.update_playback_preferences(&self.settings);
-        }
         self.preferences_writer.schedule(&self.settings);
     }
 
@@ -1046,44 +1049,36 @@ impl Root {
                         )],
                     );
                     let _ = this.update(cx, |root, cx| {
-                        match root.session.as_mut() {
-                            Some(session) => {
-                                // 会话里的设置是启动时的副本：先把用户此刻的偏好同步进去，
-                                // 否则 `apply_login_cookie` 整体落盘会把登录期间改过的字段写回旧值。
-                                session.update_playback_preferences(&root.settings);
-                                match session.apply_login_cookie(&cookie) {
-                                    Ok(()) => {
-                                        root.settings = session.settings().clone();
-                                        // 扫码登录成功：解除登出记号，环境变量补全恢复（#192）。
-                                        root.env_cookie_opted_out = false;
-                                        // 换了一份登录凭据：旧账号的不可播结论与逐曲冷却
-                                        // 一并作废。账号 id / 会员状态的逐项比较在
-                                        // `refresh_account` 里，但账号信息读取失败时拿不到
-                                        // 新身份，这里先保守作废。
-                                        root.invalidate_identity_conclusions();
-                                        // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
-                                        log_prefetch_resume(
-                                            root.prefetch_gate.note_login_success(),
-                                        );
-                                        root.set_status_text(
-                                            language
-                                                .text("登录成功，正在读取账号信息…")
-                                                .to_string(),
-                                        );
-                                    }
-                                    Err(err) => {
-                                        let message = root.failure_text(
-                                            "登录成功但保存失败",
-                                            &err,
-                                            SAVE_TEXT,
-                                        );
-                                        root.notify_error_once("login-save-failed", message);
+                        // 先同步写盘，写成功了才算登录：写盘失败时 Cookie 不进内存，
+                        // 界面不会一边显示已登录、一边重启又掉线。这枚 Cookie 必须
+                        // 当场落盘——用户可能登录成功三秒内就退出应用。
+                        match root.settings.apply_login_cookie(&cookie) {
+                            Ok(()) => {
+                                // 会话只持会话输入那几个字段，换 Cookie 就是重建会话；其它设置
+                                // （登录期间改过的主题、音量等）本来就没进过会话，不会被写回旧值。
+                                match root.session.as_mut() {
+                                    Some(session) => session.adopt(&root.settings),
+                                    None => {
+                                        root.session = Some(Session::new(&root.settings));
                                     }
                                 }
+                                // 扫码登录成功：解除登出记号，环境变量补全恢复（#192）。
+                                root.env_cookie_opted_out = false;
+                                // 换了一份登录凭据：旧账号的不可播结论与逐曲冷却
+                                // 一并作废。账号 id / 会员状态的逐项比较在
+                                // `refresh_account` 里，但账号信息读取失败时拿不到
+                                // 新身份，这里先保守作废。
+                                root.invalidate_identity_conclusions();
+                                // 登录类挂起的恢复事件 = 重新登录成功（票 #112）。
+                                log_prefetch_resume(root.prefetch_gate.note_login_success());
+                                root.set_status_text(
+                                    language.text("登录成功，正在读取账号信息…").to_string(),
+                                );
                             }
-                            None => {
-                                let message = language.text("登录成功（会话未初始化）").to_string();
-                                root.notify_warning_once("login-session-missing", message);
+                            Err(err) => {
+                                let message =
+                                    root.failure_text("登录成功但保存失败", &err, SAVE_TEXT);
+                                root.notify_error_once("login-save-failed", message);
                             }
                         }
                         root.login = LoginState::Idle;
@@ -4380,31 +4375,6 @@ impl Root {
         self.start_track(true, cx);
     }
 
-    /// 设置页保存后调用：落盘并重建会话。
-    #[allow(dead_code)] // 设置表单（roadmap 第 3 项）接入后由保存按钮调用
-    pub fn apply_settings(&mut self, settings: Settings) {
-        let reporter_settings = settings.clone();
-        match self
-            .session
-            .as_mut()
-            .map(|session| session.apply(settings.clone()))
-        {
-            Some(Ok(())) => {
-                self.settings = settings;
-                self.set_status_text(self.tr("设置已保存"));
-            }
-            Some(Err(err)) => {
-                let message = self.failure_text("保存失败", &err, SAVE_TEXT);
-                self.notify_error_once("settings-save-failed", message);
-            }
-            None => {
-                self.settings = settings;
-                self.session = Some(Session::new(self.settings.clone()));
-            }
-        }
-        self.play_reporter.apply_settings(reporter_settings);
-    }
-
     /// 发起一次配置热重载轮询（main.rs 心跳每 ~500ms 调用一次）。
     ///
     /// 返回 `None` 表示上一次轮询还在后台跑，这次跳过。
@@ -4498,6 +4468,8 @@ impl Root {
         let shortcuts_changed = old.shortcut_toggle != incoming.shortcut_toggle
             || old.shortcut_previous != incoming.shortcut_previous
             || old.shortcut_next != incoming.shortcut_next;
+        // 另算一份「音质变没变」不算第二张分类表：它只决定要不要按新意图重新预取，
+        // 要不要重建会话由下面的 `session_inputs_differ` 统一判。
         let quality_changed =
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
         let session_changed = incoming.session_inputs_differ(&old);
@@ -4539,8 +4511,8 @@ impl Root {
         // 会话类改动：重建会话（不落盘）。当前曲目不断；下一次取流/搜索/上报用新值。
         if session_changed {
             match self.session.as_mut() {
-                Some(session) => session.adopt(incoming.clone()),
-                None => self.session = Some(Session::new(incoming.clone())),
+                Some(session) => session.adopt(&incoming),
+                None => self.session = Some(Session::new(&incoming)),
             }
         }
         self.play_reporter.apply_settings(incoming.clone());
