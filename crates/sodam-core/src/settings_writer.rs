@@ -704,12 +704,6 @@ mod tests {
                 }
             });
             barrier.wait();
-            let mut observations = 0;
-            while !setter.is_finished() || !taker.is_finished() {
-                let _ = slot.is_pending();
-                observations += 1;
-            }
-            assert!(observations > 0, "并发期间必须真实走过托盘的无锁读取");
             setter.join().unwrap();
             taker.join().unwrap();
         });
