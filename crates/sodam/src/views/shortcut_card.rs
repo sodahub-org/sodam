@@ -235,7 +235,6 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                             move |root, _event: &ClickEvent, _window, cx| {
                                 shortcuts::set_keystroke(&mut root.settings, slot, String::new());
                                 root.shortcuts_dirty = true;
-                                // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
                                 root.save_settings();
                                 let status = if root.language.is_zh() {
                                     root.tr("快捷键已恢复默认").to_string()
@@ -373,7 +372,6 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         Some(crate::ui::message::DEFAULT_DURATION),
                         "shortcut-updated",
                     );
-                    // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
                     root.save_settings();
                     cx.stop_propagation();
                     cx.notify();

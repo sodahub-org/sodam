@@ -22,7 +22,8 @@ crates/sodam-core/src/   领域层：配置 / 会话 / 队列 / 音乐库 / 播�
   models.rs              TrackItem / PlaylistItem / ArtistItem / AlbumItem / SceneItem
   queue.rs               播放队列与播放模式
   prefetch.rs            预取管线在全局故障期间的挂起与恢复（纯状态机）
-  quit_gate.rs           主动退出闸门：先等启动落盘做完再退（纯状态机）
+  quit_gate.rs           主动退出闸门：先等设置写队列刷完再退（纯状态机）
+  settings_writer.rs     设置写队列：防抖合并、退出刷尾、登出摘 Cookie 都排在这一条
   audio.rs               rodio 播放线程
 crates/sodam/src/        GPUI 应用
   main.rs                入口、窗口、托盘启动

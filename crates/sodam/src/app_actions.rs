@@ -364,16 +364,12 @@ impl Root {
                     cx.notify();
                 }
                 // 排队落盘失败：下一拍就在这里进状态行，不憋到退出才报（#259）。
-                if let Some(failure) = root.settings_writer.take_error() {
-                    if root.quit_gate.is_saving() {
-                        // 正在等刷尾退出：状态行留给「正在保存…」，原文进日志就够了。
-                        root.log_failure(failure.kind.context(), &failure.detail);
-                    } else {
-                        let context = failure.kind.context();
-                        let message = root.failure_text(context, &failure.detail, SAVE_TEXT);
-                        root.notify_error_once("settings-save-failed", message);
-                        cx.notify();
-                    }
+                // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记；
+                // 正在等刷尾退出时状态行留给「正在保存…」，这一句就不抢了。
+                if root.settings_writer.take_error().is_some() && !root.quit_gate.is_saving() {
+                    let message = root.tr(SAVE_TEXT).to_string();
+                    root.notify_error_once("settings-save-failed", message);
+                    cx.notify();
                 }
                 if snap.playing || root.pending_track.is_some() {
                     cx.notify();
@@ -564,6 +560,8 @@ impl Root {
             session.adopt(&self.settings);
         }
         // 落盘排进后台队列：连点几档也只写一次盘（#259）。
+        // 与以前「写盘成功才算数」不同：这里先认新档位，真写失败时状态行会补一句没保存上，
+        // 本次运行照常用新档。
         self.save_settings();
         // 普通操作反馈走状态行：确认「选了哪一档、什么时候生效」就够了，
         // 不值得再弹一条抢注意力的全局提示（见 #83）。

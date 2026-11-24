@@ -58,7 +58,9 @@ pub enum SignOut {
 }
 
 /// 真正落盘的那一步。测试里换成记账的假实现，不碰磁盘。
-pub trait SettingsSink: Send + 'static {
+///
+/// 只在 crate 内用：外部只认 [`SettingsWriter`]，不该知道落盘是怎么做的。
+pub(crate) trait SettingsSink: Send + 'static {
     /// 整份快照落盘，Cookie 沿用盘上那份。
     fn write(&mut self, snapshot: Settings) -> Result<(), String>;
     /// 登出：按盘上最新配置摘掉 Cookie。
@@ -123,16 +125,17 @@ pub struct SettingsWriter {
 
 impl SettingsWriter {
     pub fn new(path: PathBuf) -> Self {
-        Self::with_sink(Box::new(FileSink { path }))
+        Self::spawn(Box::new(FileSink { path }), IDLE_FLUSH_AFTER)
     }
 
-    fn with_sink(sink: Box<dyn SettingsSink>) -> Self {
+    /// 攒多久算「这一批改完了」，真跑用 [`IDLE_FLUSH_AFTER`]，测试里缩短。
+    fn spawn(sink: Box<dyn SettingsSink>, window: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let worker_failure = failure.clone();
         let spawned = std::thread::Builder::new()
             .name("sodam-settings".into())
-            .spawn(move || run(sink, rx, worker_failure));
+            .spawn(move || run(sink, rx, worker_failure, window));
         let thread = match spawned {
             Ok(thread) => Some(thread),
             Err(err) => {
@@ -153,10 +156,7 @@ impl SettingsWriter {
         }
     }
 
-    /// 排一份整份快照；300ms 内又改了只写最后那份。
-    ///
-    /// 顺手把队列里还攒着的那份盖掉——登录那次是界面线程当场写盘的，
-    /// 登录前拍的旧快照要是晚一步落盘，会把刚写进去的新 Cookie 换回旧的。
+    /// 排一份整份快照；300ms 内又改了只写最后那份（后到的那份盖掉先到的）。
     pub fn schedule(&self, settings: &Settings) {
         let _ = self.tx.send(Message::Snapshot(settings.clone()));
     }
@@ -194,6 +194,8 @@ impl SettingsWriter {
     }
 
     /// 退出前刷干净：返回时队列里排着的东西都已经落盘。
+    ///
+    /// 写线程已经没了（起线程失败或已退出）就直接返回——没有地方可写，也不该把退出卡住。
     pub fn flush(&self) -> impl Future<Output = ()> + Send + 'static {
         let (reply, answer) = futures_channel::oneshot::channel();
         let _ = self.tx.send(Message::Flush(reply));
@@ -236,12 +238,16 @@ fn run(
     mut sink: Box<dyn SettingsSink>,
     rx: mpsc::Receiver<Message>,
     failure: Arc<Mutex<Option<WriteFailure>>>,
+    window: Duration,
 ) {
     let mut pending: Option<Settings> = None;
+    // 已经登出过的那个 Cookie。盘上读不出来时 `save_queued_to` 只能按快照自己那份写，
+    // 这一笔记号保证登出前拍的旧快照连这条路也带不回旧身份。
+    let mut signed_out: Option<String> = None;
     loop {
         // 手上有攒着的改动就只等一个静默窗口；没有就一直睡到下一桩活。
         let message = if pending.is_some() {
-            rx.recv_timeout(IDLE_FLUSH_AFTER)
+            rx.recv_timeout(window)
         } else {
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         };
@@ -249,7 +255,14 @@ fn run(
         let mut job: Option<Message> = None;
         let mut quitting = false;
         match message {
-            Ok(Message::Snapshot(snapshot)) => {
+            Ok(Message::Snapshot(mut snapshot)) => {
+                if signed_out.as_deref() == Some(snapshot.cookie.as_str()) {
+                    // 登出前排下的那份：把这个 Cookie 摘掉再写。
+                    snapshot.cookie.clear();
+                } else if signed_out.is_some() && !snapshot.cookie.trim().is_empty() {
+                    // 换了身份（重新登录）：记号作废。
+                    signed_out = None;
+                }
                 // 同批只留最后一份：拖音量拖了二十拍就是一次盘。
                 pending = Some(snapshot);
                 continue;
@@ -276,6 +289,9 @@ fn run(
                 reply,
             }) => {
                 let outcome = sink.sign_out(&fallback, &expected_cookie);
+                if matches!(&outcome, Ok(SignOut::Done)) {
+                    signed_out = Some(expected_cookie.clone());
+                }
                 if let Err(detail) = &outcome {
                     // 登出失败由界面自己提示，这里只留一行日志。
                     log_event(
@@ -377,7 +393,16 @@ mod tests {
 
     fn writer_with(sink: FakeSink) -> (SettingsWriter, Arc<Mutex<Recording>>) {
         let log = sink.log.clone();
-        (SettingsWriter::with_sink(Box::new(sink)), log)
+        (SettingsWriter::spawn(Box::new(sink), IDLE_FLUSH_AFTER), log)
+    }
+
+    /// 静默窗口调短：防抖那几条用例不用真等 300ms，也不容易在慢机器上抖。
+    fn writer_with_window(
+        sink: FakeSink,
+        window: Duration,
+    ) -> (SettingsWriter, Arc<Mutex<Recording>>) {
+        let log = sink.log.clone();
+        (SettingsWriter::spawn(Box::new(sink), window), log)
     }
 
     fn recording(fail: bool) -> FakeSink {
@@ -390,12 +415,7 @@ mod tests {
 
     /// 没有异步运行时：测试里自己把 future 转起来（只用来等一次性回执）。
     fn block_on<F: Future>(future: F) -> F::Output {
-        struct Noop;
-        impl std::task::Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = std::task::Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut future = std::pin::pin!(future);
         loop {
             match future.as_mut().poll(&mut cx) {
@@ -433,7 +453,16 @@ mod tests {
         block_on(writer.flush());
         writer.schedule(&settings_with_volume(0.2));
         block_on(writer.flush());
-        assert_eq!(log.lock().unwrap().writes.len(), 2);
+        let log = log.lock().unwrap();
+        assert_eq!(log.writes.len(), 2);
+        assert!(
+            (log.writes[0].volume - 0.5).abs() < f32::EPSILON,
+            "第一批写的是当时那份"
+        );
+        assert!(
+            (log.writes[1].volume - 0.2).abs() < f32::EPSILON,
+            "第二批写的是新那份"
+        );
     }
 
     #[test]
@@ -446,12 +475,7 @@ mod tests {
         };
         let (writer, log) = writer_with(sink);
         writer.schedule(&settings_with_volume(0.4));
-        struct Noop;
-        impl std::task::Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = std::task::Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut flush = std::pin::pin!(writer.flush());
         // 写盘被门挡着：刷尾不许回来。
         for _ in 0..20 {
@@ -529,17 +553,16 @@ mod tests {
         assert_eq!(log.lock().unwrap().ops, vec!["write", "sign_out"]);
     }
 
-    /// 防抖：改完不立刻写，等静默窗口过去才落盘。
+    /// 防抖：改完不立刻写，等静默窗口过去才落盘；窗口里又来一份，写的是后到的那份。
     #[test]
     fn changes_wait_for_the_idle_window() {
-        let (writer, log) = writer_with(recording(false));
+        let (writer, log) = writer_with_window(recording(false), Duration::from_millis(200));
         writer.schedule(&settings_with_volume(0.7));
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(60));
         assert!(
             log.lock().unwrap().writes.is_empty(),
             "刚改完就落盘，没等静默窗口"
         );
-        // 窗口里又改一次：静默窗口重新计时，写的是最后那份。
         writer.schedule(&settings_with_volume(0.2));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -565,6 +588,34 @@ mod tests {
             log.lock().unwrap().sign_outs,
             vec!["old-cookie".to_string()]
         );
+    }
+
+    /// 盘上文件被外部删掉时，排队落盘只能按快照自己那份写：登出过的 Cookie 也不许回来。
+    #[test]
+    fn signed_out_cookie_stays_gone_even_when_the_file_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut signed_in = Settings {
+            cookie: "sessionid_ss=old".into(),
+            ..Settings::default()
+        };
+        signed_in.save_to(&path).unwrap();
+
+        let writer = SettingsWriter::new(path.clone());
+        assert_eq!(
+            block_on(writer.sign_out(signed_in.clone(), "sessionid_ss=old".into())),
+            Ok(SignOut::Done)
+        );
+        // 外部把文件删了：盘上读不出 Cookie，`save_queued_to` 只能按快照写。
+        std::fs::remove_file(&path).unwrap();
+        signed_in.set_volume(0.4);
+        writer.schedule(&signed_in);
+        block_on(writer.flush());
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Settings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reloaded.cookie, "", "登出过的 Cookie 不许被旧快照写回来");
+        assert!((reloaded.volume - 0.4).abs() < f32::EPSILON, "别的字段照写");
     }
 
     #[test]

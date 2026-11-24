@@ -216,7 +216,6 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.settings.titlebar = mode.key().to_string();
-                // 落盘排进后台队列；写失败了下一拍由心跳写进状态行。
                 root.save_settings();
                 let status = match mode {
                     TitlebarMode::Auto => root.tr("窗口按钮：自动（跟随桌面）").to_string(),

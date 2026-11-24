@@ -988,13 +988,19 @@ impl Settings {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mut next = self.clone();
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(current) = parse_settings_bytes(&bytes) {
-                next.cookie = current.cookie;
-            }
+        if let Some(current) = Self::read_latest_locked(path) {
+            next.cookie = current.cookie;
         }
         Self::debug_delay_before_write();
         next.save_to_locked(path)
+    }
+
+    /// 盘上最新那份配置；文件不在或读不出（含坏了）时 `None`。
+    ///
+    /// 调用方必须持有 [`SETTINGS_WRITE_LOCK`]（锁不可重入）。
+    fn read_latest_locked(path: &Path) -> Option<Settings> {
+        let bytes = std::fs::read(path).ok()?;
+        parse_settings_bytes(&bytes).ok()
     }
 
     /// 登出落盘：把**盘上最新那份配置**摘掉 Cookie 再写回去（#197）。
@@ -1015,9 +1021,7 @@ impl Settings {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         Self::debug_delay_before_write();
-        let latest = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| parse_settings_bytes(&bytes).ok());
+        let latest = Self::read_latest_locked(path);
         let outcome = latest.map(|mut current| {
             // 盘上本来就没有 Cookie（内存身份来自环境变量补全）：主文件不用改，
             // 但备份也要刷成同样的内容——备份里留着旧 Cookie 的话，
@@ -2603,8 +2607,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
-        let mut on_disk = Settings::default();
-        on_disk.cookie = "sessionid_ss=old".into();
+        let on_disk = Settings {
+            cookie: "sessionid_ss=old".into(),
+            ..Settings::default()
+        };
         on_disk.save_to(&path).unwrap();
 
         // 登出：盘上 Cookie 清掉。
@@ -2633,7 +2639,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
-        let mut before_login = Settings::default();
+        let before_login = Settings::default();
         before_login.save_to(&path).unwrap();
 
         let mut login = before_login.clone();
