@@ -56,12 +56,9 @@ fn current_cover_url(pending: Option<&TrackItem>, queued: Option<&TrackItem>) ->
         .map(|track| track.cover.trim().to_string())
 }
 
-/// 判定一张原图下载完成后的去向。
+/// 文件在就发布；文件已删就不发布并放行重试；没下到则保留失败记号。
 ///
-/// 清缓存或缓存淘汰可能刚好把文件删掉：`original_cover_path` 解析出了路径，
-/// 回调跑在删除之后时没人兜底，所以这里自己再查一遍。死路径一旦交给
-/// `CoverStore` 发布，下一次查询就会把它当成命中，这首歌的歌词页大图
-/// 整个会话都回不来。缩略图那条路早就是这样做的。
+/// 这条复核不能省：死路径会被 `CoverStore` 当成已有封面，歌词页大图再也回不来。
 fn settle_original_cover(
     path: Option<PathBuf>,
     file_exists: impl FnOnce(&std::path::Path) -> bool,

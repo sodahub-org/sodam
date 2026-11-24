@@ -19,8 +19,9 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 unicode-segmentation = "1.13.3"
-# 封面邮箱：渲染推需求时叫醒消费循环，空队列时只等 500ms。
+# 封面需求队列：渲染提交需求，消费循环按需唤醒。
 futures-channel.workspace = true
+# 组合两路 future：定时器/唤醒通道取先到的（app.rs），zip 并行等待（media/mpris.rs）。
 futures-lite.workspace = true
 
 # StatusNotifier 托盘是 Linux 桌面协议，macOS 上没有 D-Bus session bus。

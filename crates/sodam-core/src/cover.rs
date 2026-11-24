@@ -721,7 +721,7 @@ mod tests {
         }
     }
 
-    /// 验收：同一 URL 连要十次，最多只发一次取图请求。
+    /// 渲染每帧都会重新要图；去重必须认 URL，不能认请求次数。
     #[test]
     fn want_same_url_ten_times_fetches_once() {
         let mut store = CoverStore::default();
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(store.want(&url), 1, "清掉失败记录后能重新下");
     }
 
-    /// 清缓存后失败户也能重新下。
+    /// 清缓存后失败的那张也能重新下。
     #[test]
     fn clear_completed_revives_failed_url() {
         let mut store = CoverStore::default();
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(store.want(&url), 1);
     }
 
-    /// 验收：队列塞满后挤掉的那张还能重新排进来。
+    /// 队列满时先撤回最旧项的去重状态，否则被挤掉的图再也排不回来。
     #[test]
     fn full_queue_evicts_oldest_and_allows_requeue() {
         let mut store = CoverStore::default();
@@ -974,10 +974,7 @@ mod tests {
         assert_eq!(store.want(&url), 1, "作废之后能重新下");
     }
 
-    /// 验收：查路径 / 查颜色 / 取快照只读，不改状态、不消费排队项。
-    ///
-    /// store 本身没有取图入口，取图只在 `drain` 之后由调用方做；这里钉住
-    /// 读口子不能把排队项吃掉、不能放行去重、不能凭空变出路径。
+    /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。
     #[test]
     fn read_ports_are_side_effect_free() {
         let mut store = CoverStore::default();
@@ -1007,7 +1004,7 @@ mod tests {
         assert_eq!(store.drain_original(), urls(&["cover-a"]));
     }
 
-    /// 淘汰反查只认「真没了」的路径：重建回来的不算缺。
+    /// 下载可能把淘汰列表里的文件重建回来，反查不能据此清掉映射。
     #[test]
     fn removed_paths_skip_rebuilt_files() {
         let mut store = CoverStore::default();
@@ -1029,6 +1026,41 @@ mod tests {
         assert!(handle
             .urls_for_removed_paths(std::slice::from_ref(&path), |_| false)
             .is_empty());
+    }
+
+    /// 被删路径成千上万，不能为了反查 URL 对整张内存表逐个 stat。
+    #[test]
+    fn removed_paths_only_check_matching_entries() {
+        let mut store = CoverStore::default();
+        store.want(&urls(&["cover-a", "cover-b"]));
+        store.drain();
+        let removed = PathBuf::from("/tmp/a.img");
+        store.complete(
+            "cover-a",
+            CoverOutcome::Ready {
+                path: removed.clone(),
+                color: None,
+            },
+        );
+        store.complete(
+            "cover-b",
+            CoverOutcome::Ready {
+                path: PathBuf::from("/tmp/b.img"),
+                color: None,
+            },
+        );
+
+        let mut checked = Vec::new();
+        let matches =
+            store
+                .paths_handle()
+                .urls_for_removed_paths(std::slice::from_ref(&removed), |path| {
+                    checked.push(path.to_path_buf());
+                    true
+                });
+        assert_eq!(checked, vec![removed]);
+        assert_eq!(matches.len(), 1);
+        assert!(matches.contains("cover-a"));
     }
 
     /// 原图先回来时给列表兜底，不打断缩略图自己的记账。
