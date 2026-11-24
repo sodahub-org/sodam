@@ -45,6 +45,11 @@ pub struct CoverPaths {
     inner: Arc<RwLock<HashMap<String, PathBuf>>>,
 }
 
+/// 把被删路径列表做成匹配集合；调用方可在持锁前先准备好。
+pub fn removed_cover_path_set(removed: &[PathBuf]) -> HashSet<&Path> {
+    removed.iter().map(PathBuf::as_path).collect()
+}
+
 /// 从任意 URL → 路径迭代器里挑出被删路径对应的条目。
 ///
 /// 只匹配内存里的路径，不碰磁盘；调用方再确认文件是否真的没了。
@@ -114,7 +119,7 @@ impl CoverPaths {
     where
         F: FnMut(&Path) -> bool,
     {
-        let removed: HashSet<&Path> = removed.iter().map(PathBuf::as_path).collect();
+        let removed = removed_cover_path_set(removed);
         let candidates: Vec<(String, PathBuf)> = {
             let paths = self
                 .inner
@@ -376,9 +381,9 @@ impl CoverStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        cover_paths_for_removed_paths, CoverOutcome, CoverStore, MAX_CONCURRENCY, MAX_QUEUE,
+        cover_paths_for_removed_paths, removed_cover_path_set, CoverOutcome, CoverStore,
+        MAX_CONCURRENCY, MAX_QUEUE,
     };
-    use std::collections::HashSet;
     use std::path::PathBuf;
 
     fn urls(items: &[&str]) -> Vec<String> {
@@ -661,14 +666,14 @@ mod tests {
         assert!(matches.contains("cover-a"));
     }
 
-    /// 缩略图是锁里的表，原图是普通 HashMap；匹配函数不能绑定某一种容器。
+    /// 缩略图从锁里的表取 entries，原图从 HashMap 取；entries 不能钉成 HashMap。
     #[test]
-    fn removed_path_helper_accepts_arrays() {
+    fn removed_path_helper_accepts_array_entries() {
         let removed = PathBuf::from("/tmp/gone.img");
         let kept = PathBuf::from("/tmp/kept.img");
         let entries = [("gone", removed.as_path()), ("kept", kept.as_path())];
 
-        let removed_set = HashSet::from([removed.as_path()]);
+        let removed_set = removed_cover_path_set(std::slice::from_ref(&removed));
         let matches = cover_paths_for_removed_paths(entries, &removed_set);
         assert_eq!(matches, vec![("gone".to_string(), removed)]);
     }

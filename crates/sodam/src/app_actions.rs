@@ -9,7 +9,9 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
-use sodam_core::cover::{cover_paths_for_removed_paths, CoverOutcome, CoverWant};
+use sodam_core::cover::{
+    cover_paths_for_removed_paths, removed_cover_path_set, CoverOutcome, CoverWant,
+};
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -43,8 +45,7 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     removed: &[PathBuf],
     is_still_missing: F,
 ) -> HashSet<String> {
-    let removed_set: HashSet<&std::path::Path> =
-        removed.iter().map(|path| path.as_path()).collect();
+    let removed_set = removed_cover_path_set(removed);
     cover_paths_for_removed_paths(
         covers
             .iter()
