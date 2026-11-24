@@ -92,7 +92,7 @@ pub fn identity_change(
 pub enum NotImprovedReason {
     /// 新流仍是试听，或试听回退被整曲缓存拦住。
     PreviewOnly,
-    /// 拿到完整流，但能比较出它不比旧文件更好。
+    /// 拿到完整流但没比旧文件好，或早退时没有更具体结论。
     NotBetter,
     /// 拿到完整流，档位可识别且低于目标，确认这次没有更高档。
     NoHigherTier,

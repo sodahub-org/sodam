@@ -740,9 +740,10 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
 
 fn skipped_upgrade_reason(current: &CachedTrack, target_rank: Option<i64>) -> NotImprovedReason {
     if current.preview {
-        return NotImprovedReason::PreviewOnly;
+        return NotImprovedReason::AlreadyChecked;
     }
     let Some(target_rank) = target_rank else {
+        // 目标未知时没有更具体结论，按票面允许并入 not_better。
         return NotImprovedReason::NotBetter;
     };
     if current.quality_rank == Some(0) {
@@ -2294,7 +2295,7 @@ mod tests {
         );
         assert_eq!(
             skipped_upgrade_reason(&cached("未知 128k", Some(0), true), Some(100)),
-            NotImprovedReason::PreviewOnly
+            NotImprovedReason::AlreadyChecked
         );
     }
 
