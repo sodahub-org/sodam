@@ -10,9 +10,24 @@ use sodam_core::log_outlet::{enabled, log_event, LogLevel, LogTopic};
 
 const REPORT_AFTER: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy)]
+enum TimerSource {
+    Independent,
+    SharedTray,
+}
+
+impl TimerSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::SharedTray => "shared:tray",
+        }
+    }
+}
+
 pub(crate) struct LoopProbe {
     name: &'static str,
-    timer: &'static str,
+    timer: TimerSource,
     started: Instant,
     logging: bool,
     wakes: u64,
@@ -23,10 +38,14 @@ pub(crate) struct LoopProbe {
 
 impl LoopProbe {
     pub(crate) fn new(name: &'static str) -> Self {
-        Self::new_with_timer(name, "independent")
+        Self::with_source(name, TimerSource::Independent)
     }
 
-    pub(crate) fn new_with_timer(name: &'static str, timer: &'static str) -> Self {
+    pub(crate) fn new_shared_tray(name: &'static str) -> Self {
+        Self::with_source(name, TimerSource::SharedTray)
+    }
+
+    fn with_source(name: &'static str, timer: TimerSource) -> Self {
         Self {
             name,
             timer,
@@ -101,7 +120,7 @@ impl LoopProbe {
             "loop_counts",
             &[
                 ("loop", self.name),
-                ("timer", self.timer),
+                ("timer", self.timer.label()),
                 ("wakes", wakes.as_str()),
                 ("wakes_per_s", wakes_per_s.as_str()),
                 ("app_entries", app_entries.as_str()),

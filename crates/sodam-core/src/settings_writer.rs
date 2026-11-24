@@ -657,8 +657,9 @@ mod tests {
     #[test]
     fn startup_failure_signal_matches_unlocked_tray_checks() {
         use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
 
-        let slot = StartupFailureSlot::default();
+        let slot = Arc::new(StartupFailureSlot::default());
         for _ in 0..100 {
             slot.set(WriteFailure {
                 kind: FailureKind::Startup,
@@ -669,11 +670,24 @@ mod tests {
             assert!(!slot.is_pending(), "take 后托盘不加锁也要看到空槽");
         }
 
+        let (tx, rx) = mpsc::channel();
+        let guard = slot.failure.lock().unwrap();
+        let probe = slot.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(probe.is_pending());
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        handle.join().unwrap();
+        assert!(result.is_ok(), "持锁时托盘也必须能立即读到原子门");
+
         let sets = Arc::new(AtomicUsize::new(0));
         let takes = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                for _ in 0..1_000 {
+            let barrier = Barrier::new(3);
+            let setter = scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..10_000 {
                     slot.set(WriteFailure {
                         kind: FailureKind::Startup,
                         detail: "并发写入".into(),
@@ -681,13 +695,23 @@ mod tests {
                     sets.fetch_add(1, Ordering::Relaxed);
                 }
             });
-            scope.spawn(|| {
-                for _ in 0..1_000 {
+            let taker = scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..10_000 {
                     if slot.take().is_some() {
                         takes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
+            barrier.wait();
+            let mut observations = 0;
+            while !setter.is_finished() || !taker.is_finished() {
+                let _ = slot.is_pending();
+                observations += 1;
+            }
+            assert!(observations > 0, "并发期间必须真实走过托盘的无锁读取");
+            setter.join().unwrap();
+            taker.join().unwrap();
         });
 
         assert!(
