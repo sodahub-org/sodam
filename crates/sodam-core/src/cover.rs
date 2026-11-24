@@ -49,8 +49,13 @@ pub enum CoverOutcome {
 /// 已完成路径和失败终态的只读句柄：渲染闭包克隆它查图，不用整表复制。
 #[derive(Debug, Clone, Default)]
 pub struct CoverPaths {
-    inner: Arc<RwLock<HashMap<String, PathBuf>>>,
-    failed: Arc<RwLock<HashSet<String>>>,
+    inner: Arc<RwLock<CoverPathsInner>>,
+}
+
+#[derive(Debug, Default)]
+struct CoverPathsInner {
+    paths: HashMap<String, PathBuf>,
+    failed: HashSet<String>,
 }
 
 impl CoverPaths {
@@ -59,71 +64,67 @@ impl CoverPaths {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .paths
             .contains_key(url.trim())
     }
 
     /// 这张图是否已失败到顶，不再自动请求（只查内存）。
     pub fn is_failed(&self, url: &str) -> bool {
-        self.failed
+        self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failed
             .contains(url.trim())
     }
 
     /// 查一张图的本地路径（只查内存）。
     pub fn get(&self, url: &str) -> Option<PathBuf> {
-        let paths = self
-            .inner
+        self.inner
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.get(url.trim()).cloned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .paths
+            .get(url.trim())
+            .cloned()
     }
 
     fn insert(&self, url: &str, path: PathBuf) {
         let url = url.trim();
-        let mut paths = self
+        let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.insert(url.to_string(), path);
-        self.failed
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(url);
+        inner.paths.insert(url.to_string(), path);
+        inner.failed.remove(url);
     }
 
     fn remove(&self, url: &str) {
         let url = url.trim();
-        let mut paths = self
+        let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.remove(url);
-        self.failed
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(url);
+        inner.paths.remove(url);
+        inner.failed.remove(url);
     }
 
     fn mark_failed(&self, url: &str) {
         let url = url.trim();
         if !url.is_empty() {
-            self.failed
+            self.inner
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .failed
                 .insert(url.to_string());
         }
     }
 
     fn clear(&self) {
-        self.inner
+        let mut inner = self
+            .inner
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        self.failed
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.paths.clear();
+        inner.failed.clear();
     }
 
     /// 按被删的文件路径反查 URL；只对命中删除列表的条目做磁盘检查。
@@ -139,11 +140,12 @@ impl CoverPaths {
     {
         let removed: HashSet<&Path> = removed.iter().map(PathBuf::as_path).collect();
         let candidates: Vec<(String, PathBuf)> = {
-            let paths = self
+            let inner = self
                 .inner
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            paths
+            inner
+                .paths
                 .iter()
                 .filter(|(_, path)| removed.contains(path.as_path()))
                 .map(|(url, path)| (url.clone(), path.clone()))
@@ -875,6 +877,26 @@ mod tests {
         assert_eq!(store.records.len(), many.len(), "排队和在飞记录要保留");
         assert_eq!(store.want(std::slice::from_ref(&many[0])), 0);
         assert_eq!(store.want(std::slice::from_ref(&many[MAX_CONCURRENCY])), 0);
+    }
+
+    #[test]
+    fn clear_completed_keeps_mixed_slots_until_both_are_empty() {
+        let mut store = CoverStore::default();
+        let url = "cover-a";
+        store.want(&urls(&[url]));
+        store.drain();
+        store.complete(url, ready("/tmp/thumb.img"));
+        assert!(store.want_original(url));
+        store.drain_original();
+
+        store.clear_completed();
+        assert_eq!(store.records.len(), 1, "原图还在飞，记录不能删");
+        assert!(!store.want_original(url), "在飞原图仍不能重复入队");
+
+        store.complete_original(url, CoverOutcome::Failed);
+        assert_eq!(store.records.len(), 1, "还有一次失败次数，记录不能删");
+        store.clear_completed();
+        assert!(store.records.is_empty(), "两格都空了才回收");
     }
 
     /// 队列满时先撤回最旧项的去重状态，否则被挤掉的图再也排不回来。
