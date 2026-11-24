@@ -16,69 +16,93 @@ pub enum PlayIntent {
 /// 这次失败要记哪种账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureRecord {
+    /// 不写不可播集合，也不增加连败。
     #[default]
     None,
+    /// 调用方把当前曲目写进不可播集合。
     Unplayable,
+    /// 调用方给连败数加一。
     Consecutive,
 }
 
 /// 常驻提示放哪个槽位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoticeSlot {
+    /// 不写常驻错误位。
     #[default]
     None,
+    /// 调用方写 `Root.playback_error`。
     PlaybackError,
+    /// 调用方写整圈结论与 `Root.playback_error`。
     RoundExhausted,
 }
 
 /// 一次性提示走哪个渠道。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoticeChannel {
+    /// 不发一次性提示。
     #[default]
     None,
+    /// 调用方发一次警告。
     Warning,
+    /// 调用方发一次错误。
     Error,
+    /// 调用方先发失败警告，再发连败封顶错误。
     WarningThenError,
 }
 
 /// 提示的槽位与渠道；文案由调用方按原词典选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FailureNotice {
+    /// 常驻提示写哪个槽位。
     pub slot: NoticeSlot,
+    /// 一次性提示走哪些渠道。
     pub channel: NoticeChannel,
 }
 
 /// 队列怎么前进。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Advance {
+    /// 调用方不换歌。
     #[default]
     Stay,
+    /// 调用方按当前模式重试当前曲目。
     RetrySame,
+    /// 调用方先真实推进队列，再装载下一首。
     Next,
 }
 
 /// 本轮怎么落闸。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Halt {
+    /// 调用方不停机。
     #[default]
     None,
+    /// 调用方把声音和本轮自动续播都停下。
     Playback,
+    /// 调用方停本轮，并留下整圈无歌结论。
     ExhaustedRound,
+    /// 调用方停机，并留下连败封顶结论。
     ConsecutiveFailures,
 }
 
 /// 一次失败决策的四样输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlayFailureDecision {
+    /// 调用方要记哪种账。
     pub record: FailureRecord,
+    /// 调用方要写和发哪些提示。
     pub notice: FailureNotice,
+    /// 调用方怎么移动队列。
     pub advance: Advance,
+    /// 调用方怎么停本轮。
     pub halt: Halt,
 }
 
 impl PlayFailureDecision {
     /// 身份已变：这次尝试不产生任何结论。
-    pub const fn invalidated() -> Self {
+    #[cfg(test)]
+    pub(crate) const fn invalidated() -> Self {
         Self {
             record: FailureRecord::None,
             notice: FailureNotice {
@@ -89,25 +113,23 @@ impl PlayFailureDecision {
             halt: Halt::None,
         }
     }
-
-    pub const fn has_conclusions(&self) -> bool {
-        !matches!(self.record, FailureRecord::None)
-            || !matches!(self.notice.slot, NoticeSlot::None)
-            || !matches!(self.notice.channel, NoticeChannel::None)
-            || !matches!(self.advance, Advance::Stay)
-            || !matches!(self.halt, Halt::None)
-    }
 }
 
 /// 纯决策的输入；身份校验和预取挂起留在调用方。
 pub struct PlayFailureInput<'a> {
+    /// 现在要声音，还是只预装第一首。
     pub intent: PlayIntent,
+    /// 已经分类好的失败。
     pub failure: &'a PlaybackFailure,
+    /// 记账后的集合里是否还有可播候选。
     pub has_candidate: bool,
+    /// 本次失败之前的连败数。
     pub consecutive_failures: u32,
+    /// 当前队列模式。
     pub mode: PlayMode,
 }
 
+/// 连续几次装载失败后停止本轮。
 pub const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 
 /// 按现状决定一次播放失败的后果。
@@ -410,7 +432,7 @@ mod tests {
             ),
             (
                 "任意·身份变了",
-                PlayFailureDecision::invalidated(),
+                decide(PlayIntent::Now, per_track, true, 0, PlayMode::ListLoop),
                 PlayFailureDecision::invalidated(),
             ),
         ];
@@ -456,8 +478,15 @@ mod tests {
 
     #[test]
     fn identity_invalidation_leaves_no_decision_or_visible_consequence() {
+        let normal = decide(
+            PlayIntent::Now,
+            RecoveryAction::TrackUnavailable,
+            true,
+            0,
+            PlayMode::ListLoop,
+        );
         let result = PlayFailureDecision::invalidated();
-        assert!(!result.has_conclusions());
+        assert_ne!(result, normal);
         assert_eq!(result.record, FailureRecord::None);
         assert_eq!(result.notice, FailureNotice::default());
         assert_eq!(result.advance, Advance::Stay);

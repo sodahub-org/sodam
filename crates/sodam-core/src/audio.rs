@@ -953,20 +953,18 @@ mod tests {
     }
 
     #[test]
-    fn pause_command_is_sent_to_the_audio_thread() {
+    fn pause_emits_engine_command_without_faking_snapshot_state() {
         let (tx, rx) = channel();
         let engine = PlaybackEngine {
             tx,
-            snapshot: Arc::new(Mutex::new(PlaybackSnapshot {
-                playing: true,
-                ..Default::default()
-            })),
+            snapshot: Arc::new(Mutex::new(PlaybackSnapshot::default())),
             next_load: AtomicU64::new(1),
         };
 
         engine.pause();
 
         assert!(matches!(rx.try_recv(), Ok(Command::Pause)));
+        assert!(!engine.snapshot().playing);
     }
 
     #[test]

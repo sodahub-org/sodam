@@ -18,8 +18,8 @@ use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::play_failure::{
-    decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel, NoticeSlot, PlayFailureInput,
-    PlayIntent,
+    decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel, NoticeSlot,
+    PlayFailureDecision, PlayFailureInput, PlayIntent,
 };
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
@@ -4244,7 +4244,7 @@ impl Root {
                         let context = load_failure_context(failure.stage, root.language);
                         root.log_failure(&context, &failure);
                         let engine_playing = root.engine.snapshot().playing;
-                        let identity_current = clear_failed_attempt(
+                        let identity_current = clear_attempt_and_check_identity(
                             &mut root.pending_track,
                             &mut root.progress_token,
                             &mut root.playing,
@@ -4301,22 +4301,18 @@ impl Root {
             _ if decision.record == FailureRecord::Unplayable => "track-unavailable",
             _ => "track-stream-failed",
         };
-        let mut skipped = false;
+        let mut advanced = false;
+        if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
+            advance_failure_queue(&mut self.queue, &self.unplayable);
+        }
         if decision.advance == Advance::Next {
-            let advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
+            advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
             if !advanced {
-                if decision.record == FailureRecord::Unplayable {
-                    self.halt_exhausted_round();
-                } else {
-                    let message = self.tr(play_failure_text(failure, false)).to_string();
-                    self.playback_error = Some(message.clone());
-                    self.notify_warning_once(notice_key, message);
-                    self.halt_playback();
-                }
+                // 查询与推进在同一拍完成；仅防队列规则以后变化。
                 return;
             }
-            skipped = true;
         }
+        let skipped = skipped_after_advance(decision, advanced);
 
         let message = if decision.halt == Halt::ExhaustedRound {
             self.tr("这一轮没有能播的歌了").to_string()
@@ -4726,10 +4722,8 @@ fn has_playable_after_failure(
     track_id: &str,
     failure: &PlaybackFailure,
 ) -> bool {
-    let mut after_record = unplayable.clone();
-    after_record.record_failure(track_id, failure);
     queue
-        .next_playable(|id| after_record.is_unavailable(id))
+        .next_playable(|id| unplayable.is_unavailable_after_failure(track_id, id, failure))
         .is_some()
 }
 
@@ -4739,7 +4733,11 @@ fn advance_failure_queue(queue: &mut Queue, unplayable: &UnplayableTracks) -> bo
         .is_some()
 }
 
-fn clear_failed_attempt(
+fn skipped_after_advance(decision: PlayFailureDecision, advanced: bool) -> bool {
+    decision.advance == Advance::Next && advanced
+}
+
+fn clear_attempt_and_check_identity(
     pending_track: &mut Option<TrackItem>,
     progress_token: &mut Option<u64>,
     playing: &mut bool,
@@ -4755,6 +4753,7 @@ fn clear_failed_attempt(
     false
 }
 
+/// 状态位与暂停回调同一入口，测试可确认没有只改标志位。
 fn halt_playback_with(playback_halted: &mut bool, playing: &mut bool, pause: impl FnOnce()) {
     *playback_halted = true;
     *playing = false;
@@ -4987,7 +4986,6 @@ mod upgrade_estimate_tests {
 mod play_failure_flow_tests {
     use super::*;
     use sodam_core::failure::Retryability;
-    use sodam_core::play_failure::PlayFailureDecision;
 
     fn per_track_failure() -> PlaybackFailure {
         PlaybackFailure::new(
@@ -5052,7 +5050,7 @@ mod play_failure_flow_tests {
         ]);
         let before = queue.current().map(|track| track.id.clone());
         let advanced = advance_failure_queue(&mut queue, &UnplayableTracks::default());
-        let skipped = decision.advance == Advance::Next && advanced;
+        let skipped = skipped_after_advance(decision, advanced);
         assert!(skipped);
         assert_ne!(queue.current().map(|track| track.id.clone()), before);
         assert!(play_failure_text(&failure, skipped).contains("已跳过"));
@@ -5067,40 +5065,40 @@ mod play_failure_flow_tests {
     }
 
     #[test]
-    fn stale_attempt_cleans_loading_state_before_dropping_all_conclusions() {
+    fn attempt_cleanup_distinguishes_current_and_stale_identity() {
         let mut pending = Some(TrackItem {
-            id: "old-account".into(),
+            id: "track".into(),
             ..Default::default()
         });
         let mut progress_token = Some(7);
         let mut playing = true;
-        let mut prefetch_suspended = false;
-        let identity_current = clear_failed_attempt(
+        assert!(clear_attempt_and_check_identity(
+            &mut pending,
+            &mut progress_token,
+            &mut playing,
+            false,
+            true,
+        ));
+        assert!(pending.is_none());
+        assert!(progress_token.is_none());
+        assert!(playing);
+
+        pending = Some(TrackItem {
+            id: "old-account".into(),
+            ..Default::default()
+        });
+        progress_token = Some(8);
+        playing = true;
+        assert!(!clear_attempt_and_check_identity(
             &mut pending,
             &mut progress_token,
             &mut playing,
             false,
             false,
-        );
-        if identity_current {
-            prefetch_suspended = true;
-        }
-        let decision = if identity_current {
-            decide_play_failure(PlayFailureInput {
-                intent: PlayIntent::Now,
-                failure: &per_track_failure(),
-                has_candidate: true,
-                consecutive_failures: 0,
-                mode: PlayMode::ListLoop,
-            })
-        } else {
-            PlayFailureDecision::invalidated()
-        };
+        ));
         assert!(pending.is_none());
         assert!(progress_token.is_none());
         assert!(!playing);
-        assert!(!prefetch_suspended);
-        assert!(!decision.has_conclusions());
     }
 
     #[test]

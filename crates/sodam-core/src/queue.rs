@@ -645,6 +645,17 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_advance_discards_unavailable_redo_without_moving() {
+        let mut queue = Queue::new(tracks(2));
+        queue.mode = PlayMode::Shuffle;
+        queue.redo = Some(1);
+
+        assert!(queue.advance_playable(|_| true).is_none());
+        assert!(queue.redo.is_none());
+        assert_eq!(queue.index(), 0);
+    }
+
+    #[test]
     fn insert_next_keeps_current_and_inserts_after_it() {
         let mut queue = Queue::new(tracks(3));
         let inserted = tracks(2);
