@@ -138,15 +138,18 @@ impl SettingsWriter {
         let (tx, rx) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let worker_failure = failure.clone();
+        let dead_logged = AtomicBool::new(false);
         let spawned = std::thread::Builder::new()
             .name("sodam-settings".into())
             .spawn(move || run(sink, rx, worker_failure, window));
         let thread = match spawned {
             Ok(thread) => Some(thread),
             Err(err) => {
+                // 线程起不来 = 队列从头就是死的，别说成「检查磁盘空间」。
+                dead_logged.store(true, Ordering::Relaxed);
                 if let Ok(mut slot) = failure.lock() {
                     *slot = Some(WriteFailure {
-                        kind: FailureKind::Settings,
+                        kind: FailureKind::QueueStopped,
                         detail: err.to_string(),
                     });
                 }
@@ -158,7 +161,7 @@ impl SettingsWriter {
             thread,
             failure,
             abandon_on_drop: AtomicBool::new(false),
-            dead_logged: AtomicBool::new(false),
+            dead_logged,
         }
     }
 
@@ -181,18 +184,18 @@ impl SettingsWriter {
     /// 记一行日志，再往失败槽里塞一条——下一拍心跳会把提示写进状态行，
     /// 用户重启时不会突然发现刚才的改动白改了。
     ///
-    /// 队列死了就再也起不来：日志只记第一笔，免得连点设置刷一串一样的行。
+    /// 队列死了就再也起不来：日志只记第一笔，免得连点设置刷一串一样的行；
+    /// 但提示每次都要塞——心跳取走一条就清空，不塞用户后面就永远看不到「没存上」。
     fn note_dead_queue(&self) {
-        if self.dead_logged.swap(true, Ordering::Relaxed) {
-            return;
-        }
         let detail = "保存队列已经停了".to_string();
-        log_event(
-            LogLevel::Warn,
-            LogTopic::App,
-            "settings_queue_stopped",
-            &[("detail", detail.as_str())],
-        );
+        if !self.dead_logged.swap(true, Ordering::Relaxed) {
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "settings_queue_stopped",
+                &[("detail", detail.as_str())],
+            );
+        }
         if let Ok(mut slot) = self.failure.lock() {
             *slot = Some(WriteFailure {
                 kind: FailureKind::QueueStopped,

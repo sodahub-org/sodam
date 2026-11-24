@@ -644,38 +644,34 @@ impl Root {
     pub fn set_volume(&mut self, volume: f32) {
         self.settings.set_volume(volume);
         self.engine.set_volume(self.settings.volume);
-        match self.volume_scrub_pending {
-            // 拖滑条时每动一下就排一份整份快照太浪费：只记下「还在动」，
-            // 松手（或停手一会儿）再补一次整份落盘。
-            Some(_) => self.volume_scrub_pending = Some(std::time::Instant::now()),
-            None => self.save_settings(),
+        // 拖滑条时每动一下就排一份整份快照太浪费：拖动中只记时刻，
+        // 松手（或停手一会儿）再补一次整份落盘。
+        if !self.volume_scrub.touch(std::time::Instant::now()) {
+            self.save_settings();
         }
     }
 
     /// 音量拖动开始（按下滑条）：之后的外部重载不弹回音量，落盘等停手再说。
     pub(crate) fn begin_volume_scrub(&mut self) {
-        self.volume_scrub_pending = Some(std::time::Instant::now());
+        self.volume_scrub.begin(std::time::Instant::now());
     }
 
-    /// 音量拖动结束：补排一次落盘。
+    /// 音量拖动结束（松手 / 拖出滑条）：补排一次落盘。
     ///
     /// 松手事件不一定会来（拖到窗口外松手、拖动中切走窗口），所以心跳还会用
     /// [`Self::settle_volume_scrub`] 兜一层。
     pub(crate) fn end_volume_scrub(&mut self) {
-        if self.volume_scrub_pending.take().is_some() {
+        if self.volume_scrub.finish() {
             self.save_settings();
         }
     }
 
-    /// 停手超过 [`VOLUME_SCRUB_IDLE`] 就当这次拖动结束了：补排落盘、清掉记号。
+    /// 停手够久就当这次拖动结束了：补排落盘、清掉记号。
     ///
     /// 只靠 `on_mouse_up` 收尾的话，收不到松手时会丢两样：音量没落盘（重启回到旧值），
-    /// `volume_scrub_pending` 一直挂着（之后的外部热重载送来的音量全被忽略）。
+    /// 拖动记号一直挂着（之后外部热重载送来的音量全被忽略）。
     pub(crate) fn settle_volume_scrub(&mut self) {
-        if self
-            .volume_scrub_pending
-            .is_some_and(|at| at.elapsed() >= VOLUME_SCRUB_IDLE)
-        {
+        if self.volume_scrub.settled(std::time::Instant::now()) {
             self.end_volume_scrub();
         }
     }
@@ -4460,7 +4456,7 @@ impl Root {
         let old = self.settings.clone();
 
         // 防回跳：用户正拖着音量滑条时，外部重载不动音量。
-        if self.volume_scrub_pending.is_some() {
+        if self.volume_scrub.scrubbing() {
             incoming.volume = old.volume;
             incoming.volume_before_mute = old.volume_before_mute;
         }
@@ -4772,9 +4768,6 @@ fn pending_failure_text(failure: &PlaybackFailure) -> &'static str {
 fn should_skip_to_next(failure: &PlaybackFailure) -> bool {
     failure.is_per_track() || failure.action == RecoveryAction::Nothing
 }
-
-/// 音量拖动多久没动静就算这次拖完了：`on_mouse_up` 不一定会来。
-const VOLUME_SCRUB_IDLE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// 连败封顶阈值：连续这么多首装载失败就停下，别再替用户往后翻。
 const PLAY_FAILURE_HALT_AFTER: u32 = 3;

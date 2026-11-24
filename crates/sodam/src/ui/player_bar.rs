@@ -122,7 +122,8 @@ fn volume_slider(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
                             root.begin_volume_scrub();
                             apply_move(f32::from(event.position.x), root, cx);
                         } else {
-                            // 拖动期间没排落盘，松手这一下补排（#259）。
+                            // 鼠标移到滑条上但没按着：拖动已经结束（松手多半走 up，
+                            // 这里兜「按键早就松开」的情况），补排一次落盘。
                             root.end_volume_scrub();
                         }
                     }),
