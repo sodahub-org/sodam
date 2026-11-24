@@ -581,6 +581,24 @@ pub struct UpgradeRun {
     pub not_improved_reason: Option<NotImprovedReason>,
 }
 
+impl UpgradeRun {
+    fn not_improved(track: CachedTrack, reason: NotImprovedReason) -> Self {
+        Self {
+            track,
+            improved: false,
+            not_improved_reason: Some(reason),
+        }
+    }
+
+    fn improved(track: CachedTrack) -> Self {
+        Self {
+            track,
+            improved: true,
+            not_improved_reason: None,
+        }
+    }
+}
+
 /// 把 `DownloadInfo` 翻成界面用的音质标签（以**实际拉到的流**为准）。
 ///
 /// 档位名走 [`crate::quality::tier_label`]，与不符判定共用 libresoda 的那套刻度；
@@ -740,7 +758,7 @@ fn is_better_stream(info: &libresoda::soda::types::DownloadInfo, current: &Cache
 
 fn skipped_upgrade_reason(current: &CachedTrack, target_rank: Option<i64>) -> NotImprovedReason {
     if current.preview {
-        return NotImprovedReason::AlreadyChecked;
+        return NotImprovedReason::NotBetter;
     }
     let Some(target_rank) = target_rank else {
         // 目标未知时没有更具体结论，按票面允许并入 not_better。
@@ -1129,12 +1147,10 @@ impl Session {
         // 如果已有档位并不低于目标档位，直接复用已有缓存。
         // 最近已经向服务端要过该目标档位时同样不再请求，避免跨会话重复下载。
         if !current.needs_upgrade(intent, vip) {
-            let reason = skipped_upgrade_reason(&current, target_rank);
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-                not_improved_reason: Some(reason),
-            });
+            return Ok(UpgradeRun::not_improved(
+                current,
+                skipped_upgrade_reason(&current, target_rank),
+            ));
         }
 
         // 串行化升级操作并获取租约：
@@ -1155,12 +1171,10 @@ impl Session {
             }
         };
         if !current.needs_upgrade(intent, vip) {
-            let reason = skipped_upgrade_reason(&current, target_rank);
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-                not_improved_reason: Some(reason),
-            });
+            return Ok(UpgradeRun::not_improved(
+                current,
+                skipped_upgrade_reason(&current, target_rank),
+            ));
         }
 
         let target_lease = crate::cache::CacheLease::acquire(&path);
@@ -1226,11 +1240,10 @@ impl Session {
         // 核心安全护栏：试听流绝不允许覆盖已有非试听整曲缓存（即便试听流档位分数更高）
         if would_downgrade_to_preview(&info, &current) {
             let _ = std::fs::remove_file(&part);
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-                not_improved_reason: Some(NotImprovedReason::PreviewOnly),
-            });
+            return Ok(UpgradeRun::not_improved(
+                current,
+                NotImprovedReason::PreviewOnly,
+            ));
         }
 
         let new_rank = crate::quality::stream_rank(&info);
@@ -1255,11 +1268,7 @@ impl Session {
                 record_upgrade_check(&quality_path, &path, current.quality_rank, checked_rank);
             }
             let reason = downloaded_not_improved_reason(&current, &info, confirmed_miss.is_some());
-            return Ok(UpgradeRun {
-                track: current,
-                improved: false,
-                not_improved_reason: Some(reason),
-            });
+            return Ok(UpgradeRun::not_improved(current, reason));
         }
 
         // 试听在上面已经被挡住：走到这里一定是整曲替换。
@@ -1286,19 +1295,15 @@ impl Session {
         )?;
 
         crate::mem::release_malloc_pressure();
-        Ok(UpgradeRun {
-            track: CachedTrack {
-                path,
-                quality,
-                preview: false,
-                quality_rank: Some(new_rank),
-                checked_rank,
-                preview_retry_blocked: false,
-                lease: target_lease,
-            },
-            improved: true,
-            not_improved_reason: None,
-        })
+        Ok(UpgradeRun::improved(CachedTrack {
+            path,
+            quality,
+            preview: false,
+            quality_rank: Some(new_rank),
+            checked_rank,
+            preview_retry_blocked: false,
+            lease: target_lease,
+        }))
     }
 
     /// 测试用：看一眼会话手里那份输入（界面那份在 `Root.settings`）。
@@ -2295,7 +2300,7 @@ mod tests {
         );
         assert_eq!(
             skipped_upgrade_reason(&cached("未知 128k", Some(0), true), Some(100)),
-            NotImprovedReason::AlreadyChecked
+            NotImprovedReason::NotBetter
         );
     }
 
