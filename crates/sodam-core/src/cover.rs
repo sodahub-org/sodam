@@ -607,6 +607,13 @@ impl CoverStore {
                 };
             }
         }
+        if self
+            .records
+            .get(url)
+            .is_some_and(|record| record.original.state == State::Failed)
+        {
+            self.original_paths.mark_failed(url);
+        }
         // 清缓存时当前曲目的原图还在下载：这次按文件在不在落账，落完还缺就补排。
         self.originals.requeue_if_demanded(
             url,
@@ -1395,18 +1402,22 @@ mod tests {
     fn original_failed_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = "original-a";
+        let paths = store.originals_handle();
 
         assert!(store.want_original(url));
         assert_eq!(store.drain_original(), vec![url.to_string()]);
         store.complete_original(url, CoverOutcome::Failed);
+        assert!(paths.lookup(url).should_request, "失败一次还要继续请求");
         assert!(store.want_original(url), "失败一次还能再试");
 
         assert_eq!(store.drain_original(), vec![url.to_string()]);
         store.complete_original(url, CoverOutcome::Failed);
+        assert!(!paths.lookup(url).should_request, "失败两次后停止请求");
         assert!(!store.want_original(url), "失败两次后本会话不再自动重试");
         assert!(store.drain_original().is_empty());
 
         store.forget([url]);
+        assert!(paths.lookup(url).should_request, "作废后恢复请求");
         assert!(store.want_original(url), "作废之后能重新下");
     }
 
@@ -1596,19 +1607,23 @@ mod tests {
     fn original_vanished_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = "original-a";
+        let paths = store.originals_handle();
 
         assert!(store.want_original(url));
         assert_eq!(store.drain_original(), vec![url.to_string()]);
         store.complete_original(url, CoverOutcome::Vanished);
         assert!(store.original_path(url).is_none(), "死路径不能发布");
+        assert!(paths.lookup(url).should_request, "第一次还要继续请求");
         assert!(store.want_original(url), "文件没了第一次还能再试");
 
         assert_eq!(store.drain_original(), vec![url.to_string()]);
         store.complete_original(url, CoverOutcome::Vanished);
+        assert!(!paths.lookup(url).should_request, "两次后停止请求");
         assert!(!store.want_original(url), "两次都撞上文件已没就先放弃");
         assert!(store.drain_original().is_empty());
 
         store.forget([url]);
+        assert!(paths.lookup(url).should_request, "作废后恢复请求");
         assert!(store.want_original(url), "作废之后能重新下");
     }
 
