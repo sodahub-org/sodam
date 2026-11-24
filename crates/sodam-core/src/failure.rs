@@ -278,11 +278,12 @@ impl UnplayableTracks {
         if self.entries.contains_key(failed_track_id) || self.entries.len() < Self::CAPACITY {
             return recorded;
         }
-        let victim = if failure.retryability != Retryability::Never {
-            Self::oldest_transient(&self.entries).or(Some(failed_track_id))
-        } else {
-            Self::eviction_victim(&self.entries)
-        };
+        let victim = Self::eviction_victim_with_incoming(
+            &self.entries,
+            failed_track_id,
+            failure.retryability,
+            Instant::now(),
+        );
         if victim == Some(candidate_id) {
             return false;
         }
@@ -353,6 +354,15 @@ impl UnplayableTracks {
         reason: UnplayableReason,
         at: Instant,
     ) {
+        let victim = (self.entries.len() >= Self::CAPACITY && !self.entries.contains_key(track_id))
+            .then(|| Self::eviction_victim_with_incoming(&self.entries, track_id, retryability, at))
+            .flatten()
+            .map(str::to_string);
+        if let Some(victim) = victim.as_deref() {
+            if victim != track_id {
+                Arc::make_mut(&mut self.entries).remove(victim);
+            }
+        }
         Arc::make_mut(&mut self.entries).insert(
             track_id.to_string(),
             UnplayableEntry {
@@ -361,6 +371,9 @@ impl UnplayableTracks {
                 reason,
             },
         );
+        if victim.as_deref() == Some(track_id) {
+            Arc::make_mut(&mut self.entries).remove(track_id);
+        }
         self.evict_over_capacity();
     }
 
@@ -394,6 +407,27 @@ impl UnplayableTracks {
 
     fn eviction_victim(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
         Self::oldest_transient(entries).or_else(|| Self::oldest(entries))
+    }
+
+    fn eviction_victim_with_incoming<'a>(
+        entries: &'a HashMap<String, UnplayableEntry>,
+        incoming_id: &'a str,
+        incoming_retryability: Retryability,
+        incoming_at: Instant,
+    ) -> Option<&'a str> {
+        if incoming_retryability != Retryability::Never {
+            return match Self::oldest_transient(entries) {
+                Some(track_id) if entries[track_id].recorded_at <= incoming_at => Some(track_id),
+                _ => Some(incoming_id),
+            };
+        }
+        if let Some(track_id) = Self::oldest_transient(entries) {
+            return Some(track_id);
+        }
+        match Self::oldest(entries) {
+            Some(track_id) if entries[track_id].recorded_at <= incoming_at => Some(track_id),
+            _ => Some(incoming_id),
+        }
     }
 
     fn oldest_transient(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
@@ -1380,7 +1414,7 @@ mod tests {
         assert!(set.contains("track-3"));
     }
 
-    /// 超界时先清瞬时类，再按失败时刻先进先出。
+    /// 预测与真实记录一致，且预测本身不修改集合。
     #[test]
     fn failure_projection_matches_real_recording_without_mutating() {
         let per_track = PlaybackFailure::new(
@@ -1472,6 +1506,7 @@ mod tests {
         assert!(!set.is_unavailable_after_failure("current", "newer-transient", &incoming));
     }
 
+    /// 超界时先清瞬时类，再按失败时刻先进先出。
     #[test]
     fn unplayable_set_evicts_transient_entries_before_permanent_ones() {
         let base = Instant::now();

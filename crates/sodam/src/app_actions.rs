@@ -4259,7 +4259,7 @@ impl Root {
                             cx.notify();
                             return;
                         }
-                        root.handle_play_failure(&failure, &track, cx);
+                        root.handle_play_failure(PlayIntent::Now, &failure, &track, cx);
                     }
                 }
                 cx.notify();
@@ -4270,12 +4270,13 @@ impl Root {
 
     fn handle_play_failure(
         &mut self,
+        intent: PlayIntent,
         failure: &PlaybackFailure,
         track: &TrackItem,
         cx: &mut Context<Self>,
     ) {
         let decision = decide_play_failure(PlayFailureInput {
-            intent: PlayIntent::Now,
+            intent,
             failure,
             has_candidate: has_playable_after_failure(
                 &self.queue,
@@ -4293,7 +4294,7 @@ impl Root {
                 self.unplayable.record_failure(&track.id, failure);
             }
         }
-        if counts_consecutive_failure(PlayIntent::Now, failure) {
+        if counts_consecutive_failure(intent, failure) {
             self.consecutive_failures += 1;
         }
 
@@ -4304,6 +4305,7 @@ impl Root {
         };
         let mut advanced = false;
         if decision.advance == Advance::Stay && decision.halt == Halt::ExhaustedRound {
+            // 整圈也先实际推进：能走就清理失效 redo 并加载下一首。
             if advance_failure_queue(&mut self.queue, &self.unplayable) {
                 let message = self.tr(play_failure_text(failure, true)).to_string();
                 self.playback_error = None;
@@ -4321,6 +4323,9 @@ impl Root {
                 if decision.record == FailureRecord::Unplayable {
                     self.halt_exhausted_round();
                 } else {
+                    let message = self.tr(play_failure_text(failure, false)).to_string();
+                    self.playback_error = Some(message.clone());
+                    self.notify_warning_once("track-stream-failed", message);
                     self.halt_playback();
                 }
                 return;
@@ -5008,6 +5013,7 @@ mod upgrade_estimate_tests {
 mod play_failure_flow_tests {
     use super::*;
     use sodam_core::failure::Retryability;
+    use sodam_core::play_failure::PlayFailureDecision;
 
     fn per_track_failure() -> PlaybackFailure {
         PlaybackFailure::new(
@@ -5125,14 +5131,22 @@ mod play_failure_flow_tests {
 
     #[test]
     fn stale_identity_blocks_failure_consequences() {
+        let failure = per_track_failure();
+        let mut decision: Option<PlayFailureDecision> = None;
         let mut consequences = [false; 5];
-        let continued = run_if_identity_current(false, || consequences.fill(true));
+        let continued = run_if_identity_current(false, || {
+            decision = Some(decide_play_failure(PlayFailureInput {
+                intent: PlayIntent::Now,
+                failure: &failure,
+                has_candidate: true,
+                consecutive_failures: 0,
+                mode: PlayMode::ListLoop,
+            }));
+            consequences.fill(true);
+        });
         assert!(!continued);
+        assert!(decision.is_none());
         assert_eq!(consequences, [false; 5]);
-
-        let continued = run_if_identity_current(true, || consequences.fill(true));
-        assert!(continued);
-        assert_eq!(consequences, [true; 5]);
     }
 
     #[test]

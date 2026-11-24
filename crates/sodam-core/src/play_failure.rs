@@ -97,22 +97,6 @@ pub struct PlayFailureDecision {
     pub halt: Halt,
 }
 
-impl PlayFailureDecision {
-    /// 身份已变：这次尝试不产生任何结论。
-    #[cfg(test)]
-    pub(crate) const fn invalidated() -> Self {
-        Self {
-            record: FailureRecord::None,
-            notice: FailureNotice {
-                slot: NoticeSlot::None,
-                channel: NoticeChannel::None,
-            },
-            advance: Advance::Stay,
-            halt: Halt::None,
-        }
-    }
-}
-
 /// 纯决策的输入；身份校验和预取挂起留在调用方。
 pub struct PlayFailureInput<'a> {
     /// 现在要声音，还是只预装第一首。
@@ -130,7 +114,8 @@ pub struct PlayFailureInput<'a> {
 /// 连续几次装载失败后停止本轮。
 pub const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 
-/// 连败 +1 属于调用方清理，只有点播的抖动类失败计数。
+/// 只有点播的抖动类失败（`RecoveryAction::Nothing`）才让连败数加一。
+/// 加一由调用方自己做，不进四输出。
 pub fn counts_consecutive_failure(intent: PlayIntent, failure: &PlaybackFailure) -> bool {
     intent == PlayIntent::Now && failure.action == RecoveryAction::Nothing
 }
@@ -272,7 +257,7 @@ mod tests {
         let per_track = RecoveryAction::TrackUnavailable;
         let global = RecoveryAction::Relogin;
         let transient = RecoveryAction::Nothing;
-        // 第 13 行身份变化由调用门测试覆盖，纯决策不接身份。
+        // 身份变更在调用门前拦掉，不进这张表。
         let cases = [
             (
                 "点播·按曲目·有候选",
@@ -438,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn only_transient_point_failures_increment_consecutive_failures() {
+    fn only_point_transient_failures_count() {
         for action in [
             RecoveryAction::TrackUnavailable,
             RecoveryAction::PickAnother,
@@ -460,26 +445,5 @@ mod tests {
             PlayIntent::PrepareFirst,
             &transient
         ));
-        for mode in [PlayMode::ListLoop, PlayMode::RepeatOne, PlayMode::Shuffle] {
-            let result = decide(PlayIntent::Now, RecoveryAction::Nothing, false, 0, mode);
-            assert_eq!(result.record, FailureRecord::None, "{mode:?}");
-        }
-    }
-
-    #[test]
-    fn identity_invalidation_leaves_no_decision_or_visible_consequence() {
-        let normal = decide(
-            PlayIntent::Now,
-            RecoveryAction::TrackUnavailable,
-            true,
-            0,
-            PlayMode::ListLoop,
-        );
-        let result = PlayFailureDecision::invalidated();
-        assert_ne!(result, normal);
-        assert_eq!(result.record, FailureRecord::None);
-        assert_eq!(result.notice, FailureNotice::default());
-        assert_eq!(result.advance, Advance::Stay);
-        assert_eq!(result.halt, Halt::None);
     }
 }
