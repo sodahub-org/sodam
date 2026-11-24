@@ -25,7 +25,7 @@ pub const MAX_FAILURES: u8 = 2;
 /// 封面主色。
 pub type CoverRgb = (u8, u8, u8);
 
-/// 一轮 `want` 的结果：新排进几张、因队列满挤掉几张。
+/// 一轮封面请求的统计：新排进几张、上次读取以来挤掉几张。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CoverWant {
     pub queued: usize,
@@ -265,14 +265,14 @@ impl Lane {
 
     /// 泵的下半截的公共记账：出在飞、处理作废。
     ///
-    /// 返回 `true` 表示这次结果作废，调用方不用再发布。
+    /// 返回 `Some(evicted)` 表示这次结果作废，调用方不用再发布。
     fn finish(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) -> bool {
+    ) -> Option<bool> {
         self.inflight.remove(url);
         if self.abandoned.remove(url) {
             // 下载中被 forget：这次拿回来的东西不要，退回可重排。
@@ -283,23 +283,25 @@ impl Lane {
                 slot.failures = 0;
             }
             // 作废期间又有人要这张图（点重试、滚动回来）：现在补排一次。
-            self.requeue_if_demanded(url, ready, records, select);
+            let evicted = self.requeue_if_demanded(url, ready, records, select);
             discard_empty_record(records, url);
-            return true;
+            return Some(evicted);
         }
-        false
+        None
     }
 
-    /// 有人在这张图在飞期间留了需求：结果落完立刻补排。
+    /// 有人在这张图在飞期间留了需求：结果落完立刻补排，返回是否挤掉了旧项。
     fn requeue_if_demanded(
         &mut self,
         url: &str,
         ready: &CoverPaths,
         records: &mut HashMap<String, Record>,
         select: SelectSlot,
-    ) {
+    ) -> bool {
         if self.requeue_after_release.remove(url) {
-            self.enqueue(url, ready, records, select);
+            self.enqueue(url, ready, records, select).evicted
+        } else {
+            false
         }
     }
 
@@ -384,7 +386,7 @@ pub struct CoverStore {
     thumbnail_paths: CoverPaths,
     original_paths: CoverPaths,
     colors: HashMap<String, CoverRgb>,
-    /// 上一轮 `want` 因队列满挤掉的缩略图张数（日志用）。
+    /// 上次 `take_dropped` 以来因队列满挤掉的缩略图张数（日志用）。
     thumbnail_dropped: usize,
 }
 
@@ -407,8 +409,6 @@ impl CoverStore {
     ///
     /// 同一 URL 在排队、在飞、已完成或已放弃时都不会重复入队。
     pub fn want(&mut self, urls: &[String]) -> usize {
-        // 挤掉的张数按这一轮重置；入队数直接用返回值，不再另记一份。
-        self.thumbnail_dropped = 0;
         let mut queued = 0;
         for raw in urls {
             let url = raw.trim();
@@ -439,12 +439,15 @@ impl CoverStore {
         if url.is_empty() {
             return;
         }
-        if self.thumbnails.finish(
+        if let Some(evicted) = self.thumbnails.finish(
             url,
             &self.thumbnail_paths,
             &mut self.records,
             thumbnail_slot,
         ) {
+            if evicted {
+                self.thumbnail_dropped += 1;
+            }
             return;
         }
         match outcome {
@@ -512,6 +515,7 @@ impl CoverStore {
         if self
             .originals
             .finish(url, &self.original_paths, &mut self.records, original_slot)
+            .is_some()
         {
             return;
         }
@@ -689,7 +693,7 @@ impl CoverStore {
         self.original_paths.clone()
     }
 
-    /// 取走上一轮 `want` 因队列满挤掉的张数。
+    /// 取走上次读取以来因队列满挤掉的张数，包括补排路径。
     pub fn take_dropped(&mut self) -> usize {
         std::mem::take(&mut self.thumbnail_dropped)
     }
@@ -885,6 +889,30 @@ mod tests {
         store.complete("cover-a", CoverOutcome::Failed);
         assert_eq!(store.drain(), url, "作废结果回来后要把这次需求补上");
         assert_eq!(store.want(&url), 0, "补排之后不重复入队");
+    }
+
+    #[test]
+    fn deferred_requeue_eviction_survives_next_want() {
+        let mut store = CoverStore::default();
+        let first: Vec<String> = (0..MAX_QUEUE)
+            .map(|index| format!("cover-{index}"))
+            .collect();
+        assert_eq!(store.want(&first), MAX_QUEUE);
+
+        let inflight = store.drain();
+        assert_eq!(inflight.len(), MAX_CONCURRENCY);
+        let fillers: Vec<String> = (MAX_QUEUE..MAX_QUEUE + MAX_CONCURRENCY)
+            .map(|index| format!("cover-{index}"))
+            .collect();
+        assert_eq!(store.want(&fillers), MAX_CONCURRENCY);
+
+        let released = inflight[0].clone();
+        store.forget([released.as_str()]);
+        assert_eq!(store.want(std::slice::from_ref(&released)), 0);
+        store.complete(&released, CoverOutcome::Failed);
+
+        assert_eq!(store.want(std::slice::from_ref(&released)), 0);
+        assert_eq!(store.take_dropped(), 1, "补排挤掉的也要记到日志里");
     }
 
     /// 第二次作废要把第一次作废后留的补排需求一起清掉；之后再要仍能重新记。

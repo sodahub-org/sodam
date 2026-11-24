@@ -3371,7 +3371,7 @@ impl Root {
     /// 把封面交给 CoverStore；缺图时渲染先显示占位块。
     ///
     /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
-    /// 返回这轮新入队 / 挤掉的张数，给消费循环降频和日志用。
+    /// 返回这轮新入队 / 上次读取以来挤掉的张数，给消费循环降频和日志用。
     pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> CoverWant {
         let queued = self.cover_store.want(urls);
         let stats = CoverWant {
