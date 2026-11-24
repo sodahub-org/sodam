@@ -87,32 +87,15 @@ pub fn identity_change(
     }
 }
 
-/// 一份缓存流的样子：档位分 + 是不是试听片段。
-///
-/// 只比较档位分不够：试听换成整曲时分数可能一样（同档位），但盘上那份文件确实变好了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamShape {
-    /// 这条流的档位分；`None` = 旧缓存没记。
-    pub rank: Option<i64>,
-    /// 是不是试听片段。
-    pub preview: bool,
-}
-
-impl From<&crate::session::CachedTrack> for StreamShape {
-    fn from(cached: &crate::session::CachedTrack) -> Self {
-        Self {
-            rank: cached.quality_rank,
-            preview: cached.preview,
-        }
-    }
-}
-
 /// 一首跑完落在哪一档。
+///
+/// 由升级那条路在换文件那一刻定下来，不在事后拿升级前后的两份缓存比分数：
+/// 档位未知的旧缓存没有分数可比，「量出一个正分」并不等于真的升了一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 盘上那份确实变好了。
+    /// 盘上那份确实换成了更好的流（整曲，或档位更高）。
     Upgraded,
-    /// 跑完了，但盘上没换成更好的整曲：服务端最高就这档，或只肯给试听片段。
+    /// 跑完了，但没换成更好的流：没更高档、仍只给试听片段，或者回来的流并不更好。
     /// 不算成功。
     NoHigherTier,
     /// 这次没跑成：网络、磁盘、权益，或者跑之前那一首已经被删了。
@@ -120,20 +103,9 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 按升级前后两份流的样子判定：拿到整曲才算成功，仍是试听就一律不算。
-    ///
-    /// 光比档位分不够：试听换试听也可能换到更高分，盘上那 30 秒片段不能算「升级成功」。
-    /// 档位分走 `readable_rank` 那一道闸：0 分是「量过但认不出」，
-    /// 和旧缓存没记分数的 `None` 一样不算已知档位——否则「没记分 → 量出 0 分」
-    /// 会被当成一次升级。
-    pub fn of_shapes(before: StreamShape, after: StreamShape) -> Self {
-        if after.preview {
-            return Self::NoHigherTier;
-        }
-        if before.preview {
-            return Self::Upgraded;
-        }
-        if crate::quality::readable_rank(after.rank) > crate::quality::readable_rank(before.rank) {
+    /// 把「这次有没有换成更好的流」翻成对外的结论。界面上的成功与否只认这一个映射。
+    pub fn from_improved(improved: bool) -> Self {
+        if improved {
             Self::Upgraded
         } else {
             Self::NoHigherTier
@@ -324,76 +296,11 @@ mod tests {
         );
     }
 
-    /// 档位没真提升不算成功。
+    /// 「有没有换成更好的流」是界面报成功的唯一出口，钉住它别被改宽。
     #[test]
-    fn an_equal_or_lower_tier_is_not_an_upgrade() {
-        let lossless = StreamShape {
-            rank: Some(100),
-            preview: false,
-        };
-        let highest = StreamShape {
-            rank: Some(80),
-            preview: false,
-        };
-        assert_eq!(Outcome::of_shapes(highest, lossless), Outcome::Upgraded);
-        assert_eq!(
-            Outcome::of_shapes(lossless, lossless),
-            Outcome::NoHigherTier,
-            "同一条流拿回来两次不算升级"
-        );
-        assert_eq!(
-            Outcome::of_shapes(lossless, highest),
-            Outcome::NoHigherTier,
-            "拿回更差的流不算升级"
-        );
-        // 旧缓存没记分数：这次量出来一个分数，就是实打实的提升。
-        assert_eq!(
-            Outcome::of_shapes(
-                StreamShape {
-                    rank: None,
-                    preview: false
-                },
-                highest
-            ),
-            Outcome::Upgraded
-        );
-        // 旧缓存没记分数、这次量出来 0 分（认不出）：不算已知档位，也不算升级。
-        assert_eq!(
-            Outcome::of_shapes(
-                StreamShape {
-                    rank: None,
-                    preview: false
-                },
-                StreamShape {
-                    rank: Some(0),
-                    preview: false
-                }
-            ),
-            Outcome::NoHigherTier
-        );
-        // 试听换整曲：同档位也算，盘上那份文件确实变完整了。
-        let preview = StreamShape {
-            rank: Some(80),
-            preview: true,
-        };
-        let full = StreamShape {
-            rank: Some(80),
-            preview: false,
-        };
-        assert_eq!(Outcome::of_shapes(preview, full), Outcome::Upgraded);
-        // 试听换更高分的试听：文件确实换了，但用户手里还是片段，不算升级。
-        assert_eq!(
-            Outcome::of_shapes(
-                preview,
-                StreamShape {
-                    rank: Some(100),
-                    preview: true
-                }
-            ),
-            Outcome::NoHigherTier
-        );
-        // 整曲换成试听什么时候都不算升级（这条路本来就另有护栏挡着）。
-        assert_eq!(Outcome::of_shapes(full, preview), Outcome::NoHigherTier);
+    fn improved_maps_to_the_reported_outcome() {
+        assert_eq!(Outcome::from_improved(true), Outcome::Upgraded);
+        assert_eq!(Outcome::from_improved(false), Outcome::NoHigherTier);
     }
 
     /// 换号以后去重表整份作废：同一首同一档位在新号下能再试一次。
