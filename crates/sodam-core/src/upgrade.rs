@@ -87,6 +87,31 @@ pub fn identity_change(
     }
 }
 
+/// 没换成更好的流时，逐首日志用来区分原因；不参与升级统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotImprovedReason {
+    /// 新流仍是试听，或试听回退被整曲缓存拦住。
+    PreviewOnly,
+    /// 拿到完整流，但能比较出它不比旧文件更好。
+    NotBetter,
+    /// 拿到完整流，档位可识别且低于目标，确认这次没有更高档。
+    NoHigherTier,
+    /// 这次没发请求：旧缓存已达目标，或已有探测结论覆盖目标。
+    AlreadyChecked,
+}
+
+impl NotImprovedReason {
+    /// 日志字段 `reason=` 的稳定取值（小写下划线，不随界面语言变化）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PreviewOnly => "preview_only",
+            Self::NotBetter => "not_better",
+            Self::NoHigherTier => "no_higher_tier",
+            Self::AlreadyChecked => "already_checked",
+        }
+    }
+}
+
 /// 一首跑完落在哪一档。
 ///
 /// 由升级那条路在换文件那一刻定下来，不在事后拿升级前后的两份缓存比分数：
@@ -353,5 +378,16 @@ mod tests {
         assert_eq!(StopReason::IdentityChanged.as_str(), "identity_changed");
         assert_eq!(StopReason::LoggingOut.as_str(), "logging_out");
         assert_eq!(StopReason::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn not_improved_log_values_are_stable() {
+        assert_eq!(NotImprovedReason::PreviewOnly.as_str(), "preview_only");
+        assert_eq!(NotImprovedReason::NotBetter.as_str(), "not_better");
+        assert_eq!(NotImprovedReason::NoHigherTier.as_str(), "no_higher_tier");
+        assert_eq!(
+            NotImprovedReason::AlreadyChecked.as_str(),
+            "already_checked"
+        );
     }
 }
