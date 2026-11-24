@@ -566,13 +566,13 @@ impl CachedTrack {
     }
 }
 
-/// 一次升级跑完的交付物：跑完后内存里的缓存记录，加上这次有没有真的换成更好的流。
+/// 一次升级完成判定的交付物：返回时内存里的缓存记录，以及这次有没有换成更好的流。
 ///
 /// `not_improved_reason` 在判定结果那一刻定下来：换文件、比完流，或者决定这次不发请求。
 /// `None` 表示升级成功，`Some` 表示没换成更好的流。
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpgradeRun {
-    /// 跑完那一刻的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
+    /// 返回时的内存快照；没换文件时就是原来那份。`checked_rank` 等结论可能还没落到
     /// sidecar，要准的值去读 sidecar。
     pub track: CachedTrack,
     /// 没换成更好的流时的日志原因；成功升级时为 `None`。

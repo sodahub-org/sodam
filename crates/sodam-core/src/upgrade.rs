@@ -168,7 +168,7 @@ impl Tally {
         }
     }
 
-    /// 这一轮计入了几首。提前停时小于扫出来的总数。
+    /// 这一轮计入了几首。提前停时可能小于扫出来的总数。
     pub fn total(&self) -> usize {
         self.upgraded + self.failed + self.no_higher
     }
