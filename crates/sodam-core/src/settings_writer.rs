@@ -618,6 +618,31 @@ mod tests {
         assert!((reloaded.volume - 0.4).abs() < f32::EPSILON, "别的字段照写");
     }
 
+    /// 换了身份（重新登录）之后记号作废：同一串旧 Cookie 再来不再被摘。
+    ///
+    /// 真正挡住「旧 Cookie 写回盘」的是盘上那份（`save_queued_to`）；这里只保证记号
+    /// 不会一直留着，误伤同一个账号重新登录后拿到的同一串 Cookie。
+    #[test]
+    fn a_new_identity_drops_the_signed_out_mark() {
+        let (writer, log) = writer_with(recording(false));
+        assert_eq!(
+            block_on(writer.sign_out(Settings::default(), "sessionid_ss=old".into())),
+            Ok(SignOut::Done)
+        );
+        writer.schedule(&Settings {
+            cookie: "sessionid_ss=new".into(),
+            ..Settings::default()
+        });
+        writer.schedule(&Settings {
+            cookie: "sessionid_ss=old".into(),
+            ..Settings::default()
+        });
+        block_on(writer.flush());
+        let log = log.lock().unwrap();
+        let last = log.writes.last().expect("该写一份");
+        assert_eq!(last.cookie, "sessionid_ss=old", "记号作废后不再摘 Cookie");
+    }
+
     #[test]
     fn sign_out_failure_keeps_the_reason() {
         let (writer, _log) = writer_with(recording(true));
