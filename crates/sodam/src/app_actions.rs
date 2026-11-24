@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
-use sodam_core::cover::{CoverOutcome, CoverWant};
+use sodam_core::cover::CoverOutcome;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
 use sodam_core::library::RecommendationSource;
 use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
@@ -3371,17 +3371,13 @@ impl Root {
     /// 把封面交给 CoverStore；缺图时渲染先显示占位块。
     ///
     /// 去重、队列上限、失败次数都由 store 管，这里不再维护第二份账。
-    /// 返回这轮新入队 / 上次读取以来挤掉的张数，给消费循环降频和日志用。
-    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> CoverWant {
+    /// 返回这轮新入队数；挤掉的数留给封面消费循环取走，避免直接调用提前消费。
+    pub fn ensure_covers(&mut self, urls: &[String], cx: &mut Context<Self>) -> usize {
         let queued = self.cover_store.want(urls);
-        let stats = CoverWant {
-            queued,
-            dropped: self.cover_store.take_dropped(),
-        };
-        if stats.queued > 0 {
+        if queued > 0 {
             self.pump_covers(cx);
         }
-        stats
+        queued
     }
 
     /// 驱动请求：保持最多 `MAX_CONCURRENCY` 个下载在飞，完成一个补一个。
