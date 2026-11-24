@@ -30,7 +30,7 @@ use sodam_core::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
