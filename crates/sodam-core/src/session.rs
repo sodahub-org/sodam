@@ -826,7 +826,7 @@ fn finish_unimproved_upgrade(
             record_preview_upgrade_attempt(quality_path, audio_path, current.quality_rank);
         return Outcome::NoHigherTier;
     }
-    if new_rank <= 0 && current.quality_rank.is_none() {
+    if new_rank <= 0 {
         if !can_record {
             return Outcome::UnknownRank;
         }
@@ -2362,6 +2362,54 @@ mod tests {
             reloaded.needs_upgrade(&hires, Some(true), Some(&scope)),
             "目标变化后重试"
         );
+    }
+
+    #[test]
+    fn unknown_rank_probe_backs_off_known_low_tier_without_replacing_it() {
+        use libresoda::soda::types::DownloadInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known-auto.m4a");
+        let quality_path = dir.path().join("known-auto.quality");
+        std::fs::write(&path, b"original-audio").unwrap();
+        std::fs::write(&quality_path, "极高 320k\t14\t0\t80").unwrap();
+        let mut current = CachedTrack {
+            path: path.clone(),
+            quality: "极高 320k".into(),
+            preview: false,
+            quality_rank: Some(80),
+            checked_rank: None,
+            unknown_probe: None,
+            preview_retry_blocked: false,
+            lease: crate::cache::CacheLease::acquire(&path),
+        };
+        let unknown_stream = DownloadInfo {
+            is_preview: false,
+            ..Default::default()
+        };
+        let scope = crate::cache::unknown_probe_scope(Some("user-1"), Some(true)).unwrap();
+
+        let outcome = finish_unimproved_upgrade(
+            &mut current,
+            &unknown_stream,
+            Some(100),
+            true,
+            Some(&scope),
+            &quality_path,
+            &path,
+            1_700_000_000,
+        );
+
+        assert_eq!(outcome, crate::upgrade::Outcome::UnknownRank);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original-audio");
+        let parsed =
+            crate::cache::parse_sidecar(&std::fs::read_to_string(&quality_path).unwrap(), 14)
+                .unwrap();
+        assert_eq!(parsed.actual_rank, Some(80));
+        assert_eq!(parsed.checked_rank, None);
+        assert!(parsed.fresh_unknown_probe(1_700_000_000).is_some());
+        let lossless = crate::quality::QualityIntent::parse("lossless");
+        assert!(!current.needs_upgrade(&lossless, Some(true), Some(&scope)));
     }
 
     #[test]
