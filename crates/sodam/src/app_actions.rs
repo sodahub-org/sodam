@@ -18,8 +18,8 @@ use sodam_core::log_outlet::{self, log_event, LogLevel, LogTopic};
 use sodam_core::login::LoginStatus;
 use sodam_core::models::{LyricLine, PlaylistItem, SceneItem, TrackItem};
 use sodam_core::play_failure::{
-    decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel, NoticeSlot,
-    PlayFailureDecision, PlayFailureInput, PlayIntent,
+    counts_consecutive_failure, decide_play_failure, Advance, FailureRecord, Halt, NoticeChannel,
+    NoticeSlot, PlayFailureDecision, PlayFailureInput, PlayIntent,
 };
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
@@ -4292,7 +4292,9 @@ impl Root {
             FailureRecord::Unplayable => {
                 self.unplayable.record_failure(&track.id, failure);
             }
-            FailureRecord::Consecutive => self.consecutive_failures += 1,
+        }
+        if counts_consecutive_failure(PlayIntent::Now, failure) {
+            self.consecutive_failures += 1;
         }
 
         let notice_key = match decision.halt {
@@ -4307,7 +4309,11 @@ impl Root {
         if decision.advance == Advance::Next {
             advanced = advance_failure_queue(&mut self.queue, &self.unplayable);
             if !advanced {
-                // 查询与推进在同一拍完成；仅防队列规则以后变化。
+                if decision.record == FailureRecord::Unplayable {
+                    self.halt_exhausted_round();
+                } else {
+                    self.halt_playback();
+                }
                 return;
             }
         }

@@ -278,7 +278,12 @@ impl UnplayableTracks {
         if self.entries.contains_key(failed_track_id) || self.entries.len() < Self::CAPACITY {
             return recorded;
         }
-        if Self::eviction_victim(&self.entries) == Some(candidate_id) {
+        let victim = if failure.retryability != Retryability::Never {
+            Self::oldest_transient(&self.entries).or(Some(failed_track_id))
+        } else {
+            Self::oldest(&self.entries)
+        };
+        if victim == Some(candidate_id) {
             return false;
         }
         recorded
@@ -388,16 +393,22 @@ impl UnplayableTracks {
     }
 
     fn eviction_victim(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
-        let transient = entries
+        Self::oldest_transient(entries).or_else(|| Self::oldest(entries))
+    }
+
+    fn oldest_transient(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
+        entries
             .iter()
             .filter(|(_, entry)| entry.retryability != Retryability::Never)
             .min_by_key(|(_, entry)| entry.recorded_at)
-            .map(|(track_id, _)| track_id.as_str());
-        let oldest = entries
+            .map(|(track_id, _)| track_id.as_str())
+    }
+
+    fn oldest(entries: &HashMap<String, UnplayableEntry>) -> Option<&str> {
+        entries
             .iter()
             .min_by_key(|(_, entry)| entry.recorded_at)
-            .map(|(track_id, _)| track_id.as_str());
-        transient.or(oldest)
+            .map(|(track_id, _)| track_id.as_str())
     }
 }
 
@@ -1403,6 +1414,22 @@ mod tests {
             "timeout",
         );
         assert!(!set.is_unavailable_after_failure("current", "current", &transient));
+
+        let transient_track = PlaybackFailure::new(
+            Stage::ResolveStream,
+            Retryability::Transient,
+            RecoveryAction::TrackUnavailable,
+            "preview stream",
+        );
+        let mut actual = set.clone();
+        actual.record_failure("current", &transient_track);
+        for candidate in ["current", "old-0", "old-1", "new"] {
+            assert_eq!(
+                set.is_unavailable_after_failure("current", candidate, &transient_track),
+                actual.is_unavailable(candidate),
+                "{candidate}"
+            );
+        }
     }
 
     #[test]

@@ -16,13 +16,11 @@ pub enum PlayIntent {
 /// 这次失败要记哪种账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureRecord {
-    /// 不写不可播集合，也不增加连败。
+    /// 不写不可播集合。
     #[default]
     None,
     /// 调用方把当前曲目写进不可播集合。
     Unplayable,
-    /// 调用方给连败数加一。
-    Consecutive,
 }
 
 /// 常驻提示放哪个槽位。
@@ -132,6 +130,11 @@ pub struct PlayFailureInput<'a> {
 /// 连续几次装载失败后停止本轮。
 pub const PLAY_FAILURE_HALT_AFTER: u32 = 3;
 
+/// 连败 +1 属于调用方清理，只有点播的抖动类失败计数。
+pub fn counts_consecutive_failure(intent: PlayIntent, failure: &PlaybackFailure) -> bool {
+    intent == PlayIntent::Now && failure.action == RecoveryAction::Nothing
+}
+
 /// 按现状决定一次播放失败的后果。
 ///
 /// 预装仍只试一次，不走点播的连败封顶；这里记录差异，不替预装改行为。
@@ -170,7 +173,7 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
         };
     }
 
-    if input.failure.action != RecoveryAction::Nothing {
+    if !counts_consecutive_failure(input.intent, input.failure) {
         return PlayFailureDecision {
             notice: FailureNotice {
                 slot: NoticeSlot::PlaybackError,
@@ -183,7 +186,6 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
 
     if input.consecutive_failures.saturating_add(1) >= PLAY_FAILURE_HALT_AFTER {
         return PlayFailureDecision {
-            record: FailureRecord::Consecutive,
             notice: FailureNotice {
                 slot: NoticeSlot::PlaybackError,
                 channel: NoticeChannel::WarningThenError,
@@ -195,7 +197,6 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
 
     if input.mode == PlayMode::RepeatOne {
         return PlayFailureDecision {
-            record: FailureRecord::Consecutive,
             notice: FailureNotice {
                 channel: NoticeChannel::Warning,
                 ..FailureNotice::default()
@@ -207,7 +208,6 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
 
     if input.has_candidate {
         PlayFailureDecision {
-            record: FailureRecord::Consecutive,
             notice: FailureNotice {
                 channel: NoticeChannel::Warning,
                 ..FailureNotice::default()
@@ -217,7 +217,6 @@ pub fn decide_play_failure(input: PlayFailureInput<'_>) -> PlayFailureDecision {
         }
     } else {
         PlayFailureDecision {
-            record: FailureRecord::Consecutive,
             notice: FailureNotice {
                 slot: NoticeSlot::PlaybackError,
                 channel: NoticeChannel::Warning,
@@ -362,7 +361,7 @@ mod tests {
                 "点播·抖动·单曲·未封顶",
                 decide(PlayIntent::Now, transient, false, 0, PlayMode::RepeatOne),
                 decision(
-                    FailureRecord::Consecutive,
+                    FailureRecord::None,
                     NoticeSlot::None,
                     NoticeChannel::Warning,
                     Advance::RetrySame,
@@ -373,7 +372,7 @@ mod tests {
                 "点播·抖动·单曲·封顶",
                 decide(PlayIntent::Now, transient, false, 2, PlayMode::RepeatOne),
                 decision(
-                    FailureRecord::Consecutive,
+                    FailureRecord::None,
                     NoticeSlot::PlaybackError,
                     NoticeChannel::WarningThenError,
                     Advance::Stay,
@@ -384,7 +383,7 @@ mod tests {
                 "点播·抖动·有候选·未封顶",
                 decide(PlayIntent::Now, transient, true, 0, PlayMode::ListLoop),
                 decision(
-                    FailureRecord::Consecutive,
+                    FailureRecord::None,
                     NoticeSlot::None,
                     NoticeChannel::Warning,
                     Advance::Next,
@@ -395,7 +394,7 @@ mod tests {
                 "点播·抖动·有候选·封顶",
                 decide(PlayIntent::Now, transient, true, 2, PlayMode::ListLoop),
                 decision(
-                    FailureRecord::Consecutive,
+                    FailureRecord::None,
                     NoticeSlot::PlaybackError,
                     NoticeChannel::WarningThenError,
                     Advance::Stay,
@@ -406,7 +405,7 @@ mod tests {
                 "点播·抖动·无候选",
                 decide(PlayIntent::Now, transient, false, 0, PlayMode::ListLoop),
                 decision(
-                    FailureRecord::Consecutive,
+                    FailureRecord::None,
                     NoticeSlot::PlaybackError,
                     NoticeChannel::Warning,
                     Advance::Stay,
@@ -453,27 +452,22 @@ mod tests {
             RecoveryAction::CheckEntitlement,
             RecoveryAction::FreeSpace,
         ] {
+            let failure = failure(action);
             for intent in [PlayIntent::Now, PlayIntent::PrepareFirst] {
-                let result = decide(intent, action, false, 0, PlayMode::ListLoop);
-                assert_ne!(result.record, FailureRecord::Consecutive, "{action:?}");
+                assert!(!counts_consecutive_failure(intent, &failure), "{action:?}");
             }
         }
 
+        let transient = failure(RecoveryAction::Nothing);
+        assert!(counts_consecutive_failure(PlayIntent::Now, &transient));
+        assert!(!counts_consecutive_failure(
+            PlayIntent::PrepareFirst,
+            &transient
+        ));
         for mode in [PlayMode::ListLoop, PlayMode::RepeatOne, PlayMode::Shuffle] {
             let result = decide(PlayIntent::Now, RecoveryAction::Nothing, false, 0, mode);
-            assert_eq!(result.record, FailureRecord::Consecutive, "{mode:?}");
+            assert_eq!(result.record, FailureRecord::None, "{mode:?}");
         }
-        assert_ne!(
-            decide(
-                PlayIntent::PrepareFirst,
-                RecoveryAction::Nothing,
-                false,
-                0,
-                PlayMode::ListLoop
-            )
-            .record,
-            FailureRecord::Consecutive
-        );
     }
 
     #[test]
