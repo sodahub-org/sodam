@@ -691,6 +691,7 @@ mod tests {
 
         let start = Arc::new(Barrier::new(3));
         let first_done = Arc::new(Barrier::new(3));
+        let observer_ready = Arc::new(Barrier::new(3));
         let done = Arc::new(AtomicBool::new(false));
         let observed = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
@@ -701,6 +702,7 @@ mod tests {
                     detail: "并发写入".into(),
                 });
                 first_done.wait();
+                observer_ready.wait();
                 for _ in 1..10_000 {
                     slot.set(WriteFailure {
                         kind: FailureKind::Startup,
@@ -712,12 +714,14 @@ mod tests {
                 start.wait();
                 let _ = slot.take();
                 first_done.wait();
+                observer_ready.wait();
                 for _ in 1..10_000 {
                     let _ = slot.take();
                 }
             });
             let observer = scope.spawn(|| {
                 first_done.wait();
+                let mut first = true;
                 loop {
                     let guard = slot.failure.lock().unwrap();
                     assert_eq!(
@@ -727,6 +731,10 @@ mod tests {
                     );
                     observed.store(true, Ordering::Release);
                     drop(guard);
+                    if first {
+                        observer_ready.wait();
+                        first = false;
+                    }
                     if done.load(Ordering::Acquire) {
                         break;
                     }

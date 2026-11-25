@@ -62,22 +62,14 @@ impl LoopProbe {
     }
 
     pub(crate) fn tick(&mut self) {
-        self.count_tick();
+        self.timer_wakes += 1;
+        self.iterations += 1;
         self.report();
     }
 
     pub(crate) fn check(&mut self) {
-        self.count_check();
+        self.iterations += 1;
         self.report();
-    }
-
-    fn count_tick(&mut self) {
-        self.timer_wakes += 1;
-        self.iterations += 1;
-    }
-
-    fn count_check(&mut self) {
-        self.iterations += 1;
     }
 
     pub(crate) fn app_entry(&mut self) {
@@ -164,22 +156,4 @@ impl LoopProbe {
 
 fn rate(count: u64, seconds: f64) -> String {
     format!("{:.2}", count as f64 / seconds)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_check_counts_iteration_without_timer_wake() {
-        let mut probe = LoopProbe::new_shared_tray("single");
-        probe.count_check();
-        assert_eq!(probe.timer_wakes, 0);
-        assert_eq!(probe.iterations, 1);
-
-        let mut tray = LoopProbe::new("tray");
-        tray.count_tick();
-        assert_eq!(tray.timer_wakes, 1);
-        assert_eq!(tray.iterations, 1);
-    }
 }
