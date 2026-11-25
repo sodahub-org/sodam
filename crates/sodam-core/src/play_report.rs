@@ -17,7 +17,8 @@ use crate::log_outlet::{log_event, LogLevel, LogTopic};
 use crate::session::Session;
 
 /// 单次观察的最大计时间隔（毫秒）。系统睡眠 / 卡顿后的巨大会话被截断，
-/// 避免把「实际没播」的时间算进时长。
+/// 避免把「实际没播」的时间算进时长。心跳空闲档正好 1s，档位不能再拉长，
+/// 否则多出的收听时长会被静默截掉。
 const MAX_TICK_MS: i64 = 1_000;
 
 /// 首次进度上报阈值（秒）：进度越过它才认为「真的开始放了」。
@@ -102,7 +103,7 @@ impl PlayReporter {
         self.settings = settings;
     }
 
-    /// 喂一拍播放快照（UI 心跳每 ~200ms 调一次）。
+    /// 喂一拍播放快照（UI 心跳热档 200ms、空闲档 1s）。
     pub fn observe(&mut self, snapshot: &PlaybackSnapshot) {
         self.observe_at(snapshot, Instant::now());
     }

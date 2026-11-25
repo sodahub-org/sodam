@@ -564,6 +564,8 @@ pub struct Root {
     /// 渲染期收集到的封面需求（虚拟列表只渲染可见行，所以这里排的就是
     /// 「当前真正看得见」的那些封面）。由后台循环消费，新需求会立刻叫醒它。
     pub(crate) cover_mailbox: Arc<CoverMailbox>,
+    /// 心跳空闲时的唤醒口；播放或装载状态变化时缩短下一次等待。
+    pub(crate) heartbeat_wake_tx: futures_channel::mpsc::Sender<()>,
     /// 真实播放过的曲目 id（最近在后）。用于队列抽屉的「已播放」分区；
     /// 不能用「当前下标之前」来推 —— 那会把跳过的歌也算进去（实测踩过）。
     pub played_history: Vec<String>,
@@ -615,8 +617,10 @@ pub struct Root {
     /// 60 秒内不再为同一首重排，到期自然过期。按曲目结论进不可播集合（永久拦截），
     /// 全局故障挂 `prefetch_gate`——这张表不承担这两种职责，也不会产生永不过期的条目。
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
-    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）在**未落闸**时补一次预取。
-    pub(crate) prefetch_patrol: u32,
+    /// 上次预取巡检时刻；未落闸时每 5s 补一次预取。
+    pub(crate) last_prefetch_patrol: std::time::Instant,
+    /// 上次检查缓存维护的时刻；每 60s 检查一次，被升级或清理挡住时本轮跳过。
+    pub(crate) last_cache_maintenance: std::time::Instant,
     /// 登录凭据代数：重新登录成功、退出登录、账号信息刷新（换号或会员状态变化）时 +1。
     ///
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
@@ -660,6 +664,8 @@ pub struct Root {
     /// 已处理过的完成事件（曲目结束序号 + 跳转序号）。
     pub(crate) last_finished_seq: u64,
     pub(crate) last_seek_seq: u64,
+    /// 已处理过的引擎错误序号；暂停时出现新错误也要把心跳叫到热档。
+    pub(crate) last_error_seq: u64,
     /// 拖动进度条时的预览位置（0.0~1.0）：拖动中只改它，松手才真跳。
     pub progress_preview: Option<f32>,
     /// 歌词页大封面：切曲后的 `(track_id, 开始时刻)`；管「至少 200ms 加载态」的门。
@@ -819,6 +825,7 @@ impl Root {
         };
         let (cover_wake, mut cover_wake_rx) = futures_channel::mpsc::channel::<()>(1);
         let cover_mailbox = Arc::new(CoverMailbox::new(cover_wake));
+        let (heartbeat_wake_tx, heartbeat_wake_rx) = futures_channel::mpsc::channel(1);
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -965,7 +972,8 @@ impl Root {
             volume_track_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
             prefetch_cooldown_since: HashMap::new(),
-            prefetch_patrol: 0,
+            last_prefetch_patrol: std::time::Instant::now(),
+            last_cache_maintenance: std::time::Instant::now(),
             auth_epoch: 0,
             logout_in_flight: false,
             prefetch_gate: PrefetchGate::default(),
@@ -986,12 +994,14 @@ impl Root {
             pending_track: None,
             last_finished_seq: engine_progress.finished_seq,
             last_seek_seq: engine_progress.seek_seq,
+            last_error_seq: engine_progress.error_seq,
             progress_preview: None,
             lyrics_cover_gate: None,
             theme_snapshot_key: None,
             queue_cache: (0, Arc::new(Vec::new())),
             cover_store: CoverStore::default(),
             cover_mailbox,
+            heartbeat_wake_tx,
             contributors_image: None,
             contributors_fetching: false,
             contributors_failed: false,
@@ -1215,7 +1225,7 @@ impl Root {
             })
             .detach();
         }
-        Self::start_heartbeat(cx);
+        Self::start_heartbeat(cx, heartbeat_wake_rx);
         // 歌词逐字高亮需要比主心跳更高的刷新率（#80）。
         Self::start_lyrics_ticker(cx);
 
@@ -2059,7 +2069,7 @@ impl Render for Root {
                     //
                     // 上面那段 `if self.lyrics_scroll_animating()` 在本函数**更早**的位置，
                     // 那时补间还不存在；而 ticker 又因"动画进行中"退回空闲档不 notify，
-                    // 所以下一次渲染要等 200ms 主心跳 —— 单行滚动只有 180ms，
+                    // 所以下一次渲染最多要等一个主心跳周期 —— 单行滚动只有 180ms，
                     // 第一次推进就直接到 1.0，自动换句的"滑上去"会变成瞬移。
                     if self.lyrics_scroll_animating() {
                         window.request_animation_frame();

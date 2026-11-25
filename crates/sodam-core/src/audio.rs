@@ -47,6 +47,9 @@ pub struct PlaybackSnapshot {
     pub preview: bool,
     /// 最近一次错误（设备不可用、解码失败…），UI 直接展示
     pub error: String,
+    /// 错误序号：每次写入错误 +1，暂停时也能让心跳发现新错误。
+    /// 只给心跳比新旧；别拿整份快照做相等判断。
+    pub error_seq: u64,
     /// 当前曲目是否已播完（UI 据此自动切下一首）
     pub finished: bool,
     /// 播完序号：每播完一次 +1。UI 用它做「处理过了吗」的判断 ——
@@ -163,7 +166,7 @@ impl PlaybackEngine {
                 &[("detail", detail.as_str())],
             );
             if let Ok(mut snap) = snapshot.lock() {
-                snap.error = "音频播放没能启动，请重启应用。".to_string();
+                record_error(&mut snap, "音频播放没能启动，请重启应用。".to_string());
             }
         }
         Self {
@@ -267,11 +270,20 @@ impl PlaybackEngine {
     }
 }
 
+fn record_error(snap: &mut PlaybackSnapshot, message: String) {
+    snap.error = message;
+    snap.error_seq = snap.error_seq.wrapping_add(1);
+    snap.playing = false;
+    snap.finished = false;
+}
+
+fn clear_error(snap: &mut PlaybackSnapshot) {
+    snap.error.clear();
+}
+
 fn set_error(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
-        snap.error = message;
-        snap.playing = false;
-        snap.finished = false;
+        record_error(&mut snap, message);
     }
 }
 
@@ -310,9 +322,7 @@ fn load_failed(
         snap.quality.clear();
         snap.quality_rank = None;
         snap.preview = false;
-        snap.error = message;
-        snap.playing = false;
-        snap.finished = false;
+        record_error(&mut snap, message);
     }
 }
 
@@ -334,7 +344,7 @@ fn mark_seek_succeeded(state: &Arc<Mutex<PlaybackSnapshot>>, seconds: f64, playi
     if let Ok(mut snap) = state.lock() {
         snap.seek_pending = false;
         snap.finished = false;
-        snap.error.clear();
+        clear_error(&mut snap);
         snap.position_seconds = seconds;
         snap.playing = playing;
     }
@@ -343,9 +353,7 @@ fn mark_seek_succeeded(state: &Arc<Mutex<PlaybackSnapshot>>, seconds: f64, playi
 fn mark_seek_failed(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
         snap.seek_pending = false;
-        snap.finished = false;
-        snap.error = message;
-        snap.playing = false;
+        record_error(&mut snap, message);
     }
 }
 
@@ -655,7 +663,7 @@ fn audio_thread(
                     snap.quality = quality.clone();
                     snap.quality_rank = quality_rank;
                     snap.preview = preview;
-                    snap.error.clear();
+                    clear_error(&mut snap);
                     snap.finished = false;
                     snap.seek_pending = false;
                     finished_reported = false;
@@ -835,7 +843,7 @@ fn follow_default_output(
     if let Ok(mut snap) = state.lock() {
         snap.position_seconds = position.as_secs_f64();
         snap.playing = !paused;
-        snap.error.clear();
+        clear_error(&mut snap);
     }
 }
 
@@ -987,6 +995,7 @@ mod tests {
         assert!(!snap.finished);
         assert!(!snap.playing);
         assert_eq!(snap.error, "cannot rebuild");
+        assert_eq!(snap.error_seq, 1);
     }
 
     #[test]
@@ -1168,6 +1177,7 @@ mod tests {
         assert_eq!(snap.track_id, track.id);
         assert!(!snap.playing && !snap.finished);
         assert!(!snap.error.is_empty());
+        assert_eq!(snap.error_seq, 1);
     }
 
     #[test]
