@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn startup_failure_signal_matches_unlocked_tray_checks() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::AtomicBool;
         use std::sync::Barrier;
 
         let slot = Arc::new(StartupFailureSlot::default());
@@ -670,6 +670,10 @@ mod tests {
             assert!(!slot.is_pending(), "take 后托盘不加锁也要看到空槽");
         }
 
+        slot.set(WriteFailure {
+            kind: FailureKind::Startup,
+            detail: "持锁读取".into(),
+        });
         let (tx, rx) = mpsc::channel();
         let guard = slot.failure.lock().unwrap();
         let probe = slot.clone();
@@ -679,45 +683,52 @@ mod tests {
         let result = rx.recv_timeout(Duration::from_secs(1));
         drop(guard);
         handle.join().unwrap();
-        assert!(result.is_ok(), "持锁时托盘也必须能立即读到原子门");
+        assert!(
+            result.expect("持锁读取超时"),
+            "持锁时托盘也必须立即读到待报项"
+        );
+        assert!(slot.take().is_some());
 
-        let sets = Arc::new(AtomicUsize::new(0));
-        let takes = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let done = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
-            let barrier = Arc::new(Barrier::new(3));
-            let setter_barrier = barrier.clone();
-            let setter_slot = slot.clone();
-            let setter_sets = sets.clone();
-            let setter = scope.spawn(move || {
-                setter_barrier.wait();
+            let setter = scope.spawn(|| {
+                barrier.wait();
                 for _ in 0..10_000 {
-                    setter_slot.set(WriteFailure {
+                    slot.set(WriteFailure {
                         kind: FailureKind::Startup,
                         detail: "并发写入".into(),
                     });
-                    setter_sets.fetch_add(1, Ordering::Relaxed);
                 }
             });
-            let taker_barrier = barrier.clone();
-            let taker_slot = slot.clone();
-            let taker_takes = takes.clone();
-            let taker = scope.spawn(move || {
-                taker_barrier.wait();
+            let taker = scope.spawn(|| {
+                barrier.wait();
                 for _ in 0..10_000 {
-                    if taker_slot.take().is_some() {
-                        taker_takes.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = slot.take();
+                }
+            });
+            let observer = scope.spawn(|| loop {
+                let guard = slot.failure.lock().unwrap();
+                assert_eq!(
+                    slot.is_pending(),
+                    guard.is_some(),
+                    "并发期间原子门和失败槽必须一致"
+                );
+                observed.store(true, Ordering::Release);
+                drop(guard);
+                if done.load(Ordering::Acquire) {
+                    break;
                 }
             });
             barrier.wait();
             setter.join().unwrap();
             taker.join().unwrap();
+            done.store(true, Ordering::Release);
+            observer.join().unwrap();
         });
 
-        assert!(
-            takes.load(Ordering::Relaxed) <= sets.load(Ordering::Relaxed),
-            "非空 take 次数不能超过 set 次数"
-        );
+        assert!(observed.load(Ordering::Acquire));
         let signal = slot.is_pending();
         let payload = slot.failure.lock().unwrap().is_some();
         assert_eq!(signal, payload, "并发结束后原子门和失败槽必须一致");
