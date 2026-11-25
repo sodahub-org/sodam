@@ -51,7 +51,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # C 侧基线按 arch 传：x86_64 钉死，aarch64 传空串（cc 按 target 取名，本来也读不到）。
+      # C 侧基线只给 x86_64 传；aarch64 没有这个键，取到空串（cc 按 target 取名，本来也读不到）。
       - name: Build release binary
         env:
           CFLAGS_x86_64_unknown_linux_gnu: ${{ matrix.cflags_x86_64 }}
