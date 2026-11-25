@@ -396,7 +396,7 @@ impl Root {
         cx.notify();
     }
 
-    fn wake_heartbeat(&self) {
+    fn wake_heartbeat(&mut self) {
         let _ = self.heartbeat_wake_tx.try_send(());
     }
 
@@ -4158,6 +4158,10 @@ impl Root {
             return;
         }
         self.release_playback_halt();
+        // 恢复前先把暂停区间记到观察边界，避免播放上报把暂停时长算进收听。
+        if !snapshot.playing {
+            self.play_reporter.observe(&snapshot);
+        }
         self.engine.toggle();
         self.playing = !snapshot.playing;
         self.wake_heartbeat();
