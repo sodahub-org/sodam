@@ -48,7 +48,7 @@ pub struct PlaybackSnapshot {
     /// 最近一次错误（设备不可用、解码失败…），UI 直接展示
     pub error: String,
     /// 错误序号：每次写入错误 +1，暂停时也能让心跳发现新错误。
-    /// 只给心跳判新旧，不参与「快照相等即状态未变」的判断。
+    /// 只给心跳比新旧；别拿整份快照做相等判断。
     pub error_seq: u64,
     /// 当前曲目是否已播完（UI 据此自动切下一首）
     pub finished: bool,

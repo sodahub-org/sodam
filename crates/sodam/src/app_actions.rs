@@ -513,7 +513,8 @@ impl Root {
                         }
                     }
                     root.settle_volume_scrub();
-                    // 按墙钟覆盖队列变更；落闸时不跑，恢复后下一拍补。
+                    // 预取巡检按真实时间算间隔，不数心跳拍子，队列增删不会把巡检往后拖；
+                    // 落闸期间跳过，撤闸后第一拍立刻补跑。
                     let now = std::time::Instant::now();
                     if now.saturating_duration_since(root.last_prefetch_patrol) >= PREFETCH_PATROL
                         && !root.playback_halted
