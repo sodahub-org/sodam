@@ -56,10 +56,31 @@ while IFS= read -r symbol; do
         echo "反汇编失败：$symbol" >&2
         exit 1
     fi
-    # 覆盖 v3 的三种形态：向量（ymm/zmm）、BMI1/BMI2 标量、AVX-512 掩码寄存器；
-    # 再加一条 128 位 VEX（AVX1），baseline 构建不该出现。
-    hits=$(printf '%s\n' "$disassembly" |
-        grep -E '\b(mulx|adcx|adox|rorx|pdep|pext|shlx|shrx|sarx|andn|blsr|blsmsk|blsi|bzhi|bextr|lzcnt|tzcnt)\b|%ymm|%zmm|%k[0-7]|\bv[a-z0-9]+[[:space:]]+%x' || true)
+    # 认助记符那一列，不去猜操作数长什么样：
+    #   * baseline 的 x86-64 助记符没有 v 开头，v 前缀一律算 VEX/EVEX（含无操作数的 vzeroupper）；
+    #   * BMI1/BMI2 按助记符点名，带 b/w/l/q 后缀也算；
+    #   * 操作数里出现 %ymm / %zmm / %k 掩码寄存器同样算越界。
+    hits=$(printf '%s\n' "$disassembly" | awk -F'\t' '
+        BEGIN {
+            n = split("mulx adcx adox rorx pdep pext shlx shrx sarx andn blsr blsmsk blsi bzhi bextr lzcnt tzcnt", a, " ")
+            for (i = 1; i <= n; i++) banned[a[i]] = 1
+        }
+        NF >= 3 {
+            mnemonic = $3
+            sub(/[ \t].*/, "", mnemonic)
+            base = mnemonic
+            if (base ~ /^[a-z]+[bwlq]$/) base = substr(base, 1, length(base) - 1)
+            if (mnemonic ~ /^v/) {
+                print
+                next
+            }
+            if (base in banned) {
+                print
+                next
+            }
+            if ($0 ~ /%ymm|%zmm|%k[0-7]/) print
+        }
+    ')
     if [[ -n "$hits" ]]; then
         echo "越界：$symbol 里有高于 x86-64 baseline 的指令（#306）" >&2
         echo "$hits" | head -n 5 >&2
