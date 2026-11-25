@@ -309,6 +309,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             .text_color(theme::text_muted())
                             .child(if loading_cards {
                                 language.text("正在加载…").to_string()
+                            } else if cards_failed && cards.is_empty() {
+                                // 一张都没读到：这颗按钮就是卡的恢复入口，直说重试。
+                                language.text("重试加载").to_string()
                             } else {
                                 language.textf(
                                     "加载更多探索歌单（当前 {} 张）",

@@ -1669,8 +1669,8 @@ impl Root {
     }
 
     pub fn load_scenes(&mut self, cx: &mut Context<Self>) {
-        if self.scene_request_in_flight() {
-            // 已经有请求在飞：给一句反馈，「加载更多」点下去别像没接上。
+        // 只拦自己那条探索卡请求：模式在重试时点「加载更多」，照常补卡。
+        if self.loading_scene_cards {
             self.set_status_text(self.tr("正在加载…"));
             cx.notify();
             return;
@@ -1778,8 +1778,8 @@ impl Root {
                 log_event(
                     LogLevel::Warn,
                     LogTopic::App,
-                    "scenes_load_partial",
-                    &[("mode_error", error.as_str()), ("card_error", "")],
+                    "scenes_modes_failed",
+                    &[("error", error.as_str())],
                 );
                 let message = self.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
                 self.notify_warning_once("scenes-load-failed", message);
@@ -1859,10 +1859,10 @@ impl Root {
                         log_event(
                             LogLevel::Warn,
                             LogTopic::App,
-                            "scenes_load_partial",
-                            &[("mode_error", ""), ("card_error", error.as_str())],
+                            "scenes_cards_failed",
+                            &[("error", error.as_str())],
                         );
-                        let message = root.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
+                        let message = root.failure_text("读取探索歌单失败", &err, REMOTE_TEXT);
                         root.notify_warning_once("scenes-load-failed", message);
                     }
                 }
