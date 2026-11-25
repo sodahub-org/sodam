@@ -29,8 +29,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 钉在 24.04，别换回 ubuntu-latest：26.04 的镜像默认装 amd64v3 变体的 GCC
+          # （--with-arch-64=x86-64-v3），C 依赖会被编成 AVX2/BMI2，没有这些指令的老 CPU
+          # 一发起 HTTPS 就 SIGILL（#306）。换 runner 前先看下一步的护栏会不会红。
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
@@ -49,6 +52,11 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked --workspace
+
+      # 产物护栏（#306）：C 侧一旦带上 AVX2/BMI2，老 CPU 会在 TLS 握手时直接 SIGILL。
+      - name: Check x86_64 ISA baseline
+        if: matrix.arch == 'x86_64'
+        run: scripts/check-isa.sh target/release/sodam
 
       - name: Create pacman package
         run: |
