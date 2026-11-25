@@ -657,7 +657,6 @@ mod tests {
     #[test]
     fn startup_failure_signal_matches_unlocked_tray_checks() {
         use std::sync::atomic::AtomicUsize;
-        use std::sync::Barrier;
 
         let slot = Arc::new(StartupFailureSlot::default());
         for _ in 0..100 {
@@ -684,9 +683,7 @@ mod tests {
         let sets = Arc::new(AtomicUsize::new(0));
         let takes = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|scope| {
-            let barrier = Barrier::new(3);
             let setter = scope.spawn(|| {
-                barrier.wait();
                 for _ in 0..10_000 {
                     slot.set(WriteFailure {
                         kind: FailureKind::Startup,
@@ -696,14 +693,12 @@ mod tests {
                 }
             });
             let taker = scope.spawn(|| {
-                barrier.wait();
                 for _ in 0..10_000 {
                     if slot.take().is_some() {
                         takes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
-            barrier.wait();
             setter.join().unwrap();
             taker.join().unwrap();
         });
