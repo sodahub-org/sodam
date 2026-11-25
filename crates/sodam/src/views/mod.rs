@@ -291,12 +291,12 @@ fn track_row(
         .child({
             // 封面：只在「这一行真的被渲染出来」时才把 URL 丢进请求队列，
             // 没滚到的行不会发任何请求（虚拟列表天然只渲染可见行）。
-            let url = track.cover.clone();
-            let cached = covers.get(&url);
-            if cached.is_none() && !url.is_empty() {
-                cover_mailbox.request(url.clone());
+            let url = &track.cover;
+            let lookup = covers.lookup(url);
+            if lookup.should_request {
+                cover_mailbox.request(url);
             }
-            cover(cached, theme::size::ROW_ART, theme::radius::ART)
+            cover(lookup.path, theme::size::ROW_ART, theme::radius::ART)
         })
         .child({
             // 标题列宽度由 columns_for 显式算出（与表头同宽）；
@@ -693,9 +693,9 @@ pub(crate) fn scrolling_detail_page(
             return div().into_any_element();
         };
         let item = album.clone();
-        let cover_path = covers.get(&album.cover);
-        if cover_path.is_none() && !album.cover.trim().is_empty() {
-            cover_mailbox.request(album.cover.clone());
+        let lookup = covers.lookup(&album.cover);
+        if lookup.should_request {
+            cover_mailbox.request(&album.cover);
         }
         div()
             .id(gpui::ElementId::Name(
@@ -720,7 +720,7 @@ pub(crate) fn scrolling_detail_page(
                     });
                 }
             })
-            .child(cover(cover_path, 52.0, theme::radius::ART))
+            .child(cover(lookup.path, 52.0, theme::radius::ART))
             .child(
                 div()
                     .flex_1()

@@ -973,11 +973,11 @@ fn queue_drawer_inner(
                         let Some(track) = tracks.get(index) else {
                             return div().h(px(QUEUE_ROW_H)).into_any_element();
                         };
-                        let url = track.cover.clone();
-                        let cached = covers.get(&url);
+                        let url = &track.cover;
+                        let lookup = covers.lookup(url);
                         // 只有渲染出来的行才排队取封面（虚拟列表只渲染可见行）
-                        if cached.is_none() && !url.is_empty() {
-                            cover_mailbox.request(url.clone());
+                        if lookup.should_request {
+                            cover_mailbox.request(url);
                         }
                         let title = track.title.clone();
                         let artist = track.artist.clone();
@@ -1027,7 +1027,7 @@ fn queue_drawer_inner(
                                     });
                                 }
                             })
-                            .child(cover(cached, theme::size::ROW_ART, theme::radius::ART))
+                            .child(cover(lookup.path, theme::size::ROW_ART, theme::radius::ART))
                             .child(
                                 div()
                                     .flex()

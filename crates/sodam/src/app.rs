@@ -13,7 +13,7 @@ use gpui::{
 };
 use sodam_core::{
     config::EnvCookieFill,
-    cover::{CoverStore, CoverWant},
+    cover::{CoverStore, CoverWant, MAX_QUEUE},
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
     log_outlet::{self, log_event, LogLevel, LogTopic},
@@ -27,7 +27,7 @@ use sodam_core::{
     session::{AccountInfo, Session},
     PlayReporter, PlaybackEngine, Settings,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -43,13 +43,17 @@ pub(crate) const QUEUE_STOPPED_TEXT: &str = "设置没法保存了，重启应�
 /// 既不是网络也不是写入的失败（例如本地编码出错）：不指责任何一方，只说重试。
 pub(crate) const RETRY_TEXT: &str = "出现了一点问题，请重试。";
 
+const COVER_MAILBOX_CAPACITY: usize = MAX_QUEUE;
+
 /// 渲染闭包够不到 `Root`，把封面需求丢进这个邮箱；`request` 顺带叫醒消费循环。
 pub(crate) struct CoverMailbox {
     inner: Mutex<CoverMailboxInner>,
 }
 
 struct CoverMailboxInner {
-    queue: Vec<String>,
+    queue: VecDeque<String>,
+    pending: HashSet<String>,
+    dropped: usize,
     wake: futures_channel::mpsc::Sender<()>,
     /// 消费循环已退出只记一次，别让每次推需求都刷一条日志。
     wake_closed_logged: bool,
@@ -59,20 +63,37 @@ impl CoverMailbox {
     fn new(wake: futures_channel::mpsc::Sender<()>) -> Self {
         Self {
             inner: Mutex::new(CoverMailboxInner {
-                queue: Vec::new(),
+                queue: VecDeque::new(),
+                pending: HashSet::new(),
+                dropped: 0,
                 wake,
                 wake_closed_logged: false,
             }),
         }
     }
 
-    /// 渲染路径只做一次 push；去重交给 `CoverStore::want`，不在这里扫队列。
-    pub(crate) fn request(&self, url: String) {
+    /// 只合并尚未处理的 URL；满时丢最旧，最终下载状态仍由 `CoverStore::want` 定。
+    pub(crate) fn request(&self, url: &str) {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.queue.push(url);
+        if inner.pending.contains(url) {
+            return;
+        }
+        if inner.queue.len() >= COVER_MAILBOX_CAPACITY {
+            if let Some(evicted) = inner.queue.pop_front() {
+                inner.pending.remove(&evicted);
+                inner.dropped += 1;
+            }
+        }
+        let url = url.to_string();
+        inner.pending.insert(url.clone());
+        inner.queue.push_back(url);
         if let Err(error) = inner.wake.try_send(()) {
             // 通道满说明已经有一个叫醒信号在路上，不用管；接收端没了说明消费循环
             // 已经退出，需求只会堆在邮箱里，留一条日志让人能查。
@@ -88,7 +109,16 @@ impl CoverMailbox {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut inner.queue)
+        inner.pending.clear();
+        inner.queue.drain(..).collect()
+    }
+
+    fn take_dropped(&self) -> usize {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut inner.dropped)
     }
 }
 
@@ -1077,19 +1107,20 @@ impl Root {
             root.nav = Nav::Lyrics;
             cx.notify();
         }
-        // 封面需求消费循环：渲染只往邮箱里塞 URL，去重交给 CoverStore::want。
+        // 封面需求消费循环：邮箱先合并待处理批次，最终去重交给 CoverStore::want。
         // 有活时 60ms 一拍；空下来后睡 500ms，但新需求会立刻把循环叫醒。
         {
             let mailbox = root.cover_mailbox.clone();
             cx.spawn(async move |this, cx| loop {
                 let pending = mailbox.take();
+                let mailbox_dropped = mailbox.take_dropped();
                 let had_demand = !pending.is_empty();
                 let stats = if had_demand {
                     match this.update(cx, |root, cx| {
                         let queued = root.ensure_covers(&pending, cx);
                         CoverWant {
                             queued,
-                            dropped: root.cover_store.take_dropped(),
+                            dropped: root.cover_store.take_dropped() + mailbox_dropped,
                         }
                     }) {
                         Ok(stats) => stats,
@@ -2153,7 +2184,7 @@ impl Render for Root {
 mod tests {
     use super::{
         apply_verify_window_result, verify_window_step, CoverMailbox, VerifyWindowState,
-        VerifyWindowStep,
+        VerifyWindowStep, COVER_MAILBOX_CAPACITY,
     };
 
     /// 渲染推一条需求，消费循环要被叫醒，`take` 一次拿干净。
@@ -2162,10 +2193,49 @@ mod tests {
         let (wake, mut rx) = futures_channel::mpsc::channel::<()>(1);
         let mailbox = CoverMailbox::new(wake);
 
-        mailbox.request("cover-a".to_string());
+        mailbox.request("cover-a");
         assert!(rx.try_recv().is_ok(), "有需求要叫醒消费循环");
         assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
         assert!(mailbox.take().is_empty());
+    }
+
+    #[test]
+    fn cover_mailbox_coalesces_duplicates_and_resets_after_take() {
+        let (wake, _rx) = futures_channel::mpsc::channel::<()>(1);
+        let mailbox = CoverMailbox::new(wake);
+
+        mailbox.request(" cover-a ");
+        mailbox.request("cover-a");
+        mailbox.request("   ");
+        assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
+
+        mailbox.request("cover-a");
+        assert_eq!(mailbox.take(), vec!["cover-a".to_string()]);
+    }
+
+    #[test]
+    fn cover_mailbox_cap_evicts_oldest_and_keeps_newest() {
+        let (wake, mut rx) = futures_channel::mpsc::channel::<()>(0);
+        let mailbox = CoverMailbox::new(wake);
+
+        for index in 0..COVER_MAILBOX_CAPACITY {
+            mailbox.request(&format!("cover-{index}"));
+        }
+        mailbox.request("cover-0");
+        mailbox.request("cover-extra");
+
+        let pending = mailbox.take();
+        assert_eq!(pending.len(), COVER_MAILBOX_CAPACITY);
+        assert_eq!(pending.first(), Some(&"cover-1".to_string()));
+        assert_eq!(pending.last(), Some(&"cover-extra".to_string()));
+        assert!(!pending.iter().any(|url| url == "cover-0"));
+        assert!(rx.try_recv().is_ok(), "有新需求要叫醒消费循环");
+        assert!(rx.try_recv().is_err(), "唤醒信号只保留一个");
+        assert_eq!(mailbox.take_dropped(), 1, "邮箱挤掉也要记账");
+        assert_eq!(mailbox.take_dropped(), 0, "日志计数取走一次就清零");
+
+        mailbox.request("cover-0");
+        assert_eq!(mailbox.take(), vec!["cover-0".to_string()]);
     }
 
     const FAILED_TEXT: &str = "打开验证窗口失败，请改用官方客户端导出 Cookie。";

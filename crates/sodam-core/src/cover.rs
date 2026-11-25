@@ -1,7 +1,7 @@
 //! 封面状态：一条 URL 一条记录，缩略图和原图各占一格。
 //!
 //! 取图本身不在这里：这里只回答「这张问过没有 / 排到哪一步了 / 结果是什么」。
-//! 读口子（`path` / `color` / `original_path` / `paths_handle` / `originals_handle`）
+//! 读口子（`path` / `color` / `original_path` / `paths_handle` / `originals_handle` / `lookup`）
 //! 是纯内存查询，不碰磁盘也不发请求；下载由调用方泵出去，结果再用
 //! [`CoverStore::complete`] / [`CoverStore::complete_original`] 交回来。
 
@@ -46,10 +46,23 @@ pub enum CoverOutcome {
     Failed,
 }
 
-/// 已完成路径的只读句柄：渲染闭包克隆它查图，不用整表复制。
+/// 已完成路径和失败终态的只读句柄：渲染闭包克隆它查图，不用整表复制。
 #[derive(Debug, Clone, Default)]
 pub struct CoverPaths {
-    inner: Arc<RwLock<HashMap<String, PathBuf>>>,
+    inner: Arc<RwLock<CoverPathsInner>>,
+}
+
+#[derive(Debug, Default)]
+struct CoverPathsInner {
+    paths: HashMap<String, PathBuf>,
+    failed: HashSet<String>,
+}
+
+/// 一次读取的结果：已有路径，还是需要渲染方继续请求。
+#[derive(Debug)]
+pub struct CoverLookup {
+    pub path: Option<PathBuf>,
+    pub should_request: bool,
 }
 
 impl CoverPaths {
@@ -58,39 +71,77 @@ impl CoverPaths {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .paths
             .contains_key(url.trim())
     }
 
     /// 查一张图的本地路径（只查内存）。
     pub fn get(&self, url: &str) -> Option<PathBuf> {
-        let paths = self
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .paths
+            .get(url.trim())
+            .cloned()
+    }
+
+    /// 一次读锁同时拿到路径和要不要请求，渲染只读一遍。
+    pub fn lookup(&self, url: &str) -> CoverLookup {
+        let url = url.trim();
+        let inner = self
             .inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.get(url.trim()).cloned()
+        if let Some(path) = inner.paths.get(url) {
+            return CoverLookup {
+                path: Some(path.clone()),
+                should_request: false,
+            };
+        }
+        CoverLookup {
+            path: None,
+            should_request: !url.is_empty() && !inner.failed.contains(url),
+        }
     }
 
     fn insert(&self, url: &str, path: PathBuf) {
-        let mut paths = self
+        let url = url.trim();
+        let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.insert(url.trim().to_string(), path);
+        inner.paths.insert(url.to_string(), path);
+        inner.failed.remove(url);
     }
 
     fn remove(&self, url: &str) {
-        let mut paths = self
+        let url = url.trim();
+        let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        paths.remove(url.trim());
+        inner.paths.remove(url);
+        inner.failed.remove(url);
+    }
+
+    fn mark_failed(&self, url: &str) {
+        let url = url.trim();
+        if !url.is_empty() {
+            self.inner
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .failed
+                .insert(url.to_string());
+        }
     }
 
     fn clear(&self) {
-        self.inner
+        let mut inner = self
+            .inner
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.paths.clear();
+        inner.failed.clear();
     }
 
     /// 按被删的文件路径反查 URL；只对命中删除列表的条目做磁盘检查。
@@ -106,11 +157,12 @@ impl CoverPaths {
     {
         let removed: HashSet<&Path> = removed.iter().map(PathBuf::as_path).collect();
         let candidates: Vec<(String, PathBuf)> = {
-            let paths = self
+            let inner = self
                 .inner
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            paths
+            inner
+                .paths
                 .iter()
                 .filter(|(_, path)| removed.contains(path.as_path()))
                 .map(|(url, path)| (url.clone(), path.clone()))
@@ -150,6 +202,15 @@ struct Record {
     original: Slot,
 }
 
+impl Record {
+    fn is_empty(&self) -> bool {
+        self.thumbnail.state == State::Idle
+            && self.original.state == State::Idle
+            && self.thumbnail.failures == 0
+            && self.original.failures == 0
+    }
+}
+
 fn thumbnail_slot(record: &mut Record) -> &mut Slot {
     &mut record.thumbnail
 }
@@ -162,13 +223,7 @@ type SelectSlot = fn(&mut Record) -> &mut Slot;
 
 /// 两格都回到默认状态时把记录删掉，别让淘汰 / 切歌每轮留下空记录。
 fn discard_empty_record(records: &mut HashMap<String, Record>, url: &str) {
-    let empty = records.get(url).is_some_and(|record| {
-        record.thumbnail.state == State::Idle
-            && record.original.state == State::Idle
-            && record.thumbnail.failures == 0
-            && record.original.failures == 0
-    });
-    if empty {
+    if records.get(url).is_some_and(Record::is_empty) {
         records.remove(url);
     }
 }
@@ -486,6 +541,13 @@ impl CoverStore {
                 };
             }
         }
+        if self
+            .records
+            .get(url)
+            .is_some_and(|record| record.thumbnail.state == State::Failed)
+        {
+            self.thumbnail_paths.mark_failed(url);
+        }
     }
 
     /// 要一张原图；返回这次是否新排进队列。
@@ -644,6 +706,7 @@ impl CoverStore {
         self.thumbnail_paths.clear();
         self.original_paths.clear();
         self.colors.clear();
+        self.records.retain(|_, record| !record.is_empty());
     }
 
     /// 原图先下回来时给列表兜个底：只发布缩略图路径，不动在飞 / 排队记账。
@@ -755,18 +818,28 @@ mod tests {
     fn failed_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
 
         assert_eq!(store.want(&url), 1);
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
+        assert!(
+            paths.lookup("cover-a").should_request,
+            "失败一次还要继续请求"
+        );
         assert_eq!(store.want(&url), 1, "失败一次还能再试");
 
         assert_eq!(store.drain(), url);
         store.complete("cover-a", CoverOutcome::Failed);
+        assert!(
+            !paths.lookup("cover-a").should_request,
+            "失败两次后停止自动请求"
+        );
         assert_eq!(store.want(&url), 0, "失败两次后本会话不再自动重试");
         assert!(store.drain().is_empty());
 
         store.forget(url.iter().map(String::as_str));
+        assert!(paths.lookup("cover-a").should_request, "作废后恢复请求");
         assert_eq!(store.want(&url), 1, "清掉失败记录后能重新下");
     }
 
@@ -775,16 +848,96 @@ mod tests {
     fn clear_completed_revives_failed_url() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Failed);
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Failed);
+        assert!(!paths.lookup("cover-a").should_request);
         assert_eq!(store.want(&url), 0);
 
         store.clear_completed();
+        assert!(paths.lookup("cover-a").should_request, "清缓存后恢复请求");
         assert_eq!(store.want(&url), 1);
+    }
+
+    #[test]
+    fn clear_completed_revives_vanished_url() {
+        let mut store = CoverStore::default();
+        let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Vanished);
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(!paths.lookup("cover-a").should_request);
+
+        store.clear_completed();
+        assert!(paths.lookup("cover-a").should_request, "清缓存后恢复请求");
+        assert_eq!(store.want(&url), 1);
+    }
+
+    #[test]
+    fn clear_completed_reclaims_ready_and_failed_records() {
+        let mut store = CoverStore::default();
+        let url = urls(&["cover-a"]);
+
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", ready("/tmp/a.img"));
+        assert_eq!(store.records.len(), 1);
+        store.clear_completed();
+        assert!(store.records.is_empty(), "已完成的空记录要回收");
+
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Failed);
+        store.want(&url);
+        store.drain();
+        store.complete("cover-a", CoverOutcome::Failed);
+        assert_eq!(store.records.len(), 1);
+        store.clear_completed();
+        assert!(store.records.is_empty(), "失败终态清缓存后也回收");
+    }
+
+    #[test]
+    fn clear_completed_keeps_queued_and_inflight_records() {
+        let mut store = CoverStore::default();
+        let many: Vec<String> = (0..MAX_CONCURRENCY + 1)
+            .map(|index| format!("cover-{index}"))
+            .collect();
+        store.want(&many);
+        assert_eq!(store.drain().len(), MAX_CONCURRENCY);
+        assert_eq!(store.records.len(), many.len());
+
+        store.clear_completed();
+        assert_eq!(store.records.len(), many.len(), "排队和在飞记录要保留");
+        assert_eq!(store.want(std::slice::from_ref(&many[0])), 0);
+        assert_eq!(store.want(std::slice::from_ref(&many[MAX_CONCURRENCY])), 0);
+    }
+
+    #[test]
+    fn clear_completed_keeps_mixed_slots_until_both_are_empty() {
+        let mut store = CoverStore::default();
+        let url = "cover-a";
+        store.want(&urls(&[url]));
+        store.drain();
+        store.complete(url, ready("/tmp/thumb.img"));
+        assert!(store.want_original(url));
+        store.drain_original();
+
+        store.clear_completed();
+        assert_eq!(store.records.len(), 1, "原图还在飞，记录不能删");
+        assert!(!store.want_original(url), "在飞原图仍不能重复入队");
+
+        store.complete_original(url, CoverOutcome::Failed);
+        assert_eq!(store.records.len(), 1, "还有一次失败次数，记录不能删");
+        store.clear_completed();
+        assert!(store.records.is_empty(), "两格都空了才回收");
     }
 
     /// 队列满时先撤回最旧项的去重状态，否则被挤掉的图再也排不回来。
@@ -984,17 +1137,21 @@ mod tests {
     fn vanished_twice_gives_up_until_forgotten() {
         let mut store = CoverStore::default();
         let url = urls(&["cover-a"]);
+        let paths = store.paths_handle();
         store.want(&url);
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(paths.lookup("cover-a").should_request, "第一次还要继续请求");
         assert_eq!(store.want(&url), 1, "第一次还能重排");
 
         store.drain();
         store.complete("cover-a", CoverOutcome::Vanished);
+        assert!(!paths.lookup("cover-a").should_request, "两次后停止请求");
         assert_eq!(store.want(&url), 0, "两次后先放弃");
         assert!(store.drain().is_empty());
 
         store.forget(["cover-a"]);
+        assert!(paths.lookup("cover-a").should_request, "作废后恢复请求");
         assert_eq!(store.want(&url), 1, "作废之后能重新下");
     }
 
@@ -1023,6 +1180,30 @@ mod tests {
         assert_eq!(paths.get(url), None);
     }
 
+    #[test]
+    fn lookup_combines_path_and_request_state() {
+        let paths = CoverPaths::default();
+        let missing = paths.lookup(" cover-a ");
+        assert!(missing.path.is_none());
+        assert!(missing.should_request);
+        assert!(!paths.lookup("   ").should_request);
+
+        paths.insert("cover-a", PathBuf::from("/tmp/a.img"));
+        let ready = paths.lookup("cover-a");
+        assert_eq!(ready.path, Some(PathBuf::from("/tmp/a.img")));
+        assert!(!ready.should_request);
+
+        paths.mark_failed("cover-a");
+        let failed = paths.lookup("cover-a");
+        assert_eq!(failed.path, Some(PathBuf::from("/tmp/a.img")));
+        assert!(!failed.should_request);
+
+        paths.remove("cover-a");
+        let retry = paths.lookup("cover-a");
+        assert!(retry.path.is_none());
+        assert!(retry.should_request);
+    }
+
     /// 读口子不能偷偷改状态：否则一次渲染就能消费队列或放行重复下载。
     #[test]
     fn read_ports_are_side_effect_free() {
@@ -1034,6 +1215,7 @@ mod tests {
             assert!(store.path("cover-a").is_none());
             assert!(store.color("cover-a").is_none());
             assert!(store.paths_handle().get("cover-a").is_none());
+            assert!(store.paths_handle().lookup("cover-a").should_request);
         }
         assert_eq!(store.want(&all), 0, "读口子不能放行去重");
         assert_eq!(store.drain(), all, "读口子不能消费排队项");
@@ -1239,6 +1421,7 @@ mod tests {
         store.complete_original(url, CoverOutcome::Failed);
 
         store.clear_completed();
+        assert!(store.records.is_empty(), "清掉失败次数后不留空记录");
         assert!(store.want_original(url));
         assert_eq!(store.drain_original(), vec![url.to_string()]);
         store.complete_original(url, CoverOutcome::Failed);
