@@ -102,7 +102,7 @@ impl PlayReporter {
         self.settings = settings;
     }
 
-    /// 喂一拍播放快照（UI 心跳每 ~200ms 调一次）。
+    /// 喂一拍播放快照（UI 心跳热档 200ms、空闲档 1s）。
     pub fn observe(&mut self, snapshot: &PlaybackSnapshot) {
         self.observe_at(snapshot, Instant::now());
     }

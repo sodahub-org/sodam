@@ -47,6 +47,8 @@ pub struct PlaybackSnapshot {
     pub preview: bool,
     /// 最近一次错误（设备不可用、解码失败…），UI 直接展示
     pub error: String,
+    /// 错误序号：每次写入错误 +1，暂停时也能让心跳发现新错误。
+    pub error_seq: u64,
     /// 当前曲目是否已播完（UI 据此自动切下一首）
     pub finished: bool,
     /// 播完序号：每播完一次 +1。UI 用它做「处理过了吗」的判断 ——
@@ -164,6 +166,7 @@ impl PlaybackEngine {
             );
             if let Ok(mut snap) = snapshot.lock() {
                 snap.error = "音频播放没能启动，请重启应用。".to_string();
+                snap.error_seq = snap.error_seq.wrapping_add(1);
             }
         }
         Self {
@@ -270,6 +273,7 @@ impl PlaybackEngine {
 fn set_error(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
         snap.error = message;
+        snap.error_seq = snap.error_seq.wrapping_add(1);
         snap.playing = false;
         snap.finished = false;
     }
@@ -311,6 +315,7 @@ fn load_failed(
         snap.quality_rank = None;
         snap.preview = false;
         snap.error = message;
+        snap.error_seq = snap.error_seq.wrapping_add(1);
         snap.playing = false;
         snap.finished = false;
     }
@@ -345,6 +350,7 @@ fn mark_seek_failed(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
         snap.seek_pending = false;
         snap.finished = false;
         snap.error = message;
+        snap.error_seq = snap.error_seq.wrapping_add(1);
         snap.playing = false;
     }
 }
@@ -987,6 +993,7 @@ mod tests {
         assert!(!snap.finished);
         assert!(!snap.playing);
         assert_eq!(snap.error, "cannot rebuild");
+        assert_eq!(snap.error_seq, 1);
     }
 
     #[test]
@@ -1168,6 +1175,7 @@ mod tests {
         assert_eq!(snap.track_id, track.id);
         assert!(!snap.playing && !snap.finished);
         assert!(!snap.error.is_empty());
+        assert_eq!(snap.error_seq, 1);
     }
 
     #[test]

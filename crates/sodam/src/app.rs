@@ -586,8 +586,10 @@ pub struct Root {
     /// 60 秒内不再为同一首重排，到期自然过期。按曲目结论进不可播集合（永久拦截），
     /// 全局故障挂 `prefetch_gate`——这张表不承担这两种职责，也不会产生永不过期的条目。
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
-    /// 预取巡检节拍：心跳每 200ms 自增，每 25 拍（约 5s）在**未落闸**时补一次预取。
-    pub(crate) prefetch_patrol: u32,
+    /// 上次预取巡检时刻；未落闸时每 5s 补一次预取。
+    pub(crate) last_prefetch_patrol: std::time::Instant,
+    /// 上次缓存维护时刻；每 60s 维护一次。
+    pub(crate) last_cache_maintenance: std::time::Instant,
     /// 登录凭据代数：重新登录成功、退出登录、账号信息刷新（换号或会员状态变化）时 +1。
     ///
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
@@ -631,6 +633,8 @@ pub struct Root {
     /// 已处理过的完成事件（曲目结束序号 + 跳转序号）。
     pub(crate) last_finished_seq: u64,
     pub(crate) last_seek_seq: u64,
+    /// 已处理过的引擎错误序号；暂停时出现新错误也要把心跳叫到热档。
+    pub(crate) last_error_seq: u64,
     /// 拖动进度条时的预览位置（0.0~1.0）：拖动中只改它，松手才真跳。
     pub progress_preview: Option<f32>,
     /// 歌词页大封面：切曲后的 `(track_id, 开始时刻)`；管「至少 200ms 加载态」的门。
@@ -933,7 +937,8 @@ impl Root {
             volume_track_bounds: Arc::new(Mutex::new(None)),
             prefetch_inflight: HashSet::new(),
             prefetch_cooldown_since: HashMap::new(),
-            prefetch_patrol: 0,
+            last_prefetch_patrol: std::time::Instant::now(),
+            last_cache_maintenance: std::time::Instant::now(),
             auth_epoch: 0,
             logout_in_flight: false,
             prefetch_gate: PrefetchGate::default(),
@@ -954,6 +959,7 @@ impl Root {
             pending_track: None,
             last_finished_seq: engine_progress.finished_seq,
             last_seek_seq: engine_progress.seek_seq,
+            last_error_seq: 0,
             progress_preview: None,
             lyrics_cover_gate: None,
             theme_snapshot_key: None,
