@@ -205,6 +205,28 @@ impl Root {
     }
 }
 
+/// 听歌模式页「常用模式」这次请求走到了哪一步。
+///
+/// 不跟探索卡共用一个 bool：页面上加载中、加载失败、加载完但为空是三副样子，
+/// 一个 bool 分不出来。失败之后也不自动重发，交给页面上的重试按钮（#213）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneModesState {
+    /// 还没请求过（新登录、刚进页面）。
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    /// 请求失败：页面显示「常用模式暂不可用」+ 重试。
+    Failed,
+}
+
+impl SceneModesState {
+    /// 只有没读过才去读；失败后要用户点重试，避免断网时进页面就再打一轮。
+    pub fn needs_request(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
 /// 登录状态机。
 pub enum LoginState {
     /// 还没开始
@@ -477,9 +499,16 @@ pub struct Root {
     pub search_keyword: String,
     /// 听歌模式页：常用模式与探索歌单。
     pub scenes: Arc<Vec<SceneItem>>,
-    pub loading_scenes: bool,
+    /// 常用模式自己的状态：请求失败要能停留在页面上，不和探索卡混在一起。
+    pub scene_modes_state: SceneModesState,
+    /// 模式请求序号：登出 / 换号后，在飞的回调按序号丢弃，不能把旧账号的模式写回来。
+    scene_modes_seq: u64,
+    /// 探索卡请求序号：与模式各记各的，谁先回来谁先落，互不挡住对方。
+    scene_cards_seq: u64,
     pub scene_cards: Arc<Vec<SceneCard>>,
     pub loading_scene_cards: bool,
+    /// 探索卡最近一次请求失败：卡区不能把「没读成功」说成「暂无探索歌单」。
+    pub scene_cards_failed: bool,
     /// 听歌模式页的变高虚拟列表状态；只渲染可视行，避免几十张封面同时布局。
     pub scenes_list: gpui::ListState,
     /// 详情页使用独立列表状态，避免页面切换时共享状态导致内容/滚动错乱。
@@ -875,9 +904,12 @@ impl Root {
             searching: false,
             search_keyword: String::new(),
             scenes: Arc::new(Vec::new()),
-            loading_scenes: false,
+            scene_modes_state: SceneModesState::Idle,
+            scene_modes_seq: 0,
+            scene_cards_seq: 0,
             scene_cards: Arc::new(Vec::new()),
             loading_scene_cards: false,
+            scene_cards_failed: false,
             scenes_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(theme::space::XL)),
             liked_detail_list: gpui::ListState::new(
                 1,

@@ -1,6 +1,7 @@
 //! 听歌模式页。
 
 use super::*;
+use crate::app::SceneModesState;
 use crate::ui::middle_drag::DragTarget;
 /// 听歌模式页：常用模式 + 探索歌单，使用变高虚拟列表只渲染可视行。
 pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
@@ -20,8 +21,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .as_ref()
         .and_then(|source| source.scene.as_ref())
         .map(|scene| scene.sub_queue_type.clone());
-    let _loading_scenes = root.loading_scenes;
+    let modes_state = root.scene_modes_state;
     let loading_cards = root.loading_scene_cards;
+    let cards_failed = root.scene_cards_failed;
     let card_count = cards.len();
     let entity = cx.entity();
     let common_columns = root.scenes_common_columns.max(1);
@@ -30,8 +32,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let card_rows = cards.len().div_ceil(card_columns).max(1);
     let width_slot = root.scenes_width.clone();
 
-    // 首次加载是整页状态：不要同时显示“读取模式/暂无歌单/加载更多”。
-    if root.loading_scenes && cards.is_empty() {
+    // 整页加载只在常用模式正在读、探索卡也还空着时出现：探索卡单独在飞
+    // 就留在列表里，让卡区自己显示加载态，别把整页伪装成「正在读取听歌模式」（#213）。
+    if loading_cards && cards.is_empty() && modes_state == SceneModesState::Loading {
         return div()
             .size_full()
             .flex()
@@ -57,6 +60,35 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         else if index <= common_rows {
             let row = index - 1;
             if scenes.is_empty() {
+                // 三态分开：加载中转圈、失败给「不可用 + 重试」、加载完还空着就说实话。
+                // 拿转圈顶替失败会让页面永远像在加载，用户没有可点的恢复动作（#213）。
+                let state = match modes_state {
+                    SceneModesState::Loading => loading_state(language.text("正在读取常用模式…")),
+                    SceneModesState::Failed => div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::space::MD))
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(language.text("常用模式暂不可用").to_string())
+                        .child(
+                            compact_retry_pill("retry-scene-modes", language.text("重试加载"))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+                                        entity.update(cx, |root, cx| {
+                                            root.retry_scene_modes(cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .into_any_element(),
+                    SceneModesState::Ready | SceneModesState::Idle => div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(language.text("暂无常用模式").to_string())
+                        .into_any_element(),
+                };
                 return div()
                     .id("scene-modes-loading")
                     .w_full()
@@ -64,7 +96,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(loading_state(language.text("正在读取常用模式…")))
+                    .child(state)
                     .into_any_element();
             }
             let mut row_element = div()
@@ -223,6 +255,13 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 if cards.is_empty() {
                     let state = if loading_cards {
                         loading_state(language.text("正在读取探索歌单…"))
+                    } else if cards_failed {
+                        // 一次都没读成功时不能说「暂无探索歌单」；页底的「加载更多」可以再试。
+                        div()
+                            .text_size(theme::Text::Small.size())
+                            .text_color(theme::text_muted())
+                            .child(language.text("探索歌单暂不可用").to_string())
+                            .into_any_element()
                     } else {
                         empty_state("list-music", language.text("暂无探索歌单"))
                     };
@@ -270,6 +309,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             .text_color(theme::text_muted())
                             .child(if loading_cards {
                                 language.text("正在加载…").to_string()
+                            } else if cards_failed && cards.is_empty() {
+                                // 一张都没读到：这颗按钮就是卡的恢复入口，直说重试。
+                                language.text("重试加载").to_string()
                             } else {
                                 language.textf(
                                     "加载更多探索歌单（当前 {} 张）",
@@ -318,19 +360,7 @@ pub(crate) fn retry_button(
     language: crate::ui::i18n::Language,
     cx: &mut Context<Root>,
 ) -> AnyElement {
-    div()
-        .id("retry-playback-assets")
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(theme::size::CONTROL_SM))
-        .px(px(theme::space::MD))
-        .rounded(px(theme::radius::PILL))
-        .bg(theme::surface_elevated())
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::surface_hover()))
-        .text_size(theme::Text::Tiny.size())
-        .text_color(theme::text_muted())
+    compact_retry_pill("retry-playback-assets", language.text("重试加载"))
         .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
             if let Some(track) = root
                 .pending_track
@@ -340,7 +370,6 @@ pub(crate) fn retry_button(
                 root.retry_playback_assets(track, cx);
             }
         }))
-        .child(language.text("重试加载"))
         .into_any_element()
 }
 
