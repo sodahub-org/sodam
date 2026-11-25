@@ -689,13 +689,19 @@ mod tests {
         );
         assert!(slot.take().is_some());
 
-        let barrier = Arc::new(Barrier::new(3));
+        let start = Arc::new(Barrier::new(3));
+        let first_done = Arc::new(Barrier::new(3));
         let done = Arc::new(AtomicBool::new(false));
         let observed = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
             let setter = scope.spawn(|| {
-                barrier.wait();
-                for _ in 0..10_000 {
+                start.wait();
+                slot.set(WriteFailure {
+                    kind: FailureKind::Startup,
+                    detail: "并发写入".into(),
+                });
+                first_done.wait();
+                for _ in 1..10_000 {
                     slot.set(WriteFailure {
                         kind: FailureKind::Startup,
                         detail: "并发写入".into(),
@@ -703,25 +709,30 @@ mod tests {
                 }
             });
             let taker = scope.spawn(|| {
-                barrier.wait();
-                for _ in 0..10_000 {
+                start.wait();
+                let _ = slot.take();
+                first_done.wait();
+                for _ in 1..10_000 {
                     let _ = slot.take();
                 }
             });
-            let observer = scope.spawn(|| loop {
-                let guard = slot.failure.lock().unwrap();
-                assert_eq!(
-                    slot.is_pending(),
-                    guard.is_some(),
-                    "并发期间原子门和失败槽必须一致"
-                );
-                observed.store(true, Ordering::Release);
-                drop(guard);
-                if done.load(Ordering::Acquire) {
-                    break;
+            let observer = scope.spawn(|| {
+                first_done.wait();
+                loop {
+                    let guard = slot.failure.lock().unwrap();
+                    assert_eq!(
+                        slot.is_pending(),
+                        guard.is_some(),
+                        "并发期间原子门和失败槽必须一致"
+                    );
+                    observed.store(true, Ordering::Release);
+                    drop(guard);
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             });
-            barrier.wait();
+            start.wait();
             setter.join().unwrap();
             taker.join().unwrap();
             done.store(true, Ordering::Release);
