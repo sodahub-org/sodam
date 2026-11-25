@@ -435,6 +435,9 @@ impl Root {
                     let new_error = snap.error_seq != root.last_error_seq;
                     let loading =
                         root.pending_track.is_some() || root.pending_engine_load.is_some();
+                    let engine_error_unshown = !snap.error.is_empty()
+                        && !snap.track_id.is_empty()
+                        && root.playback_error.as_deref() != Some(snap.error.as_str());
                     let hot = snap.playing
                         || root.playing
                         || loading
@@ -447,11 +450,7 @@ impl Root {
                             root.playing = snap.playing;
                             cx.notify();
                         }
-                        if root.pending_track.is_none()
-                            && !snap.error.is_empty()
-                            && !snap.track_id.is_empty()
-                            && root.playback_error.as_deref() != Some(snap.error.as_str())
-                        {
+                        if root.pending_track.is_none() && engine_error_unshown {
                             root.playing = false;
                             root.playback_error = Some(snap.error.clone());
                             let message = root.language.engine_error(&snap.error);
@@ -477,11 +476,8 @@ impl Root {
                     }
 
                     // 装载期产生的错误等 loading 退出后再消费。
-                    let defer_error = new_error
-                        && root.pending_track.is_some()
-                        && !snap.error.is_empty()
-                        && !snap.track_id.is_empty()
-                        && root.playback_error.as_deref() != Some(snap.error.as_str());
+                    let defer_error =
+                        new_error && root.pending_track.is_some() && engine_error_unshown;
                     if new_error && !defer_error {
                         root.last_error_seq = snap.error_seq;
                     }
