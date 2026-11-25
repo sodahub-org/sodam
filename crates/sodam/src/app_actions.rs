@@ -426,7 +426,7 @@ impl Root {
                     probe.engine_snapshot();
                     root.play_reporter.observe(&snap);
 
-                    let current = finished_event_is_current(
+                    let new_finished = finished_event_is_current(
                         snap.finished_seq,
                         snap.seek_seq,
                         &mut root.last_finished_seq,
@@ -441,7 +441,7 @@ impl Root {
                     let hot = snap.playing
                         || root.playing
                         || loading
-                        || (snap.finished && current)
+                        || (snap.finished && new_finished)
                         || new_error;
                     if hot {
                         if root.pending_engine_load == Some(snap.load_seq) {
@@ -465,7 +465,7 @@ impl Root {
                             root.consecutive_failures = 0;
                             root.progress_token = None;
                         }
-                        let should_advance = current && !root.playback_halted;
+                        let should_advance = new_finished && !root.playback_halted;
                         if snap.finished && should_advance && root.pending_track.is_none() {
                             if root.queue.mode == PlayMode::RepeatOne {
                                 root.advance_next(false, cx);
