@@ -693,7 +693,6 @@ mod tests {
         let first_done = Arc::new(Barrier::new(3));
         let observer_ready = Arc::new(Barrier::new(3));
         let done = Arc::new(AtomicBool::new(false));
-        let observed = Arc::new(AtomicBool::new(false));
         std::thread::scope(|scope| {
             let setter = scope.spawn(|| {
                 start.wait();
@@ -727,12 +726,11 @@ mod tests {
                         let guard = slot.failure.lock().unwrap();
                         slot.is_pending() == guard.is_some()
                     };
-                    observed.store(true, Ordering::Release);
                     if first {
                         observer_ready.wait();
                         first = false;
                     }
-                    assert!(consistent, "并发期间原子门和失败槽必须一致");
+                    assert!(consistent, "并发期间原子标志和失败槽必须一致");
                     if done.load(Ordering::Acquire) {
                         break;
                     }
@@ -745,10 +743,9 @@ mod tests {
             observer.join().unwrap();
         });
 
-        assert!(observed.load(Ordering::Acquire));
         let signal = slot.is_pending();
         let payload = slot.failure.lock().unwrap().is_some();
-        assert_eq!(signal, payload, "并发结束后原子门和失败槽必须一致");
+        assert_eq!(signal, payload, "并发结束后原子标志和失败槽必须一致");
     }
 
     #[test]
