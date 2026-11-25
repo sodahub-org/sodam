@@ -29,8 +29,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 钉在 24.04，别换回 ubuntu-latest：它现在解析到 26.04（v0.4.0 的 job 日志写着
-          # `Image: ubuntu-26.04`），镜像自带 amd64v3 变体的 GCC（--with-arch-64=x86-64-v3），
+          # 钉在 24.04，别换回 ubuntu-latest：镜像的 GCC 若默认 amd64v3（--with-arch-64=x86-64-v3），
           # C 依赖会被编成 AVX2/BMI2，没有这些指令的老 CPU 一发起 HTTPS 就 SIGILL（#306）。
           # 换 runner 前先看下面那道护栏会不会红。
           - arch: x86_64
@@ -38,7 +37,6 @@ jobs:
             cflags_x86_64: '-march=x86-64 -mtune=generic'
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            cflags_x86_64: ''
     steps:
       - uses: actions/checkout@v4
 
