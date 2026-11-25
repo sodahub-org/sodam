@@ -3,7 +3,7 @@
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, img, point, px, size, svg, uniform_list, AnyElement, Bounds, ClickEvent,
-    Div, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Window,
+    Div, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Stateful, Window,
 };
 
 use crate::app::{LoginState, Nav, Root, VerifyWindowState};
@@ -869,7 +869,7 @@ fn page_header(title: &str, subtitle: &str) -> AnyElement {
 /// 紧凑的「重试」按钮外壳：行内高度，给失败终态的一行用。
 ///
 /// 推荐页失败终态、播放资源重试、听歌模式失败都走这个形状，样式只留一处（#213）。
-fn compact_retry_pill(id: &'static str, label: String) -> Div {
+fn compact_retry_pill(id: &'static str, label: String) -> Stateful<Div> {
     div()
         .id(id)
         .flex()

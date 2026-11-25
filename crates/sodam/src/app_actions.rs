@@ -1172,6 +1172,9 @@ impl Root {
                                 // `refresh_account` 里，但账号信息读取失败时拿不到
                                 // 新身份，这里先保守作废。
                                 root.invalidate_identity_conclusions();
+                                // 听歌模式同样按账号给：登录前留下的模式、探索卡和
+                                // 失败终态不能带进新会话，在飞的请求也按序号丢掉。
+                                root.reset_scene_state();
                                 // 新 Cookie 已生效，旧账号 id 不能再和它配对；范围缺失时按放行处理。
                                 root.account = None;
                                 if root.nav == Nav::Settings {
