@@ -602,16 +602,15 @@ impl Root {
                 } else {
                     (NO_WINDOW, false)
                 };
-                if notify {
-                    if this
+                if notify
+                    && this
                         .update(cx, |_root, cx| {
                             probe.app_entry();
                             cx.notify();
                         })
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
                 cx.background_executor().timer(interval).await;
             }
