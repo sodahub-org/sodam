@@ -1127,6 +1127,10 @@ impl Root {
                             CoverWant {
                                 queued,
                                 dropped: root.cover_store.take_dropped() + mailbox_dropped,
+                            }
+                        }) {
+                            Ok(stats) => stats,
+                            Err(_) => break,
                         }
                     } else {
                         CoverWant::default()
