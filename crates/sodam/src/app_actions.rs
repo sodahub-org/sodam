@@ -410,17 +410,36 @@ impl Root {
             const IDLE: std::time::Duration = std::time::Duration::from_secs(1);
             const PREFETCH_PATROL: std::time::Duration = std::time::Duration::from_secs(5);
             const CACHE_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
+            enum Waited {
+                Timer,
+                Signal,
+                Closed,
+            }
             let mut probe = LoopProbe::new("heartbeat");
             let mut interval = HOT;
             loop {
                 let sleep = cx.background_executor().timer(interval);
-                let _ = futures_lite::future::or(sleep, async {
-                    let _ = wake_rx.next().await;
-                })
+                let waited = futures_lite::future::or(
+                    async {
+                        sleep.await;
+                        Waited::Timer
+                    },
+                    async {
+                        if wake_rx.next().await.is_some() {
+                            Waited::Signal
+                        } else {
+                            Waited::Closed
+                        }
+                    },
+                )
                 .await;
-                probe.tick();
+                match waited {
+                    Waited::Timer => probe.tick(),
+                    Waited::Signal => probe.check(),
+                    Waited::Closed => break,
+                }
                 let mut next_interval = IDLE;
-                let _ = this.update(cx, |root, cx| {
+                let updated = this.update(cx, |root, cx| {
                     probe.app_entry();
                     let snap = root.engine.snapshot();
                     probe.engine_snapshot();
@@ -484,6 +503,7 @@ impl Root {
                     if root.round_exhausted.is_some() && root.has_playable_ahead() {
                         root.clear_round_exhaustion();
                     }
+                    // 先判退出刷尾，避免把保存失败的提示在退出几秒里取走扔掉。
                     if !root.quit_gate.is_saving() {
                         if let Some(failure) = root.settings_writer.take_error() {
                             root.report_settings_failure(failure, cx);
@@ -509,6 +529,9 @@ impl Root {
                     root.load_more_recommendation(cx);
                     next_interval = if hot { HOT } else { IDLE };
                 });
+                if updated.is_err() {
+                    break;
+                }
                 interval = next_interval;
             }
         })
