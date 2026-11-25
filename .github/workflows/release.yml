@@ -59,7 +59,7 @@ jobs:
       # 产物护栏（#306）：C 侧一旦带上 AVX2/BMI2，老 CPU 会在 TLS 握手时直接 SIGILL。
       - name: Check x86_64 ISA baseline (ring x25519 C path)
         if: matrix.arch == 'x86_64'
-        run: scripts/check-isa.sh target/release/sodam
+        run: scripts/check-x86-64-baseline.sh target/release/sodam
 
       - name: Create pacman package
         run: |
