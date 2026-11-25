@@ -499,12 +499,12 @@ pub struct Root {
     pub search_keyword: String,
     /// 听歌模式页：常用模式与探索歌单。
     pub scenes: Arc<Vec<SceneItem>>,
-    /// 场景页任意请求（读模式或读探索卡）是否在飞：只是互斥闸，别再拿它当渲染状态。
-    pub scene_request_in_flight: bool,
     /// 常用模式自己的状态：请求失败要能停留在页面上，不和探索卡混在一起。
     pub scene_modes_state: SceneModesState,
-    /// 场景请求序号：登出 / 换号后，在飞的回调按序号丢弃，不能把旧账号的模式写回来。
-    scene_request_seq: u64,
+    /// 模式请求序号：登出 / 换号后，在飞的回调按序号丢弃，不能把旧账号的模式写回来。
+    scene_modes_seq: u64,
+    /// 探索卡请求序号：与模式各记各的，谁先回来谁先落，互不挡住对方。
+    scene_cards_seq: u64,
     pub scene_cards: Arc<Vec<SceneCard>>,
     pub loading_scene_cards: bool,
     /// 听歌模式页的变高虚拟列表状态；只渲染可视行，避免几十张封面同时布局。
@@ -902,9 +902,9 @@ impl Root {
             searching: false,
             search_keyword: String::new(),
             scenes: Arc::new(Vec::new()),
-            scene_request_in_flight: false,
             scene_modes_state: SceneModesState::Idle,
-            scene_request_seq: 0,
+            scene_modes_seq: 0,
+            scene_cards_seq: 0,
             scene_cards: Arc::new(Vec::new()),
             loading_scene_cards: false,
             scenes_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(theme::space::XL)),

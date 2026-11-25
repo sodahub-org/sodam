@@ -1175,6 +1175,11 @@ impl Root {
                                 // 听歌模式同样按账号给：登录前留下的模式、探索卡和
                                 // 失败终态不能带进新会话，在飞的请求也按序号丢掉。
                                 root.reset_scene_state();
+                                // 正停在听歌模式页就用新身份读一遍，否则页面要等
+                                // 用户离开再回来才有内容。
+                                if root.nav == Nav::Scenes {
+                                    root.load_scenes(cx);
+                                }
                                 // 新 Cookie 已生效，旧账号 id 不能再和它配对；范围缺失时按放行处理。
                                 root.account = None;
                                 if root.nav == Nav::Settings {
@@ -1658,8 +1663,13 @@ impl Root {
         self.scenes_list_items = count;
     }
 
+    /// 场景页是否有请求在飞：模式和探索卡两条独立，任一条在飞都算。
+    fn scene_request_in_flight(&self) -> bool {
+        self.loading_scene_cards || matches!(self.scene_modes_state, SceneModesState::Loading)
+    }
+
     pub fn load_scenes(&mut self, cx: &mut Context<Self>) {
-        if self.scene_request_in_flight {
+        if self.scene_request_in_flight() {
             return;
         }
         let existing_ids: Vec<u64> = self
@@ -1670,13 +1680,7 @@ impl Root {
         // 模式和探索卡是两次请求：模式读不读只看它自己的状态，
         // 不能拿「探索卡有没有数据」当判据（#213）。
         let needs_modes = self.scene_modes_state.needs_request();
-        self.scene_request_in_flight = true;
         self.loading_scene_cards = true;
-        if needs_modes {
-            self.scene_modes_state = SceneModesState::Loading;
-        }
-        self.scene_request_seq = self.scene_request_seq.wrapping_add(1);
-        let request_seq = self.scene_request_seq;
         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
             let existing = existing_ids.len().to_string();
             let loading = self.loading_scene_cards.to_string();
@@ -1697,21 +1701,99 @@ impl Root {
         };
         self.set_status_text(message);
         cx.notify();
+        // 两条请求各跑各的：模式慢或失败都不用等探索卡（#213）。
+        if needs_modes {
+            self.start_scene_modes_request(false, cx);
+        }
+        self.start_scene_cards_request(existing_ids, cx);
+    }
+
+    /// 发一次模式请求：结果一回来就落状态，不等探索卡。
+    ///
+    /// `announce` 控制成功时要不要写状态行：首屏加载由探索卡那条收尾，
+    /// 重试路径自己说一句「常用模式已更新」。
+    fn start_scene_modes_request(&mut self, announce: bool, cx: &mut Context<Self>) {
+        self.scene_modes_state = SceneModesState::Loading;
+        self.scene_modes_seq = self.scene_modes_seq.wrapping_add(1);
+        let request_seq = self.scene_modes_seq;
+        let settings = self.settings.clone();
+        let work = cx.background_spawn(async move {
+            sodam_core::library::scene_modes(&Session::new(settings))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |root, cx| {
+                // 登出 / 换号后旧请求才回来：结果属于上一个身份，丢掉。
+                if root.scene_modes_seq != request_seq {
+                    return;
+                }
+                root.apply_scene_modes(result, announce, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 模式结果落回：成功就换列表刷封面，失败记失败终态。
+    fn apply_scene_modes(
+        &mut self,
+        result: anyhow::Result<Vec<SceneItem>>,
+        announce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(modes) => {
+                self.scene_modes_state = SceneModesState::Ready;
+                if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
+                    let count = modes.len().to_string();
+                    log_event(
+                        LogLevel::Debug,
+                        LogTopic::App,
+                        "scenes_modes_applied",
+                        &[("modes", count.as_str())],
+                    );
+                }
+                if modes.is_empty() {
+                    if announce {
+                        self.set_status_text(self.tr("暂无常用模式"));
+                    }
+                    return;
+                }
+                let covers: Vec<String> = modes
+                    .iter()
+                    .map(|scene| scene.cover.clone())
+                    .filter(|cover| !cover.is_empty())
+                    .collect();
+                self.scenes = Arc::new(modes);
+                self.sync_scenes_list();
+                self.ensure_covers(&covers, cx);
+                if announce {
+                    self.set_status_text(self.tr("常用模式已更新"));
+                }
+            }
+            Err(err) => {
+                self.scene_modes_state = SceneModesState::Failed;
+                // 失败默认可见：只开到 DEBUG 才记等于报障时又是空白。
+                let error = err.to_string();
+                log_event(
+                    LogLevel::Warn,
+                    LogTopic::App,
+                    "scenes_load_partial",
+                    &[("mode_error", error.as_str()), ("card_error", "")],
+                );
+                let message = self.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
+                self.notify_warning_once("scenes-load-failed", message);
+            }
+        }
+    }
+
+    /// 发一次探索卡请求：结果只动探索卡，不碰模式状态。
+    fn start_scene_cards_request(&mut self, existing_ids: Vec<u64>, cx: &mut Context<Self>) {
+        self.scene_cards_seq = self.scene_cards_seq.wrapping_add(1);
+        let request_seq = self.scene_cards_seq;
         let settings = self.settings.clone();
         let work = cx.background_spawn(async move {
             let session = Session::new(settings);
-            let mut mode_error = None;
-            let mut card_error = None;
-            let mut modes = Vec::new();
-            let mut cards = Vec::new();
-
-            if needs_modes {
-                match sodam_core::library::scene_modes(&session) {
-                    Ok(value) => modes = value,
-                    Err(err) => mode_error = Some(err.to_string()),
-                }
-            }
-
             let result = if existing_ids.is_empty() {
                 sodam_core::library::scene_discover_cards(&session).and_then(|mut cards| {
                     if cards.is_empty() {
@@ -1725,86 +1807,44 @@ impl Root {
             } else {
                 sodam_core::library::scene_discover_cards_more(&session, &[])
             };
-            match result {
-                Ok(value) => cards = value,
-                Err(err) => card_error = Some(err.to_string()),
-            }
+            let mut cards = result?;
             cards.retain(|card| {
                 card.inner_block_id
                     .parse::<u64>()
                     .map(|id| !existing_ids.contains(&id))
                     .unwrap_or(true)
             });
-            Ok::<_, anyhow::Error>((modes, cards, mode_error, card_error))
+            Ok::<_, anyhow::Error>(cards)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
-                // 登出 / 换号后旧请求才回来：结果属于上一个身份，丢掉。
-                if root.scene_request_seq != request_seq {
+                if root.scene_cards_seq != request_seq {
                     return;
                 }
-                root.scene_request_in_flight = false;
                 root.loading_scene_cards = false;
                 match result {
-                    Ok((modes, cards, mode_error, card_error)) => {
-                        if needs_modes {
-                            root.scene_modes_state = if mode_error.is_some() {
-                                SceneModesState::Failed
-                            } else {
-                                SceneModesState::Ready
-                            };
-                        }
+                    Ok(cards) => {
                         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
-                            let cards_count = cards.len().to_string();
-                            let modes_count = modes.len().to_string();
+                            let count = cards.len().to_string();
                             log_event(
                                 LogLevel::Debug,
                                 LogTopic::App,
-                                "scenes_load_applied",
-                                &[
-                                    ("cards", cards_count.as_str()),
-                                    ("modes", modes_count.as_str()),
-                                ],
+                                "scenes_cards_applied",
+                                &[("cards", count.as_str())],
                             );
                         }
-                        if mode_error.is_some() || card_error.is_some() {
-                            // 部分失败默认可见：只开到 DEBUG 才记等于报障时又是空白。
-                            let mode_error_text = mode_error.as_deref().unwrap_or_default();
-                            let card_error_text = card_error.as_deref().unwrap_or_default();
-                            log_event(
-                                LogLevel::Warn,
-                                LogTopic::App,
-                                "scenes_load_partial",
-                                &[
-                                    ("mode_error", mode_error_text),
-                                    ("card_error", card_error_text),
-                                ],
-                            );
-                        }
-                        let mut covers: Vec<String> = cards
+                        let covers: Vec<String> = cards
                             .iter()
                             .map(|card| card.playlist.cover.clone())
                             .collect();
-                        covers.extend(
-                            modes
-                                .iter()
-                                .map(|scene| scene.cover.clone())
-                                .filter(|cover| !cover.is_empty()),
-                        );
                         let added = cards.len();
-                        if !modes.is_empty() {
-                            root.scenes = Arc::new(modes);
-                        }
                         let mut all_cards = root.scene_cards.as_ref().clone();
                         all_cards.extend(cards);
                         root.scene_cards = Arc::new(all_cards);
                         root.sync_scenes_list();
                         root.ensure_covers(&covers, cx);
-                        if let Some(err) = mode_error.or(card_error) {
-                            let message = root.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
-                            root.notify_warning_once("scenes-load-failed", message);
-                        } else if added == 0 {
+                        if added == 0 {
                             root.set_status_text(root.tr("没有更多探索歌单"));
                         } else {
                             let message =
@@ -1813,11 +1853,15 @@ impl Root {
                         }
                     }
                     Err(err) => {
-                        if needs_modes {
-                            root.scene_modes_state = SceneModesState::Failed;
-                        }
+                        let error = err.to_string();
+                        log_event(
+                            LogLevel::Warn,
+                            LogTopic::App,
+                            "scenes_load_partial",
+                            &[("mode_error", ""), ("card_error", error.as_str())],
+                        );
                         let message = root.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
-                        root.notify_error_once("scenes-load-failed", message);
+                        root.notify_warning_once("scenes-load-failed", message);
                     }
                 }
                 cx.notify();
@@ -1831,56 +1875,15 @@ impl Root {
     /// 页面上的重试按钮走这条：模式单独失败时，探索卡那边可能已经有数据了，
     /// 再跑一遍 `load_scenes` 只会顺手读卡，和用户按的那颗按钮对不上（#213）。
     pub fn retry_scene_modes(&mut self, cx: &mut Context<Self>) {
-        if self.scene_request_in_flight {
-            // 探索卡请求还在飞时点重试：给一句反馈，别让按钮看起来没接上。
+        if matches!(self.scene_modes_state, SceneModesState::Loading) {
+            // 模式请求还在飞：给一句反馈，别让按钮看起来没接上。
             self.set_status_text(self.tr("正在加载…"));
             cx.notify();
             return;
         }
-        self.scene_modes_state = SceneModesState::Loading;
-        self.scene_request_in_flight = true;
-        self.scene_request_seq = self.scene_request_seq.wrapping_add(1);
-        let request_seq = self.scene_request_seq;
         self.set_status_text(self.tr("正在读取听歌模式…"));
         cx.notify();
-        let settings = self.settings.clone();
-        let work = cx.background_spawn(async move {
-            sodam_core::library::scene_modes(&Session::new(settings))
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |root, cx| {
-                if root.scene_request_seq != request_seq {
-                    return;
-                }
-                root.scene_request_in_flight = false;
-                match result {
-                    Ok(modes) => {
-                        root.scene_modes_state = SceneModesState::Ready;
-                        if modes.is_empty() {
-                            root.set_status_text(root.tr("暂无常用模式"));
-                        } else {
-                            let covers: Vec<String> = modes
-                                .iter()
-                                .map(|scene| scene.cover.clone())
-                                .filter(|cover| !cover.is_empty())
-                                .collect();
-                            root.scenes = Arc::new(modes);
-                            root.sync_scenes_list();
-                            root.ensure_covers(&covers, cx);
-                            root.set_status_text(root.tr("常用模式已更新"));
-                        }
-                    }
-                    Err(err) => {
-                        root.scene_modes_state = SceneModesState::Failed;
-                        let message = root.failure_text("读取听歌模式失败", &err, REMOTE_TEXT);
-                        root.notify_warning_once("scenes-load-failed", message);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.start_scene_modes_request(true, cx);
     }
 
     pub fn start_scene_queue(&mut self, scene: SceneItem, cx: &mut Context<Self>) {
@@ -2743,11 +2746,11 @@ impl Root {
 
     /// 场景页内容按账号给：登出、换号都清掉，在飞的回调按序号丢弃。
     fn reset_scene_state(&mut self) {
-        self.scene_request_seq = self.scene_request_seq.wrapping_add(1);
+        self.scene_modes_seq = self.scene_modes_seq.wrapping_add(1);
+        self.scene_cards_seq = self.scene_cards_seq.wrapping_add(1);
         self.scenes = Arc::new(Vec::new());
         self.scene_cards = Arc::new(Vec::new());
         self.scene_modes_state = SceneModesState::Idle;
-        self.scene_request_in_flight = false;
         self.loading_scene_cards = false;
         self.sync_scenes_list();
     }
@@ -3549,7 +3552,7 @@ impl Root {
                 Nav::Scenes
                     if should_auto_load_scenes(
                         self.scene_cards.is_empty(),
-                        self.scene_request_in_flight,
+                        self.scene_request_in_flight(),
                         self.scene_modes_state,
                     ) =>
                 {
@@ -4796,8 +4799,12 @@ impl Root {
                 self.liked_ids_failed = false;
                 self.liked_loaded = false;
                 self.open_playlist = None;
-                // 常用模式/探索歌单同样属于上一个账号：清掉，重新进页面再按新身份读。
+                // 常用模式/探索歌单同样属于上一个账号：清掉；正停在这一页就用新身份重读，
+                // 否则页面会空到用户离开再回来。
                 self.reset_scene_state();
+                if self.nav == Nav::Scenes {
+                    self.load_scenes(cx);
+                }
                 self.refresh_account(cx);
                 self.load_liked_ids(cx);
             }
@@ -6332,15 +6339,45 @@ mod scene_modes_gate_tests {
             .expect("retry_scene_modes 应当存在");
         let body = &body[..body.find("pub fn start_scene_queue").unwrap_or(body.len())];
 
-        assert!(body.contains("scene_modes(&Session::new(settings))"));
         assert!(
-            !body.contains("scene_discover_cards"),
-            "重试只重发模式，不追加探索卡"
+            body.contains("start_scene_modes_request(true"),
+            "重试只发模式请求"
+        );
+        assert!(
+            !body.contains("start_scene_cards_request"),
+            "重试不该顺手读探索卡"
         );
         assert!(
             !body.contains("没有更多探索歌单"),
             "重试不该复用「加载更多」的文案"
         );
-        assert!(!body.contains("scene_cards ="), "重试不该碰探索卡数据");
+    }
+
+    /// 模式结果不等探索卡：两条请求各自落回，互不阻塞（#213）。
+    #[test]
+    fn mode_result_does_not_wait_for_the_cards_request() {
+        let source = include_str!("app_actions.rs");
+        let modes = source
+            .split("fn start_scene_modes_request")
+            .nth(1)
+            .expect("start_scene_modes_request 应当存在");
+        let modes = &modes[..modes.find("fn apply_scene_modes").unwrap_or(modes.len())];
+        assert!(
+            !modes.contains("scene_discover_cards"),
+            "模式请求不该把探索卡串在同一条后台任务里"
+        );
+
+        let cards = source
+            .split("fn start_scene_cards_request")
+            .nth(1)
+            .expect("start_scene_cards_request 应当存在");
+        let cards = &cards[..cards
+            .find("pub fn retry_scene_modes")
+            .unwrap_or(cards.len())];
+        assert!(
+            !cards.contains("scene_modes("),
+            "探索卡请求不该写常用模式的状态"
+        );
+        assert!(!cards.contains("scene_modes_state"), "探索卡请求只动探索卡");
     }
 }
