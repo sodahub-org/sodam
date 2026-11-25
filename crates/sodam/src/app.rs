@@ -535,6 +535,8 @@ pub struct Root {
     /// 渲染期收集到的封面需求（虚拟列表只渲染可见行，所以这里排的就是
     /// 「当前真正看得见」的那些封面）。由后台循环消费，新需求会立刻叫醒它。
     pub(crate) cover_mailbox: Arc<CoverMailbox>,
+    /// 心跳空闲时的唤醒口；播放或装载状态变化时缩短下一次等待。
+    pub(crate) heartbeat_wake_tx: futures_channel::mpsc::Sender<()>,
     /// 真实播放过的曲目 id（最近在后）。用于队列抽屉的「已播放」分区；
     /// 不能用「当前下标之前」来推 —— 那会把跳过的歌也算进去（实测踩过）。
     pub played_history: Vec<String>,
@@ -794,6 +796,7 @@ impl Root {
         };
         let (cover_wake, mut cover_wake_rx) = futures_channel::mpsc::channel::<()>(1);
         let cover_mailbox = Arc::new(CoverMailbox::new(cover_wake));
+        let (heartbeat_wake_tx, heartbeat_wake_rx) = futures_channel::mpsc::channel(1);
         let mut root = Self {
             titlebar_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             // 未登录只能待在设置页（登录入口在设置 → 账户）
@@ -966,6 +969,7 @@ impl Root {
             queue_cache: (0, Arc::new(Vec::new())),
             cover_store: CoverStore::default(),
             cover_mailbox,
+            heartbeat_wake_tx,
             contributors_image: None,
             contributors_fetching: false,
             contributors_failed: false,
@@ -1189,7 +1193,7 @@ impl Root {
             })
             .detach();
         }
-        Self::start_heartbeat(cx);
+        Self::start_heartbeat(cx, heartbeat_wake_rx);
         // 歌词逐字高亮需要比主心跳更高的刷新率（#80）。
         Self::start_lyrics_ticker(cx);
 

@@ -6,6 +6,7 @@ use crate::loop_probe::LoopProbe;
 use crate::ui::i18n::Language;
 use crate::ui::middle_drag::DragTarget;
 use crate::ui::theme::{self, ThemeKind};
+use futures_lite::StreamExt;
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
@@ -395,8 +396,15 @@ impl Root {
         cx.notify();
     }
 
+    fn wake_heartbeat(&self) {
+        let _ = self.heartbeat_wake_tx.try_send(());
+    }
+
     /// UI 心跳：热档 200ms，空闲 1s；空闲拍只跑尾巴活。
-    pub(crate) fn start_heartbeat(cx: &mut Context<Self>) {
+    pub(crate) fn start_heartbeat(
+        cx: &mut Context<Self>,
+        mut wake_rx: futures_channel::mpsc::Receiver<()>,
+    ) {
         cx.spawn(async move |this, cx| {
             const HOT: std::time::Duration = std::time::Duration::from_millis(200);
             const IDLE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -405,7 +413,11 @@ impl Root {
             let mut probe = LoopProbe::new("heartbeat");
             let mut interval = HOT;
             loop {
-                cx.background_executor().timer(interval).await;
+                let sleep = cx.background_executor().timer(interval);
+                let _ = futures_lite::future::or(sleep, async {
+                    let _ = wake_rx.next().await;
+                })
+                .await;
                 probe.tick();
                 let mut next_interval = IDLE;
                 let _ = this.update(cx, |root, cx| {
@@ -421,7 +433,6 @@ impl Root {
                         &mut root.last_seek_seq,
                     );
                     let new_error = snap.error_seq != root.last_error_seq;
-                    root.last_error_seq = snap.error_seq;
                     let loading =
                         root.pending_track.is_some() || root.pending_engine_load.is_some();
                     let hot = snap.playing
@@ -465,6 +476,15 @@ impl Root {
                         }
                     }
 
+                    // 装载期产生的错误等 loading 退出后再消费。
+                    let defer_error = new_error
+                        && root.pending_track.is_some()
+                        && !snap.error.is_empty()
+                        && !snap.track_id.is_empty()
+                        && root.playback_error.as_deref() != Some(snap.error.as_str());
+                    if new_error && !defer_error {
+                        root.last_error_seq = snap.error_seq;
+                    }
                     if root.round_exhausted.is_some() && root.has_playable_ahead() {
                         root.clear_round_exhaustion();
                     }
@@ -509,6 +529,7 @@ impl Root {
             loop {
                 probe.tick();
                 let has_window = cx.update(|cx| !cx.windows().is_empty());
+                probe.app_entry();
                 let (interval, notify) = if has_window {
                     this.update(cx, |root, _cx| {
                         probe.app_entry();
@@ -1830,6 +1851,7 @@ impl Root {
         self.pending_track = Some(track.clone());
         self.pending_engine_load = None;
         self.progress_preview = Some(0.0);
+        self.wake_heartbeat();
         self.set_status("已准备播放：{}", std::slice::from_ref(&track.title));
         self.ensure_covers(std::slice::from_ref(&track.cover), cx);
         cx.notify();
@@ -4114,6 +4136,7 @@ impl Root {
         self.release_playback_halt();
         self.engine.toggle();
         self.playing = !snapshot.playing;
+        self.wake_heartbeat();
         if self.playing {
             // 已装载曲目的「按播放」同样是用户主动播放：磁盘类预取挂起由它解除，
             // 与 `start_track(user_initiated = true)` 保持同一语义（票 #117）。
@@ -4185,6 +4208,7 @@ impl Root {
         self.pending_track = Some(track.clone());
         self.pending_engine_load = None;
         self.progress_preview = None;
+        self.wake_heartbeat();
         self.set_status("正在准备播放：{}…", std::slice::from_ref(&track.title));
         // 每次切歌都只留新曲目的原图需求；不在歌词页时也要清掉上一轮的排队和补排。
         self.cover_store.retain_original_only(&track.cover);
