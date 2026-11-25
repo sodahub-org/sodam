@@ -129,11 +129,15 @@ fn retry_current_original_cover(
     !cache_clearing && displayed_cover == Some(url)
 }
 
-/// 进页面时要不要自动读听歌模式。
+/// 进听歌模式页时要不要自动拉一次。
 ///
-/// 判据和「加载更多」用同一个：只拦自己的探索卡请求。模式失败终态则不自动重发，
-/// 断网时每次进页面都再打一轮会变成请求循环，恢复交给页面上的重试按钮。
-fn should_auto_load_scenes(cards_empty: bool, cards_loading: bool, modes: SceneModesState) -> bool {
+/// 探索卡请求在飞时不叠加。模式失败终态还在时整页不自动重发：断网时每次
+/// 进页面都再打一轮就成了请求循环；卡的恢复交给页底那颗「重试加载」。
+fn should_auto_load_scene_page(
+    cards_empty: bool,
+    cards_loading: bool,
+    modes: SceneModesState,
+) -> bool {
     cards_empty && !cards_loading && !matches!(modes, SceneModesState::Failed)
 }
 
@@ -3548,7 +3552,7 @@ impl Root {
                 }
                 // 听歌模式只负责首屏懒加载；“加载更多”必须由用户显式点击。
                 Nav::Scenes
-                    if should_auto_load_scenes(
+                    if should_auto_load_scene_page(
                         self.scene_cards.is_empty(),
                         self.loading_scene_cards,
                         self.scene_modes_state,
@@ -6297,18 +6301,22 @@ mod scene_modes_gate_tests {
     /// 失败终态挡住的是自动重发，不是用户点的重试（#213）。
     #[test]
     fn failed_modes_state_blocks_only_automatic_reload() {
-        assert!(should_auto_load_scenes(true, false, SceneModesState::Idle));
+        assert!(should_auto_load_scene_page(
+            true,
+            false,
+            SceneModesState::Idle
+        ));
         assert!(
-            !should_auto_load_scenes(true, false, SceneModesState::Failed),
+            !should_auto_load_scene_page(true, false, SceneModesState::Failed),
             "失败终态还在时进页面不能再自动打请求"
         );
         assert!(
-            !should_auto_load_scenes(false, false, SceneModesState::Idle),
+            !should_auto_load_scene_page(false, false, SceneModesState::Idle),
             "探索卡已经有数据就不用再走首屏加载"
         );
         assert!(
-            !should_auto_load_scenes(true, true, SceneModesState::Idle),
-            "已经有请求在飞时不要叠加"
+            !should_auto_load_scene_page(true, true, SceneModesState::Idle),
+            "探索卡请求在飞时不要叠加"
         );
     }
 
