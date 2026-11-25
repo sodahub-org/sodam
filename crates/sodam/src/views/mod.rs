@@ -3,7 +3,7 @@
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, img, point, px, size, svg, uniform_list, AnyElement, Bounds, ClickEvent,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Window,
+    Div, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Window,
 };
 
 use crate::app::{LoginState, Nav, Root, VerifyWindowState};
@@ -866,6 +866,26 @@ fn page_header(title: &str, subtitle: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// 紧凑的「重试」按钮外壳：行内高度，给失败终态的一行用。
+///
+/// 推荐页失败终态、播放资源重试、听歌模式失败都走这个形状，样式只留一处（#213）。
+fn compact_retry_pill(id: &'static str, label: String) -> Div {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(theme::size::CONTROL_SM))
+        .px(px(theme::space::MD))
+        .rounded(px(theme::radius::PILL))
+        .bg(theme::surface_elevated())
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::surface_hover()))
+        .text_size(theme::Text::Tiny.size())
+        .text_color(theme::text_muted())
+        .child(label)
+}
+
 /// 推荐页的失败终态：一句人话 + 重试。
 ///
 /// 不能退回「正在准备推荐队列…」那个加载态：断网时它会一直转圈，用户既看不出
@@ -892,23 +912,11 @@ fn recommendation_error_state(root: &Root, message: String, cx: &mut Context<Roo
                 .child(message),
         )
         .child(
-            div()
-                .id("retry-recommendation")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(theme::size::CONTROL_SM))
-                .px(px(theme::space::MD))
-                .rounded(px(theme::radius::PILL))
-                .bg(theme::surface_elevated())
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::surface_hover()))
-                .text_size(theme::Text::Tiny.size())
-                .text_color(theme::text_muted())
-                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+            compact_retry_pill("retry-recommendation", root.tr("重试加载").to_string()).on_click(
+                cx.listener(|root, _event: &ClickEvent, _window, cx| {
                     root.retry_recommendation(cx);
-                }))
-                .child(root.tr("重试加载")),
+                }),
+            ),
         )
         .into_any_element()
 }

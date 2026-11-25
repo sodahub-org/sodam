@@ -1668,7 +1668,7 @@ impl Root {
         // 不能拿「探索卡有没有数据」当判据（#213）。
         let needs_modes = self.scene_modes_state.needs_request();
         self.loading_scenes = true;
-        self.loading_scene_cards = !existing_ids.is_empty();
+        self.loading_scene_cards = true;
         if needs_modes {
             self.scene_modes_state = SceneModesState::Loading;
         }
@@ -1829,6 +1829,8 @@ impl Root {
     /// 再跑一遍 `load_scenes` 只会顺手读卡，和用户按的那颗按钮对不上（#213）。
     pub fn retry_scene_modes(&mut self, cx: &mut Context<Self>) {
         if self.loading_scenes {
+            // 探索卡请求还在飞时点重试：给一句反馈，别让按钮看起来没接上。
+            self.set_status_text(self.tr("正在加载…"));
             return;
         }
         self.scene_modes_state = SceneModesState::Loading;
@@ -4790,11 +4792,8 @@ impl Root {
                 self.liked_ids_failed = false;
                 self.liked_loaded = false;
                 self.open_playlist = None;
-                // 常用模式/探索歌单同样属于上一个账号：清掉；正停在这一页就用新身份重读。
+                // 常用模式/探索歌单同样属于上一个账号：清掉，重新进页面再按新身份读。
                 self.reset_scene_state();
-                if self.nav == Nav::Scenes {
-                    self.load_scenes(cx);
-                }
                 self.refresh_account(cx);
                 self.load_liked_ids(cx);
             }

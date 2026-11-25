@@ -21,7 +21,6 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .as_ref()
         .and_then(|source| source.scene.as_ref())
         .map(|scene| scene.sub_queue_type.clone());
-    let loading_scenes = root.loading_scenes;
     let modes_state = root.scene_modes_state;
     let loading_cards = root.loading_scene_cards;
     let card_count = cards.len();
@@ -32,8 +31,9 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let card_rows = cards.len().div_ceil(card_columns).max(1);
     let width_slot = root.scenes_width.clone();
 
-    // 首次加载是整页状态：不要同时显示“读取模式/暂无歌单/加载更多”。
-    if loading_scenes && cards.is_empty() {
+    // 整页加载只在常用模式正在读、探索卡也还空着时出现：探索卡单独在飞
+    // 就留在列表里，让卡区自己显示加载态，别把整页伪装成「正在读取听歌模式」（#213）。
+    if loading_cards && cards.is_empty() && modes_state == SceneModesState::Loading {
         return div()
             .size_full()
             .flex()
@@ -71,26 +71,18 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .text_color(theme::text_muted())
                         .child(language.text("常用模式暂不可用").to_string())
                         .child(
-                            div()
-                                .id("retry-scene-modes")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .h(px(theme::size::CONTROL_SM))
-                                .px(px(theme::space::MD))
-                                .rounded(px(theme::radius::PILL))
-                                .bg(theme::surface_elevated())
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme::surface_hover()))
-                                .on_click({
-                                    let entity = entity.clone();
-                                    move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
-                                        entity.update(cx, |root, cx| {
-                                            root.retry_scene_modes(cx);
-                                        });
-                                    }
-                                })
-                                .child(language.text("重试加载").to_string()),
+                            compact_retry_pill(
+                                "retry-scene-modes",
+                                language.text("重试加载").to_string(),
+                            )
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+                                    entity.update(cx, |root, cx| {
+                                        root.retry_scene_modes(cx);
+                                    });
+                                }
+                            }),
                         )
                         .into_any_element(),
                     SceneModesState::Ready | SceneModesState::Idle => div()
@@ -360,30 +352,20 @@ pub(crate) fn retry_button(
     language: crate::ui::i18n::Language,
     cx: &mut Context<Root>,
 ) -> AnyElement {
-    div()
-        .id("retry-playback-assets")
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(theme::size::CONTROL_SM))
-        .px(px(theme::space::MD))
-        .rounded(px(theme::radius::PILL))
-        .bg(theme::surface_elevated())
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::surface_hover()))
-        .text_size(theme::Text::Tiny.size())
-        .text_color(theme::text_muted())
-        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-            if let Some(track) = root
-                .pending_track
-                .clone()
-                .or_else(|| root.queue.current().cloned())
-            {
-                root.retry_playback_assets(track, cx);
-            }
-        }))
-        .child(language.text("重试加载"))
-        .into_any_element()
+    compact_retry_pill(
+        "retry-playback-assets",
+        language.text("重试加载").to_string(),
+    )
+    .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+        if let Some(track) = root
+            .pending_track
+            .clone()
+            .or_else(|| root.queue.current().cloned())
+        {
+            root.retry_playback_assets(track, cx);
+        }
+    }))
+    .into_any_element()
 }
 
 fn section_title(text: &str) -> AnyElement {
