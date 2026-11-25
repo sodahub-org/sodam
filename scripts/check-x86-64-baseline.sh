@@ -45,7 +45,7 @@ symbols=$(printf '%s\n' "$raw_symbols" | awk 'NF >= 3 { print $NF }' |
 # 两个都得在：少一个说明符号名变了或被 strip 了，护栏等于没装，直接报错
 for want in "${wanted[@]}"; do
     if ! grep -qE "x25519_${want}$" <<<"$symbols"; then
-        echo "在 $binary 里找不到 x25519_$want（被 strip 了？），护栏失效" >&2
+        echo "在 $binary 里找不到 x25519_$want（被 strip 了，还是换了 ring 版本、函数改名了？），护栏失效" >&2
         exit 1
     fi
 done
@@ -56,8 +56,10 @@ while IFS= read -r symbol; do
         echo "反汇编失败：$symbol" >&2
         exit 1
     fi
+    # 覆盖 v3 的三种形态：向量（ymm/zmm）、BMI1/BMI2 标量、AVX-512 掩码寄存器；
+    # 再加一条 128 位 VEX（AVX1），baseline 构建不该出现。
     hits=$(printf '%s\n' "$disassembly" |
-        grep -E '\b(mulx|adcx|adox|rorx)\b|%ymm|%zmm' || true)
+        grep -E '\b(mulx|adcx|adox|rorx|pdep|pext|shlx|shrx|sarx|andn|blsr|blsmsk|blsi|bzhi|bextr|lzcnt|tzcnt)\b|%ymm|%zmm|%k[0-7]|\bv[a-z0-9]+[[:space:]]+%x' || true)
     if [[ -n "$hits" ]]; then
         echo "越界：$symbol 里有高于 x86-64 baseline 的指令（#306）" >&2
         echo "$hits" | head -n 5 >&2
