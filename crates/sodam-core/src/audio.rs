@@ -276,6 +276,10 @@ fn record_error(snap: &mut PlaybackSnapshot, message: String) {
     snap.finished = false;
 }
 
+fn clear_error(snap: &mut PlaybackSnapshot) {
+    snap.error.clear();
+}
+
 fn set_error(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
         record_error(&mut snap, message);
@@ -339,7 +343,7 @@ fn mark_seek_succeeded(state: &Arc<Mutex<PlaybackSnapshot>>, seconds: f64, playi
     if let Ok(mut snap) = state.lock() {
         snap.seek_pending = false;
         snap.finished = false;
-        snap.error.clear();
+        clear_error(&mut snap);
         snap.position_seconds = seconds;
         snap.playing = playing;
     }
@@ -658,7 +662,7 @@ fn audio_thread(
                     snap.quality = quality.clone();
                     snap.quality_rank = quality_rank;
                     snap.preview = preview;
-                    snap.error.clear();
+                    clear_error(&mut snap);
                     snap.finished = false;
                     snap.seek_pending = false;
                     finished_reported = false;
@@ -838,7 +842,7 @@ fn follow_default_output(
     if let Ok(mut snap) = state.lock() {
         snap.position_seconds = position.as_secs_f64();
         snap.playing = !paused;
-        snap.error.clear();
+        clear_error(&mut snap);
     }
 }
 
