@@ -657,6 +657,7 @@ mod tests {
     #[test]
     fn startup_failure_signal_matches_unlocked_tray_checks() {
         use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
 
         let slot = Arc::new(StartupFailureSlot::default());
         for _ in 0..100 {
@@ -683,22 +684,32 @@ mod tests {
         let sets = Arc::new(AtomicUsize::new(0));
         let takes = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|scope| {
-            let setter = scope.spawn(|| {
+            let barrier = Arc::new(Barrier::new(3));
+            let setter_barrier = barrier.clone();
+            let setter_slot = slot.clone();
+            let setter_sets = sets.clone();
+            let setter = scope.spawn(move || {
+                setter_barrier.wait();
                 for _ in 0..10_000 {
-                    slot.set(WriteFailure {
+                    setter_slot.set(WriteFailure {
                         kind: FailureKind::Startup,
                         detail: "并发写入".into(),
                     });
-                    sets.fetch_add(1, Ordering::Relaxed);
+                    setter_sets.fetch_add(1, Ordering::Relaxed);
                 }
             });
-            let taker = scope.spawn(|| {
+            let taker_barrier = barrier.clone();
+            let taker_slot = slot.clone();
+            let taker_takes = takes.clone();
+            let taker = scope.spawn(move || {
+                taker_barrier.wait();
                 for _ in 0..10_000 {
-                    if slot.take().is_some() {
-                        takes.fetch_add(1, Ordering::Relaxed);
+                    if taker_slot.take().is_some() {
+                        taker_takes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
+            barrier.wait();
             setter.join().unwrap();
             taker.join().unwrap();
         });
