@@ -11,7 +11,7 @@
 # 这是一道金丝雀：构建机的 C 基线一旦被抬高，这两个函数一定跟着抬高，不用去猜别的依赖。
 # 要核对整包的话得连 glibc / crt 一起看，那是另一件事（换 runner，而不是扫指令）。
 #
-# 用法：scripts/check-x86-64-baseline.sh <elf>
+# 用法：scripts/check-x86-64-baseline.sh <elf>（相对路径按仓库根解析）
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,7 +21,12 @@ binary=${1:?usage: check-x86-64-baseline.sh <elf>}
     exit 1
 }
 
-if ! readelf -h "$binary" | grep -q 'X86-64'; then
+if ! header=$(readelf -h "$binary"); then
+    echo "读不出 $binary 的 ELF 头（缺 binutils？），护栏失效" >&2
+    exit 1
+fi
+
+if ! grep -q 'X86-64' <<<"$header"; then
     echo "跳过 $binary：不是 x86-64 产物"
     exit 0
 fi
