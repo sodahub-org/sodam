@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::shortcuts::{self, Slot};
+use std::sync::atomic::Ordering;
 
 /// 存储串 → 给人看的按键形式。
 ///
@@ -234,7 +235,7 @@ fn shortcut_row(root: &Root, slot: Slot, cx: &mut Context<Root>) -> AnyElement {
                         .on_click(cx.listener(
                             move |root, _event: &ClickEvent, _window, cx| {
                                 shortcuts::set_keystroke(&mut root.settings, slot, String::new());
-                                root.shortcuts_dirty = true;
+                                root.shortcuts_dirty.store(true, Ordering::Release);
                                 root.save_settings();
                                 let status = if root.language.is_zh() {
                                     root.tr("快捷键已恢复默认").to_string()
@@ -359,7 +360,7 @@ pub(crate) fn section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     }
                     shortcuts::set_keystroke(&mut root.settings, slot, stored);
                     root.shortcut_capture = None;
-                    root.shortcuts_dirty = true;
+                    root.shortcuts_dirty.store(true, Ordering::Release);
                     let status = if root.language.is_zh() {
                         root.tr("快捷键已更新").to_string()
                     } else {

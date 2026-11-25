@@ -2,6 +2,7 @@
 //!
 //! [`Root`] 的字段定义在 [`super`]，这里按领域拆分实现，避免单文件继续膨胀。
 
+use crate::loop_probe::LoopProbe;
 use crate::ui::i18n::Language;
 use crate::ui::middle_drag::DragTarget;
 use crate::ui::theme::{self, ThemeKind};
@@ -24,7 +25,7 @@ use sodam_core::play_failure::{
 use sodam_core::playback_trace::{drive_play_attempt, PlaybackTrace};
 use sodam_core::prefetch::{is_global_failure, SuspensionClass};
 use sodam_core::session::Session;
-use sodam_core::settings_writer::{FailureKind, SignOut};
+use sodam_core::settings_writer::{FailureKind, SignOut, WriteFailure};
 use sodam_core::upgrade::{
     identity_change, stop_reason, IdentityChange, NotImprovedReason, Outcome, StopConditions,
     StopReason, Tally,
@@ -32,6 +33,7 @@ use sodam_core::upgrade::{
 use sodam_core::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::{
@@ -371,112 +373,133 @@ impl Root {
         log_prefetch_suspension(class);
     }
 
+    /// 启动期配置回存失败正常情况下由托盘拍报告；退出等待期间不消费，留给退出状态。
+    pub(crate) fn report_startup_persist_result(&mut self, cx: &mut Context<Self>) {
+        if self.quit_gate.is_saving() {
+            return;
+        }
+        let Some(failure) = self.settings_writer.take_startup_error() else {
+            return;
+        };
+        self.report_settings_failure(failure, cx);
+    }
+
+    fn report_settings_failure(&mut self, failure: WriteFailure, cx: &mut Context<Self>) {
+        let text = match failure.kind {
+            FailureKind::Startup => STARTUP_SAVE_TEXT,
+            FailureKind::QueueStopped => QUEUE_STOPPED_TEXT,
+            FailureKind::Settings => SAVE_TEXT,
+        };
+        let message = self.tr(text).to_string();
+        self.notify_error_once("settings-save-failed", message);
+        cx.notify();
+    }
+
     /// UI 心跳：播放中每 200ms 刷新一次（进度条需要持续重绘），
     /// 曲目播完则自动切下一首。
     pub(crate) fn start_heartbeat(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(200))
-                .await;
-            let _ = this.update(cx, |root, cx| {
-                let snap = root.engine.snapshot();
-                // 播放进度 / 时长上报：喂一拍快照（内部异步发请求，不阻塞）
-                root.play_reporter.observe(&snap);
-                // 「这一轮没有能播的歌了」只在条件仍成立时留着：账号 / 会员状态变化
-                // 让集合作废、或队列换成了一批新歌之后，常驻错误要自己撤下，不等用户关。
-                if root.round_exhausted.is_some() && root.has_playable_ahead() {
-                    root.clear_round_exhaustion();
-                }
-                // 加载完成：引擎已切到 pending 曲目 → 清 loading 态
-                if root.pending_engine_load == Some(snap.load_seq) {
-                    root.pending_engine_load = None;
-                    root.pending_track = None;
-                    root.playing = snap.playing;
-                    cx.notify();
-                }
-                if root.pending_track.is_none()
-                    && !snap.error.is_empty()
-                    && !snap.track_id.is_empty()
-                    && root.playback_error.as_deref() != Some(snap.error.as_str())
-                {
-                    root.playing = false;
-                    root.playback_error = Some(snap.error.clone());
-                    let message = root.language.engine_error(&snap.error);
-                    root.notify_error_once("playback-engine-failed", message);
-                    cx.notify();
-                }
-                // 排队落盘失败：下一拍就在这里进状态行，不憋到退出才报（#259）。
-                // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记。
-                //
-                // 正在等刷尾退出时状态行留给「正在保存…」：先判这个，再去取失败——
-                // 顺序反了会把失败取走扔掉，退出那几秒里写盘失败的提示就永远看不到了。
-                if !root.quit_gate.is_saving() {
-                    if let Some(failure) = root.settings_writer.take_error() {
-                        let text = match failure.kind {
-                            FailureKind::Settings => SAVE_TEXT,
-                            FailureKind::Startup => STARTUP_SAVE_TEXT,
-                            FailureKind::QueueStopped => QUEUE_STOPPED_TEXT,
-                        };
-                        let message = root.tr(text).to_string();
-                        root.notify_error_once("settings-save-failed", message);
+        cx.spawn(async move |this, cx| {
+            let mut probe = LoopProbe::new("heartbeat");
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                probe.tick();
+                let _ = this.update(cx, |root, cx| {
+                    probe.app_entry();
+                    let snap = root.engine.snapshot();
+                    probe.engine_snapshot();
+                    // 播放进度 / 时长上报：喂一拍快照（内部异步发请求，不阻塞）
+                    root.play_reporter.observe(&snap);
+                    // 「这一轮没有能播的歌了」只在条件仍成立时留着：账号 / 会员状态变化
+                    // 让集合作废、或队列换成了一批新歌之后，常驻错误要自己撤下，不等用户关。
+                    if root.round_exhausted.is_some() && root.has_playable_ahead() {
+                        root.clear_round_exhaustion();
+                    }
+                    // 加载完成：引擎已切到 pending 曲目 → 清 loading 态
+                    if root.pending_engine_load == Some(snap.load_seq) {
+                        root.pending_engine_load = None;
+                        root.pending_track = None;
+                        root.playing = snap.playing;
                         cx.notify();
                     }
-                }
-                // 音量拖动收不到松手事件时（拖到窗口外松手、拖动中切走窗口），
-                // 停手一拍就当作结束：补排落盘，别让音量停在内存里（#259）。
-                root.settle_volume_scrub();
-                if snap.playing || root.pending_track.is_some() {
-                    cx.notify();
-                }
-                // 熔断复位：装载成功不算「缓过来」，声音真的播出去若干秒才算；
-                // 而且必须归属到最近一次成功装载——上一首还在放时清零连败，
-                // 封顶就永远触发不了（见 AttemptProgress::recovered）。
-                let progress = AttemptProgress::of(&snap, root.progress_token);
-                if progress.recovered() {
-                    root.consecutive_failures = 0;
-                    root.progress_token = None;
-                }
-                // 播完自动下一首：按序号判断（循环同一首也不会漏切）。
-                // 注意：正在装载下一首（pending）时「播完」属于旧曲目，
-                // 只消费事件不推进——否则会把 pending 的那首跳过去（收尾瞬间
-                // 手动切歌/插入队列时踩过）。
-                // seek 之前积压的完成事件不能把当前曲目推进到下一首。
-                let current = finished_event_is_current(
-                    snap.finished_seq,
-                    snap.seek_seq,
-                    &mut root.last_finished_seq,
-                    &mut root.last_seek_seq,
-                );
-                // 封顶闸门打开时不推进：连续几首都没播出来还往后翻，就是在替用户决定
-                // 「再试几首」，而网络恢复该由用户按下播放来确认。
-                let should_advance = current && !root.playback_halted;
-                if snap.finished && should_advance && root.pending_track.is_none() {
-                    if root.queue.mode == PlayMode::RepeatOne {
-                        // 播完重播：单曲循环的正常语义，不能拿「不可播的前进」替换。
-                        root.advance_next(false, cx);
-                    } else {
-                        // 自动续播同样先查不可播集合：已确认放不出来的歌不再白打一次网络。
-                        root.auto_advance_track(cx);
+                    if root.pending_track.is_none()
+                        && !snap.error.is_empty()
+                        && !snap.track_id.is_empty()
+                        && root.playback_error.as_deref() != Some(snap.error.as_str())
+                    {
+                        root.playing = false;
+                        root.playback_error = Some(snap.error.clone());
+                        let message = root.language.engine_error(&snap.error);
+                        root.notify_error_once("playback-engine-failed", message);
+                        cx.notify();
                     }
-                }
-                // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
-                // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
-                root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
-                if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
-                    // 冷却从挂起时刻算；判定放在真正会预取的那一拍。落闸期间这条预取
-                    // 巡检不执行，因此也不检查冷却、不写 resumed 日志——实际恢复顺延到
-                    // 用户主动播放后的下一拍（docs/ARCHITECTURE.md 已写明这条前提）。
-                    let now = std::time::Instant::now();
-                    log_prefetch_resume(root.prefetch_gate.expire_cooldown(now));
-                    root.prefetch_cooldown_since
-                        .retain(|_, failed_at| prefetch_cooldown_active(*failed_at, now));
-                    root.spawn_prefetch(cx);
-                }
-                if root.prefetch_patrol % 300 == 0 {
-                    root.maintain_cache(cx);
-                }
-                root.load_more_recommendation(cx);
-            });
+                    // 排队落盘失败：下一拍就在这里进状态行，不憋到退出才报（#259）。
+                    // 技术原文由写线程记了一行日志，这里只给一句人话，不重复记。
+                    //
+                    // 正在等刷尾退出时状态行留给「正在保存…」：先判这个，再去取失败——
+                    // 顺序反了会把失败取走扔掉，退出那几秒里写盘失败的提示就永远看不到了。
+                    if !root.quit_gate.is_saving() {
+                        if let Some(failure) = root.settings_writer.take_error() {
+                            root.report_settings_failure(failure, cx);
+                        }
+                    }
+                    // 音量拖动收不到松手事件时（拖到窗口外松手、拖动中切走窗口），
+                    // 停手一拍就当作结束：补排落盘，别让音量停在内存里（#259）。
+                    root.settle_volume_scrub();
+                    if snap.playing || root.pending_track.is_some() {
+                        cx.notify();
+                    }
+                    // 熔断复位：装载成功不算「缓过来」，声音真的播出去若干秒才算；
+                    // 而且必须归属到最近一次成功装载——上一首还在放时清零连败，
+                    // 封顶就永远触发不了（见 AttemptProgress::recovered）。
+                    let progress = AttemptProgress::of(&snap, root.progress_token);
+                    if progress.recovered() {
+                        root.consecutive_failures = 0;
+                        root.progress_token = None;
+                    }
+                    // 播完自动下一首：按序号判断（循环同一首也不会漏切）。
+                    // 注意：正在装载下一首（pending）时「播完」属于旧曲目，
+                    // 只消费事件不推进——否则会把 pending 的那首跳过去（收尾瞬间
+                    // 手动切歌/插入队列时踩过）。
+                    // seek 之前积压的完成事件不能把当前曲目推进到下一首。
+                    let current = finished_event_is_current(
+                        snap.finished_seq,
+                        snap.seek_seq,
+                        &mut root.last_finished_seq,
+                        &mut root.last_seek_seq,
+                    );
+                    // 封顶闸门打开时不推进：连续几首都没播出来还往后翻，就是在替用户决定
+                    // 「再试几首」，而网络恢复该由用户按下播放来确认。
+                    let should_advance = current && !root.playback_halted;
+                    if snap.finished && should_advance && root.pending_track.is_none() {
+                        if root.queue.mode == PlayMode::RepeatOne {
+                            // 播完重播：单曲循环的正常语义，不能拿「不可播的前进」替换。
+                            root.advance_next(false, cx);
+                        } else {
+                            // 自动续播同样先查不可播集合：已确认放不出来的歌不再白打一次网络。
+                            root.auto_advance_track(cx);
+                        }
+                    }
+                    // 预取巡检：每 25 拍（约 5s）补一次，覆盖 append/remove 等
+                    // 队列变更路径（spawn_prefetch 自身会去重，空转开销极小）
+                    root.prefetch_patrol = root.prefetch_patrol.wrapping_add(1);
+                    if root.prefetch_patrol % 25 == 0 && !root.playback_halted {
+                        // 冷却从挂起时刻算；判定放在真正会预取的那一拍。落闸期间这条预取
+                        // 巡检不执行，因此也不检查冷却、不写 resumed 日志——实际恢复顺延到
+                        // 用户主动播放后的下一拍（docs/ARCHITECTURE.md 已写明这条前提）。
+                        let now = std::time::Instant::now();
+                        log_prefetch_resume(root.prefetch_gate.expire_cooldown(now));
+                        root.prefetch_cooldown_since
+                            .retain(|_, failed_at| prefetch_cooldown_active(*failed_at, now));
+                        root.spawn_prefetch(cx);
+                    }
+                    if root.prefetch_patrol % 300 == 0 {
+                        root.maintain_cache(cx);
+                    }
+                    root.load_more_recommendation(cx);
+                });
+            }
         })
         .detach();
     }
@@ -492,79 +515,86 @@ impl Root {
     /// 为什么不用 `with_animation`：那个是给 SVG / 变换用的，无法带动文字重排；
     /// 而 `cx.notify()` 只是标脏，真正重绘仍由 gpui 的帧调度合并，不会堆帧。
     pub(crate) fn start_lyrics_ticker(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            // 先决定这一拍要不要重绘、以及下一拍睡多久。
-            //
-            // 关键判据是「**这一行此刻是否真的在走字**」，而不是「有没有当前行」：
-            // 没有逐字时间轴的歌（普通 LRC）整行直接全亮，根本不会有动画；
-            // 逐字行也有大半时间停在"已走满、等下一句"。这些时候按 60fps 重绘
-            // 纯粹是空转 —— 实测一首无逐字轴的歌能占到单核 46%，白白浪费。
-            //
-            // 所以只在真正需要时用 16ms，其余时间直接**睡到下一个会变化的时刻**。
-            let (interval, notify) = this
-                .update(cx, |root, _cx| {
-                    const HOT: std::time::Duration = std::time::Duration::from_millis(16);
-                    const IDLE: std::time::Duration = std::time::Duration::from_millis(120);
-                    if root.nav != Nav::Lyrics {
-                        return (IDLE, false);
-                    }
-                    // 样张模式（开发验证）也要能刷新。
-                    if root.lyrics_demo_position.is_some() {
-                        return (HOT, true);
-                    }
-                    // 滚动过渡进行中：让 timer 退到空闲档，动画交给
-                    // `request_animation_frame` 驱动（见 `Root::render`）。
-                    // 两个驱动源同时推进会造成重复推进、间隔不匀，反而更不平滑。
-                    if root.lyrics_scroll_animating() {
-                        return (IDLE, false);
-                    }
-                    let snapshot = root.engine.snapshot();
-                    if !snapshot.playing {
-                        return (IDLE, false);
-                    }
+        cx.spawn(async move |this, cx| {
+            let mut probe = LoopProbe::new("lyrics");
+            loop {
+                probe.tick();
+                // 先决定这一拍要不要重绘、以及下一拍睡多久。
+                //
+                // 关键判据是「**这一行此刻是否真的在走字**」，而不是「有没有当前行」：
+                // 没有逐字时间轴的歌（普通 LRC）整行直接全亮，根本不会有动画；
+                // 逐字行也有大半时间停在"已走满、等下一句"。这些时候按 60fps 重绘
+                // 纯粹是空转 —— 实测一首无逐字轴的歌能占到单核 46%，白白浪费。
+                //
+                // 所以只在真正需要时用 16ms，其余时间直接**睡到下一个会变化的时刻**。
+                let (interval, notify) = this
+                    .update(cx, |root, _cx| {
+                        probe.app_entry();
+                        const HOT: std::time::Duration = std::time::Duration::from_millis(16);
+                        const IDLE: std::time::Duration = std::time::Duration::from_millis(120);
+                        if root.nav != Nav::Lyrics {
+                            return (IDLE, false);
+                        }
+                        // 样张模式（开发验证）也要能刷新。
+                        if root.lyrics_demo_position.is_some() {
+                            return (HOT, true);
+                        }
+                        // 滚动过渡进行中：让 timer 退到空闲档，动画交给
+                        // `request_animation_frame` 驱动（见 `Root::render`）。
+                        // 两个驱动源同时推进会造成重复推进、间隔不匀，反而更不平滑。
+                        if root.lyrics_scroll_animating() {
+                            return (IDLE, false);
+                        }
+                        probe.engine_snapshot();
+                        let snapshot = root.engine.snapshot();
+                        if !snapshot.playing {
+                            return (IDLE, false);
+                        }
 
-                    // 当前行是否还在"走字"：有逐字轴，且还没走到行尾。
-                    let revealing = root
-                        .lyrics_active
-                        .and_then(|index| root.lyrics.get(index))
-                        .is_some_and(|line| {
-                            line_undergoing_reveal(line, root.lyrics_position_seconds)
-                        });
-                    if revealing {
-                        return (HOT, true);
-                    }
+                        // 当前行是否还在"走字"：有逐字轴，且还没走到行尾。
+                        let revealing = root
+                            .lyrics_active
+                            .and_then(|index| root.lyrics.get(index))
+                            .is_some_and(|line| {
+                                line_undergoing_reveal(line, root.lyrics_position_seconds)
+                            });
+                        if revealing {
+                            return (HOT, true);
+                        }
 
-                    // 空闲：睡到下一句开始之前，那时才需要重新点亮/开始走字。
-                    //
-                    // 用快照位置而不是 `lyrics_position_seconds`：后者只在渲染时更新，
-                    // 空闲期间不渲染就会滞后，按它算等待会睡过头。
-                    let next_start = root
-                        .lyrics
-                        .iter()
-                        .map(|line| line.start_seconds)
-                        .filter(|start| *start > snapshot.position_seconds)
-                        .fold(f64::INFINITY, f64::min);
-                    let next_start = next_start.is_finite().then_some(next_start);
-                    // 进入"下一句马上开始"的窗口就必须 notify：
-                    // `lyrics_position_seconds` 与 `lyrics_active` 只在 `Root::render`
-                    // 里更新。若醒来自顾自继续睡，就会一直拿旧位置判定"还没到"，
-                    // 直到 200ms 主心跳才切句 —— 正好抵消 `lyrics_idle_wait`
-                    // 想到达的"刚好赶上"。
-                    let near = lyrics_near_next_line(snapshot.position_seconds, next_start);
-                    (
-                        lyrics_idle_wait(snapshot.position_seconds, next_start),
-                        near,
-                    )
-                })
-                .unwrap_or((std::time::Duration::from_millis(120), false));
-            let _ = this.update(cx, |_root, cx| {
-                // 滚动过渡不在这里推进：它跑在 `Root::render` 的帧回调里，
-                // 那里与平台刷新同步。这里只负责常规的逐字高亮重绘。
-                if notify {
-                    cx.notify();
-                }
-            });
-            cx.background_executor().timer(interval).await;
+                        // 空闲：睡到下一句开始之前，那时才需要重新点亮/开始走字。
+                        //
+                        // 用快照位置而不是 `lyrics_position_seconds`：后者只在渲染时更新，
+                        // 空闲期间不渲染就会滞后，按它算等待会睡过头。
+                        let next_start = root
+                            .lyrics
+                            .iter()
+                            .map(|line| line.start_seconds)
+                            .filter(|start| *start > snapshot.position_seconds)
+                            .fold(f64::INFINITY, f64::min);
+                        let next_start = next_start.is_finite().then_some(next_start);
+                        // 进入"下一句马上开始"的窗口就必须 notify：
+                        // `lyrics_position_seconds` 与 `lyrics_active` 只在 `Root::render`
+                        // 里更新。若醒来自顾自继续睡，就会一直拿旧位置判定"还没到"，
+                        // 直到 200ms 主心跳才切句 —— 正好抵消 `lyrics_idle_wait`
+                        // 想到达的"刚好赶上"。
+                        let near = lyrics_near_next_line(snapshot.position_seconds, next_start);
+                        (
+                            lyrics_idle_wait(snapshot.position_seconds, next_start),
+                            near,
+                        )
+                    })
+                    .unwrap_or((std::time::Duration::from_millis(120), false));
+                let _ = this.update(cx, |_root, cx| {
+                    probe.app_entry();
+                    // 滚动过渡不在这里推进：它跑在 `Root::render` 的帧回调里，
+                    // 那里与平台刷新同步。这里只负责常规的逐字高亮重绘。
+                    if notify {
+                        cx.notify();
+                    }
+                });
+                cx.background_executor().timer(interval).await;
+            }
         })
         .detach();
     }
@@ -4627,7 +4657,7 @@ impl Root {
         }
         // 快捷键：置脏位，main.rs 心跳里统一重绑（清空 + 重建 keymap）。
         if shortcuts_changed {
-            self.shortcuts_dirty = true;
+            self.shortcuts_dirty.store(true, Ordering::Release);
         }
         // 会话类改动：重建会话（不落盘）。当前曲目不断；下一次取流/搜索/上报用新值。
         if session_changed {

@@ -11,6 +11,8 @@ mod app_text;
 mod tray;
 mod ui;
 mod views;
+// 帧日志循环计数，见 loop_probe.rs。
+mod loop_probe;
 // 系统媒体控制（媒体键 / 桌面媒体挂件），见 media.rs。
 mod media;
 // 播放控制快捷键（可重绑），见 shortcuts.rs。
@@ -24,11 +26,16 @@ mod menus;
 use gpui::{
     px, size, App, AppContext as _, Bounds, Entity, TitlebarOptions, WindowBounds, WindowOptions,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use crate::loop_probe::LoopProbe;
+use sodam_core::settings_writer::StartupFailureSlot;
 
 /// 更紧凑的启动窗口尺寸（逻辑像素）；通过 Bounds::centered 在主屏幕居中。
 const DEFAULT_SIZE: (f32, f32) = (980.0, 640.0);
 const MIN_SIZE: (f32, f32) = (900.0, 560.0);
+const MAX_ACTIVATIONS_PER_TICK: usize = 16;
 
 fn main_window_options(cx: &mut App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(DEFAULT_SIZE.0), px(DEFAULT_SIZE.1)), cx);
@@ -71,21 +78,49 @@ fn native_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
     None
 }
 
-/// 托盘事件循环：把命令转发为应用动作，并周期同步播放状态到 `sync`。
+struct TraySignals {
+    media_commands: Option<Arc<AtomicBool>>,
+    shortcuts_dirty: Arc<AtomicBool>,
+    startup_save: StartupFailureSlot,
+}
+
+/// 100ms 托盘拍：转发托盘和媒体命令，处理单实例激活、快捷键重绑、
+/// 启动回存失败与配置巡检，并同步托盘和系统媒体状态。
 /// 双平台共用；平台差异只在 `sync` 闭包（见 tray.rs）。
 fn start_tray_service(
     rx: std::sync::mpsc::Receiver<tray::TrayCommand>,
+    activations: std::sync::mpsc::Receiver<()>,
     app: Entity<app::Root>,
+    signals: TraySignals,
     cx: &mut App,
     mut sync: impl FnMut(tray::TrayState) + 'static,
 ) {
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
+        let mut tray_probe = LoopProbe::new("tray");
+        let mut single_probe = LoopProbe::new_shared_tray("single");
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(100))
                 .await;
+            tick = tick.wrapping_add(1);
+            tray_probe.tick();
+
+            if tick % 2 == 0 {
+                single_probe.check();
+                if activations.try_recv().is_ok() {
+                    for _ in 1..MAX_ACTIVATIONS_PER_TICK {
+                        if activations.try_recv().is_err() {
+                            break;
+                        }
+                    }
+                    single_probe.app_entry();
+                    cx.update(|cx| show_window(cx, &app));
+                }
+            }
+
             while let Ok(command) = rx.try_recv() {
+                tray_probe.app_entry();
                 match command {
                     tray::TrayCommand::Show => cx.update(|cx| show_window(cx, &app)),
                     tray::TrayCommand::Toggle => {
@@ -104,56 +139,73 @@ fn start_tray_service(
                 };
             }
 
-            // 系统媒体控件（媒体键 / 桌面挂件按钮）的请求 → 播放动作。
-            for command in cx.update(|cx| media::drain_commands(cx)) {
+            if signals
+                .media_commands
+                .as_ref()
+                .is_some_and(|pending| pending.load(Ordering::Acquire))
+            {
+                tray_probe.signal_app_entry();
                 cx.update(|cx| {
+                    let commands = media::drain_commands(cx);
                     app.update(cx, |root, cx| {
-                        let playing = root.engine.snapshot().playing;
-                        match command {
-                            media::Command::Play if !playing => root.toggle_play(cx),
-                            media::Command::Pause if playing => root.toggle_play(cx),
-                            media::Command::Toggle => root.toggle_play(cx),
-                            media::Command::Next => root.next_track(cx),
-                            media::Command::Previous => root.prev_track(cx),
-                            _ => {}
+                        for command in commands {
+                            tray_probe.engine_snapshot();
+                            let playing = root.engine.snapshot().playing;
+                            match command {
+                                media::Command::Play if !playing => root.toggle_play(cx),
+                                media::Command::Pause if playing => root.toggle_play(cx),
+                                media::Command::Toggle => root.toggle_play(cx),
+                                media::Command::Next => root.next_track(cx),
+                                media::Command::Previous => root.prev_track(cx),
+                                _ => {}
+                            }
                         }
-                    })
+                    });
                 });
             }
 
-            // 设置页重绑快捷键后置位，这里重新注册（清空 + 重建 keymap，见 shortcuts::apply）。
-            let settings_changed = cx.update(|cx| {
-                app.update(cx, |root, _cx| {
-                    let dirty = root.shortcuts_dirty;
-                    root.shortcuts_dirty = false;
-                    dirty
-                })
-            });
-            if settings_changed {
-                let settings = cx.update(|cx| app.read(cx).settings.clone());
-                cx.update(|cx| shortcuts::apply(cx, &settings));
+            if signals.shortcuts_dirty.load(Ordering::Acquire) {
+                tray_probe.signal_app_entry();
+                cx.update(|cx| {
+                    let settings = app.update(cx, |root, _cx| {
+                        root.shortcuts_dirty.store(false, Ordering::Release);
+                        root.settings.clone()
+                    });
+                    shortcuts::apply(cx, &settings);
+                });
             }
 
-            tick += 1;
+            if signals.startup_save.is_pending() {
+                tray_probe.signal_app_entry();
+                cx.update(|cx| {
+                    app.update(cx, |root, cx| root.report_startup_persist_result(cx));
+                });
+            }
+
             // 配置热重载巡检：每 ~500ms 一次，读盘与解析放后台线程，结果回 UI 应用（#185）。
             // 错开托盘同步的那一拍，避免同帧做两批后台活。
             if tick % 5 == 2 {
+                tray_probe.app_entry();
                 let request = cx.update(|cx| app.update(cx, |root, _cx| root.begin_config_poll()));
                 if let Some(request) = request {
                     let app = app.clone();
+                    let app_entries = tray_probe.app_entry_counter();
                     cx.spawn(async move |cx| {
                         let (event, snapshot) = cx
                             .background_executor()
                             .spawn(async move { request.poll() })
                             .await;
+                        app_entries.fetch_add(1, Ordering::Relaxed);
                         app.update(cx, |root, cx| root.finish_config_poll(event, snapshot, cx));
                     })
                     .detach();
                 }
             }
             if tick % 5 == 0 {
-                let now = cx.update(|cx| {
-                    app.update(cx, |root, _cx| {
+                tray_probe.app_entry();
+                cx.update(|cx| {
+                    let now = app.update(cx, |root, _cx| {
+                        tray_probe.engine_snapshot();
                         let snapshot = root.engine.snapshot();
                         let track = root.queue.current();
                         let title = if snapshot.track_id.is_empty() {
@@ -174,7 +226,6 @@ fn start_tray_service(
                             has_track: !snapshot.track_id.is_empty(),
                             cover_path: track.and_then(|track| root.cover_of(&track.cover)),
                         });
-                        // 顺手发布给系统媒体面板（内容没变时 publish 内部会跳过）。
                         media::NowPlaying {
                             track_id: snapshot.track_id.clone(),
                             title: snapshot.title.clone(),
@@ -185,9 +236,9 @@ fn start_tray_service(
                             position_seconds: snapshot.position_seconds,
                             playing: snapshot.playing,
                         }
-                    })
+                    });
+                    media::publish(cx, &now);
                 });
-                cx.update(|cx| media::publish(cx, &now));
             }
         }
     })
@@ -204,26 +255,6 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
         cx.open_window(options, |_window, _cx| app).ok();
     }
     cx.activate(true);
-}
-
-/// 第二个实例启动时发来的「把窗口提到前台」请求。
-///
-/// socket 监听在独立线程，这里用轮询把信号搬到 UI 线程 —— 不能在渲染线程上
-/// 阻塞 `recv()`，200ms 的延迟对这个操作完全够用。
-fn start_single_instance_service(
-    activations: std::sync::mpsc::Receiver<()>,
-    app: Entity<app::Root>,
-    cx: &mut App,
-) {
-    cx.spawn(async move |cx| loop {
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(200))
-            .await;
-        while activations.try_recv().is_ok() {
-            cx.update(|cx| show_window(cx, &app));
-        }
-    })
-    .detach();
 }
 
 fn main() {
@@ -294,10 +325,15 @@ fn main() {
                 let sync =
                     tray::create_status_item(tray_tx, crate::ui::i18n::Language::system_locale());
 
-                start_tray_service(tray_rx, app.clone(), cx, sync);
+                let signals = TraySignals {
+                    media_commands: media::command_signal(cx),
+                    shortcuts_dirty: app.read(cx).shortcuts_dirty.clone(),
+                    startup_save: app.read(cx).settings_writer.startup_failure_slot(),
+                };
+                start_tray_service(tray_rx, activations, app.clone(), signals, cx, sync);
             }
-
-            start_single_instance_service(activations, app.clone(), cx);
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            let _ = activations;
 
             cx.activate(true);
         });

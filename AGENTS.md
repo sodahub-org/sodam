@@ -27,6 +27,7 @@ crates/sodam-core/src/   领域层：配置 / 会话 / 队列 / 音乐库 / 播�
   audio.rs               rodio 播放线程
 crates/sodam/src/        GPUI 应用
   main.rs                入口、窗口、托盘启动
+  loop_probe.rs          帧日志开关下的循环迭代 / 计时器来源 / 进 app / 引擎快照计数
   app.rs                 Root 状态、输入法、渲染入口
   app_actions.rs         播放、队列、收藏、歌单、推荐、封面、设置动作
   app_search.rs          搜索、艺人页、专辑页动作
