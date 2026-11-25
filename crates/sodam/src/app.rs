@@ -962,7 +962,7 @@ impl Root {
             pending_track: None,
             last_finished_seq: engine_progress.finished_seq,
             last_seek_seq: engine_progress.seek_seq,
-            last_error_seq: 0,
+            last_error_seq: engine_progress.error_seq,
             progress_preview: None,
             lyrics_cover_gate: None,
             theme_snapshot_key: None,
@@ -2037,7 +2037,7 @@ impl Render for Root {
                     //
                     // 上面那段 `if self.lyrics_scroll_animating()` 在本函数**更早**的位置，
                     // 那时补间还不存在；而 ticker 又因"动画进行中"退回空闲档不 notify，
-                    // 所以下一次渲染要等 200ms 主心跳 —— 单行滚动只有 180ms，
+                    // 所以下一次渲染最多要等一个主心跳周期 —— 单行滚动只有 180ms，
                     // 第一次推进就直接到 1.0，自动换句的"滑上去"会变成瞬移。
                     if self.lyrics_scroll_animating() {
                         window.request_animation_frame();

@@ -735,6 +735,7 @@ impl Root {
     /// 音量拖动开始（按下滑条）：之后的外部重载不弹回音量，落盘等停手再说。
     pub(crate) fn begin_volume_scrub(&mut self) {
         self.volume_scrub.begin(std::time::Instant::now());
+        self.wake_heartbeat();
     }
 
     /// 音量拖动结束（松手 / 拖出滑条）：补排一次落盘。
