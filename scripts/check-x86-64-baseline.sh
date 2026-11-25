@@ -50,8 +50,8 @@ fi
 
 wanted=(ge_scalarmult_base public_from_private_generic_masked)
 alternation=$(IFS='|'; echo "${wanted[*]}")
-# 只看已定义的符号（`U`/`w`/`v` 这类外部引用和弱符号不算），后缀匹配顺带排除 `_adx` 汇编变体
-symbols=$(printf '%s\n' "$raw_symbols" | awk '$2 !~ /^[UuwvW]$/ { print $NF }' |
+# 只看有地址的已定义符号：未定义引用（`U name`）没有地址列，弱符号 `W` 反而是真定义，不能一刀砍掉
+symbols=$(printf '%s\n' "$raw_symbols" | awk '$1 ~ /^[0-9a-f]+$/ { print $NF }' |
     grep -E "x25519_(${alternation})$" || true)
 
 # 两个都得在：少一个说明符号名变了或被 strip 了，护栏等于没装，直接报错
