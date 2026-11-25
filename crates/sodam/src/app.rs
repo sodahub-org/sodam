@@ -499,7 +499,8 @@ pub struct Root {
     pub search_keyword: String,
     /// 听歌模式页：常用模式与探索歌单。
     pub scenes: Arc<Vec<SceneItem>>,
-    pub loading_scenes: bool,
+    /// 场景页任意请求（读模式或读探索卡）是否在飞：只是互斥闸，别再拿它当渲染状态。
+    pub scene_request_in_flight: bool,
     /// 常用模式自己的状态：请求失败要能停留在页面上，不和探索卡混在一起。
     pub scene_modes_state: SceneModesState,
     /// 场景请求序号：登出 / 换号后，在飞的回调按序号丢弃，不能把旧账号的模式写回来。
@@ -901,7 +902,7 @@ impl Root {
             searching: false,
             search_keyword: String::new(),
             scenes: Arc::new(Vec::new()),
-            loading_scenes: false,
+            scene_request_in_flight: false,
             scene_modes_state: SceneModesState::Idle,
             scene_request_seq: 0,
             scene_cards: Arc::new(Vec::new()),

@@ -1656,7 +1656,7 @@ impl Root {
     }
 
     pub fn load_scenes(&mut self, cx: &mut Context<Self>) {
-        if self.loading_scenes {
+        if self.scene_request_in_flight {
             return;
         }
         let existing_ids: Vec<u64> = self
@@ -1667,7 +1667,7 @@ impl Root {
         // 模式和探索卡是两次请求：模式读不读只看它自己的状态，
         // 不能拿「探索卡有没有数据」当判据（#213）。
         let needs_modes = self.scene_modes_state.needs_request();
-        self.loading_scenes = true;
+        self.scene_request_in_flight = true;
         self.loading_scene_cards = true;
         if needs_modes {
             self.scene_modes_state = SceneModesState::Loading;
@@ -1741,7 +1741,7 @@ impl Root {
                 if root.scene_request_seq != request_seq {
                     return;
                 }
-                root.loading_scenes = false;
+                root.scene_request_in_flight = false;
                 root.loading_scene_cards = false;
                 match result {
                     Ok((modes, cards, mode_error, card_error)) => {
@@ -1828,13 +1828,14 @@ impl Root {
     /// 页面上的重试按钮走这条：模式单独失败时，探索卡那边可能已经有数据了，
     /// 再跑一遍 `load_scenes` 只会顺手读卡，和用户按的那颗按钮对不上（#213）。
     pub fn retry_scene_modes(&mut self, cx: &mut Context<Self>) {
-        if self.loading_scenes {
+        if self.scene_request_in_flight {
             // 探索卡请求还在飞时点重试：给一句反馈，别让按钮看起来没接上。
             self.set_status_text(self.tr("正在加载…"));
+            cx.notify();
             return;
         }
         self.scene_modes_state = SceneModesState::Loading;
-        self.loading_scenes = true;
+        self.scene_request_in_flight = true;
         self.scene_request_seq = self.scene_request_seq.wrapping_add(1);
         let request_seq = self.scene_request_seq;
         self.set_status_text(self.tr("正在读取听歌模式…"));
@@ -1849,7 +1850,7 @@ impl Root {
                 if root.scene_request_seq != request_seq {
                     return;
                 }
-                root.loading_scenes = false;
+                root.scene_request_in_flight = false;
                 match result {
                     Ok(modes) => {
                         root.scene_modes_state = SceneModesState::Ready;
@@ -2743,7 +2744,7 @@ impl Root {
         self.scenes = Arc::new(Vec::new());
         self.scene_cards = Arc::new(Vec::new());
         self.scene_modes_state = SceneModesState::Idle;
-        self.loading_scenes = false;
+        self.scene_request_in_flight = false;
         self.loading_scene_cards = false;
         self.sync_scenes_list();
     }
@@ -3545,7 +3546,7 @@ impl Root {
                 Nav::Scenes
                     if should_auto_load_scenes(
                         self.scene_cards.is_empty(),
-                        self.loading_scenes,
+                        self.scene_request_in_flight,
                         self.scene_modes_state,
                     ) =>
                 {
