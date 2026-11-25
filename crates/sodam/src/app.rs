@@ -507,6 +507,8 @@ pub struct Root {
     scene_cards_seq: u64,
     pub scene_cards: Arc<Vec<SceneCard>>,
     pub loading_scene_cards: bool,
+    /// 探索卡最近一次请求失败：卡区不能把「没读成功」说成「暂无探索歌单」。
+    pub scene_cards_failed: bool,
     /// 听歌模式页的变高虚拟列表状态；只渲染可视行，避免几十张封面同时布局。
     pub scenes_list: gpui::ListState,
     /// 详情页使用独立列表状态，避免页面切换时共享状态导致内容/滚动错乱。
@@ -907,6 +909,7 @@ impl Root {
             scene_cards_seq: 0,
             scene_cards: Arc::new(Vec::new()),
             loading_scene_cards: false,
+            scene_cards_failed: false,
             scenes_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(theme::space::XL)),
             liked_detail_list: gpui::ListState::new(
                 1,

@@ -1670,6 +1670,9 @@ impl Root {
 
     pub fn load_scenes(&mut self, cx: &mut Context<Self>) {
         if self.scene_request_in_flight() {
+            // 已经有请求在飞：给一句反馈，「加载更多」点下去别像没接上。
+            self.set_status_text(self.tr("正在加载…"));
+            cx.notify();
             return;
         }
         let existing_ids: Vec<u64> = self
@@ -1683,15 +1686,12 @@ impl Root {
         self.loading_scene_cards = true;
         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
             let existing = existing_ids.len().to_string();
-            let loading = self.loading_scene_cards.to_string();
+            let modes = if needs_modes { "true" } else { "false" };
             log_event(
                 LogLevel::Debug,
                 LogTopic::App,
                 "scenes_load_start",
-                &[
-                    ("existing", existing.as_str()),
-                    ("loading", loading.as_str()),
-                ],
+                &[("existing", existing.as_str()), ("modes", modes)],
             );
         }
         let message = if needs_modes {
@@ -1825,6 +1825,7 @@ impl Root {
                 root.loading_scene_cards = false;
                 match result {
                     Ok(cards) => {
+                        root.scene_cards_failed = false;
                         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
                             let count = cards.len().to_string();
                             log_event(
@@ -1853,6 +1854,7 @@ impl Root {
                         }
                     }
                     Err(err) => {
+                        root.scene_cards_failed = true;
                         let error = err.to_string();
                         log_event(
                             LogLevel::Warn,
@@ -2752,6 +2754,7 @@ impl Root {
         self.scene_cards = Arc::new(Vec::new());
         self.scene_modes_state = SceneModesState::Idle;
         self.loading_scene_cards = false;
+        self.scene_cards_failed = false;
         self.sync_scenes_list();
     }
 

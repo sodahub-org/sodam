@@ -297,6 +297,7 @@ impl Language {
             "暂无常用模式" => "No modes yet",
             "正在读取探索歌单…" => "Loading playlists…",
             "暂无探索歌单" => "No discovery playlists",
+            "探索歌单暂不可用" => "Playlists unavailable",
             "电台" => "Radio",
             "首" => "tracks",
             "账号" => "Account",

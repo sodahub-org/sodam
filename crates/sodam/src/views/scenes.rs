@@ -23,6 +23,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .map(|scene| scene.sub_queue_type.clone());
     let modes_state = root.scene_modes_state;
     let loading_cards = root.loading_scene_cards;
+    let cards_failed = root.scene_cards_failed;
     let card_count = cards.len();
     let entity = cx.entity();
     let common_columns = root.scenes_common_columns.max(1);
@@ -71,18 +72,15 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .text_color(theme::text_muted())
                         .child(language.text("常用模式暂不可用").to_string())
                         .child(
-                            compact_retry_pill(
-                                "retry-scene-modes",
-                                language.text("重试加载").to_string(),
-                            )
-                            .on_click({
-                                let entity = entity.clone();
-                                move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
-                                    entity.update(cx, |root, cx| {
-                                        root.retry_scene_modes(cx);
-                                    });
-                                }
-                            }),
+                            compact_retry_pill("retry-scene-modes", language.text("重试加载"))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+                                        entity.update(cx, |root, cx| {
+                                            root.retry_scene_modes(cx);
+                                        });
+                                    }
+                                }),
                         )
                         .into_any_element(),
                     SceneModesState::Ready | SceneModesState::Idle => div()
@@ -257,6 +255,13 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 if cards.is_empty() {
                     let state = if loading_cards {
                         loading_state(language.text("正在读取探索歌单…"))
+                    } else if cards_failed {
+                        // 一次都没读成功时不能说「暂无探索歌单」；页底的「加载更多」可以再试。
+                        div()
+                            .text_size(theme::Text::Small.size())
+                            .text_color(theme::text_muted())
+                            .child(language.text("探索歌单暂不可用").to_string())
+                            .into_any_element()
                     } else {
                         empty_state("list-music", language.text("暂无探索歌单"))
                     };
@@ -352,20 +357,17 @@ pub(crate) fn retry_button(
     language: crate::ui::i18n::Language,
     cx: &mut Context<Root>,
 ) -> AnyElement {
-    compact_retry_pill(
-        "retry-playback-assets",
-        language.text("重试加载").to_string(),
-    )
-    .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-        if let Some(track) = root
-            .pending_track
-            .clone()
-            .or_else(|| root.queue.current().cloned())
-        {
-            root.retry_playback_assets(track, cx);
-        }
-    }))
-    .into_any_element()
+    compact_retry_pill("retry-playback-assets", language.text("重试加载"))
+        .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+            if let Some(track) = root
+                .pending_track
+                .clone()
+                .or_else(|| root.queue.current().cloned())
+            {
+                root.retry_playback_assets(track, cx);
+            }
+        }))
+        .into_any_element()
 }
 
 fn section_title(text: &str) -> AnyElement {

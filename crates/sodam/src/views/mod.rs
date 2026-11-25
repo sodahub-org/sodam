@@ -869,7 +869,7 @@ fn page_header(title: &str, subtitle: &str) -> AnyElement {
 /// 紧凑的「重试」按钮外壳：行内高度，给失败终态的一行用。
 ///
 /// 推荐页失败终态、播放资源重试、听歌模式失败都走这个形状，样式只留一处（#213）。
-fn compact_retry_pill(id: &'static str, label: String) -> Stateful<Div> {
+fn compact_retry_pill(id: &'static str, label: impl IntoElement) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -912,11 +912,11 @@ fn recommendation_error_state(root: &Root, message: String, cx: &mut Context<Roo
                 .child(message),
         )
         .child(
-            compact_retry_pill("retry-recommendation", root.tr("重试加载").to_string()).on_click(
-                cx.listener(|root, _event: &ClickEvent, _window, cx| {
+            compact_retry_pill("retry-recommendation", root.tr("重试加载")).on_click(cx.listener(
+                |root, _event: &ClickEvent, _window, cx| {
                     root.retry_recommendation(cx);
-                }),
-            ),
+                },
+            )),
         )
         .into_any_element()
 }
