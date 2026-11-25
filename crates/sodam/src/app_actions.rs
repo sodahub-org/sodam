@@ -430,9 +430,6 @@ impl Root {
                         || (snap.finished && current)
                         || new_error;
                     if hot {
-                        if root.round_exhausted.is_some() && root.has_playable_ahead() {
-                            root.clear_round_exhaustion();
-                        }
                         if root.pending_engine_load == Some(snap.load_seq) {
                             root.pending_engine_load = None;
                             root.pending_track = None;
@@ -468,6 +465,9 @@ impl Root {
                         }
                     }
 
+                    if root.round_exhausted.is_some() && root.has_playable_ahead() {
+                        root.clear_round_exhaustion();
+                    }
                     if !root.quit_gate.is_saving() {
                         if let Some(failure) = root.settings_writer.take_error() {
                             root.report_settings_failure(failure, cx);
@@ -491,11 +491,7 @@ impl Root {
                         root.maintain_cache(cx);
                     }
                     root.load_more_recommendation(cx);
-                    next_interval = if hot || snap.playing || root.playing || loading {
-                        HOT
-                    } else {
-                        IDLE
-                    };
+                    next_interval = if hot { HOT } else { IDLE };
                 });
                 interval = next_interval;
             }

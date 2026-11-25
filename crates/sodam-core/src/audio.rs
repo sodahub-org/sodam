@@ -165,8 +165,7 @@ impl PlaybackEngine {
                 &[("detail", detail.as_str())],
             );
             if let Ok(mut snap) = snapshot.lock() {
-                snap.error = "音频播放没能启动，请重启应用。".to_string();
-                snap.error_seq = snap.error_seq.wrapping_add(1);
+                record_error(&mut snap, "音频播放没能启动，请重启应用。".to_string());
             }
         }
         Self {
@@ -270,12 +269,16 @@ impl PlaybackEngine {
     }
 }
 
+fn record_error(snap: &mut PlaybackSnapshot, message: String) {
+    snap.error = message;
+    snap.error_seq = snap.error_seq.wrapping_add(1);
+    snap.playing = false;
+    snap.finished = false;
+}
+
 fn set_error(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
-        snap.error = message;
-        snap.error_seq = snap.error_seq.wrapping_add(1);
-        snap.playing = false;
-        snap.finished = false;
+        record_error(&mut snap, message);
     }
 }
 
@@ -314,10 +317,7 @@ fn load_failed(
         snap.quality.clear();
         snap.quality_rank = None;
         snap.preview = false;
-        snap.error = message;
-        snap.error_seq = snap.error_seq.wrapping_add(1);
-        snap.playing = false;
-        snap.finished = false;
+        record_error(&mut snap, message);
     }
 }
 
@@ -348,10 +348,7 @@ fn mark_seek_succeeded(state: &Arc<Mutex<PlaybackSnapshot>>, seconds: f64, playi
 fn mark_seek_failed(state: &Arc<Mutex<PlaybackSnapshot>>, message: String) {
     if let Ok(mut snap) = state.lock() {
         snap.seek_pending = false;
-        snap.finished = false;
-        snap.error = message;
-        snap.error_seq = snap.error_seq.wrapping_add(1);
-        snap.playing = false;
+        record_error(&mut snap, message);
     }
 }
 
