@@ -8,6 +8,9 @@
 # 只查编译器生成的 C 函数。ring 里由 CPUID 守着、运行时才走的 `*_adx` 汇编本来就用
 # BMI2/ADX，一并查就是误报。
 #
+# 这是一道金丝雀：构建机的 C 基线一旦被抬高，这两个函数一定跟着抬高，不用去猜别的依赖。
+# 要核对整包的话，得连 glibc / crt 一起看，那是另一件事（换 runner 而不是扫指令）。
+#
 # 用法：scripts/check-isa.sh <elf>
 set -euo pipefail
 
@@ -26,14 +29,21 @@ fi
 symbols=$(nm "$binary" 2>/dev/null | awk 'NF >= 3 { print $NF }' |
     grep -E 'x25519_(ge_scalarmult_base|public_from_private_generic_masked)$' || true)
 
-if [[ -z "$symbols" ]]; then
-    echo "在 $binary 里没找到 ring 的 x25519 C 函数（被 strip 了？），护栏失效" >&2
-    exit 1
-fi
+# 两个都得在：少一个说明符号名变了或被 strip 了，护栏等于没装，直接报错
+for want in x25519_ge_scalarmult_base x25519_public_from_private_generic_masked; do
+    if ! grep -qE "x25519_${want}$" <<<"$symbols"; then
+        echo "在 $binary 里找不到 $want（被 strip 了？），护栏失效" >&2
+        exit 1
+    fi
+done
 
 status=0
 while IFS= read -r symbol; do
-    hits=$(objdump -d --disassemble="$symbol" "$binary" |
+    if ! disassembly=$(objdump -d --disassemble="$symbol" "$binary"); then
+        echo "反汇编失败：$symbol" >&2
+        exit 1
+    fi
+    hits=$(printf '%s\n' "$disassembly" |
         grep -E '\b(mulx|adcx|adox|rorx)\b|%ymm|%zmm' || true)
     if [[ -n "$hits" ]]; then
         echo "越界：$symbol 里有高于 x86-64 baseline 的指令（#306）" >&2

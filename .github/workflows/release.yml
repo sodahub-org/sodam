@@ -50,11 +50,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # C 侧基线也钉死，别只吃 runner 的默认值；Rust 侧 rustc 默认就是 x86-64 baseline。
       - name: Build release binary
+        env:
+          CFLAGS_x86_64_unknown_linux_gnu: '-march=x86-64 -mtune=generic'
         run: cargo build --release --locked --workspace
 
       # 产物护栏（#306）：C 侧一旦带上 AVX2/BMI2，老 CPU 会在 TLS 握手时直接 SIGILL。
-      - name: Check x86_64 ISA baseline
+      - name: Check x86_64 ISA baseline (ring x25519 C path)
         if: matrix.arch == 'x86_64'
         run: scripts/check-isa.sh target/release/sodam
 

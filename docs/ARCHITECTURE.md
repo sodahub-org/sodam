@@ -233,6 +233,10 @@ TrackItem + cache path
 
 - Linux ARM64 使用 `packaging/arch/PKGBUILD` 生成 pacman 包；
   x86_64 / aarch64 另用 `packaging/deb/make-deb.sh` 从同一份 release 二进制打 `.deb`。
+- Linux x86_64 的发布包按 x86-64 baseline 构建：x86_64 的 runner 钉在 `ubuntu-24.04`
+  （26.04 的镜像默认用 amd64v3 变体的 GCC，C 依赖会带上 AVX2/BMI2，没有这些指令的老 CPU
+  一发起 HTTPS 就 SIGILL，见 #306）。构建时另给 C 代码钉 `-march=x86-64`，构建完再用
+  `scripts/check-isa.sh` 扫一遍产物兜底。
 - 安装内容：`/usr/bin/sodam`、desktop entry、hicolor icon。
 - GUI 通过 `scripts/run.sh` 启动时带 `MemoryMax=2G` 护栏。
 - 托盘和窗口关闭逻辑使用显式退出模式：关闭主窗口保留进程，退出走托盘菜单。
