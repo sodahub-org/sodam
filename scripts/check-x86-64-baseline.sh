@@ -5,17 +5,25 @@
 # C 依赖会被编成 x86-64-v3。没有 AVX2/BMI2 的老 CPU（Ivy Bridge 等）一发起 HTTPS 就在
 # TLS 握手里 SIGILL，进程内拦不住，只能在产物这一层挡。
 #
-# 只查编译器生成的 C 函数。ring 里由 CPUID 守着、运行时才走的 `*_adx` 汇编本来就用
-# BMI2/ADX，一并查就是误报。
+# 只查编译器生成的 C 函数：ring 里由 CPUID 守着、运行时才走的 `*_adx` 汇编不查，查了是误报。
 #
-# 这是一道金丝雀：构建机的 C 基线一旦被抬高，这两个函数一定跟着抬高，不用去猜别的依赖。
-# 要核对整包的话得连 glibc / crt 一起看，那是另一件事（换 runner，而不是扫指令）。
-#
-# 用法：scripts/check-x86-64-baseline.sh <elf>（相对路径按仓库根解析）
+# 用法：scripts/check-x86-64-baseline.sh [--allow-skip] <elf>（相对路径按仓库根解析）
+#   --allow-skip  非 x86-64 产物时跳过。默认是失败，免得 workflow 的 if 写漏了却一片绿。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-binary=${1:?usage: check-x86-64-baseline.sh <elf>}
+allow_skip=0
+if [[ ${1:-} == "--allow-skip" ]]; then
+    allow_skip=1
+    shift
+fi
+
+binary=${1:?usage: check-x86-64-baseline.sh [--allow-skip] <elf>}
+case "$binary" in
+    /*) ;;
+    *) binary="$PWD/$binary" ;;
+esac
+
 [[ -f "$binary" ]] || {
     echo "找不到产物：$binary" >&2
     exit 1
@@ -27,8 +35,12 @@ if ! header=$(readelf -h "$binary"); then
 fi
 
 if ! grep -q 'X86-64' <<<"$header"; then
-    echo "跳过 $binary：不是 x86-64 产物"
-    exit 0
+    if [[ $allow_skip -eq 1 ]]; then
+        echo "跳过 $binary：不是 x86-64 产物（--allow-skip）"
+        exit 0
+    fi
+    echo "$binary 不是 x86-64 产物：这一步只给 x86_64 用，workflow 的 if 写漏了？要跳过请显式传 --allow-skip" >&2
+    exit 1
 fi
 
 if ! raw_symbols=$(nm "$binary"); then
@@ -38,8 +50,8 @@ fi
 
 wanted=(ge_scalarmult_base public_from_private_generic_masked)
 alternation=$(IFS='|'; echo "${wanted[*]}")
-# 后缀匹配，顺带把 `_adx` 汇编变体排除在外
-symbols=$(printf '%s\n' "$raw_symbols" | awk 'NF >= 3 { print $NF }' |
+# 只看已定义的符号（`U`/`w`/`v` 这类外部引用和弱符号不算），后缀匹配顺带排除 `_adx` 汇编变体
+symbols=$(printf '%s\n' "$raw_symbols" | awk '$2 !~ /^[UuwvW]$/ { print $NF }' |
     grep -E "x25519_(${alternation})$" || true)
 
 # 两个都得在：少一个说明符号名变了或被 strip 了，护栏等于没装，直接报错
@@ -52,28 +64,28 @@ done
 
 status=0
 while IFS= read -r symbol; do
-    if ! disassembly=$(objdump -d --disassemble="$symbol" "$binary"); then
+    # --no-show-raw-insn：每行固定是「地址: 助记符 操作数」，不用猜机器码那一列占多宽
+    if ! disassembly=$(objdump -d --no-show-raw-insn --disassemble="$symbol" "$binary"); then
         echo "反汇编失败：$symbol" >&2
         exit 1
     fi
-    # 认助记符那一列，不去猜操作数长什么样：
-    #   * baseline 的 x86-64 助记符没有 v 开头，v 前缀一律算 VEX/EVEX（含无操作数的 vzeroupper）；
+    # 认助记符，不去猜操作数长什么样：
+    #   * baseline 的 x86-64 助记符没有 v 开头，v 前缀一律算 VEX/EVEX（verr/verw 那两条老指令除外）；
     #   * BMI1/BMI2、LZCNT、MOVBE 按助记符点名，带 b/w/l/q 后缀也算；
     #   * 操作数里出现 %ymm / %zmm / %k 掩码寄存器同样算越界。
-    # 一条都没解析出来（objdump 换了列分隔、换成 llvm-objdump）就算解析失败，不能静默放行。
-    if ! hits=$(printf '%s\n' "$disassembly" | awk -F'\t' '
+    # 一条都没解析出来就算解析失败，不能静默放行。
+    if ! hits=$(printf '%s\n' "$disassembly" | awk '
         BEGIN {
             n = split("mulx adcx adox rorx pdep pext shlx shrx sarx andn blsr blsmsk blsi bzhi bextr lzcnt tzcnt movbe", a, " ")
             for (i = 1; i <= n; i++) banned[a[i]] = 1
         }
-        NF >= 3 {
-            mnemonic = $3
-            sub(/[ \t].*/, "", mnemonic)
+        $1 ~ /^[0-9a-f]+:$/ {
+            mnemonic = $2
             if (mnemonic !~ /^[a-z][a-z0-9]*$/) next
             seen++
             base = mnemonic
             if (base ~ /^[a-z]+[bwlq]$/) base = substr(base, 1, length(base) - 1)
-            if (mnemonic ~ /^v/) {
+            if (mnemonic ~ /^v/ && mnemonic !~ /^ver[rw]$/) {
                 print
                 next
             }
@@ -90,7 +102,7 @@ while IFS= read -r symbol; do
     fi
     if [[ -n "$hits" ]]; then
         echo "越界：$symbol 里有高于 x86-64 baseline 的指令（#306）" >&2
-        echo "$hits" | head -n 5 >&2
+        sed -n '1,5p' <<<"$hits" >&2
         status=1
     fi
 done <<<"$symbols"

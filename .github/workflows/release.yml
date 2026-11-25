@@ -29,13 +29,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 钉在 24.04，别换回 ubuntu-latest：26.04 的镜像默认装 amd64v3 变体的 GCC
-          # （--with-arch-64=x86-64-v3），C 依赖会被编成 AVX2/BMI2，没有这些指令的老 CPU
-          # 一发起 HTTPS 就 SIGILL（#306）。换 runner 前先看下一步的护栏会不会红。
+          # 钉在 24.04，别换回 ubuntu-latest：runner 已经滚到 26.04，镜像自带 amd64v3 变体的
+          # GCC（--with-arch-64=x86-64-v3），C 依赖会被编成 AVX2/BMI2，没有这些指令的老 CPU
+          # 一发起 HTTPS 就 SIGILL（#306）。换 runner 前先看下面那道护栏会不会红。
           - arch: x86_64
             runner: ubuntu-24.04
+            cflags: '-march=x86-64 -mtune=generic'
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            cflags: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -50,10 +52,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # C 侧基线也钉死，别只吃 runner 的默认值；Rust 侧 rustc 默认就是 x86-64 baseline。
+      # C 侧基线按 arch 传：x86_64 钉死，aarch64 传空串（cc 按 target 取名，本来也读不到）。
       - name: Build release binary
         env:
-          CFLAGS_x86_64_unknown_linux_gnu: '-march=x86-64 -mtune=generic'
+          CFLAGS_x86_64_unknown_linux_gnu: ${{ matrix.cflags }}
         run: cargo build --release --locked --workspace
 
       # 产物护栏（#306）：C 侧一旦带上 AVX2/BMI2，老 CPU 会在 TLS 握手时直接 SIGILL。
