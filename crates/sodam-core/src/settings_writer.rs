@@ -723,18 +723,16 @@ mod tests {
                 first_done.wait();
                 let mut first = true;
                 loop {
-                    let guard = slot.failure.lock().unwrap();
-                    assert_eq!(
-                        slot.is_pending(),
-                        guard.is_some(),
-                        "并发期间原子门和失败槽必须一致"
-                    );
+                    let consistent = {
+                        let guard = slot.failure.lock().unwrap();
+                        slot.is_pending() == guard.is_some()
+                    };
                     observed.store(true, Ordering::Release);
-                    drop(guard);
                     if first {
                         observer_ready.wait();
                         first = false;
                     }
+                    assert!(consistent, "并发期间原子门和失败槽必须一致");
                     if done.load(Ordering::Acquire) {
                         break;
                     }
