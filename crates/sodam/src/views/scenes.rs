@@ -1,6 +1,7 @@
 //! 听歌模式页。
 
 use super::*;
+use crate::app::SceneModesState;
 use crate::ui::middle_drag::DragTarget;
 /// 听歌模式页：常用模式 + 探索歌单，使用变高虚拟列表只渲染可视行。
 pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
@@ -20,7 +21,8 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .as_ref()
         .and_then(|source| source.scene.as_ref())
         .map(|scene| scene.sub_queue_type.clone());
-    let _loading_scenes = root.loading_scenes;
+    let loading_scenes = root.loading_scenes;
+    let modes_state = root.scene_modes_state;
     let loading_cards = root.loading_scene_cards;
     let card_count = cards.len();
     let entity = cx.entity();
@@ -31,7 +33,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let width_slot = root.scenes_width.clone();
 
     // 首次加载是整页状态：不要同时显示“读取模式/暂无歌单/加载更多”。
-    if root.loading_scenes && cards.is_empty() {
+    if loading_scenes && cards.is_empty() {
         return div()
             .size_full()
             .flex()
@@ -57,6 +59,46 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         else if index <= common_rows {
             let row = index - 1;
             if scenes.is_empty() {
+                // 三态分开：加载中转圈、失败给「不可用 + 重试」、加载完还空着就说实话。
+                // 拿转圈顶替失败会让页面永远像在加载，用户没有可点的恢复动作（#213）。
+                let state = match modes_state {
+                    SceneModesState::Loading => loading_state(language.text("正在读取常用模式…")),
+                    SceneModesState::Failed => div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::space::MD))
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(language.text("常用模式暂不可用").to_string())
+                        .child(
+                            div()
+                                .id("retry-scene-modes")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(theme::size::CONTROL_SM))
+                                .px(px(theme::space::MD))
+                                .rounded(px(theme::radius::PILL))
+                                .bg(theme::surface_elevated())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    move |_event: &ClickEvent, _window, cx: &mut gpui::App| {
+                                        entity.update(cx, |root, cx| {
+                                            root.retry_scene_modes(cx);
+                                        });
+                                    }
+                                })
+                                .child(language.text("重试加载").to_string()),
+                        )
+                        .into_any_element(),
+                    SceneModesState::Ready | SceneModesState::Idle => div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(language.text("暂无常用模式").to_string())
+                        .into_any_element(),
+                };
                 return div()
                     .id("scene-modes-loading")
                     .w_full()
@@ -64,7 +106,7 @@ pub(crate) fn scenes_view(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(loading_state(language.text("正在读取常用模式…")))
+                    .child(state)
                     .into_any_element();
             }
             let mut row_element = div()

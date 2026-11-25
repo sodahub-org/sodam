@@ -293,6 +293,8 @@ impl Language {
             "探索更多新模式" => "Explore More Modes",
             "正在读取常用模式…" => "Loading modes…",
             "常用模式暂不可用" => "Modes unavailable",
+            "常用模式已更新" => "Modes updated",
+            "暂无常用模式" => "No modes yet",
             "正在读取探索歌单…" => "Loading playlists…",
             "暂无探索歌单" => "No discovery playlists",
             "电台" => "Radio",
