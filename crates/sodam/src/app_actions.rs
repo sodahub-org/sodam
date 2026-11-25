@@ -527,7 +527,11 @@ impl Root {
                         root.maintain_cache(cx);
                     }
                     root.load_more_recommendation(cx);
-                    next_interval = if hot { HOT } else { IDLE };
+                    next_interval = if hot || root.volume_scrub.scrubbing() {
+                        HOT
+                    } else {
+                        IDLE
+                    };
                 });
                 if updated.is_err() {
                     break;
