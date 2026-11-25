@@ -590,7 +590,7 @@ pub struct Root {
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
     /// 上次预取巡检时刻；未落闸时每 5s 补一次预取。
     pub(crate) last_prefetch_patrol: std::time::Instant,
-    /// 上次缓存维护时刻；每 60s 维护一次。
+    /// 上次检查缓存维护的时刻；每 60s 检查一次，被升级或清理挡住时本轮跳过。
     pub(crate) last_cache_maintenance: std::time::Instant,
     /// 登录凭据代数：重新登录成功、退出登录、账号信息刷新（换号或会员状态变化）时 +1。
     ///

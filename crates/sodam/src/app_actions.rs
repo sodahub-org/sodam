@@ -484,11 +484,14 @@ impl Root {
                             root.consecutive_failures = 0;
                             root.progress_token = None;
                         }
+                        // 封顶时继续翻歌等于替用户决定再试几首。
                         let should_advance = new_finished && !root.playback_halted;
                         if snap.finished && should_advance && root.pending_track.is_none() {
                             if root.queue.mode == PlayMode::RepeatOne {
+                                // 单曲循环只重播，不能换成跳不可播的下一首。
                                 root.advance_next(false, cx);
                             } else {
+                                // 自动续播也先查不可播集合，避免重复打网络。
                                 root.auto_advance_track(cx);
                             }
                         }
@@ -510,6 +513,7 @@ impl Root {
                         }
                     }
                     root.settle_volume_scrub();
+                    // 按墙钟覆盖队列变更；落闸时不跑，恢复后下一拍补。
                     let now = std::time::Instant::now();
                     if now.saturating_duration_since(root.last_prefetch_patrol) >= PREFETCH_PATROL
                         && !root.playback_halted
@@ -554,7 +558,7 @@ impl Root {
                 let has_window = cx.update(|cx| !cx.windows().is_empty());
                 probe.app_entry();
                 let (interval, notify) = if has_window {
-                    this.update(cx, |root, _cx| {
+                    match this.update(cx, |root, _cx| {
                         probe.app_entry();
                         if root.nav != Nav::Lyrics {
                             return (IDLE, false);
@@ -591,16 +595,23 @@ impl Root {
                             lyrics_idle_wait(snapshot.position_seconds, next_start),
                             near,
                         )
-                    })
-                    .unwrap_or((IDLE, false))
+                    }) {
+                        Ok(value) => value,
+                        Err(_) => break,
+                    }
                 } else {
                     (NO_WINDOW, false)
                 };
                 if notify {
-                    let _ = this.update(cx, |_root, cx| {
-                        probe.app_entry();
-                        cx.notify();
-                    });
+                    if this
+                        .update(cx, |_root, cx| {
+                            probe.app_entry();
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 cx.background_executor().timer(interval).await;
             }
@@ -734,8 +745,11 @@ impl Root {
 
     /// 音量拖动开始（按下滑条）：之后的外部重载不弹回音量，落盘等停手再说。
     pub(crate) fn begin_volume_scrub(&mut self) {
+        let started = !self.volume_scrub.scrubbing();
         self.volume_scrub.begin(std::time::Instant::now());
-        self.wake_heartbeat();
+        if started {
+            self.wake_heartbeat();
+        }
     }
 
     /// 音量拖动结束（松手 / 拖出滑条）：补排一次落盘。
