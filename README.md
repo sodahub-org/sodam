@@ -159,6 +159,8 @@ UI 规范见 [`docs/UI-SPEC.md`](docs/UI-SPEC.md)。
 
 - Rust stable，最低 `1.85`
 - Linux：Wayland 或 X11 运行时
+- Linux x86_64：CPU 只要 x86-64 baseline（2013 年以前的机器，比如 Ivy Bridge，也能跑）；
+  发布包按这个基线构建，不依赖 AVX2 / BMI2
 - macOS：Apple Silicon（M 系列），macOS 12+；构建需完整版 Xcode（Metal shader 编译，
   仅装 Command Line Tools 会报 `xcrun: unable to find utility "metal"`）
 - Windows：Windows 10+ x64；源码构建需 VS 2022 Build Tools（C++ 工作负载）
