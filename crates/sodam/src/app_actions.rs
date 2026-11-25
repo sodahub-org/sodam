@@ -131,10 +131,10 @@ fn retry_current_original_cover(
 
 /// 进页面时要不要自动读听歌模式。
 ///
-/// 失败终态还在时不自动重发：断网时每次进页面都再打一轮请求，页面就在
-/// 失败和重试之间来回跳。恢复交给页面上的重试按钮（#213）。
-fn should_auto_load_scenes(cards_empty: bool, loading: bool, modes: SceneModesState) -> bool {
-    cards_empty && !loading && !matches!(modes, SceneModesState::Failed)
+/// 判据和「加载更多」用同一个：只拦自己的探索卡请求。模式失败终态则不自动重发，
+/// 断网时每次进页面都再打一轮会变成请求循环，恢复交给页面上的重试按钮。
+fn should_auto_load_scenes(cards_empty: bool, cards_loading: bool, modes: SceneModesState) -> bool {
+    cards_empty && !cards_loading && !matches!(modes, SceneModesState::Failed)
 }
 
 impl Root {
@@ -1661,11 +1661,6 @@ impl Root {
             self.scenes_list.reset(count);
         }
         self.scenes_list_items = count;
-    }
-
-    /// 场景页是否有请求在飞：模式和探索卡两条独立，任一条在飞都算。
-    fn scene_request_in_flight(&self) -> bool {
-        self.loading_scene_cards || matches!(self.scene_modes_state, SceneModesState::Loading)
     }
 
     pub fn load_scenes(&mut self, cx: &mut Context<Self>) {
@@ -3555,7 +3550,7 @@ impl Root {
                 Nav::Scenes
                     if should_auto_load_scenes(
                         self.scene_cards.is_empty(),
-                        self.scene_request_in_flight(),
+                        self.loading_scene_cards,
                         self.scene_modes_state,
                     ) =>
                 {
