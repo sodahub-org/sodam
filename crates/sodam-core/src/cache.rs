@@ -435,11 +435,11 @@ where
     G: Fn(&Path) -> K,
     R: FnMut(&Path) -> bool,
 {
-    let total = files
+    let scanned_total = files
         .iter()
         .fold(0u64, |sum, file| sum.saturating_add(file.bytes));
-    if total <= limit_bytes {
-        return (total, Vec::new());
+    if scanned_total <= limit_bytes {
+        return (scanned_total, Vec::new());
     }
     let mut groups: HashMap<K, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
     let mut protected: HashSet<K> = HashSet::new();
@@ -1010,18 +1010,14 @@ pub fn maintain(
     let audio_dir = crate::audio::cache_dir();
     let covers_dir = crate::audio::cover_cache_dir();
     let report = maintain_with(&audio_dir, &covers_dir, limits, last_seen, list_dir);
-    // 删过东西按 Info 记一条，什么都没有按 Debug 记：日常不刷屏，排障时能算成本。
-    let level = if report.removed_files > 0 {
-        LogLevel::Info
-    } else {
-        LogLevel::Debug
-    };
-    if crate::log_outlet::enabled(level, LogTopic::App) {
+    // 每轮都记一条 Info：一轮最多 48 行/天，成本曲线要能直接看出来，不能只在
+    // 排障日志里才有（#310 的那次尖峰就是默认日志下看不见的）。
+    if crate::log_outlet::enabled(LogLevel::Info, LogTopic::App) {
         let elapsed = report.elapsed.as_millis().to_string();
         let scanned = report.scanned_files.to_string();
         let removed = report.removed_files.to_string();
         log_event(
-            level,
+            LogLevel::Info,
             LogTopic::App,
             "cache_maintenance",
             &[
