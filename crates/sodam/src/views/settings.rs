@@ -22,9 +22,8 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// 缓存用量那一行：读全了写「共」，读不全写「至少」。
+/// 缓存用量那一行：读全了写「共」，读不全写「至少」，整棵树读不到的那段写「读不到」。
 ///
-/// 整棵树一个文件都没读到时那一段写「读不到」，不写 0 B；两棵树都读不到才整行说读不到。
 /// 只有一棵读不到、另一棵是空的时候没有总数可写，只报读得到的那棵。
 fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
     let total = usage.total_bytes();
@@ -83,7 +82,7 @@ fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
         usage.covers.files.to_string(),
         human_bytes(usage.covers.bytes),
     ];
-    // key 写成字面量、不塞进变量：i18n 守卫只认调用点上的字符串字面量。
+    // key 用字面量：i18n 守卫只扫调用点上的字面量。
     if incomplete {
         language.textf("至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）", &args)
     } else {
@@ -93,19 +92,17 @@ fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
 
 /// 读不全时的解释：数字可能偏小、稍后会自动重试。
 ///
-/// 不写具体原因：代码只知道有地方没读到，分不清是被别的程序占着还是没权限。
+/// 整棵树读不到时数字行已经写了「读不到」，这里不再重复；不写具体原因，代码只知道
+/// 有地方没读到，分不清是被别的程序占着还是没权限。
 fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'static str> {
-    (usage.incomplete() && usage.total_bytes() > 0)
-        .then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
+    let explain = usage.incomplete() && !usage.audio.unreadable() && !usage.covers.unreadable();
+    explain.then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
 }
 
-/// 上限旁边那句「没删干净」：上一轮读不全就提醒上限可能没生效，否则看是不是真删不动。
+/// 上限旁边那句「没删干净」：音频树读不全就提醒上限可能没生效，否则看是不是真删不动。
 ///
-/// 读不全看的是上一轮维护的结论：上限是维护在收口，不是这一次统计扫描。
-/// 读不全只说明数字可能偏小，不代表上限真没生效——现在没超就不猜，否则只要有个
-/// 子目录长期读不到，这句会一直挂着。超限那句要上一轮和现在都超着才说：用户刚清过
-/// 缓存、或手动删过文件时，旧结论已经不作数。一个字节都没读到时，数字那行已经说明
-/// 读不到，这里不再重复。
+/// 两种提示都只在现在真超限时才出现；删不动那句还要求上一轮也超着，用户刚清过缓存时
+/// 旧结论已经不作数。读不全只看音频这棵树，封面读不全不影响音频上限的判断。
 fn cache_blocked_hint(
     language: Language,
     mark: Option<&MaintenanceMark>,
@@ -113,9 +110,8 @@ fn cache_blocked_hint(
     audio_limit_bytes: u64,
 ) -> Option<&'static str> {
     let mark = mark?;
-    // 上限只管音频，超没超也只看音频：封面读不全不该让上限那句一直挂着。
     let over = usage.audio.bytes > audio_limit_bytes;
-    if mark.incomplete {
+    if usage.audio.incomplete {
         return over.then(|| language.text("上限可能暂时没生效；稍后会自动重试"));
     }
     (mark.audio_bytes > audio_limit_bytes && over).then(|| {
@@ -1682,47 +1678,58 @@ mod tests {
 
     #[test]
     fn cache_usage_hint_only_explains_the_low_numbers() {
-        let nothing = usage(0, 0, 0, true);
         let read = usage(1024, 1, 1, false);
-        let hidden = usage(2048, 2, 2, true);
+        // 读到了数，但这一轮没读全。
+        let partial = usage(2048, 2, 2, true);
+        // 整棵树一个文件都没读到。
+        let hidden = usage(0, 0, 0, true);
 
-        let hint = cache_usage_hint(Language::Chinese, both(nothing, hidden)).unwrap();
+        let hint = cache_usage_hint(Language::Chinese, both(read, partial)).unwrap();
         assert!(hint.contains("数字可能偏小"), "{hint}");
         assert!(!hint.contains("上限"), "上限那句在上限旁边那一行：{hint}");
 
         assert!(
-            cache_usage_hint(Language::Chinese, both(nothing, nothing)).is_none(),
-            "一个字节都没读到时，那一行已经说明了"
+            cache_usage_hint(Language::Chinese, both(hidden, partial)).is_none(),
+            "数字行已经写了「读不到」，别再说一遍"
         );
+        assert!(cache_usage_hint(Language::Chinese, both(hidden, hidden)).is_none());
         assert!(cache_usage_hint(Language::Chinese, both(read, read)).is_none());
     }
 
     #[test]
-    fn cache_blocked_hint_says_the_limit_may_not_apply_when_the_last_round_was_incomplete() {
-        let over = both(usage(8192, 3, 3, true), usage(2048, 2, 2, true));
-        let unreadable = MaintenanceMark {
+    fn cache_blocked_hint_says_the_limit_may_not_apply_when_the_audio_tree_is_incomplete() {
+        let mark = MaintenanceMark {
             completed_at: std::time::SystemTime::UNIX_EPOCH,
             audio_bytes: 0,
             cover_bytes: 0,
-            incomplete: true,
+            incomplete: false,
         };
 
-        let hint = cache_blocked_hint(Language::Chinese, Some(&unreadable), over, 4096).unwrap();
+        let over_unreadable = both(usage(8192, 3, 3, true), usage(2048, 2, 2, true));
+        let hint =
+            cache_blocked_hint(Language::Chinese, Some(&mark), over_unreadable, 4096).unwrap();
         assert!(hint.contains("上限可能暂时没生效"), "{hint}");
 
-        let small = both(usage(1024, 2, 2, true), usage(2048, 2, 2, true));
+        let small_unreadable = both(usage(1024, 2, 2, true), usage(2048, 2, 2, true));
         assert!(
-            cache_blocked_hint(Language::Chinese, Some(&unreadable), small, 4096).is_none(),
+            cache_blocked_hint(Language::Chinese, Some(&mark), small_unreadable, 4096).is_none(),
             "读不全但没超限时，别凭一条 incomplete 就说上限没生效"
+        );
+
+        // 只有封面读不全：音频自己读全了，超限就得说「删不动」，不能说上限没生效。
+        let over_with_cover_gap = both(usage(8192, 3, 3, false), usage(0, 0, 0, true));
+        assert!(
+            cache_blocked_hint(Language::Chinese, Some(&mark), over_with_cover_gap, 4096).is_none(),
+            "封面读不全不影响音频上限的判断"
         );
 
         let nothing = both(usage(0, 0, 0, true), usage(0, 0, 0, true));
         assert!(
-            cache_blocked_hint(Language::Chinese, Some(&unreadable), nothing, 4096).is_none(),
+            cache_blocked_hint(Language::Chinese, Some(&mark), nothing, 4096).is_none(),
             "一个字节都没读到时，数字那行已经说明读不到"
         );
         assert!(
-            cache_blocked_hint(Language::Chinese, None, over, 4096).is_none(),
+            cache_blocked_hint(Language::Chinese, None, over_unreadable, 4096).is_none(),
             "还没跑过维护就不猜上限"
         );
     }
@@ -1738,16 +1745,9 @@ mod tests {
             incomplete: false,
         };
 
-        let unreadable = MaintenanceMark {
-            incomplete: true,
-            ..mark
-        };
-
-        assert!(cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024).is_some());
         assert!(
-            cache_blocked_hint(Language::Chinese, Some(&unreadable), over, 1024)
-                .is_some_and(|hint| hint.contains("上限可能暂时没生效")),
-            "上一轮读不全时，别把超限说成删不动"
+            cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024)
+                .is_some_and(|hint| hint.contains("上次清理没能删到上限以下"))
         );
         assert!(
             cache_blocked_hint(Language::Chinese, Some(&mark), cleared, 1024).is_none(),

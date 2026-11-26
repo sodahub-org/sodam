@@ -855,6 +855,13 @@ mod tests {
         }
     }
 
+    /// 一条模板填几个参数：`{}` 和 `{name}` 都算一个，`textf` 两种都认。
+    fn placeholders(template: &str) -> usize {
+        Language::normalize_placeholders(template.to_string())
+            .matches("{}")
+            .count()
+    }
+
     /// 取出 `needle`（如 `.tr(`）后紧跟的字符串字面量；允许换行缩进。
     fn literal_keys<'a>(source: &'a str, needle: &str) -> Vec<&'a str> {
         let mut keys = Vec::new();
@@ -977,6 +984,7 @@ mod tests {
 
         let mut scanned = 0;
         let mut missing = Vec::new();
+        let mut mismatched = Vec::new();
         for file in files {
             if file.ends_with("ui/i18n.rs") {
                 continue;
@@ -994,8 +1002,22 @@ mod tests {
             keys.extend(nth_argument_literal(&source, ".failure_text(", 2));
             for key in keys {
                 scanned += 1;
-                if Language::english_text(key).is_none() && !CALL_SITE_ONLY.contains(&key) {
-                    missing.push(format!("{}: {key}", file.display()));
+                let Some(english) = Language::english_text(key) else {
+                    if !CALL_SITE_ONLY.contains(&key) {
+                        missing.push(format!("{}: {key}", file.display()));
+                    }
+                    continue;
+                };
+                // `textf` 按顺序填占位符：英文少一个就会输出半截话，界面看不出来。
+                let want = placeholders(key);
+                let got = placeholders(english);
+                if want != got {
+                    mismatched.push(format!(
+                        "{}: {key}（{} 个 -> {} 个）",
+                        file.display(),
+                        want,
+                        got
+                    ));
                 }
             }
         }
@@ -1007,6 +1029,13 @@ mod tests {
             missing.is_empty(),
             "英文词典缺少这些 key：\n{}",
             missing.join("\n")
+        );
+        mismatched.sort();
+        mismatched.dedup();
+        assert!(
+            mismatched.is_empty(),
+            "英文词典的占位符个数和中文 key 对不上：\n{}",
+            mismatched.join("\n")
         );
     }
 
