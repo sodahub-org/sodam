@@ -913,17 +913,17 @@ pub struct MaintenanceMark {
 /// 常规维护间隔：缓存是「别无限涨」的软约束，按小时级检查就够，不必每分钟重算
 /// 一遍树。取 6 小时是和 Kodi 的图片缓存同一档：它的「无活可干」下一次
 /// 检查也要 6 小时起步，再密就回到「每分钟扫一次」的老问题。
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// 加密检查间隔，两种情况共用：已用 ≥ 90%，或上一轮有子树读不全。
+/// 把检查调密的间隔，两种情况共用：已用 ≥ 90%，或上一轮有子树读不全。
 ///
 /// 配额是软上限：贴着额度时还在下载，按常规间隔一查就等于超着一整天；读不全的
 /// 字节又只是下界，同样不能按常规间隔放走。其余情况仍按 [`MAINTENANCE_INTERVAL`]。
-const MAINTENANCE_NEAR_LIMIT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+pub const MAINTENANCE_NEAR_LIMIT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// 已知超限后的重试下限：播放中的文件被租约挡着时这一轮可能一个都没删掉，
 /// 不设下限就会每拍重扫，等于把尖峰按分钟复现。
-const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
+pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
@@ -931,10 +931,10 @@ const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
 /// 这一拍要不要真跑一轮维护。
 ///
 /// 越接近上限查得越密：
-/// - 已知超限：过了 10 分钟就重试（挡住删除时不能每拍重扫）；
-/// - 上一轮读不全：过了 30 分钟就重查（读不全的字节只是下界）；
-/// - 已用 ≥ 90%：同样过了 30 分钟就查一次；
-/// - 其余：过了 6 小时才查。
+/// - 已知超限：过了 [`MAINTENANCE_PRESSURE_RETRY`] 就重试（挡住删除时不能每拍重扫）；
+/// - 上一轮读不全：过了 [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 就重查（下界不能当真）；
+/// - 已用 ≥ 90%：同样过了 [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 就查一次；
+/// - 其余：过了 [`MAINTENANCE_INTERVAL`] 才查。
 ///
 /// 没有记录（首次运行、记录损坏、用户清空过缓存根）按到期处理，跑一轮就能重新立账。
 pub fn maintenance_due(
@@ -4060,7 +4060,7 @@ mod tests {
         };
         assert!(
             !maintenance_due(Some(&incomplete), limits, now),
-            "读不全的盘点按加密档重试，别每拍重扫"
+            "读不全的盘点按密集档重试，别每拍重扫"
         );
         let incomplete_retry = MaintenanceMark {
             completed_at: now - MAINTENANCE_NEAR_LIMIT_INTERVAL,
