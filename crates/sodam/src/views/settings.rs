@@ -1083,7 +1083,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
             let limit_bytes = root.settings.audio_cache_limit_mb * 1024 * 1024;
             let usage_hint = cache_usage_hint(root.language, usage);
             // 维护正在跑、或强制请求还排着队时，旧结论已经不作数，别拿它报「上次没删动」。
-            let mark = if root.cache_maintenance_running || root.cache_maintenance_pending {
+            let mark = if root.cache_maintenance_running || root.cache_check.owed() {
                 None
             } else {
                 root.cache_mark.as_ref()
