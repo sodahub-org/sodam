@@ -863,46 +863,33 @@ pub fn cover_cache_dir() -> std::path::PathBuf {
     crate::cache::root_dir().join("covers")
 }
 
-/// 目录占用：**递归**统计（字节数，文件数）。
-///
-/// 封面缩略图在 `covers/`，原图在 `covers/original/` 子目录 ——
-/// 只看顶层会把整个子目录漏掉（实测踩过：字节/张数都偏小）。
-/// 与淘汰共用 `cache::scan_files`：同一份遍历口径（不跟随符号链接、不重复两套实现），
-/// 读不到的部分同样不计入，统计只做展示、不影响淘汰决策。
-fn dir_usage(dir: &std::path::Path) -> (u64, usize) {
-    let scan = crate::cache::scan_files(dir);
-    (scan.total_bytes(), scan.files.len())
-}
-
-/// 顶层目录里指定扩展名的文件数（用于「歌曲数」：只数 `.m4a`）。
-fn count_extension(dir: &std::path::Path, extension: &str) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.path().extension().map(|ext| ext == extension) == Some(true))
-        .count()
-}
-
-/// 缓存统计：(音频字节, 歌曲数, 封面字节, 封面张数)。
+/// 缓存统计：音频、封面两棵树的用量（字节、文件数、歌曲数，以及读全了没有）。
 ///
 /// * 字节数含**全部**文件（`.m4a` / `.quality` 边车 / 下载中的 `.part` /
 ///   封面原图子目录）；
-/// * 「歌曲数」只数 `.m4a`：边车和临时文件不是歌，全算会把数量翻倍（踩过）；
+/// * 「歌曲数」只数顶层 `.m4a`：边车和临时文件不是歌，全算会把数量翻倍（踩过）；
 /// * 「封面张数」数全部图片缓存文件（含原图）。
 ///
+/// 与维护共用 [`crate::cache::CacheUsage::scan`]：同一份遍历口径（不跟随符号链接、
+/// 不重复两套实现），读不到的部分同样不计入，但会把「没读全」带出来，
+/// 设置页据此把数字标成「至少」。
+///
 /// 注意：这是同步扫盘，别在渲染路径里每帧调 —— 调用方应后台执行并缓存结果。
-pub fn cache_stats() -> (u64, usize, u64, usize) {
-    let (audio_bytes, _) = dir_usage(&cache_dir());
-    let songs = count_extension(&cache_dir(), "m4a");
-    let (cover_bytes, cover_files) = dir_usage(&cover_cache_dir());
-    (audio_bytes, songs, cover_bytes, cover_files)
+pub fn cache_stats() -> crate::cache::CacheUsageSummary {
+    crate::cache::CacheUsageSummary {
+        audio: crate::cache::CacheUsage::scan(&cache_dir()),
+        covers: crate::cache::CacheUsage::scan(&cover_cache_dir()),
+    }
 }
 
-/// 清空缓存（音频 + 封面），返回删除的文件数。
-pub fn clear_cache() -> usize {
-    crate::cache::clear_in(&cache_dir()) + crate::cache::clear_in(&cover_cache_dir())
+/// 清空缓存（音频 + 封面），返回删除的文件数与这轮读没读全。
+pub fn clear_cache() -> crate::cache::ClearReport {
+    let audio = crate::cache::clear_in(&cache_dir());
+    let covers = crate::cache::clear_in(&cover_cache_dir());
+    crate::cache::ClearReport {
+        removed: audio.removed + covers.removed,
+        incomplete: audio.incomplete || covers.incomplete,
+    }
 }
 
 #[cfg(test)]
@@ -1157,7 +1144,7 @@ mod tests {
         assert_eq!(snap.load_seq, seq);
         assert_eq!(snap.track_id, "failed");
         assert!(!snap.playing && !snap.finished && !snap.error.is_empty());
-        assert_eq!(crate::cache::clear_in(dir.path()), 1);
+        assert_eq!(crate::cache::clear_in(dir.path()).removed, 1);
     }
 
     #[test]

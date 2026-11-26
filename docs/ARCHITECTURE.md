@@ -144,8 +144,14 @@ TrackItem + cache path
   以上时不再按账本反复触发，仍由上面的密集档兜住——否则删不动时写一首就会扫一遍盘。
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
   `audio_bytes` / `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` /
-  `*_incomplete`）与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、删完之后的音频树
-  总量，日志里就能和磁盘上的实际占用对账）。
+  `*_incomplete`）、`audio_gap` / `cover_gap`（`none` / `dir` / `entries` / `metadata`，
+  读不全时写明缺口落在哪一层）与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、
+  删完之后的音频树总量，日志里就能和磁盘上的实际占用对账）。
+  两棵树的用量统一用 `cache::CacheUsage` 表示：字节、文件数、歌曲数，加一个「这轮读全了没有」；
+  维护报告与进设置页的一次性统计（`audio::cache_stats`）都产出它。读不全时这几个数只是下界，
+  设置页写成「至少 X」并跟一句「有缓存文件暂时读不到，数字可能偏小；稍后会自动重试」，
+  不写具体原因（代码只知道没读到，分不清是被别的程序占着还是没权限）；一个字节都没读到时
+  不写「至少 0 B」。手动清空返回 `cache::ClearReport`，提示里说清这一轮有没有读全。
   规模基准一条命令：`cargo run --release -p sodam-core --example cache_bench`，造
   1000 / 5000 / 20000 个文件各跑一轮，输出耗时、扫描文件数、删除数；入口是
   `cache::maintain_in`，不碰全局缓存根。
@@ -167,7 +173,8 @@ TrackItem + cache path
   `.part` / `.part.meta` / `.dec.tmp` 等，名单见 `cache::STAGED_SUFFIXES`）有两道收尾：
   每轮维护按 7 天保留期**整族**清扫过期残留（族里任一成员还年轻就整族保留，不在边界上
   拆开续传对；`.part.lock` 永不删——它的 mtime 停在首次下载，删掉正被内核锁挂着的锁会
-  让后到的下载者另立新锁、破坏跨进程互斥）；启动后的首轮维护另清一次音频根**顶层**的旧格式
+  让后到的下载者另立新锁、破坏跨进程互斥；音频树这一轮读不全时暂存清扫整轮跳过——
+  看不到的可能是族里最新的一员，见过的那几条会显得「整族都过期」）；启动后的首轮维护另清一次音频根**顶层**的旧格式
   （#241 之前）非锁残留——只列这一层、不递归，`staging/` 里的交给上面那条 7 天清扫；认族只
   看文件名后缀（`is_staged_part`），所以这一层里哪怕是不相干的 `notes.txt.part` 也算
   残留、到龄一起清。24 小时门槛 + 租约 + 进程级一次性门（`legacy_residue_swept` 记删除数；
@@ -177,7 +184,8 @@ TrackItem + cache path
 - 音频与封面共用同一份递归扫描（`cache::scan_files`）和同一个按组 LRU 淘汰器，两者只在
   分组键（`{track}-{tag}` vs. 封面 URL 哈希）和删除方式（租约检查 vs. 直接删）上不同。
   扫描区分「目录不存在」和「子树读不到」：前者按空目录正常处理，后者把扫描标成不完整，
-  可读部分照旧收进来。不完整扫描下，封面只在「可读部分自己已超限」时按它淘汰（真实占用
+  可读部分照旧收进来，并记下缺口落在哪一层（`ScanGap`：`dir` / `entries` / `metadata`），
+  维护报告与日志用它说明这一轮为什么没读全。不完整扫描下，封面只在「可读部分自己已超限」时按它淘汰（真实占用
   必然也超限，删掉的确实是可读文件里最旧的），否则本轮不删；两种情况都写一条 Warn 日志
   `cover_trim_incomplete`（`readable_bytes` / `readable_files` / `action`），同一个动作只写
   一次，扫描恢复完整后复位。读不到的那部分有多大无从得知，目录可能停在限额之上，这条日志

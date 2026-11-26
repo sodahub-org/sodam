@@ -521,9 +521,32 @@ impl Language {
             "中文" => "中文",
             "语言已恢复为跟随系统" => "Language restored to system",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => "Total {} ({} songs {}, {} covers {})",
+            "至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
+                "At least {} ({} songs {}, {} covers {})"
+            }
+            "暂时读不到缓存占用，稍后会自动重试" => {
+                "Cache usage can't be read right now. Retrying automatically."
+            }
+            "有缓存文件暂时读不到，数字可能偏小；稍后会自动重试" => {
+                "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
+            }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
-            "音频缓存上限：{}" => "Audio cache limit: {}",
-            "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留" => "Older songs are removed automatically; files in use are kept until released",
+            "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
+                "Cleared {} cache files; some files couldn't be read, so a few may remain"
+            }
+            "歌曲缓存上限：{}" => "Song cache limit: {}",
+            "合计里还包含封面图片；封面另有 {} 上限" => {
+                "The total above also includes cover images; covers have their own {} limit"
+            }
+            "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留，所以占用会暂时超过上限" => {
+                "Older songs are cleaned up automatically; files in use are kept for now, so usage can temporarily go over the limit"
+            }
+            "上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试" => {
+                "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet. Retrying automatically."
+            }
+            "正在播放或下载的文件会保留，等它们停用后再清一次" => {
+                "Files in use for playback or download are kept; clear again once they're released"
+            }
             "清空缓存" => "Clear Cache",
             "正在清理…" => "Clearing…",
             "批量升级缓存" => "Batch Upgrade Cache",

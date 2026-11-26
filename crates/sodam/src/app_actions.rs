@@ -1016,7 +1016,7 @@ impl Root {
         self.cache_clearing = true;
         let work = cx.background_spawn(async { sodam_core::audio::clear_cache() });
         cx.spawn(async move |this, cx| {
-            let removed = work.await;
+            let report = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_clearing = false;
                 // 文件已清理，已完成的结果作废；排队 / 在飞保留，免得同一张下两遍。
@@ -1026,7 +1026,15 @@ impl Root {
                 // 已完成结果的作废由上面的 `clear_completed()` 完成；
                 // 原图没有渲染期自动入队口子，这里只补排当前曲目。
                 root.restore_current_original_cover(cx);
-                let message = root.localized("已清理缓存：{} 个文件", &[removed.to_string()]);
+                // 读不全时没看到的文件清不掉，别报成「清干净了」。
+                let message = if report.incomplete {
+                    root.localized(
+                        "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净",
+                        &[report.removed.to_string()],
+                    )
+                } else {
+                    root.localized("已清理缓存：{} 个文件", &[report.removed.to_string()])
+                };
                 root.notify_success_once("cache-clear", message);
                 root.refresh_cache_stats(cx);
                 cx.notify();

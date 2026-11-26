@@ -247,14 +247,38 @@ pub(crate) struct ScannedFile {
     pub(crate) modified: SystemTime,
 }
 
+/// 扫描缺口落在哪一层：整个目录打不开、这一层有条目读不到、文件元数据取不到。
+///
+/// 只记「哪一层」，不记操作系统的原始错误：同一类失败在不同平台上的错误码并不一致，
+/// 日志里留一个稳定的层名，比留一个随平台变来变去的 `io::Error` 文案更好查。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanGap {
+    Dir,
+    Entry,
+    Metadata,
+}
+
+impl ScanGap {
+    /// 日志字段用的稳定名字。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dir => "dir",
+            Self::Entry => "entries",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
 /// 一次递归扫描的结果。
 ///
 /// `incomplete` 记录「有地方没读到」：目录打不开、条目读错、元数据取不到。
 /// 这种情况下 `files` 只是可读部分的视图，总量偏小，不能当成完整统计。
+/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用。
 #[derive(Default)]
 pub(crate) struct Scan {
     pub(crate) files: Vec<ScannedFile>,
     pub(crate) incomplete: bool,
+    pub(crate) gap: Option<ScanGap>,
 }
 
 impl Scan {
@@ -263,6 +287,53 @@ impl Scan {
             .iter()
             .fold(0u64, |sum, file| sum.saturating_add(file.bytes))
     }
+
+    /// 记一处扫描缺口；只保留第一处的层名，`incomplete` 与 `gap` 一起置上。
+    fn mark_incomplete(&mut self, gap: ScanGap) {
+        self.incomplete = true;
+        if self.gap.is_none() {
+            self.gap = Some(gap);
+        }
+    }
+}
+
+/// 一处缓存目录的用量：字节、文件数、歌曲数，以及这一轮读全了没有。
+///
+/// `incomplete` 为真时前三个数都只是下界，设置页必须写成「至少」，
+/// 不能当成准确值。维护这一轮的盘点与进设置页的一次性统计都产出它，
+/// 两处数字的口径因此只有一份。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub bytes: u64,
+    pub files: usize,
+    /// 顶层 `.m4a` 才算歌；边车、暂存、封面都不算。
+    pub songs: usize,
+    pub incomplete: bool,
+}
+
+impl CacheUsage {
+    /// 扫一遍目录得到用量。和维护共用同一份递归扫描，不另写一套遍历。
+    pub fn scan(dir: &Path) -> Self {
+        let scan = scan_files(dir);
+        let songs = scan
+            .files
+            .iter()
+            .filter(|file| is_top_level_audio(dir, file.path.as_path()))
+            .count();
+        Self {
+            bytes: scan.total_bytes(),
+            files: scan.files.len(),
+            songs,
+            incomplete: scan.incomplete,
+        }
+    }
+}
+
+/// 音频、封面两棵树的用量：设置页读这一份，维护一轮结束后整份覆盖。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheUsageSummary {
+    pub audio: CacheUsage,
+    pub covers: CacheUsage,
 }
 
 #[derive(Clone, Copy)]
@@ -350,11 +421,13 @@ where
         // 不算「扫描不完整」，也不该让封面淘汰在这一轮停摆。
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => {
-            scan.incomplete = true;
+            scan.mark_incomplete(ScanGap::Dir);
             return;
         }
     };
-    scan.incomplete |= listing.incomplete;
+    if listing.incomplete {
+        scan.mark_incomplete(ScanGap::Entry);
+    }
     for entry in listing.entries {
         match entry.kind {
             EntryKind::Dir => scan_into(&entry.path, scan, list),
@@ -373,7 +446,7 @@ where
                         modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
                     }),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => scan.incomplete = true,
+                    Err(_) => scan.mark_incomplete(ScanGap::Metadata),
                 },
             },
             EntryKind::Other => {}
@@ -723,18 +796,41 @@ where
     }
 }
 
-/// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
+/// 一次手动清空的结论。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClearReport {
+    pub removed: usize,
+    /// 这一轮有没有目录没读到：读不全时，没看到的那几个文件清不掉。
+    pub incomplete: bool,
+}
+
+/// 递归清理缓存，保留正在使用的音频和近期临时文件。
 ///
 /// 挑法是「整家不新鲜就删」：可续传的那拨按保护键成族（数据和记录必须一起判，
 /// 拆开就接不上续传），正式文件、边车、封面各自成家、各看各的。
 /// 租约护着这一家时一条都不删（[`Family::remove`]）。
-pub fn clear_in(root: &Path) -> usize {
-    let files = scan_files(root).files;
-    Family::staged(&files)
+///
+/// 清空不靠扫描结果决定「删不删」（看到就照常清），但要把这一轮读没读全交回去，
+/// 好在提示里说清有没有留下没清到的文件。
+pub fn clear_in(root: &Path) -> ClearReport {
+    clear_with(root, list_dir)
+}
+
+/// 清空实现，目录读取可注入：测试用它模拟「某个子目录读不到」。
+fn clear_with<L>(root: &Path, list: L) -> ClearReport
+where
+    L: FnMut(&Path) -> ListingResult,
+{
+    let scan = scan_with(root, list);
+    let removed = Family::staged(&scan.files)
         .iter()
         .filter(|family| !family.fresh())
         .map(|family| family.remove(|_: &ScannedFile| true).len())
-        .sum()
+        .sum();
+    ClearReport {
+        removed,
+        incomplete: scan.incomplete,
+    }
 }
 
 /// 按最后使用时间淘汰音频（命中缓存时更新 mtime）。租约文件可暂时超额。
@@ -951,13 +1047,20 @@ const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 锁不进族（为什么见 [`Family::staged_payload`]）；锁本身也不会被删
 /// （[`remove_idle`] 的第一条）。
 ///
+/// `complete` 是音频树这一轮读没读全。读不全时看不到的可能是族里最新的一员，
+/// 见过的那几条会显得「整族都过期」，这一轮就一个都不清；缺口补上下轮再说。
+///
 /// 正式文件与音质边车不跟着族走：它们各自成家、各看各的年纪。
 fn purge_stale_staging_files(
     files: &[ScannedFile],
     staging_dir: &Path,
     max_age: Duration,
     now: SystemTime,
+    complete: bool,
 ) -> Vec<PathBuf> {
+    if !complete {
+        return Vec::new();
+    }
     let in_staging = files
         .iter()
         .filter(|file| file.path.parent() == Some(staging_dir));
@@ -1202,6 +1305,8 @@ fn near_limit(known: u64, limit: u64) -> bool {
 /// 一轮维护的结论：设置页的数字、界面要同步的删除清单、日志要的指标都在这里。
 pub struct MaintenanceReport {
     pub audio_bytes: u64,
+    /// 这一轮删完之后音频树里还剩几个文件（含边车与暂存）。
+    pub audio_files: usize,
     pub songs: usize,
     pub cover_bytes: u64,
     pub cover_files: usize,
@@ -1209,6 +1314,9 @@ pub struct MaintenanceReport {
     pub removed_covers: Vec<PathBuf>,
     pub audio_incomplete: bool,
     pub cover_incomplete: bool,
+    /// 第一次扫描缺口落在哪一层；读全了是 `None`。
+    pub audio_gap: Option<ScanGap>,
+    pub cover_gap: Option<ScanGap>,
     pub scanned_files: usize,
     pub removed_files: usize,
     /// 这一轮跑完之后，任一棵树仍在上限之上（多半是租约或锁挡住了删除）。
@@ -1222,14 +1330,42 @@ pub struct MaintenanceReport {
 }
 
 impl MaintenanceReport {
-    /// 设置页那四个数字，顺序与 `Root::cache_summary` 一致。
-    pub fn summary(&self) -> (u64, usize, u64, usize) {
-        (
-            self.audio_bytes,
-            self.songs,
-            self.cover_bytes,
-            self.cover_files,
-        )
+    /// 音频树的用量；读不全时数字只是下界。
+    pub fn audio_usage(&self) -> CacheUsage {
+        CacheUsage {
+            bytes: self.audio_bytes,
+            files: self.audio_files,
+            songs: self.songs,
+            incomplete: self.audio_incomplete,
+        }
+    }
+
+    /// 封面树的用量；封面不数歌。
+    pub fn cover_usage(&self) -> CacheUsage {
+        CacheUsage {
+            bytes: self.cover_bytes,
+            files: self.cover_files,
+            songs: 0,
+            incomplete: self.cover_incomplete,
+        }
+    }
+
+    /// 设置页要的两棵树用量：一次覆盖，别让两处各拼一份。
+    pub fn summary(&self) -> CacheUsageSummary {
+        CacheUsageSummary {
+            audio: self.audio_usage(),
+            covers: self.cover_usage(),
+        }
+    }
+
+    /// 这一轮读不全的原因，日志用：没读全时写明是哪棵树、哪一层，
+    /// 不是只留一个布尔。读全了是 `none`。
+    pub fn audio_gap_label(&self) -> &'static str {
+        self.audio_gap.map_or("none", ScanGap::label)
+    }
+
+    pub fn cover_gap_label(&self) -> &'static str {
+        self.cover_gap.map_or("none", ScanGap::label)
     }
 
     pub fn mark(&self, completed_at: SystemTime) -> MaintenanceMark {
@@ -1274,6 +1410,8 @@ pub fn maintain(
                 ("removed_files", removed.as_str()),
                 ("audio_bytes", audio_bytes.as_str()),
                 ("skipped_reason", report.skipped_reason),
+                ("audio_gap", report.audio_gap_label()),
+                ("cover_gap", report.cover_gap_label()),
                 ("over_limit", over_limit.as_str()),
             ],
         );
@@ -1319,6 +1457,7 @@ where
 
     let mut audio = scan_with(audio_dir, list);
     let audio_incomplete = audio.incomplete;
+    let audio_gap = audio.gap;
     let audio_scanned = audio.files.len();
 
     let staging = staging_dir(audio_dir);
@@ -1327,6 +1466,7 @@ where
         &staging,
         STALE_STAGING_MAX_AGE,
         SystemTime::now(),
+        !audio_incomplete,
     );
     let purged_files = purged.len();
     if !purged.is_empty() {
@@ -1334,12 +1474,14 @@ where
         audio.files.retain(|file| !gone.contains(&file.path));
     }
 
+    let audio_after_purge = audio.files.len();
     let songs_before = audio
         .files
         .iter()
         .filter(|file| is_top_level_audio(audio_dir, file.path.as_path()))
         .count();
     let (audio_bytes, removed_audio) = trim_audio_scan(audio, limits.audio_bytes);
+    let audio_files = audio_after_purge.saturating_sub(removed_audio.len());
     let songs_removed = removed_audio
         .iter()
         .filter(|path| is_top_level_audio(audio_dir, path.as_path()))
@@ -1347,6 +1489,7 @@ where
 
     let covers = scan_with(covers_dir, list);
     let cover_incomplete = covers.incomplete;
+    let cover_gap = covers.gap;
     let cover_before = covers.files.len();
     let (cover_bytes, removed_covers) = trim_covers_scan(
         covers,
@@ -1377,12 +1520,15 @@ where
 
     MaintenanceReport {
         audio_bytes,
+        audio_files,
         songs: songs_before.saturating_sub(songs_removed),
         cover_bytes,
         cover_files: cover_before.saturating_sub(removed_covers.len()),
         removed_covers,
         audio_incomplete,
         cover_incomplete,
+        audio_gap,
+        cover_gap,
         scanned_files: audio_scanned + cover_before,
         removed_files,
         over_limit,
@@ -2261,12 +2407,12 @@ mod tests {
         file(dir.path(), "audio/abandoned.part", 90_000);
         file(dir.path(), "covers/thumb.img", 0);
         file(dir.path(), "covers/original/full.img", 0);
-        assert_eq!(clear_in(dir.path()), 3);
+        assert_eq!(clear_in(dir.path()).removed, 3);
         assert!(audio.exists());
         assert!(audio.with_extension("quality").exists());
         assert!(dir.path().join("audio/download.part").exists());
         drop(lease);
-        assert_eq!(clear_in(dir.path()), 2);
+        assert_eq!(clear_in(dir.path()).removed, 2);
     }
 
     /// #60 的回归断言：清空缓存不能顺手删掉排障证据。
@@ -2280,7 +2426,7 @@ mod tests {
         let outlet = crate::log_outlet::LogOutlet::new(log_dir.clone());
         outlet.write_line("diagnostic entry");
 
-        assert_eq!(clear_in(&cache), 2);
+        assert_eq!(clear_in(&cache).removed, 2);
         assert!(log_dir.join(crate::log_outlet::LOG_FILE_NAME).exists());
     }
 
@@ -2451,7 +2597,11 @@ mod tests {
     /// 模拟「某个子目录读不到」的扫描：权限位在 root 下无效、Windows 上不生效，
     /// 所以直接替换目录读取，而不是去 chmod。
     fn scan_denying(root: &Path, denied: &Path) -> Scan {
-        scan_with(root, |path| {
+        scan_with(root, denying(denied))
+    }
+
+    fn denying(denied: &Path) -> impl FnMut(&Path) -> ListingResult + Copy + '_ {
+        move |path| {
             if path == denied {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -2460,7 +2610,52 @@ mod tests {
             } else {
                 list_dir(path)
             }
-        })
+        }
+    }
+
+    /// 读不全时记下缺口在哪一层；目录整个打不开就是 `dir`。
+    #[test]
+    fn scan_records_where_it_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), "audio/keep.m4a", 0);
+        let denied = dir.path().join("audio/staging");
+        let scan = scan_denying(dir.path(), &denied);
+        assert!(scan.incomplete);
+        assert_eq!(scan.gap, Some(ScanGap::Dir), "整层目录打不开要记成 dir");
+    }
+
+    /// 用量一次给出字节、文件数、歌曲数；目录不存在算空的，不算没读全。
+    #[test]
+    fn usage_scan_counts_bytes_files_and_songs() {
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), "audio/one.m4a", 0);
+        file(dir.path(), "audio/one.quality", 0);
+        file(dir.path(), "audio/staging/two.m4a.part", 0);
+
+        let usage = CacheUsage::scan(&dir.path().join("audio"));
+        assert_eq!(usage.bytes, 30);
+        assert_eq!(usage.files, 3);
+        assert_eq!(usage.songs, 1, "边车和暂存不是歌");
+        assert!(!usage.incomplete);
+
+        let missing = CacheUsage::scan(&dir.path().join("missing"));
+        assert_eq!(missing, CacheUsage::default(), "目录不存在是空的");
+    }
+
+    /// 清空照常删看得到的文件，但要把「这轮没读全」交回去。
+    #[test]
+    fn clear_report_says_when_some_files_could_not_be_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = file(dir.path(), "audio/old.m4a", 90_000);
+        let hidden = file(dir.path(), "audio/staging/hidden.m4a.part", 90_000);
+        let denied = dir.path().join("audio/staging");
+
+        let report = clear_with(dir.path(), denying(&denied));
+
+        assert_eq!(report.removed, 1, "看得到的老文件照常清");
+        assert!(report.incomplete, "没读到的要报出来，别报成清干净了");
+        assert!(!old.exists());
+        assert!(hidden.exists(), "读不到的目录里的文件原样保留");
     }
 
     /// 对目录跑一次封面淘汰（测试用：告警门独立，不碰进程级状态）。
@@ -2486,12 +2681,21 @@ mod tests {
 
     /// 对 staging 目录跑一次保留期清扫（测试用）：只认这一层的直接子项。
     fn purge_staging(staging: &Path) -> usize {
-        let files: Vec<ScannedFile> = scan_files(staging)
+        let scan = scan_files(staging);
+        let complete = !scan.incomplete;
+        let files: Vec<ScannedFile> = scan
             .files
             .into_iter()
             .filter(|file| file.path.parent() == Some(staging))
             .collect();
-        purge_stale_staging_files(&files, staging, STALE_STAGING_MAX_AGE, SystemTime::now()).len()
+        purge_stale_staging_files(
+            &files,
+            staging,
+            STALE_STAGING_MAX_AGE,
+            SystemTime::now(),
+            complete,
+        )
+        .len()
     }
 
     /// 静默跑一轮封面淘汰：只关心删了什么、不关心日志的测试用它。
@@ -2716,9 +2920,9 @@ mod tests {
         let second = CacheLease::acquire(&path);
         drop(first);
         drop(second);
-        assert_eq!(clear_in(dir.path()), 0);
+        assert_eq!(clear_in(dir.path()).removed, 0);
         drop(clone);
-        assert_eq!(clear_in(dir.path()), 1);
+        assert_eq!(clear_in(dir.path()).removed, 1);
     }
 
     #[test]
@@ -3137,7 +3341,7 @@ mod tests {
         assert!(part.exists());
 
         // 清空缓存操作同样不能删除租约文件
-        assert_eq!(clear_in(dir.path()), 0);
+        assert_eq!(clear_in(dir.path()).removed, 0);
         assert!(target.exists());
         assert!(part.exists());
 
@@ -4036,7 +4240,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let old_data = file(dir.path(), "staging/123-lossless-normal.m4a.part", 90_000);
         let fresh_meta = file(dir.path(), "staging/123-lossless-normal.m4a.part.meta", 0);
-        assert_eq!(clear_in(dir.path()), 0, "族里有新鲜成员就一件都不删");
+        assert_eq!(
+            clear_in(dir.path()).removed,
+            0,
+            "族里有新鲜成员就一件都不删"
+        );
         assert!(old_data.exists() && fresh_meta.exists(), "清缓存不拆续传对");
     }
 
@@ -4233,7 +4441,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let path = file(outside.path(), "keep.img", 0);
         std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
-        assert_eq!(clear_in(dir.path()), 0);
+        assert_eq!(clear_in(dir.path()).removed, 0);
         assert!(path.exists());
     }
 
@@ -4262,6 +4470,12 @@ mod tests {
         assert_eq!(report.audio_bytes, 20, "报告的是淘汰之后的字节数");
         assert_eq!(report.removed_files, 2, "整组 sidecar 一起删");
         assert_eq!(report.songs, 1);
+        assert_eq!(report.audio_files, 2, "剩下的音频与边车各算一个文件");
+        let summary = report.summary();
+        assert_eq!(summary.audio.bytes, 20);
+        assert_eq!(summary.audio.files, 2);
+        assert_eq!(summary.audio.songs, 1);
+        assert!(!summary.audio.incomplete);
         assert!(!old.exists() && !old.with_extension("quality").exists());
         assert!(recent.exists() && recent.with_extension("quality").exists());
     }
@@ -4295,6 +4509,50 @@ mod tests {
         assert!(fresh.exists(), "保留期内的暂存不动");
         assert_eq!(report.audio_bytes, 20, "剩下的只有 a.m4a 与新鲜暂存");
         assert_eq!(report.songs, 1);
+    }
+
+    /// 音频树读不全时：过期暂存一个都不清，报告写明缺口在哪一层，用量标成「至少」。
+    #[test]
+    fn maintenance_round_holds_back_staging_when_the_scan_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        let old = STALE_STAGING_MAX_AGE.as_secs() + 60;
+        let expired = file(dir.path(), "audio/staging/1-lossless-normal.m4a.part", old);
+        let expired_meta = file(
+            dir.path(),
+            "audio/staging/1-lossless-normal.m4a.part.meta",
+            old,
+        );
+        file(dir.path(), "audio/keep.m4a", 0);
+        file(dir.path(), "covers/one.img", 0);
+        let denied = audio.join("staging");
+
+        let report = maintain_with(
+            &audio,
+            &covers,
+            MaintenanceLimits::from_mb(1024, 512),
+            &HashMap::new(),
+            denying(&denied),
+        );
+
+        assert!(report.audio_incomplete);
+        assert_eq!(report.skipped_reason, "audio_incomplete");
+        assert_eq!(report.audio_gap_label(), "dir", "报告要写清缺口落在哪一层");
+        assert_eq!(report.cover_gap_label(), "none");
+        assert_eq!(report.removed_files, 0, "读不全时这一轮什么都不删");
+        assert!(
+            expired.exists() && expired_meta.exists(),
+            "过期暂存原样留着"
+        );
+
+        let summary = report.summary();
+        assert!(summary.audio.incomplete, "读不全的音频用量只是下界");
+        assert_eq!(summary.audio.bytes, 10, "只数看得到的 keep.m4a");
+        assert_eq!(summary.audio.files, 1);
+        assert_eq!(summary.audio.songs, 1);
+        assert!(!summary.covers.incomplete, "封面树读全了");
+        assert_eq!(summary.covers.files, 1);
     }
 
     /// 到期判定只看落盘结论——没到期不扫，已知超限不等到期，但也不能每拍重扫。
