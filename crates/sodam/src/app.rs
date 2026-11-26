@@ -639,6 +639,11 @@ pub struct Root {
     pub(crate) cache_summary: (u64, usize, u64, usize),
     /// 缓存统计重算的发起序号：只让最新一次扫盘的结果落回状态。
     pub(crate) cache_summary_request_seq: u64,
+    /// 上次维护的结论（完成时刻 + 当时的占用）：到期判定只做一次比较。
+    ///
+    /// 启动时从缓存根读回来，每轮维护结束后由后台写回——进程重启不清零，
+    /// 也就不会「每次启动 60 秒后必扫一遍」（#310）。
+    pub(crate) cache_mark: Option<sodam_core::cache::MaintenanceMark>,
     pub(crate) cache_maintenance_running: bool,
     pub(crate) cache_clearing: bool,
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
@@ -979,6 +984,7 @@ impl Root {
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_summary_request_seq: 0,
+            cache_mark: sodam_core::cache::load_mark(),
             cache_maintenance_running: false,
             cache_clearing: false,
             batch_upgrade_target: sodam_core::quality::QualityIntent::Tier("lossless".into()),
@@ -1030,7 +1036,12 @@ impl Root {
             }
         })
         .detach();
-        root.maintain_cache(cx);
+        root.maintain_cache(false, cx);
+        // 未登录直接停在设置页，不走 `on_nav_changed`：这里补一次统计，
+        // 否则设置页会一直显示 0（启动那一轮维护可能按到期规则跳过）。
+        if root.nav == Nav::Settings {
+            root.refresh_cache_stats(cx);
+        }
         if logged_in {
             root.refresh_account(cx);
             root.load_liked_ids(cx);
