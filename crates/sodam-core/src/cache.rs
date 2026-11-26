@@ -862,7 +862,7 @@ fn purge_stale_staging_files(
     for members in families.values() {
         if members.iter().all(|&(_, expired)| expired) {
             for (path, _) in members {
-                if remove_idle(*path) {
+                if remove_idle(path) {
                     removed.push(path.to_path_buf());
                 }
             }
