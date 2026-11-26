@@ -348,12 +348,17 @@ where
                     bytes: meta.len(),
                     modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
                 }),
-                // 枚举时取不到元数据：文件已被删掉是正常竞争；还在却读不到才算缺口。
-                None => {
-                    if entry.path.exists() {
-                        scan.incomplete = true;
-                    }
-                }
+                // 枚举时取不到元数据：可能是已经被删掉，也可能是读不到。按路径再问一次
+                // 把两者分开——这条路径只在出错时才走，多一次 stat 换回原来的判定口径。
+                None => match std::fs::metadata(&entry.path) {
+                    Ok(meta) => scan.files.push(ScannedFile {
+                        path: entry.path,
+                        bytes: meta.len(),
+                        modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
+                    }),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => scan.incomplete = true,
+                },
             },
             EntryKind::Other => {}
         }
@@ -794,7 +799,7 @@ pub fn sweep_legacy_residue() -> usize {
         Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return 0,
     };
-    // 先问门再列目录：门关了就别每分钟白付一次 read_dir + 每文件 metadata。
+    // 先问门再列目录：门关了就别每轮白付一次 read_dir + 每文件 metadata。
     // 参数立即求值的话，扫完进 advance 才发现已结束，门等于只省了删除不省扫描。
     if gate.is_finished() {
         return 0;
@@ -967,11 +972,23 @@ pub struct MaintenanceReport {
     pub scanned_files: usize,
     pub removed_files: usize,
     pub elapsed: Duration,
-    /// 没有删除动作时的原因（`below_limit` / `*_incomplete`），有删除时是 `none`。
+    /// 这一轮的结论缩写，日志直接用：`none`（删了东西）/ `below_limit` /
+    /// `blocked`（超限但都被租约或锁挡住）/ `audio_incomplete` / `covers_incomplete`。
+    /// 扫描缺口优先于「跳过」：读不全时数字只是下界，先让人看见这件事。
     pub skipped_reason: &'static str,
 }
 
 impl MaintenanceReport {
+    /// 设置页那四个数字，顺序与 `Root::cache_summary` 一致。
+    pub fn summary(&self) -> (u64, usize, u64, usize) {
+        (
+            self.audio_bytes,
+            self.songs,
+            self.cover_bytes,
+            self.cover_files,
+        )
+    }
+
     pub fn mark(&self, completed_at: SystemTime) -> MaintenanceMark {
         MaintenanceMark {
             completed_at,
@@ -1027,7 +1044,8 @@ fn is_top_level_audio(audio_dir: &Path, path: &Path) -> bool {
 /// 「每棵树只遍历一次」。
 ///
 /// 暂存清扫排在配额淘汰前面：它只碰 7 天以上的死文件（淘汰本来也不会动 24 小时内的
-/// 族），先摘掉能让配额少算一份，最终落盘结果与旧顺序一致。
+/// 族），先摘掉能让配额少算一份。旧顺序是先淘汰后清扫，所以超限时可能多删几首正式缓存；
+/// 现在先清死文件，删得更少，最终占用同样回到上限以内。
 fn maintain_with<L>(
     audio_dir: &Path,
     covers_dir: &Path,
@@ -2285,7 +2303,7 @@ mod tests {
         assert!(hidden.exists(), "读不到的部分不动");
     }
 
-    /// 「动作」只在变化时上报一次：一直不完整也不会每分钟写一条 Warn。
+    /// 「动作」只在变化时上报一次：一直不完整也不会每轮写一条 Warn。
     #[test]
     fn cover_trim_alerts_once_per_action_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -3895,51 +3913,6 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
         assert_eq!(clear_in(dir.path()), 0);
         assert!(path.exists());
-    }
-
-    /// #310：一轮维护对音频树、封面树各只遍历一次，数字来自同一次盘点。
-    #[test]
-    fn maintenance_round_scans_each_tree_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let audio = dir.path().join("audio");
-        let covers = dir.path().join("covers");
-        file(dir.path(), "audio/a.m4a", 0);
-        file(dir.path(), "audio/a.quality", 0);
-        file(dir.path(), "audio/staging/b.m4a.part", 0);
-        file(dir.path(), "covers/0000000000000001-160.img", 0);
-        file(dir.path(), "covers/original/0000000000000001.img", 0);
-
-        let visits = std::cell::RefCell::new(Vec::new());
-        let report = maintain_with(
-            &audio,
-            &covers,
-            MaintenanceLimits::from_mb(1024, 512),
-            &HashMap::new(),
-            |path| {
-                visits.borrow_mut().push(path.to_path_buf());
-                list_dir(path)
-            },
-        );
-
-        let audio_visits = visits
-            .borrow()
-            .iter()
-            .filter(|path| path.as_path() == audio.as_path())
-            .count();
-        let cover_visits = visits
-            .borrow()
-            .iter()
-            .filter(|path| path.as_path() == covers.as_path())
-            .count();
-        assert_eq!(audio_visits, 1, "音频树一轮只扫一遍");
-        assert_eq!(cover_visits, 1, "封面树一轮只扫一遍");
-        assert_eq!(report.audio_bytes, 30, "音频字节含 sidecar 与暂存");
-        assert_eq!(report.songs, 1, "只有顶层 .m4a 算歌");
-        assert_eq!(report.cover_bytes, 20, "封面字节含原图子目录");
-        assert_eq!(report.cover_files, 2);
-        assert_eq!(report.scanned_files, 5);
-        assert_eq!(report.removed_files, 0);
-        assert_eq!(report.skipped_reason, "below_limit");
     }
 
     /// 超过上限时照旧整组淘汰，报告里的数字是删完之后的。

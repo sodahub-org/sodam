@@ -619,8 +619,8 @@ pub struct Root {
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
     /// 上次预取巡检时刻；未落闸时每 5s 补一次预取。
     pub(crate) last_prefetch_patrol: std::time::Instant,
-    /// 上次检查缓存维护的时刻；每 60s 检查一次，被升级或清理挡住时本轮跳过。
-    pub(crate) last_cache_maintenance: std::time::Instant,
+    /// 上次问「维护到期没」的时刻；每 60s 问一次，被升级或清理挡住时本轮跳过。
+    pub(crate) last_cache_check: std::time::Instant,
     /// 登录凭据代数：重新登录成功、退出登录、账号信息刷新（换号或会员状态变化）时 +1。
     ///
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
@@ -978,7 +978,7 @@ impl Root {
             prefetch_inflight: HashSet::new(),
             prefetch_cooldown_since: HashMap::new(),
             last_prefetch_patrol: std::time::Instant::now(),
-            last_cache_maintenance: std::time::Instant::now(),
+            last_cache_check: std::time::Instant::now(),
             auth_epoch: 0,
             logout_in_flight: false,
             prefetch_gate: PrefetchGate::default(),
@@ -1037,7 +1037,7 @@ impl Root {
             }
         })
         .detach();
-        root.maintain_cache(false, cx);
+        root.check_cache_maintenance(cx);
         // 未登录直接停在设置页，不走 `on_nav_changed`：这里补一次统计，
         // 否则设置页会一直显示 0（启动那一轮维护可能按到期规则跳过）。
         // 维护这轮真跑起来了就不再单独扫：它的盘点结果会直接落进 cache_summary，
