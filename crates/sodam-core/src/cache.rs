@@ -937,16 +937,14 @@ pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
 
-/// 被替换掉的旧文件：正式音频与它的边车各多大。字段具名，调用处写反了看得出来。
+/// 被替换掉的旧文件：正式音频与它的边车各多大。
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Replaced {
     pub audio: u64,
     pub sidecar: u64,
 }
 
-/// 一次落地写进正式缓存的确切字节：调用方在动手之前量好、写完之后填进来。
-///
-/// 用结构体而不是一串 `u64`：五个相邻的同类型参数写反了编译器不会吭声，账会静默错一份。
+/// 一次落地写进正式缓存的确切字节：动手之前量好，写完之后填进来。
 pub(crate) struct Landing {
     /// 这次尝试开始前暂存族在盘上多大（含马上会被清掉的残留交付目标）。
     pub staged_before: u64,
@@ -1032,8 +1030,9 @@ pub(crate) fn note_download_landed(landing: Landing) {
 
 /// 量一个文件有多大，取不到当 0。
 ///
-/// 只用在「量不准也不会把账带错方向」的地方：被换掉的旧文件（少减只会偏大）、
-/// 写失败后实际落了半截的边车（少记那点，下一轮扫描就纠正）。
+/// 用在两处，误差都不改扫描结论，下一轮扫描自然纠正：
+/// - 被换掉的旧文件：取不到就少减，账偏大；
+/// - 写失败后半截的边车：取不到就少记，账偏小。
 pub(crate) fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
