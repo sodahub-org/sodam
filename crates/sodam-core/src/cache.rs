@@ -937,11 +937,25 @@ pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
 
-/// 被替换掉的旧文件：正式音频与它的边车各多大。
-#[derive(Default)]
-struct ReplacedBytes {
-    audio: u64,
-    sidecar: u64,
+/// 被替换掉的旧文件：正式音频与它的边车各多大。字段具名，调用处写反了看得出来。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Replaced {
+    pub audio: u64,
+    pub sidecar: u64,
+}
+
+/// 一次落地写进正式缓存的确切字节：调用方在动手之前量好、写完之后填进来。
+///
+/// 用结构体而不是一串 `u64`：五个相邻的同类型参数写反了编译器不会吭声，账会静默错一份。
+pub(crate) struct Landing {
+    /// 这次尝试开始前暂存族在盘上多大（含马上会被清掉的残留交付目标）。
+    pub staged_before: u64,
+    /// 落地的音频字节。服务器判「早就下完了」、这次传输量为 0 时，是盘上完整文件的大小。
+    pub audio: u64,
+    /// 落地的边车字节。
+    pub sidecar: u64,
+    /// 被换掉的旧文件。
+    pub replaced: Replaced,
 }
 
 /// 上次真看盘之后的音频净增量（字节）。
@@ -949,8 +963,11 @@ struct ReplacedBytes {
 /// 只累计「又多了多少」：每次下载尝试只加这次长出来（或缩掉）的部分；真看盘一开始
 /// 就清零，扫描结论永远是基准。只算音频——下载只往音频树写，封面有固定上限，不掺进来。
 ///
-/// 下载途中正好赶上一次看盘时，这次尝试记的差额可能把扫描已经算过的一小截再加一遍；
-/// 最多多算这一首当时写进去的那点，下一轮扫描就纠正，方向偏大不偏小。
+/// 两个方向都会有误差，但都只影响「提前多少」，不改扫描结论，下一轮扫描自然纠正：
+/// - 偏大：下载途中正好赶上一次看盘，这次尝试记的差额可能把扫描已经算过的一小截
+///   再加一遍；
+/// - 偏小：落地时减掉的旧文件若是上次看盘之后才出现（比如进程重启后账本从零开始），
+///   减掉就等于凭空少算那一份。
 static AUDIO_DELTA: AtomicI64 = AtomicI64::new(0);
 
 fn as_i64(bytes: u64) -> i64 {
@@ -963,15 +980,10 @@ fn size_change(before: u64, after: u64) -> i64 {
 }
 
 /// 一次下载落进正式缓存时的净变化：暂存长到交付大小、旧音频与旧边车被换掉。
-fn landed_delta(
-    staged_before: u64,
-    audio_bytes: u64,
-    sidecar_bytes: u64,
-    replaced: ReplacedBytes,
-) -> i64 {
-    size_change(staged_before, audio_bytes)
-        .saturating_sub(as_i64(replaced.audio))
-        .saturating_add(size_change(replaced.sidecar, sidecar_bytes))
+fn landed_delta(landing: Landing) -> i64 {
+    size_change(landing.staged_before, landing.audio)
+        .saturating_sub(as_i64(landing.replaced.audio))
+        .saturating_add(size_change(landing.replaced.sidecar, landing.sidecar))
 }
 
 /// 上次看盘之后又写进来的音频字节（净增量，可为负）。
@@ -1014,31 +1026,14 @@ pub(crate) fn note_staged_change(target: &Path, before: u64) {
 }
 
 /// 一次下载把字节落进正式缓存（点播与升级共用）。
-///
-/// `staged_before` 是这次尝试开始前暂存族的大小；`audio_bytes` / `sidecar_bytes` 是落地的
-/// 实际字节数；`old_*` 是替换前正式文件与边车的大小。调用方都要在动手之前量好。
-pub(crate) fn note_download_landed(
-    staged_before: u64,
-    audio_bytes: u64,
-    sidecar_bytes: u64,
-    old_audio_bytes: u64,
-    old_sidecar_bytes: u64,
-) {
-    AUDIO_DELTA.fetch_add(
-        landed_delta(
-            staged_before,
-            audio_bytes,
-            sidecar_bytes,
-            ReplacedBytes {
-                audio: old_audio_bytes,
-                sidecar: old_sidecar_bytes,
-            },
-        ),
-        Ordering::Relaxed,
-    );
+pub(crate) fn note_download_landed(landing: Landing) {
+    AUDIO_DELTA.fetch_add(landed_delta(landing), Ordering::Relaxed);
 }
 
-/// 量一个文件有多大。取不到当 0：只用来量被换掉的旧文件，少减一份账只会偏大，不会偏小。
+/// 量一个文件有多大，取不到当 0。
+///
+/// 只用在「量不准也不会把账带错方向」的地方：被换掉的旧文件（少减只会偏大）、
+/// 写失败后实际落了半截的边车（少记那点，下一轮扫描就纠正）。
 pub(crate) fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
@@ -4431,15 +4426,15 @@ mod tests {
     #[test]
     fn landed_delta_counts_new_minus_old() {
         assert_eq!(
-            landed_delta(
-                0,
-                1_000,
-                40,
-                ReplacedBytes {
+            landed_delta(Landing {
+                staged_before: 0,
+                audio: 1_000,
+                sidecar: 40,
+                replaced: Replaced {
                     audio: 800,
                     sidecar: 30
                 }
-            ),
+            }),
             1_000 + 40 - 800 - 30,
             "换高音质的净变化正好是加新减旧"
         );
@@ -4449,7 +4444,12 @@ mod tests {
     #[test]
     fn landed_delta_resume_after_a_scan_counts_only_the_growth() {
         assert_eq!(
-            landed_delta(500, 1_000, 0, ReplacedBytes::default()),
+            landed_delta(Landing {
+                staged_before: 500,
+                audio: 1_000,
+                sidecar: 0,
+                replaced: Replaced::default()
+            }),
             500,
             "不能把盘上的 1000 再加一遍"
         );
@@ -4458,21 +4458,29 @@ mod tests {
     /// 服务器判「早就下完了」（这次传输量为 0）也要按盘上完整文件记账，不能记成 0。
     #[test]
     fn landed_delta_records_full_file_when_nothing_transferred() {
-        assert_eq!(landed_delta(0, 700, 20, ReplacedBytes::default()), 720);
+        assert_eq!(
+            landed_delta(Landing {
+                staged_before: 0,
+                audio: 700,
+                sidecar: 20,
+                replaced: Replaced::default()
+            }),
+            720
+        );
     }
 
     /// 旧文件比新文件还大时账会变成负数；往外报已知占用时按 0 封底，不报负的占用。
     #[test]
     fn landed_delta_never_reports_negative_usage() {
-        let delta = landed_delta(
-            0,
-            100,
-            10,
-            ReplacedBytes {
+        let delta = landed_delta(Landing {
+            staged_before: 0,
+            audio: 100,
+            sidecar: 10,
+            replaced: Replaced {
                 audio: 5_000,
                 sidecar: 40,
             },
-        );
+        });
         assert!(delta < 0, "旧文件减过头时账本可以为负");
         assert_eq!(
             3_000u64.saturating_add_signed(delta),
