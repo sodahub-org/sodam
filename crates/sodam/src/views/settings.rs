@@ -104,6 +104,7 @@ fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'st
 /// 两种提示都只在现在真超限时才出现，读不全只看音频这棵树，封面读不全不影响音频上限。
 /// 读不全这条不等维护结论：数字最可疑的时候，恰好可能是维护正在跑、旧结论被收起的时候。
 /// 删不动那条要上一轮和现在都超着才说，用户刚清过缓存时旧结论已经不作数。
+/// 「稍后会自动重试」由数字行下面那句说，这里不重复。
 fn cache_blocked_hint(
     language: Language,
     mark: Option<&MaintenanceMark>,
@@ -112,7 +113,7 @@ fn cache_blocked_hint(
 ) -> Option<&'static str> {
     let over = usage.audio.bytes > audio_limit_bytes;
     if usage.audio.incomplete {
-        return over.then(|| language.text("上限可能暂时没生效；稍后会自动重试"));
+        return over.then(|| language.text("上限可能暂时没生效"));
     }
     let mark = mark?;
     (mark.audio_bytes > audio_limit_bytes && over).then(|| {
