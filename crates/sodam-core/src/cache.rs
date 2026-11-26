@@ -1,6 +1,6 @@
 //! 磁盘缓存维护。所有扫描/删除由后台调用；租约保护下载、待装载和正在播放的音频。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -175,11 +175,18 @@ const STAGED_SUFFIXES: [&str; 6] = [
     ".m4a.part",
 ];
 
+/// 文件名；读不出来（非 UTF-8 或没有名字）当空串，后缀判断自然落在「不是」上。
+fn file_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+}
+
 // 同一个暂存目标的一族文件与它的交付文件共享保护键：
 // 租约挂在暂存目标上时，这几个文件都不会被维护线程删掉，淘汰也按这一键整组走。
 fn protection_key(path: &Path) -> PathBuf {
     // 长后缀在前：`.part.meta.tmp` 必须先于 `.part.meta` 被摘掉。
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name = file_name(path);
     if let Some(stem) = STAGED_SUFFIXES.iter().find_map(|s| name.strip_suffix(s)) {
         return path.with_file_name(format!("{stem}.m4a"));
     }
@@ -201,16 +208,30 @@ fn staged_family_member(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix.strip_prefix(".m4a").unwrap_or(suffix)))
 }
 
+/// 这一条是不是可续传的暂存成员（数据、记录、解密临时、锁）。
+fn is_staged_part(path: &Path) -> bool {
+    staged_family_member(file_name(path))
+}
+
+/// 这一条是不是 `.part.lock`。
+fn is_lock(path: &Path) -> bool {
+    file_name(path).ends_with(".part.lock")
+}
+
+/// 暂存清扫认的族成员：可续传的那拨，锁不算。
+///
+/// 锁的 mtime 停在首次下载，混进族里会让一整族老残留显得还年轻；
+/// 它本身也不会被删（[`remove_idle`] 的第一条）。
+fn staging_family_member(path: &Path) -> bool {
+    is_staged_part(path) && !is_lock(path)
+}
+
 fn remove_idle(path: &Path) -> bool {
     // `.part.lock` 不走任何删除路径：它的 mtime 停在首次下载那一刻，
     // 按龄判定会把「复用中的锁」误判成残留；跨进程时租约又看不见内核锁，
     // 删掉正被挂着的锁文件，后到的下载者会在同名位置另立新锁，两把锁
     // 罩同一个目标，互斥就破了。锁是 0 字节，留着没有任何代价。
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if name.ends_with(".part.lock") {
+    if is_lock(path) {
         return false;
     }
     let active = leases().lock().unwrap_or_else(|err| err.into_inner());
@@ -365,6 +386,115 @@ where
     }
 }
 
+/// 「一家子」缓存文件：同一个交付目标派生出来的全部文件——交付目标本身、
+/// 音质边车、可续传的数据与记录、解密临时、锁。
+///
+/// 「哪些文件算一家子」「这家子老不老」「能不能删」「怎么删」只在这里定义；
+/// 四个删除点各自只说这一轮挑哪几家：
+///
+/// - 清空缓存挑「整家都不新鲜的」；
+/// - 配额淘汰按最后使用时间从旧到新挑；
+/// - 旧格式残留与暂存过期清扫挑「过了保留期的」。
+///
+/// 认族只看保护键（[`protection_key`]），不要求配套文件齐全：下到一半、
+/// 记录还没落下的时候，只有数据那一条也照样是一家。
+struct Family<'a> {
+    files: Vec<&'a ScannedFile>,
+}
+
+impl<'a> Family<'a> {
+    /// 按 `key` 归族；`member` 之外的文件一条自成一家。
+    ///
+    /// 顺序按文件第一次出现的先后排，同一批扫描结果每次归出来的族都一样。
+    fn group<'f, K>(
+        files: impl IntoIterator<Item = &'f ScannedFile>,
+        member: impl Fn(&Path) -> bool,
+        key: impl Fn(&Path) -> K,
+    ) -> Vec<Family<'f>>
+    where
+        K: Eq + std::hash::Hash + Clone,
+    {
+        let mut order: Vec<K> = Vec::new();
+        let mut groups: HashMap<K, Vec<&'f ScannedFile>> = HashMap::new();
+        let mut alone: Vec<Family<'f>> = Vec::new();
+        for file in files {
+            if !member(&file.path) {
+                alone.push(Family { files: vec![file] });
+                continue;
+            }
+            match groups.entry(key(&file.path)) {
+                hash_map::Entry::Occupied(mut group) => group.get_mut().push(file),
+                hash_map::Entry::Vacant(entry) => {
+                    order.push(entry.key().clone());
+                    entry.insert(vec![file]);
+                }
+            }
+        }
+        let mut families: Vec<Family<'f>> = order
+            .into_iter()
+            .filter_map(|key| groups.remove(&key).map(|files| Family { files }))
+            .collect();
+        families.extend(alone);
+        families
+    }
+
+    /// 这家子还新不新鲜：任一条成员在 24 小时窗口内就算。
+    ///
+    /// 续传的数据和记录必须一起判：中断重写的记录 mtime 比数据新，
+    /// 逐条判新鲜会把续传对拆成半套。
+    fn fresh(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| is_fresh_part(&file.path, file.modified))
+    }
+
+    /// 这家子是不是整族都过了 `max_age`；任一条还年轻就是 `false`。
+    fn expired(&self, max_age: Duration, now: SystemTime) -> bool {
+        self.files
+            .iter()
+            .all(|file| aged_out(file.modified, max_age, now))
+    }
+
+    /// 这家子最近一次活动的时间：mtime 与最近显示时间取较晚者，配额按它排 LRU。
+    fn used_at(&self, last_seen: &HashMap<PathBuf, SystemTime>) -> SystemTime {
+        self.files
+            .iter()
+            .fold(SystemTime::UNIX_EPOCH, |latest, file| {
+                let shown = last_seen.get(&file.path).copied();
+                let used_at = shown.map_or(file.modified, |shown| file.modified.max(shown));
+                latest.max(used_at)
+            })
+    }
+
+    /// 删掉这家子里挑中的成员，返回真正删掉的路径。
+    ///
+    /// 所有删除点都走这一条：`unlink` 只说这一层怎么落盘——音频要过锁与租约
+    /// （[`Family::remove`]），封面没有这层、直接删。
+    fn remove_with(
+        &self,
+        pick: impl Fn(&ScannedFile) -> bool,
+        mut unlink: impl FnMut(&Path) -> bool,
+    ) -> Vec<&'a ScannedFile> {
+        let mut removed = Vec::new();
+        for &file in &self.files {
+            if pick(file) && unlink(&file.path) {
+                removed.push(file);
+            }
+        }
+        removed
+    }
+
+    /// 音频这一家子的删除：`.part.lock` 永不动，租约护着整家时一条都不动。
+    fn remove(&self, pick: impl Fn(&ScannedFile) -> bool) -> Vec<&'a ScannedFile> {
+        self.remove_with(pick, remove_idle)
+    }
+}
+
+/// 这一条过了 `max_age` 没；mtime 在未来说明时钟回拨，按还没到算。
+fn aged_out(modified: SystemTime, max_age: Duration, now: SystemTime) -> bool {
+    now.duration_since(modified).is_ok_and(|age| age >= max_age)
+}
+
 /// 24 小时内的下载临时文件不参与淘汰（还在下载，或留着给下次续传）。
 ///
 /// 覆盖封面的 `.part` 临时名和 libresoda 暂存族的整族名字；调用方再按各自
@@ -375,13 +505,9 @@ fn is_fresh_part(path: &Path, modified: SystemTime) -> bool {
     if modified.elapsed().unwrap_or_default() >= PART_MAX_AGE {
         return false;
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
     // 暂存族按与 [`protection_key`] 共用的那份后缀表认领：
     // 数据和记录必须一起保护，删掉一边续传对就再也对不上了。
-    if staged_family_member(name) {
+    if is_staged_part(path) {
         return true;
     }
     // 兜底：非 UTF-8 文件名读不出名字，写了一半的封面/音频临时照样按
@@ -441,39 +567,21 @@ where
     if scanned_total <= limit_bytes {
         return (scanned_total, Vec::new());
     }
-    let mut groups: HashMap<K, (SystemTime, Vec<(PathBuf, u64)>)> = HashMap::new();
-    let mut protected: HashSet<K> = HashSet::new();
-    let mut total = 0u64;
-    for file in files {
-        total = total.saturating_add(file.bytes);
-        let key = group_key(&file.path);
-        // 新鲜成员照常进组（排序键随它变新），只是把整组标记为受保护。
-        if is_fresh_part(&file.path, file.modified) {
-            protected.insert(key.clone());
-        }
-        let used_at = last_seen
-            .get(&file.path)
-            .copied()
-            .map_or(file.modified, |seen| file.modified.max(seen));
-        let group = groups.entry(key).or_insert((used_at, Vec::new()));
-        group.0 = group.0.max(used_at);
-        group.1.push((file.path, file.bytes));
-    }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by_key(|(_, (used_at, _))| *used_at);
+    let mut families = Family::group(&files, |_: &Path| true, group_key);
+    families.sort_by_key(|family| family.used_at(last_seen));
+    let mut total = scanned_total;
     let mut removed = Vec::new();
-    for (key, (_, group_files)) in groups {
+    for family in &families {
         if total <= limit_bytes {
             break;
         }
-        if protected.contains(&key) {
+        // 新鲜的一家子整族计入总量但不参与淘汰：还在下的续传对不能拆。
+        if family.fresh() {
             continue;
         }
-        for (path, bytes) in group_files {
-            if remove(&path) {
-                total = total.saturating_sub(bytes);
-                removed.push(path);
-            }
+        for file in family.remove_with(|_: &ScannedFile| true, &mut remove) {
+            total = total.saturating_sub(file.bytes);
+            removed.push(file.path.clone());
         }
     }
     (total, removed)
@@ -592,33 +700,16 @@ where
 
 /// 递归清理缓存，保留正在使用的音频和近期临时文件。返回成功删除的文件数。
 ///
-/// 可续传暂存族的新鲜度按整族聚合（任一成员还年轻就整族留给下次续传），
-/// 其余文件仍按各自的新鲜度判；租约保护与 `remove_idle` 同一临界区。
+/// 挑法是「整家不新鲜就删」：可续传的那拨按保护键成族（数据和记录必须一起判，
+/// 拆开就接不上续传），正式文件、边车、封面各自成家、各看各的。
+/// 租约护着这一家时一条都不删（[`Family::remove`]）。
 pub fn clear_in(root: &Path) -> usize {
     let files = scan_files(root).files;
-    let mut protected: HashSet<PathBuf> = HashSet::new();
-    for file in &files {
-        if is_fresh_part(&file.path, file.modified) {
-            protected.insert(protection_key(&file.path));
-        }
-    }
-    files
-        .into_iter()
-        .filter(|file| {
-            let name = file
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            // 暂存族看整族结论；其余文件（正式缓存、sidecar、封面）看自己。
-            let fresh = if staged_family_member(name) {
-                protected.contains(&protection_key(&file.path))
-            } else {
-                is_fresh_part(&file.path, file.modified)
-            };
-            !fresh && remove_idle(&file.path)
-        })
-        .count()
+    Family::group(&files, is_staged_part, protection_key)
+        .iter()
+        .filter(|family| !family.fresh())
+        .map(|family| family.remove(|_: &ScannedFile| true).len())
+        .sum()
 }
 
 /// 按最后使用时间淘汰音频（命中缓存时更新 mtime）。租约文件可暂时超额。
@@ -662,7 +753,7 @@ fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
         Err(_) => return None,
     };
     let mut complete = true;
-    let mut removed = 0;
+    let mut candidates: Vec<ScannedFile> = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             complete = false;
@@ -677,15 +768,13 @@ fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
         if !file_type.is_file() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
         // 锁永不删（#243）：mtime 停在首次下载，删掉正被内核锁挂着的锁
         // 会让后到的下载者另立新锁，同一目标出现两把锁，互斥就破了。
-        if name.ends_with(".part.lock") {
+        // 连元数据都不取，读不到也不算这轮的缺口。
+        if is_lock(&path) {
             continue;
         }
-        if !staged_family_member(name) {
+        if !is_staged_part(&path) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -695,13 +784,19 @@ fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
             }
             continue;
         };
-        let modified = meta.modified().unwrap_or_else(|_| SystemTime::now());
-        if is_fresh_part(&path, modified) {
-            continue;
-        }
-        if remove_idle(&path) {
-            removed += 1;
-        }
+        candidates.push(ScannedFile {
+            path,
+            bytes: meta.len(),
+            modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
+        });
+    }
+    let mut removed = 0;
+    for family in Family::group(&candidates, is_staged_part, protection_key) {
+        // 逐条看年纪，不按整家判：只剩半截数据、记录还是新的时候，
+        // 按家会把它一起留下。老残留没有能续上的配对了，就该各自清掉。
+        removed += family
+            .remove(|file: &ScannedFile| !is_fresh_part(&file.path, file.modified))
+            .len();
     }
     if removed > 0 {
         log_event(
@@ -819,59 +914,31 @@ const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 ///
 /// `files` 是音频树这一轮的扫描结果，只认 `staging_dir` 的直接子项（staging 是平的，
 /// 旧实现也只列这一层）。过期按**整族**判：族里任一成员还年轻就整族不动——中断重写的
-/// 记录 mtime 比数据新，逐文件判龄会在边界上拆开续传对；族全过期才逐个删。
-/// 动手时走 [`remove_idle`] 的租约临界区，且 `.part.lock` 永不删
-/// （它的 mtime 停在首次下载，年久不代表失效；删掉正被内核锁挂着的锁会破坏互斥）。
+/// 记录 mtime 比数据新，逐文件判龄会在边界上拆开续传对；族全过期才整族删。
+/// 锁不进族：它的 mtime 停在首次下载，混进来会让一整族老残留显得还年轻；
+/// 锁本身也不会被删（[`Family::remove`] 的第一条）。
+///
+/// 正式文件与音质边车不跟着族走：它们各自成家、各看各的年纪。
 fn purge_stale_staging_files(
     files: &[ScannedFile],
     staging_dir: &Path,
     max_age: Duration,
     now: SystemTime,
 ) -> Vec<PathBuf> {
-    // 按保护键把暂存族归组，记下每件成员是否过期；非族名文件自成一件。
-    let mut families: HashMap<PathBuf, Vec<(&Path, bool)>> = HashMap::new();
-    let mut standalone: Vec<(&Path, bool)> = Vec::new();
-    for file in files {
-        if file.path.parent() != Some(staging_dir) {
-            continue;
-        }
-        let name = file
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        // 锁文件不参与族判定，也不会被删（remove_idle 的同一条规则）。
-        if name.ends_with(".part.lock") {
-            continue;
-        }
-        // mtime 在未来（时钟回拨）也算拿不到年龄，按「还没过期」处理。
-        let expired = now
-            .duration_since(file.modified)
-            .is_ok_and(|age| age >= max_age);
-        if staged_family_member(name) {
-            families
-                .entry(protection_key(&file.path))
-                .or_default()
-                .push((file.path.as_path(), expired));
-        } else {
-            standalone.push((file.path.as_path(), expired));
-        }
-    }
-    // 族里所有成员都过期才动（任一成员还年轻就整族留给下一次）。
+    let in_staging = files
+        .iter()
+        .filter(|file| file.path.parent() == Some(staging_dir));
     let mut removed = Vec::new();
-    for members in families.values() {
-        if members.iter().all(|&(_, expired)| expired) {
-            for (path, _) in members {
-                if remove_idle(path) {
-                    removed.push(path.to_path_buf());
-                }
-            }
+    for family in Family::group(in_staging, staging_family_member, protection_key) {
+        if !family.expired(max_age, now) {
+            continue;
         }
-    }
-    for (path, expired) in standalone {
-        if expired && remove_idle(path) {
-            removed.push(path.to_path_buf());
-        }
+        removed.extend(
+            family
+                .remove(|_: &ScannedFile| true)
+                .into_iter()
+                .map(|file| file.path.clone()),
+        );
     }
     removed
 }
@@ -3793,6 +3860,52 @@ mod tests {
         let fresh_meta = file(dir.path(), "staging/123-lossless-normal.m4a.part.meta", 0);
         assert_eq!(clear_in(dir.path()), 0, "族里有新鲜成员就一件都不删");
         assert!(old_data.exists() && fresh_meta.exists(), "清缓存不拆续传对");
+    }
+
+    /// 半家子：只有数据没有记录（或者只有记录）的残留也认成一家。
+    /// 认族只看保护键，配套文件齐不齐是另一回事；过期了照清，锁不动。
+    #[test]
+    fn purge_removes_half_family_residue_but_spares_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(STAGING_DIR_NAME);
+        let old = STALE_STAGING_MAX_AGE.as_secs() + 60;
+        let lone_data = file(&staging, "123-lossless-normal.m4a.part", old);
+        let lone_record = file(&staging, "456-lossless-normal.m4a.part.meta", old);
+        let lone_lock = file(&staging, "789-lossless-normal.m4a.part.lock", old);
+
+        assert_eq!(purge_staging(&staging), 2, "半家子过期照清，锁不算");
+        assert!(!lone_data.exists() && !lone_record.exists());
+        assert!(lone_lock.exists(), "锁永不动");
+    }
+
+    /// 一家子里混着新的：暂存清扫按整族留，旧残留清扫按条看年纪。
+    /// 后者是刻意的——老残留已经配不上续传，留着只占地方。
+    #[test]
+    fn mixed_age_family_is_kept_whole_but_legacy_sweep_goes_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio");
+        let old = STALE_STAGING_MAX_AGE.as_secs() + 60;
+        // 暂存里混龄的一族：数据老、记录新。
+        let staged_old = file(&audio, "staging/123-lossless-normal.m4a.part", old);
+        let staged_fresh = file(&audio, "staging/123-lossless-normal.m4a.part.meta", 0);
+        // 音频根下同一族名的旧格式残留：同一个后缀表，但按条判龄。
+        let legacy_old = file(&audio, "456-lossless-normal.m4a.part", old);
+        let legacy_fresh = file(&audio, "456-lossless-normal.m4a.part.meta", 0);
+
+        assert_eq!(
+            purge_staging(&audio.join(STAGING_DIR_NAME)),
+            0,
+            "族里有一条年轻就整族不动"
+        );
+        assert!(staged_old.exists() && staged_fresh.exists());
+
+        assert_eq!(
+            sweep_legacy_residue_once(&audio),
+            Some(1),
+            "旧残留逐条看年纪：老的数据清掉，新的记录留着"
+        );
+        assert!(!legacy_old.exists());
+        assert!(legacy_fresh.exists());
     }
 
     /// 临时名每次都不一样：同一张封面的两个写者不会写到同一个文件里。
