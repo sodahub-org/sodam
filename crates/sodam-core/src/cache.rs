@@ -1357,7 +1357,7 @@ pub struct MaintenanceReport {
 
 impl MaintenanceReport {
     /// 音频树的用量；读不全时数字只是下界。
-    pub fn audio_usage(&self) -> CacheUsage {
+    fn audio_usage(&self) -> CacheUsage {
         CacheUsage {
             bytes: self.audio_bytes,
             files: self.audio_files,
@@ -1367,7 +1367,7 @@ impl MaintenanceReport {
     }
 
     /// 封面树的用量；封面不数歌。
-    pub fn cover_usage(&self) -> CacheUsage {
+    fn cover_usage(&self) -> CacheUsage {
         CacheUsage {
             bytes: self.cover_bytes,
             files: self.cover_files,
@@ -1425,6 +1425,8 @@ pub fn maintain(
         let scanned = report.scanned_files.to_string();
         let removed = report.removed_files.to_string();
         let audio_bytes = report.audio_bytes.to_string();
+        // 读不全时 audio_bytes 只是下界：单独给一个字段，日志里不用自己对 skipped_reason。
+        let incomplete = u8::from(report.audio_incomplete || report.cover_incomplete).to_string();
         let over_limit = u8::from(report.over_limit).to_string();
         log_event(
             LogLevel::Info,
@@ -1438,6 +1440,7 @@ pub fn maintain(
                 ("skipped_reason", report.skipped_reason),
                 ("audio_gap", report.audio_gap_label()),
                 ("cover_gap", report.cover_gap_label()),
+                ("incomplete", incomplete.as_str()),
                 ("over_limit", over_limit.as_str()),
             ],
         );
@@ -2662,6 +2665,10 @@ mod tests {
             scan.subtree_fully_listed(&audio.join("other")),
             "缺口不在这棵子树里，这层看全了"
         );
+
+        // 缺口落在上层：这层可能根本没被列到，不能当成看全了。
+        let root_denied = scan_with(dir.path(), denying(&audio));
+        assert!(!root_denied.subtree_fully_listed(&audio.join("staging")));
     }
 
     /// 用量一次给出字节、文件数、歌曲数；目录不存在算空的，不算没读全。

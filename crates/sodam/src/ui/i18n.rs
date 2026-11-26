@@ -527,8 +527,11 @@ impl Language {
             "暂时读不到缓存占用，稍后会自动重试" => {
                 "Cache usage can't be read right now. Retrying automatically."
             }
-            "有缓存文件暂时读不到，数字可能偏小，上限也可能暂时没生效；稍后会自动重试" => {
-                "Some cache files can't be read right now, so these numbers may be low and the limit may not apply yet. Retrying automatically."
+            "有缓存文件暂时读不到，数字可能偏小；稍后会自动重试" => {
+                "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
+            }
+            "有缓存文件暂时读不到，上限可能暂时没生效；稍后会自动重试" => {
+                "Some cache files can't be read right now, so the limit may not apply yet. Retrying automatically."
             }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
             "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {

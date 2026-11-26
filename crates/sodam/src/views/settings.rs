@@ -50,25 +50,28 @@ fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
     )
 }
 
-/// 读不全时的解释：数字可能偏小，上限也可能暂时没生效，两件事一起说清。
+/// 读不全时的解释：数字可能偏小、稍后会自动重试。
 ///
 /// 不写具体原因：代码只知道有地方没读到，分不清是被别的程序占着还是没权限。
 fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'static str> {
-    (usage.incomplete() && usage.total_bytes() > 0).then(|| {
-        language.text("有缓存文件暂时读不到，数字可能偏小，上限也可能暂时没生效；稍后会自动重试")
-    })
+    (usage.incomplete() && usage.total_bytes() > 0)
+        .then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
 }
 
-/// 上限旁边那句「删不动」：上一轮跑完超限，现在看得到的部分也还超着。
+/// 上限旁边那句「没删干净」：读不全时上限可能没生效，正常时看上一轮是不是真删不动。
 ///
-/// 两个条件都要：用户刚清过缓存、或手动删过文件时，旧结论已经不作数；
-/// 只读不全的情况由数字下面那句解释说明，不在这里重复。
+/// 超限那句要上一轮和现在都超着才说：用户刚清过缓存、或手动删过文件时，
+/// 旧结论已经不作数。一个字节都没读到时，数字那行已经说明读不到，这里不再重复。
 fn cache_blocked_hint(
     language: Language,
     mark: Option<&MaintenanceMark>,
     usage: CacheUsageSummary,
     audio_limit_bytes: u64,
 ) -> Option<&'static str> {
+    if usage.incomplete() {
+        return (usage.total_bytes() > 0)
+            .then(|| language.text("有缓存文件暂时读不到，上限可能暂时没生效；稍后会自动重试"));
+    }
     let mark = mark?;
     (mark.audio_bytes > audio_limit_bytes && usage.audio.bytes > audio_limit_bytes).then(|| {
         language.text("上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试")
@@ -1604,20 +1607,33 @@ mod tests {
     }
 
     #[test]
-    fn cache_usage_hint_says_the_cap_may_not_apply_yet() {
+    fn cache_usage_hint_only_explains_the_low_numbers() {
         let nothing = usage(0, 0, 0, true);
         let read = usage(1024, 1, 1, false);
         let hidden = usage(2048, 2, 2, true);
 
         let hint = cache_usage_hint(Language::Chinese, both(nothing, hidden)).unwrap();
         assert!(hint.contains("数字可能偏小"), "{hint}");
-        assert!(hint.contains("上限也可能暂时没生效"), "{hint}");
+        assert!(!hint.contains("上限"), "上限那句在上限旁边那一行：{hint}");
 
         assert!(
             cache_usage_hint(Language::Chinese, both(nothing, nothing)).is_none(),
             "一个字节都没读到时，那一行已经说明了"
         );
         assert!(cache_usage_hint(Language::Chinese, both(read, read)).is_none());
+    }
+
+    #[test]
+    fn cache_blocked_hint_says_the_limit_may_not_apply_when_unreadable() {
+        let hidden = both(usage(0, 0, 0, true), usage(2048, 2, 2, true));
+        let hint = cache_blocked_hint(Language::Chinese, None, hidden, 4096).unwrap();
+        assert!(hint.contains("上限可能暂时没生效"), "{hint}");
+
+        let nothing = both(usage(0, 0, 0, true), usage(0, 0, 0, true));
+        assert!(
+            cache_blocked_hint(Language::Chinese, None, nothing, 4096).is_none(),
+            "一个字节都没读到时，数字那行已经说明读不到"
+        );
     }
 
     #[test]

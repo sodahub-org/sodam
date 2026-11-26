@@ -145,8 +145,9 @@ TrackItem + cache path
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
   `audio_bytes` / `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` /
   `*_incomplete`）、`audio_gap` / `cover_gap`（`none` / `dir` / `entries` / `metadata`，
-  读不全时写明缺口落在哪一层）与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、
-  删完之后的音频树总量，日志里就能和磁盘上的实际占用对账）。
+  读不全时写明缺口落在哪一层）、`incomplete`（0/1，为 1 时 `audio_bytes` 只是下界）
+  与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、删完之后的音频树总量，
+  日志里就能和磁盘上的实际占用对账）。
   两棵树的用量统一用 `cache::CacheUsage` 表示：字节、文件数、歌曲数，加一个「这轮读全了没有」；
   维护报告与进设置页的一次性统计（`audio::cache_stats`）都产出它。读不全时这几个数只是下界，
   设置页写成「至少 X」并跟一句「有缓存文件暂时读不到，数字可能偏小；稍后会自动重试」，
@@ -174,8 +175,8 @@ TrackItem + cache path
   每轮维护按 7 天保留期**整族**清扫过期残留（族里任一成员还年轻就整族保留，不在边界上
   拆开续传对；`.part.lock` 永不删——它的 mtime 停在首次下载，删掉正被内核锁挂着的锁会
   让后到的下载者另立新锁、破坏跨进程互斥；staging 这一层没整个看见时暂存清扫整轮跳过——
-  看不到的可能是族里最新的一员，见过的那几条会显得「整族都过期」；缺口在别处、这层看全了，
-  照常清「整族都过期」的）；启动后的首轮维护另清一次音频根**顶层**的旧格式
+  看不到的可能是族里最新的一员，见过的那几条会显得「整族都过期」；缺口不在这层、
+  也不在它的上层路径上（这层确实列全了）时，照常清「整族都过期」的）；启动后的首轮维护另清一次音频根**顶层**的旧格式
   （#241 之前）非锁残留——只列这一层、不递归，`staging/` 里的交给上面那条 7 天清扫；认族只
   看文件名后缀（`is_staged_part`），所以这一层里哪怕是不相干的 `notes.txt.part` 也算
   残留、到龄一起清。24 小时门槛 + 租约 + 进程级一次性门（`legacy_residue_swept` 记删除数；
