@@ -82,7 +82,7 @@ impl Language {
             "推荐队列" => "Recommendation queue",
             "请先在「设置 → 账户」扫码登录" => "Sign in with QR code in Settings → Account.",
             "语言已切换为中文" => "Language switched to Chinese",
-            "Language switched to English" => "Language switched to English",
+            "语言已切换为英文" => "Language switched to English",
             "就绪" => "Ready",
             "等待扫码…" => "Waiting for scan…",
             "已打开二次验证窗口，请在其中完成验证" => {

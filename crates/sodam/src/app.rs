@@ -1925,7 +1925,7 @@ impl Root {
         let status = if language.is_zh() {
             language.text("语言已切换为中文").to_string()
         } else {
-            language.text("Language switched to English").to_string()
+            language.text("语言已切换为英文").to_string()
         };
         self.set_status_text(status);
         cx.notify();

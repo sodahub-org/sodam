@@ -56,8 +56,9 @@ fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'st
         .then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
 }
 
-/// 上限旁边那句「没删干净」：读不全时上限可能没生效，正常时看上一轮是不是真删不动。
+/// 上限旁边那句「没删干净」：上一轮读不全就提醒上限可能没生效，否则看是不是真删不动。
 ///
+/// 读不全看的是上一轮维护的结论：上限是维护在收口，不是这一次统计扫描。
 /// 超限那句要上一轮和现在都超着才说：用户刚清过缓存、或手动删过文件时，
 /// 旧结论已经不作数。一个字节都没读到时，数字那行已经说明读不到，这里不再重复。
 fn cache_blocked_hint(
@@ -66,14 +67,10 @@ fn cache_blocked_hint(
     usage: CacheUsageSummary,
     audio_limit_bytes: u64,
 ) -> Option<&'static str> {
-    if usage.incomplete() {
-        return (usage.total_bytes() > 0)
-            .then(|| language.text("上限可能暂时没生效；稍后会自动重试"));
-    }
     let mark = mark?;
     if mark.incomplete {
-        // 上一轮连目录都没读全，说「删不动」就是把原因猜错了。
-        return None;
+        return (usage.total_bytes() > 0)
+            .then(|| language.text("上限可能暂时没生效；稍后会自动重试"));
     }
     (mark.audio_bytes > audio_limit_bytes && usage.audio.bytes > audio_limit_bytes).then(|| {
         language.text("上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试")
@@ -1626,15 +1623,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_blocked_hint_says_the_limit_may_not_apply_when_unreadable() {
+    fn cache_blocked_hint_says_the_limit_may_not_apply_when_the_last_round_was_incomplete() {
         let hidden = both(usage(0, 0, 0, true), usage(2048, 2, 2, true));
-        let hint = cache_blocked_hint(Language::Chinese, None, hidden, 4096).unwrap();
+        let unreadable = MaintenanceMark {
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            audio_bytes: 0,
+            cover_bytes: 0,
+            incomplete: true,
+        };
+
+        let hint = cache_blocked_hint(Language::Chinese, Some(&unreadable), hidden, 4096).unwrap();
         assert!(hint.contains("上限可能暂时没生效"), "{hint}");
 
         let nothing = both(usage(0, 0, 0, true), usage(0, 0, 0, true));
         assert!(
-            cache_blocked_hint(Language::Chinese, None, nothing, 4096).is_none(),
+            cache_blocked_hint(Language::Chinese, Some(&unreadable), nothing, 4096).is_none(),
             "一个字节都没读到时，数字那行已经说明读不到"
+        );
+        assert!(
+            cache_blocked_hint(Language::Chinese, None, hidden, 4096).is_none(),
+            "还没跑过维护就不猜上限"
         );
     }
 
@@ -1656,7 +1664,8 @@ mod tests {
 
         assert!(cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024).is_some());
         assert!(
-            cache_blocked_hint(Language::Chinese, Some(&unreadable), over, 1024).is_none(),
+            cache_blocked_hint(Language::Chinese, Some(&unreadable), over, 1024)
+                .is_some_and(|hint| hint.contains("上限可能暂时没生效")),
             "上一轮读不全时，别把超限说成删不动"
         );
         assert!(
