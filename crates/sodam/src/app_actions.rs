@@ -537,11 +537,14 @@ impl Root {
                             .retain(|_, failed_at| prefetch_cooldown_active(*failed_at, now));
                         root.spawn_prefetch(cx);
                     }
-                    if now.saturating_duration_since(root.last_cache_maintenance)
-                        >= CACHE_MAINTENANCE
-                    {
-                        root.last_cache_maintenance = now;
-                        root.maintain_cache(cx);
+                    if now.saturating_duration_since(root.last_cache_check) >= CACHE_MAINTENANCE {
+                        root.last_cache_check = now;
+                        // 被挡下来的强制请求优先补跑；没有就按到期规则问一句。
+                        if root.cache_maintenance_pending {
+                            root.maintain_cache_now(cx);
+                        } else {
+                            root.check_cache_maintenance(cx);
+                        }
                     }
                     root.load_more_recommendation(cx);
                     next_interval = if hot || root.volume_scrub.scrubbing() {
@@ -794,14 +797,45 @@ impl Root {
     pub(crate) fn set_cache_limit_mb(&mut self, mb: u64, cx: &mut Context<Self>) {
         self.settings.audio_cache_limit_mb = mb.clamp(1024, 1024 * 1024);
         self.save_settings();
-        self.maintain_cache(cx);
+        self.maintain_cache_now(cx);
         cx.notify();
     }
 
-    pub(crate) fn maintain_cache(&mut self, cx: &mut Context<Self>) {
+    /// 心跳与启动用：按到期规则问一句，没到点、也没超限就什么都不做。
+    pub(crate) fn check_cache_maintenance(&mut self, cx: &mut Context<Self>) {
+        self.run_cache_maintenance(false, cx);
+    }
+
+    /// 用户改了缓存上限这种必须立刻收口的场合：跳过到期判定。
+    pub(crate) fn maintain_cache_now(&mut self, cx: &mut Context<Self>) {
+        self.run_cache_maintenance(true, cx);
+    }
+
+    fn run_cache_maintenance(&mut self, force: bool, cx: &mut Context<Self>) {
         // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
         // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
         if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
+            // 改上限这类强制请求被挡住时记一笔：挡路的收尾后在心跳里补跑，
+            // 否则新上限要等常规间隔才生效（旧标记还在，可能一直看着像「没超」）。
+            if force {
+                self.cache_maintenance_pending = true;
+            }
+            return;
+        }
+        self.cache_maintenance_pending = false;
+        let limits = sodam_core::cache::MaintenanceLimits::from_mb(
+            self.settings.audio_cache_limit_mb,
+            sodam_core::cache::COVER_LIMIT_MB,
+        );
+        // 到期判定只读内存里的上次结论：没到点、也没超限，这一拍什么都不做。
+        // 心跳从此只付一次比较，不再每分钟重扫两棵树。
+        if !force
+            && !sodam_core::cache::maintenance_due(
+                self.cache_mark.as_ref(),
+                limits,
+                std::time::SystemTime::now(),
+            )
+        {
             return;
         }
         self.cache_maintenance_running = true;
@@ -810,6 +844,7 @@ impl Root {
         let limit = self.settings.audio_cache_limit_mb;
         // 在渲染线程采样「最近显示时间」：UI 命中内存缓存时不碰磁盘，mtime 只代表
         // 最后下载/落盘，只有这份快照能说明用户最近还在看。后台只拿值，不持实体、不碰 UI。
+        // 只在真要跑一轮时采：按到期规则跳过的那些拍子不该在 UI 线程上分配这张表。
         let last_seen = crate::ui::cover_cache::shown_snapshot(cx);
         if log_outlet::enabled(LogLevel::Debug, LogTopic::App) {
             let sampled = last_seen.len().to_string();
@@ -821,23 +856,26 @@ impl Root {
             );
         }
         let work = cx.background_spawn(async move {
-            // 首轮维护先清音频根下的旧格式暂存残留（孤儿 .part 等，锁永不删）。
-            // 扫全一次就收工；目录没读全最多再来 4 轮（连首轮共 5 轮），到上限放弃。
-            sodam_core::cache::sweep_legacy_residue();
-            sodam_core::cache::trim_audio(limit);
-            let removed =
-                sodam_core::cache::trim_covers(sodam_core::cache::COVER_LIMIT_MB, &last_seen);
-            let stats = sodam_core::audio::cache_stats();
-            (removed, stats)
+            // 一轮维护：音频树、封面树各只扫一次，配额淘汰、暂存清扫、统计都吃
+            // 同一份盘点结果；旧格式残留的进程内首轮清扫也在里面。
+            let report = sodam_core::cache::maintain(limits, &last_seen);
+            let mark = report.mark(std::time::SystemTime::now());
+            // 落盘失败不影响这轮结论：最坏下次启动多扫一轮。
+            let _ = sodam_core::cache::save_mark(&mark);
+            (report, mark)
         });
         cx.spawn(async move |this, cx| {
-            let (removed, stats) = work.await;
+            let (report, mark) = work.await;
             let _ = this.update(cx, |root, cx| {
                 root.cache_maintenance_running = false;
+                root.cache_mark = Some(mark);
                 // 旧扫描晚到不能把新数字盖回旧值（#248）。统计落了再顺手补设置页的预估：
                 // 未登录启动直接停在设置页，不走 `on_nav_changed`，这条是它唯一的算预估机会。
+                let mut changed = false;
                 if root.cache_summary_request_seq == stats_seq {
-                    root.cache_summary = stats;
+                    let summary = report.summary();
+                    changed |= root.cache_summary != summary;
+                    root.cache_summary = summary;
                     if root.nav == Nav::Settings {
                         root.refresh_upgrade_estimate(cx);
                     }
@@ -847,11 +885,16 @@ impl Root {
                     root.refresh_cache_stats(cx);
                 }
                 // 只同步这次真被淘汰的封面路径，不在主线程上全表扫盘。
-                root.drop_removed_covers(&removed, cx);
+                changed |= !report.removed_covers.is_empty();
+                root.drop_removed_covers(&report.removed_covers, cx);
                 if root.settings.audio_cache_limit_mb != limit {
-                    root.maintain_cache(cx);
+                    root.maintain_cache_now(cx);
                 }
-                cx.notify();
+                // 数字没变、也没删任何文件时不必重绘：一轮空 notify 会把整窗口的
+                // 布局和封面命中都白跑一遍。
+                if changed {
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -3271,7 +3314,7 @@ impl Root {
             return;
         }
         // 正在清缓存或收缩缓存时不开跑：扫完盘到真跑之间那几首会被删掉，剩下的一首首都以
-        // 「文件已被删」失败。和 `clear_cache` / `maintain_cache` 那两道拦的是同一件事。
+        // 「文件已被删」失败。和 `clear_cache` / 缓存维护那两道拦的是同一件事。
         if self.cache_clearing || self.cache_maintenance_running {
             let message = self.tr("正在整理缓存，请稍后再试");
             self.notify_warning_once("batch-upgrade-cache-busy", message);
@@ -4798,7 +4841,7 @@ impl Root {
         }
         // 缓存上限：触一次维护，让超限的旧缓存马上被清。
         if old.audio_cache_limit_mb != incoming.audio_cache_limit_mb {
-            self.maintain_cache(cx);
+            self.maintain_cache_now(cx);
         }
         // 快捷键：置脏位，main.rs 心跳里统一重绑（清空 + 重建 keymap）。
         if shortcuts_changed {

@@ -619,8 +619,8 @@ pub struct Root {
     pub(crate) prefetch_cooldown_since: HashMap<String, std::time::Instant>,
     /// 上次预取巡检时刻；未落闸时每 5s 补一次预取。
     pub(crate) last_prefetch_patrol: std::time::Instant,
-    /// 上次检查缓存维护的时刻；每 60s 检查一次，被升级或清理挡住时本轮跳过。
-    pub(crate) last_cache_maintenance: std::time::Instant,
+    /// 上次问「维护到期没」的时刻；每 60s 问一次，被升级或清理挡住时本轮跳过。
+    pub(crate) last_cache_check: std::time::Instant,
     /// 登录凭据代数：重新登录成功、退出登录、账号信息刷新（换号或会员状态变化）时 +1。
     ///
     /// 预取请求可能跨过一次登录变更：它的失败结论属于旧身份（比如旧账号的权益
@@ -639,6 +639,13 @@ pub struct Root {
     pub(crate) cache_summary: (u64, usize, u64, usize),
     /// 缓存统计重算的发起序号：只让最新一次扫盘的结果落回状态。
     pub(crate) cache_summary_request_seq: u64,
+    /// 上次维护的结论（完成时刻 + 当时的占用）：到期判定只做一次比较。
+    ///
+    /// 启动时从缓存根读回来，每轮维护结束后由后台写回——进程重启不清零，
+    /// 也就不会「每次启动 60 秒后必扫一遍」。
+    pub(crate) cache_mark: Option<sodam_core::cache::MaintenanceMark>,
+    /// 被批量升级/清缓存挡下来的强制维护请求：挡路的收尾后要在心跳里补跑。
+    pub(crate) cache_maintenance_pending: bool,
     pub(crate) cache_maintenance_running: bool,
     pub(crate) cache_clearing: bool,
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
@@ -973,12 +980,15 @@ impl Root {
             prefetch_inflight: HashSet::new(),
             prefetch_cooldown_since: HashMap::new(),
             last_prefetch_patrol: std::time::Instant::now(),
-            last_cache_maintenance: std::time::Instant::now(),
+            last_cache_check: std::time::Instant::now(),
             auth_epoch: 0,
             logout_in_flight: false,
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_summary_request_seq: 0,
+            // 启动期读一次（和上面的设置载入同一类）：只有一个时间戳和两个计数。
+            cache_mark: sodam_core::cache::load_mark(),
+            cache_maintenance_pending: false,
             cache_maintenance_running: false,
             cache_clearing: false,
             batch_upgrade_target: sodam_core::quality::QualityIntent::Tier("lossless".into()),
@@ -1030,7 +1040,14 @@ impl Root {
             }
         })
         .detach();
-        root.maintain_cache(cx);
+        root.check_cache_maintenance(cx);
+        // 未登录直接停在设置页，不走 `on_nav_changed`：这里补一次统计，
+        // 否则设置页会一直显示 0（启动那一轮维护可能按到期规则跳过）。
+        // 维护这轮真跑起来了就不再单独扫：它的盘点结果会直接落进 cache_summary，
+        // 再发一次统计只会多扫两棵树、还把这一轮的数字判成过期。
+        if root.nav == Nav::Settings && !root.cache_maintenance_running {
+            root.refresh_cache_stats(cx);
+        }
         if logged_in {
             root.refresh_account(cx);
             root.load_liked_ids(cx);
