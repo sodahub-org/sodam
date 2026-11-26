@@ -1010,8 +1010,8 @@ pub fn maintain(
     let audio_dir = crate::audio::cache_dir();
     let covers_dir = crate::audio::cover_cache_dir();
     let report = maintain_with(&audio_dir, &covers_dir, limits, last_seen, list_dir);
-    // 每轮都记一条 Info：一轮最多 48 行/天，成本曲线要能直接看出来，不能只在
-    // 排障日志里才有（#310 的那次尖峰就是默认日志下看不见的）。
+    // 每轮都记一条 Info：常规一天 4 条，贴着上限 48 条，超限又删不动时最多 144 条。
+    // 成本曲线要能直接看出来，不能只在排障日志里才有（#310 那次尖峰就是默认日志下看不见的）。
     if crate::log_outlet::enabled(LogLevel::Info, LogTopic::App) {
         let elapsed = report.elapsed.as_millis().to_string();
         let scanned = report.scanned_files.to_string();
