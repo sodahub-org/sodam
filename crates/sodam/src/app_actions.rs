@@ -855,7 +855,6 @@ impl Root {
             }
             return;
         }
-        self.cache_maintenance_pending = false;
         let limits = self.cache_maintenance_limits();
         // 到期判定只读内存里的上次结论：没到点、也没超限，这一拍什么都不做。
         // 心跳从此只付一次比较，不再每分钟重扫两棵树。
@@ -874,6 +873,8 @@ impl Root {
         if !due {
             return;
         }
+        // 真要跑才清：账本触发重查后不跑的这一次，别把之前被挡下的强制请求吞掉。
+        self.cache_maintenance_pending = false;
         self.cache_maintenance_running = true;
         self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
         let stats_seq = self.cache_summary_request_seq;
