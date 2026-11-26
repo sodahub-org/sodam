@@ -95,8 +95,13 @@ fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
 /// 整棵树读不到时数字行已经写了「读不到」，这里不再重复；不写具体原因，代码只知道
 /// 有地方没读到，分不清是被别的程序占着还是没权限。
 fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'static str> {
-    let explain = usage.incomplete() && !usage.audio.unreadable() && !usage.covers.unreadable();
-    explain.then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
+    usage_hint_shown(usage)
+        .then(|| language.text("有缓存文件暂时读不到，数字可能偏小；稍后会自动重试"))
+}
+
+/// 数字行下面那句会不会出现：读不全，但两棵树都读到了数。
+fn usage_hint_shown(usage: CacheUsageSummary) -> bool {
+    usage.incomplete() && !usage.audio.unreadable() && !usage.covers.unreadable()
 }
 
 /// 上限旁边那句「没删干净」：音频树读不全就提醒上限可能没生效，否则看是不是真删不动。
@@ -104,7 +109,7 @@ fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'st
 /// 两种提示都只在现在真超限时才出现，读不全只看音频这棵树，封面读不全不影响音频上限。
 /// 读不全这条不等维护结论：数字最可疑的时候，恰好可能是维护正在跑、旧结论被收起的时候。
 /// 删不动那条要上一轮和现在都超着才说，用户刚清过缓存时旧结论已经不作数。
-/// 「稍后会自动重试」交给数字行下面那句；那句被收起时（封面整棵读不到），这条自己补上。
+/// 「稍后会自动重试」交给数字行下面那句；那句不出现时，这条自己补上。
 fn cache_blocked_hint(
     language: Language,
     mark: Option<&MaintenanceMark>,
@@ -116,11 +121,11 @@ fn cache_blocked_hint(
         if !over {
             return None;
         }
-        // 数字行下面那句只在两棵树都读到了数时出现；它被收起时，重试承诺由这里补上。
-        return Some(if usage.covers.unreadable() {
-            language.text("上限可能暂时没生效；稍后会自动重试")
-        } else {
+        // 数字行下面那句没出现时，重试承诺由这里补上。
+        return Some(if usage_hint_shown(usage) {
             language.text("上限可能暂时没生效")
+        } else {
+            language.text("上限可能暂时没生效；稍后会自动重试")
         });
     }
     let mark = mark?;
@@ -1716,9 +1721,11 @@ mod tests {
         };
 
         let over_unreadable = both(usage(8192, 3, 3, true), usage(2048, 2, 2, true));
-        let hint =
-            cache_blocked_hint(Language::Chinese, Some(&mark), over_unreadable, 4096).unwrap();
-        assert!(hint.contains("上限可能暂时没生效"), "{hint}");
+        assert_eq!(
+            cache_blocked_hint(Language::Chinese, Some(&mark), over_unreadable, 4096),
+            Some("上限可能暂时没生效"),
+            "数字行下面那句会出现，重试承诺由它说"
+        );
 
         let small_unreadable = both(usage(1024, 2, 2, true), usage(2048, 2, 2, true));
         assert!(
@@ -1752,9 +1759,9 @@ mod tests {
             cache_blocked_hint(Language::Chinese, Some(&mark), nothing, 4096).is_none(),
             "一个字节都没读到时，数字那行已经说明读不到"
         );
-        assert!(
-            cache_blocked_hint(Language::Chinese, None, over_unreadable, 4096)
-                .is_some_and(|hint| hint.contains("上限可能暂时没生效")),
+        assert_eq!(
+            cache_blocked_hint(Language::Chinese, None, over_unreadable, 4096),
+            Some("上限可能暂时没生效"),
             "读不全这条不等维护结论：维护正在跑的时候也要提示"
         );
 
