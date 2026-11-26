@@ -104,7 +104,7 @@ fn cache_usage_hint(language: Language, usage: CacheUsageSummary) -> Option<&'st
 /// 两种提示都只在现在真超限时才出现，读不全只看音频这棵树，封面读不全不影响音频上限。
 /// 读不全这条不等维护结论：数字最可疑的时候，恰好可能是维护正在跑、旧结论被收起的时候。
 /// 删不动那条要上一轮和现在都超着才说，用户刚清过缓存时旧结论已经不作数。
-/// 「稍后会自动重试」交给数字行下面那句；那句被收起时（封面整棵读不到），这条只有结论。
+/// 「稍后会自动重试」交给数字行下面那句；那句被收起时（封面整棵读不到），这条自己补上。
 fn cache_blocked_hint(
     language: Language,
     mark: Option<&MaintenanceMark>,
@@ -113,7 +113,15 @@ fn cache_blocked_hint(
 ) -> Option<&'static str> {
     let over = usage.audio.bytes > audio_limit_bytes;
     if usage.audio.incomplete {
-        return over.then(|| language.text("上限可能暂时没生效"));
+        if !over {
+            return None;
+        }
+        // 数字行下面那句只在两棵树都读到了数时出现；它被收起时，重试承诺由这里补上。
+        return Some(if usage.covers.unreadable() {
+            language.text("上限可能暂时没生效；稍后会自动重试")
+        } else {
+            language.text("上限可能暂时没生效")
+        });
     }
     let mark = mark?;
     (mark.audio_bytes > audio_limit_bytes && over).then(|| {
@@ -1750,11 +1758,11 @@ mod tests {
             "读不全这条不等维护结论：维护正在跑的时候也要提示"
         );
 
-        // 封面整棵读不到时，数字行下面那句被收起：上限这条只剩结论，没有重试承诺。
+        // 封面整棵读不到时，数字行下面那句被收起：重试承诺由上限这条自己补上。
         let over_with_cover_hidden = both(usage(8192, 3, 3, true), usage(0, 0, 0, true));
         assert_eq!(
             cache_blocked_hint(Language::Chinese, Some(&mark), over_with_cover_hidden, 4096),
-            Some("上限可能暂时没生效")
+            Some("上限可能暂时没生效；稍后会自动重试")
         );
         assert!(cache_usage_hint(Language::Chinese, over_with_cover_hidden).is_none());
     }

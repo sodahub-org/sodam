@@ -540,6 +540,9 @@ impl Language {
                 "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
             }
             "上限可能暂时没生效" => "The limit may not apply yet",
+            "上限可能暂时没生效；稍后会自动重试" => {
+                "The limit may not apply yet. Retrying automatically."
+            }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
             "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
                 "Cleared {} cache files; some files couldn't be read, so a few may remain"
