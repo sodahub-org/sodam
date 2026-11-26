@@ -157,7 +157,7 @@ TrackItem + cache path
   拆开续传对；`.part.lock` 永不删——它的 mtime 停在首次下载，删掉正被内核锁挂着的锁会
   让后到的下载者另立新锁、破坏跨进程互斥）；启动后的首轮维护另清一次音频根**顶层**的旧格式
   （#241 之前）非锁残留——只列这一层、不递归，`staging/` 里的交给上面那条 7 天清扫；认族只
-  看文件名后缀（`staged_family_member`），所以这一层里哪怕是不相干的 `notes.txt.part` 也算
+  看文件名后缀（`is_staged_part`），所以这一层里哪怕是不相干的 `notes.txt.part` 也算
   残留、到龄一起清。24 小时门槛 + 租约 + 进程级一次性门（`legacy_residue_swept` 记删除数；
   目录没读全这轮不算数、下轮重试，连续 5 轮不完整就放弃，
   `legacy_residue_sweep_incomplete` / `legacy_residue_sweep_gave_up` 两条 Warn 留痕）。

@@ -400,6 +400,7 @@ struct Family<'a> {
 impl<'a> Family<'a> {
     /// 同一交付目标下的全部文件算一家：交付目标、音质边车、可续传的数据与记录、
     /// 解密临时、锁一起判老。配额淘汰按这一口径——还在下的那拨不能被配额拆开。
+    /// 封面淘汰也走这个入口，只是分组键换成 [`cover_group_key`]。
     fn by_target<'f, K>(
         files: impl IntoIterator<Item = &'f ScannedFile>,
         key: impl Fn(&Path) -> K,
@@ -417,6 +418,10 @@ impl<'a> Family<'a> {
     }
 
     /// 暂存过期清扫的归族：可续传那拨，锁除外（其余文件各自成家）。
+    ///
+    /// 锁的 mtime 停在首次下载，答不了「这批残留放够保留期没有」；真在下的时候
+    /// 有租约护着整族，轮不到这里判。清空那边反过来——锁正是「刚被碰过」的信号，
+    /// 所以 [`Family::staged`] 把它算在族里。
     fn staged_payload<'f>(files: impl IntoIterator<Item = &'f ScannedFile>) -> Vec<Family<'f>> {
         Self::group(files, is_staged_payload, protection_key)
     }
@@ -456,7 +461,8 @@ impl<'a> Family<'a> {
         families
     }
 
-    /// 这家子还新不新鲜：任一条成员在 24 小时窗口内就算。
+    /// 这家子还新不新鲜：任一条成员还落在 24 小时新鲜窗里就算
+    /// （新鲜窗只认暂存族名与 `.part` 后缀，见 [`is_fresh_part`]）。
     ///
     /// 续传的数据和记录必须一起判：中断重写的记录 mtime 比数据新，
     /// 逐条判新鲜会把续传对拆成半套。
@@ -812,6 +818,7 @@ fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
     for family in Family::staged(&candidates) {
         // 挑法落在成员这一层，不按整家判：只剩半截数据、记录还是新的时候，
         // 按家会把它一起留下。老残留没有能续上的配对了，就该各自清掉。
+        // 归族只为跟其他删除点共用同一条删除路，族界不影响谁被删。
         removed += family
             .remove(|file: &ScannedFile| !is_fresh_part(&file.path, file.modified))
             .len();
