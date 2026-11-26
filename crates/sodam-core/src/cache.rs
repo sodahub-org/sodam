@@ -214,9 +214,8 @@ fn is_lock(path: &Path) -> bool {
     file_name(path).ends_with(".part.lock")
 }
 
-/// 暂存里真正占地方的那拨：数据、记录、解密临时，锁除外。
-///
-/// 锁的 mtime 停在首次下载，混进族里会让一整族老残留显得还年轻。
+/// 暂存里真正占地方的那拨：数据、记录、解密临时，锁除外
+/// （锁为什么不算，见 [`Family::staged_payload`]）。
 fn is_staged_payload(path: &Path) -> bool {
     is_staged_part(path) && !is_lock(path)
 }
@@ -419,9 +418,9 @@ impl<'a> Family<'a> {
 
     /// 暂存过期清扫的归族：可续传那拨，锁除外（其余文件各自成家）。
     ///
-    /// 锁的 mtime 停在首次下载，答不了「这批残留放够保留期没有」；真在下的时候
-    /// 有租约护着整族，轮不到这里判。清空那边反过来——一把 24 小时内的锁说明
-    /// 这家子是最近才开始下的，续传对要留着，所以 [`Family::staged`] 把它算在族里。
+    /// 锁不进来，是因为它的 mtime 停在首次下载，答不了「这批残留放够保留期没有」。
+    /// 清空那边反过来：一把 24 小时内的锁说明这家子最近才开始下，续传对要留着，
+    /// 所以 [`Family::staged`] 把它算在族里。
     fn staged_payload<'f>(files: impl IntoIterator<Item = &'f ScannedFile>) -> Vec<Family<'f>> {
         Self::group(files, is_staged_payload, protection_key)
     }
@@ -508,7 +507,8 @@ impl<'a> Family<'a> {
         removed
     }
 
-    /// 音频这一家子的删除：`.part.lock` 永不动，租约护着整家时一条都不动。
+    /// 音频这一家子的删除：`.part.lock` 永不动；每条删之前各查一次租约，
+    /// 被租用的那条留在原地。
     fn remove(&self, pick: impl Fn(&ScannedFile) -> bool) -> Vec<&'a ScannedFile> {
         self.remove_with(pick, remove_idle)
     }
@@ -940,8 +940,8 @@ const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// `files` 是音频树这一轮的扫描结果，只认 `staging_dir` 的直接子项（staging 是平的，
 /// 旧实现也只列这一层）。过期按**整族**判：族里任一成员还年轻就整族不动——中断重写的
 /// 记录 mtime 比数据新，逐文件判龄会在边界上拆开续传对；族全过期才整族删。
-/// 锁不进族：它的 mtime 停在首次下载，混进来会让一整族老残留显得还年轻；
-/// 锁本身也不会被删（[`Family::remove`] 的第一条）。
+/// 锁不进族（为什么见 [`Family::staged_payload`]）；锁本身也不会被删
+/// （[`remove_idle`] 的第一条）。
 ///
 /// 正式文件与音质边车不跟着族走：它们各自成家、各看各的年纪。
 fn purge_stale_staging_files(
