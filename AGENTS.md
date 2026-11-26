@@ -57,7 +57,8 @@ packaging/windows/       Windows 安装器脚本与本机验收注意事项
 7. **提交前必须跑** `scripts/check.sh`（check + fmt + clippy + test，并带资源护栏）。
 8. **接口能力先在 libresoda 打通**：`sodam` 只做调用与展示；不要绕过 libresoda 请求汽水接口。
 9. **界面文案走 i18n**：新增用户可见文案使用 `root.tr` / `root.localized`，
-   中文原文作为稳定 key，并同步英文词典。
+   中文原文作为稳定 key，并同步英文词典。拿不到 `Root` 的纯函数可直接用
+   `Language::text` / `textf`：同一份词典，字面量 key 同样被 i18n 守卫扫描。
 10. **不要引入个人数据**：不要提交真实 Cookie、抓包签名头、本机路径或账号数据。
 
 ## 资源护栏

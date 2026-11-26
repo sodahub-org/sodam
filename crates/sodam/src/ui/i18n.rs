@@ -82,6 +82,7 @@ impl Language {
             "推荐队列" => "Recommendation queue",
             "请先在「设置 → 账户」扫码登录" => "Sign in with QR code in Settings → Account.",
             "语言已切换为中文" => "Language switched to Chinese",
+            "Language switched to English" => "Language switched to English",
             "就绪" => "Ready",
             "等待扫码…" => "Waiting for scan…",
             "已打开二次验证窗口，请在其中完成验证" => {
@@ -530,8 +531,8 @@ impl Language {
             "有缓存文件暂时读不到，数字可能偏小；稍后会自动重试" => {
                 "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
             }
-            "有缓存文件暂时读不到，上限可能暂时没生效；稍后会自动重试" => {
-                "Some cache files can't be read right now, so the limit may not apply yet. Retrying automatically."
+            "上限可能暂时没生效；稍后会自动重试" => {
+                "The limit may not apply yet. Retrying automatically."
             }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
             "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
@@ -831,7 +832,6 @@ mod tests {
         "Shortcut reset to default",
         "Shortcut updated",
         "该组合键已用于「{}」，不能绑定",
-        "Language switched to English",
     ];
 
     fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

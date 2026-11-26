@@ -33,21 +33,19 @@ fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
             .text("暂时读不到缓存占用，稍后会自动重试")
             .to_string();
     }
-    let key = if incomplete {
-        "至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）"
+    let args = [
+        human_bytes(total),
+        usage.audio.songs.to_string(),
+        human_bytes(usage.audio.bytes),
+        usage.covers.files.to_string(),
+        human_bytes(usage.covers.bytes),
+    ];
+    // key 写成字面量、不塞进变量：i18n 守卫只认调用点上的字符串字面量。
+    if incomplete {
+        language.textf("至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）", &args)
     } else {
-        "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）"
-    };
-    language.textf(
-        key,
-        &[
-            human_bytes(total),
-            usage.audio.songs.to_string(),
-            human_bytes(usage.audio.bytes),
-            usage.covers.files.to_string(),
-            human_bytes(usage.covers.bytes),
-        ],
-    )
+        language.textf("共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）", &args)
+    }
 }
 
 /// 读不全时的解释：数字可能偏小、稍后会自动重试。
@@ -70,9 +68,13 @@ fn cache_blocked_hint(
 ) -> Option<&'static str> {
     if usage.incomplete() {
         return (usage.total_bytes() > 0)
-            .then(|| language.text("有缓存文件暂时读不到，上限可能暂时没生效；稍后会自动重试"));
+            .then(|| language.text("上限可能暂时没生效；稍后会自动重试"));
     }
     let mark = mark?;
+    if mark.incomplete {
+        // 上一轮连目录都没读全，说「删不动」就是把原因猜错了。
+        return None;
+    }
     (mark.audio_bytes > audio_limit_bytes && usage.audio.bytes > audio_limit_bytes).then(|| {
         language.text("上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试")
     })
@@ -1647,7 +1649,16 @@ mod tests {
             incomplete: false,
         };
 
+        let unreadable = MaintenanceMark {
+            incomplete: true,
+            ..mark
+        };
+
         assert!(cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024).is_some());
+        assert!(
+            cache_blocked_hint(Language::Chinese, Some(&unreadable), over, 1024).is_none(),
+            "上一轮读不全时，别把超限说成删不动"
+        );
         assert!(
             cache_blocked_hint(Language::Chinese, Some(&mark), cleared, 1024).is_none(),
             "用户刚清过缓存，别再报上次删不动"

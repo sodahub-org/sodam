@@ -87,7 +87,7 @@
 
 ## 5. 文案与 i18n
 
-- 用户可见文案必须走 `root.tr` / `root.localized`。
+- 用户可见文案必须走 i18n：界面代码用 `root.tr` / `root.localized`。
 - 拿不到 `Root` 的纯函数（设置页里能单测的文案拼装）可以直接用
   `Language::text` / `textf`：它们和上面两个走同一份词典，字面量 key 同样被 i18n 守卫扫描。
 - 中文原文作为 key，英文词典在 `ui/i18n.rs`。

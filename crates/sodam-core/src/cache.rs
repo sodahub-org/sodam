@@ -1072,7 +1072,7 @@ const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 锁不进族（为什么见 [`Family::staged_payload`]）；锁本身也不会被删
 /// （[`remove_idle`] 的第一条）。
 ///
-/// `complete` 是 staging 这一层有没有整个看见（不是整棵音频树读全了没有）。
+/// `staging_fully_listed` 是 staging 这一层有没有整个看见（不是整棵音频树读全了没有）。
 /// 这层没看全时，看不到的可能是族里最新的一员，见过的那几条会显得「整族都过期」，
 /// 这一轮就一个都不清；缺口补上下轮再说。缺口在别处、这层看全了，照常清。
 ///
@@ -1082,9 +1082,9 @@ fn purge_stale_staging_files(
     staging_dir: &Path,
     max_age: Duration,
     now: SystemTime,
-    complete: bool,
+    staging_fully_listed: bool,
 ) -> Vec<PathBuf> {
-    if !complete {
+    if !staging_fully_listed {
         return Vec::new();
     }
     let in_staging = files
@@ -1425,8 +1425,8 @@ pub fn maintain(
         let scanned = report.scanned_files.to_string();
         let removed = report.removed_files.to_string();
         let audio_bytes = report.audio_bytes.to_string();
-        // 读不全时 audio_bytes 只是下界：单独给一个字段，日志里不用自己对 skipped_reason。
-        let incomplete = u8::from(report.audio_incomplete || report.cover_incomplete).to_string();
+        // 只有音频树读不全时 audio_bytes 才是下界：单独给一个字段，不用自己对 skipped_reason。
+        let audio_incomplete = u8::from(report.audio_incomplete).to_string();
         let over_limit = u8::from(report.over_limit).to_string();
         log_event(
             LogLevel::Info,
@@ -1440,7 +1440,7 @@ pub fn maintain(
                 ("skipped_reason", report.skipped_reason),
                 ("audio_gap", report.audio_gap_label()),
                 ("cover_gap", report.cover_gap_label()),
-                ("incomplete", incomplete.as_str()),
+                ("audio_incomplete", audio_incomplete.as_str()),
                 ("over_limit", over_limit.as_str()),
             ],
         );
@@ -2729,7 +2729,7 @@ mod tests {
     /// 对 staging 目录跑一次保留期清扫（测试用）：只认这一层的直接子项。
     fn purge_staging(staging: &Path) -> usize {
         let scan = scan_files(staging);
-        let complete = !scan.incomplete;
+        let fully_listed = scan.subtree_fully_listed(staging);
         let files: Vec<ScannedFile> = scan
             .files
             .into_iter()
@@ -2740,7 +2740,7 @@ mod tests {
             staging,
             STALE_STAGING_MAX_AGE,
             SystemTime::now(),
-            complete,
+            fully_listed,
         )
         .len()
     }

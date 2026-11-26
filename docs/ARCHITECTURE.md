@@ -145,7 +145,7 @@ TrackItem + cache path
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
   `audio_bytes` / `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` /
   `*_incomplete`）、`audio_gap` / `cover_gap`（`none` / `dir` / `entries` / `metadata`，
-  读不全时写明缺口落在哪一层）、`incomplete`（0/1，为 1 时 `audio_bytes` 只是下界）
+  读不全时写明缺口落在哪一层）、`audio_incomplete`（0/1，为 1 时 `audio_bytes` 只是下界）
   与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、删完之后的音频树总量，
   日志里就能和磁盘上的实际占用对账）。
   两棵树的用量统一用 `cache::CacheUsage` 表示：字节、文件数、歌曲数，加一个「这轮读全了没有」；
