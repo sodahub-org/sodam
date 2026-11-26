@@ -82,6 +82,7 @@ impl Language {
             "推荐队列" => "Recommendation queue",
             "请先在「设置 → 账户」扫码登录" => "Sign in with QR code in Settings → Account.",
             "语言已切换为中文" => "Language switched to Chinese",
+            "语言已切换为英文" => "Language switched to English",
             "就绪" => "Ready",
             "等待扫码…" => "Waiting for scan…",
             "已打开二次验证窗口，请在其中完成验证" => {
@@ -521,9 +522,46 @@ impl Language {
             "中文" => "中文",
             "语言已恢复为跟随系统" => "Language restored to system",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => "Total {} ({} songs {}, {} covers {})",
+            "至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
+                "At least {} ({} songs {}, {} covers {})"
+            }
+            "至少 {}（歌曲读不到 / 封面 {} 张 {}）" => {
+                "At least {} (songs can't be read / {} covers {})"
+            }
+            "至少 {}（歌曲 {} 首 {} / 封面读不到）" => {
+                "At least {} ({} songs {} / covers can't be read)"
+            }
+            "歌曲读不到（封面 {} 张 {}）" => "Songs can't be read ({} covers {})",
+            "歌曲 {} 首 {}（封面读不到）" => "{} songs {} (covers can't be read)",
+            "暂时读不到缓存占用，稍后会自动重试" => {
+                "Cache usage can't be read right now. Retrying automatically."
+            }
+            "有缓存文件暂时读不到，数字可能偏小；稍后会自动重试" => {
+                "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
+            }
+            "上限可能暂时没生效" => "The limit may not apply yet",
+            "上限可能暂时没生效；稍后会自动重试" => {
+                "The limit may not apply yet. Retrying automatically."
+            }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
-            "音频缓存上限：{}" => "Audio cache limit: {}",
-            "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留" => "Older songs are removed automatically; files in use are kept until released",
+            "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
+                "Cleared {} cache files; some files couldn't be read, so a few may remain"
+            }
+            "音频缓存上限：{}（合计还含封面，封面另有 {} 上限）" => {
+                "Audio cache limit: {} (the total also includes covers, which have their own {} limit)"
+            }
+            "自动清理较早使用的歌曲；占用偶尔会暂时超过上限" => {
+                "Older songs are cleaned up automatically; usage can briefly go over the limit"
+            }
+            "上次清理没能删到上限以下：有文件正在使用或暂时删不掉" => {
+                "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet"
+            }
+            "上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试" => {
+                "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet. Retrying automatically."
+            }
+            "正在播放或下载的文件会保留，等它们停用后再清一次" => {
+                "Files in use for playback or download are kept; clear again once they're released"
+            }
             "清空缓存" => "Clear Cache",
             "正在清理…" => "Clearing…",
             "批量升级缓存" => "Batch Upgrade Cache",
@@ -821,6 +859,13 @@ mod tests {
         }
     }
 
+    /// 一条模板填几个参数：`{}` 和 `{name}` 都算一个，`textf` 两种都认。
+    fn placeholders(template: &str) -> usize {
+        Language::normalize_placeholders(template.to_string())
+            .matches("{}")
+            .count()
+    }
+
     /// 取出 `needle`（如 `.tr(`）后紧跟的字符串字面量；允许换行缩进。
     fn literal_keys<'a>(source: &'a str, needle: &str) -> Vec<&'a str> {
         let mut keys = Vec::new();
@@ -943,6 +988,7 @@ mod tests {
 
         let mut scanned = 0;
         let mut missing = Vec::new();
+        let mut mismatched = Vec::new();
         for file in files {
             if file.ends_with("ui/i18n.rs") {
                 continue;
@@ -953,11 +999,29 @@ mod tests {
             let mut keys = literal_keys(&source, ".tr(");
             keys.extend(literal_keys(&source, ".localized("));
             keys.extend(literal_keys(&source, ".set_status("));
+            // 直接拿 Language 查表的地方也要扫：设置页这类纯函数没法拿到 Root，
+            // 文案只能走 `text` / `textf`，漏掉它们等于开一扇后门。
+            keys.extend(literal_keys(&source, ".text("));
+            keys.extend(literal_keys(&source, ".textf("));
             keys.extend(nth_argument_literal(&source, ".failure_text(", 2));
             for key in keys {
                 scanned += 1;
-                if Language::english_text(key).is_none() && !CALL_SITE_ONLY.contains(&key) {
-                    missing.push(format!("{}: {key}", file.display()));
+                let Some(english) = Language::english_text(key) else {
+                    if !CALL_SITE_ONLY.contains(&key) {
+                        missing.push(format!("{}: {key}", file.display()));
+                    }
+                    continue;
+                };
+                // `textf` 按顺序填占位符：英文少一个就会输出半截话，界面看不出来。
+                let want = placeholders(key);
+                let got = placeholders(english);
+                if want != got {
+                    mismatched.push(format!(
+                        "{}: {key}（{} 个 -> {} 个）",
+                        file.display(),
+                        want,
+                        got
+                    ));
                 }
             }
         }
@@ -969,6 +1033,13 @@ mod tests {
             missing.is_empty(),
             "英文词典缺少这些 key：\n{}",
             missing.join("\n")
+        );
+        mismatched.sort();
+        mismatched.dedup();
+        assert!(
+            mismatched.is_empty(),
+            "英文词典的占位符个数和中文 key 对不上：\n{}",
+            mismatched.join("\n")
         );
     }
 

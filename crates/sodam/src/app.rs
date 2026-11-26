@@ -634,9 +634,9 @@ pub struct Root {
     /// 与 `prefetch_cooldown_since`（逐曲冷却）正交，也与 `playback_halted`（播放落闸）
     /// 是两件事：前者管整条预取管线，后者管自动续播与巡检本身。
     pub(crate) prefetch_gate: PrefetchGate,
-    /// 缓存统计快照（音频字节, 歌曲数, 封面字节, 封面张数）：
+    /// 缓存统计快照（音频、封面两棵树的字节 / 文件数 / 歌曲数 / 读没读全）：
     /// 后台扫盘后回填，设置页只读它（渲染路径不做同步 IO）。
-    pub(crate) cache_summary: (u64, usize, u64, usize),
+    pub(crate) cache_summary: sodam_core::cache::CacheUsageSummary,
     /// 缓存统计重算的发起序号：只让最新一次扫盘的结果落回状态。
     pub(crate) cache_summary_request_seq: u64,
     /// 上次维护的结论（完成时刻 + 当时的占用）：到期判定只做一次比较。
@@ -984,7 +984,7 @@ impl Root {
             auth_epoch: 0,
             logout_in_flight: false,
             prefetch_gate: PrefetchGate::default(),
-            cache_summary: (0, 0, 0, 0),
+            cache_summary: sodam_core::cache::CacheUsageSummary::default(),
             cache_summary_request_seq: 0,
             // 启动期读一次（和上面的设置载入同一类）：只有一个时间戳和两个计数。
             cache_mark: sodam_core::cache::load_mark(),
@@ -1925,7 +1925,7 @@ impl Root {
         let status = if language.is_zh() {
             language.text("语言已切换为中文").to_string()
         } else {
-            language.text("Language switched to English").to_string()
+            language.text("语言已切换为英文").to_string()
         };
         self.set_status_text(status);
         cx.notify();

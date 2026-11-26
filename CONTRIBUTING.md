@@ -56,7 +56,8 @@ scripts/run.sh     # 启动 GUI（带 MemoryMax 护栏）
    或页面提示；只有启动期不可恢复错误才允许 panic。
 5. **凭据不入库、不入日志**：Cookie、签名 Token、抓包签名头、真实设备指纹禁止提交或打印。
 6. **界面文案走 i18n**：新增用户可见文案用 `root.tr` / `root.localized`，中文原文作为
-   稳定 key，并同步英文词典。
+   稳定 key，并同步英文词典。拿不到 `Root` 的纯函数可直接用 `Language::text` / `textf`：
+   同一份词典，字面量 key 同样被 i18n 守卫扫描。
 7. **接口能力先在 libresoda 打通**：SodaM 只做调用与展示，不绕过 libresoda 直接请求汽水接口。
 8. **UI 改动必须真机验证**：用 `scripts/run.sh` 启动确认，不能只过 `cargo check`。
 9. **提交前必须跑** `scripts/check.sh`。
