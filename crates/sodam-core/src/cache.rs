@@ -420,8 +420,8 @@ impl<'a> Family<'a> {
     /// 暂存过期清扫的归族：可续传那拨，锁除外（其余文件各自成家）。
     ///
     /// 锁的 mtime 停在首次下载，答不了「这批残留放够保留期没有」；真在下的时候
-    /// 有租约护着整族，轮不到这里判。清空那边反过来——锁正是「刚被碰过」的信号，
-    /// 所以 [`Family::staged`] 把它算在族里。
+    /// 有租约护着整族，轮不到这里判。清空那边反过来——一把 24 小时内的锁说明
+    /// 这家子是最近才开始下的，续传对要留着，所以 [`Family::staged`] 把它算在族里。
     fn staged_payload<'f>(files: impl IntoIterator<Item = &'f ScannedFile>) -> Vec<Family<'f>> {
         Self::group(files, is_staged_payload, protection_key)
     }
