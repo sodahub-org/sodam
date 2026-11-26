@@ -527,14 +527,14 @@ impl Language {
             "暂时读不到缓存占用，稍后会自动重试" => {
                 "Cache usage can't be read right now. Retrying automatically."
             }
-            "有缓存文件暂时读不到，数字可能偏小；稍后会自动重试" => {
-                "Some cache files can't be read right now, so these numbers may be low. Retrying automatically."
+            "有缓存文件暂时读不到，数字可能偏小，上限也可能暂时没生效；稍后会自动重试" => {
+                "Some cache files can't be read right now, so these numbers may be low and the limit may not apply yet. Retrying automatically."
             }
             "已清理缓存：{} 个文件" => "Cleared {} cache files",
             "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
                 "Cleared {} cache files; some files couldn't be read, so a few may remain"
             }
-            "歌曲缓存上限：{}" => "Song cache limit: {}",
+            "音频缓存上限：{}" => "Audio cache limit: {}",
             "合计里还包含封面图片；封面另有 {} 上限" => {
                 "The total above also includes cover images; covers have their own {} limit"
             }
@@ -828,6 +828,7 @@ mod tests {
         "Shortcut reset to default",
         "Shortcut updated",
         "该组合键已用于「{}」，不能绑定",
+        "Language switched to English",
     ];
 
     fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -976,6 +977,10 @@ mod tests {
             let mut keys = literal_keys(&source, ".tr(");
             keys.extend(literal_keys(&source, ".localized("));
             keys.extend(literal_keys(&source, ".set_status("));
+            // 直接拿 Language 查表的地方也要扫：设置页这类纯函数没法拿到 Root，
+            // 文案只能走 `text` / `textf`，漏掉它们等于开一扇后门。
+            keys.extend(literal_keys(&source, ".text("));
+            keys.extend(literal_keys(&source, ".textf("));
             keys.extend(nth_argument_literal(&source, ".failure_text(", 2));
             for key in keys {
                 scanned += 1;

@@ -1026,16 +1026,18 @@ impl Root {
                 // 已完成结果的作废由上面的 `clear_completed()` 完成；
                 // 原图没有渲染期自动入队口子，这里只补排当前曲目。
                 root.restore_current_original_cover(cx);
-                // 读不全时没看到的文件清不掉，别报成「清干净了」。
-                let message = if report.incomplete {
-                    root.localized(
+                // 读不全时没看到的文件清不掉，别报成「清干净了」；按 UI-SPEC 走警告。
+                if report.incomplete {
+                    let message = root.localized(
                         "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净",
                         &[report.removed.to_string()],
-                    )
+                    );
+                    root.notify_warning_once("cache-clear", message);
                 } else {
-                    root.localized("已清理缓存：{} 个文件", &[report.removed.to_string()])
-                };
-                root.notify_success_once("cache-clear", message);
+                    let message =
+                        root.localized("已清理缓存：{} 个文件", &[report.removed.to_string()]);
+                    root.notify_success_once("cache-clear", message);
+                }
                 root.refresh_cache_stats(cx);
                 cx.notify();
             });

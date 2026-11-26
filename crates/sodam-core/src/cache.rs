@@ -273,12 +273,14 @@ impl ScanGap {
 ///
 /// `incomplete` 记录「有地方没读到」：目录打不开、条目读错、元数据取不到。
 /// 这种情况下 `files` 只是可读部分的视图，总量偏小，不能当成完整统计。
-/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用。
+/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用；`gap_paths` 记下每一处
+/// 缺口的位置，用来判断「某一层是不是整个看见了」——只看层名不够。
 #[derive(Default)]
 pub(crate) struct Scan {
     pub(crate) files: Vec<ScannedFile>,
     pub(crate) incomplete: bool,
     pub(crate) gap: Option<ScanGap>,
+    pub(crate) gap_paths: Vec<PathBuf>,
 }
 
 impl Scan {
@@ -289,11 +291,22 @@ impl Scan {
     }
 
     /// 记一处扫描缺口；只保留第一处的层名，`incomplete` 与 `gap` 一起置上。
-    fn mark_incomplete(&mut self, gap: ScanGap) {
+    fn mark_incomplete(&mut self, gap: ScanGap, path: &Path) {
         self.incomplete = true;
+        self.gap_paths.push(path.to_owned());
         if self.gap.is_none() {
             self.gap = Some(gap);
         }
+    }
+
+    /// 这棵子树是不是整个看见了：缺口既不在它下面，也不在它的祖先上。
+    ///
+    /// 只看「缺口在不在子树里」不够：音频根那一层没读到时，staging 可能根本
+    /// 没被列到；反过来，缺口落在子树里某个文件上时，这层也不算读完。
+    fn subtree_fully_listed(&self, dir: &Path) -> bool {
+        self.gap_paths
+            .iter()
+            .all(|gap| !gap.starts_with(dir) && !dir.starts_with(gap))
     }
 }
 
@@ -306,7 +319,7 @@ impl Scan {
 pub struct CacheUsage {
     pub bytes: u64,
     pub files: usize,
-    /// 顶层 `.m4a` 才算歌；边车、暂存、封面都不算。
+    /// 顶层 `.m4a` 才算歌；边车、暂存都不算。封面树不数歌，恒为 0。
     pub songs: usize,
     pub incomplete: bool,
 }
@@ -334,6 +347,18 @@ impl CacheUsage {
 pub struct CacheUsageSummary {
     pub audio: CacheUsage,
     pub covers: CacheUsage,
+}
+
+impl CacheUsageSummary {
+    /// 两棵树加起来多少字节；任一处没读全时这只是下界。
+    pub fn total_bytes(&self) -> u64 {
+        self.audio.bytes.saturating_add(self.covers.bytes)
+    }
+
+    /// 任一处没读全：数字只是下界，界面要写成「至少」。
+    pub fn incomplete(&self) -> bool {
+        self.audio.incomplete || self.covers.incomplete
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -421,12 +446,12 @@ where
         // 不算「扫描不完整」，也不该让封面淘汰在这一轮停摆。
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => {
-            scan.mark_incomplete(ScanGap::Dir);
+            scan.mark_incomplete(ScanGap::Dir, dir);
             return;
         }
     };
     if listing.incomplete {
-        scan.mark_incomplete(ScanGap::Entry);
+        scan.mark_incomplete(ScanGap::Entry, dir);
     }
     for entry in listing.entries {
         match entry.kind {
@@ -446,7 +471,7 @@ where
                         modified: meta.modified().unwrap_or_else(|_| SystemTime::now()),
                     }),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => scan.mark_incomplete(ScanGap::Metadata),
+                    Err(_) => scan.mark_incomplete(ScanGap::Metadata, &entry.path),
                 },
             },
             EntryKind::Other => {}
@@ -1047,8 +1072,9 @@ const STALE_STAGING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 锁不进族（为什么见 [`Family::staged_payload`]）；锁本身也不会被删
 /// （[`remove_idle`] 的第一条）。
 ///
-/// `complete` 是音频树这一轮读没读全。读不全时看不到的可能是族里最新的一员，
-/// 见过的那几条会显得「整族都过期」，这一轮就一个都不清；缺口补上下轮再说。
+/// `complete` 是 staging 这一层有没有整个看见（不是整棵音频树读全了没有）。
+/// 这层没看全时，看不到的可能是族里最新的一员，见过的那几条会显得「整族都过期」，
+/// 这一轮就一个都不清；缺口补上下轮再说。缺口在别处、这层看全了，照常清。
 ///
 /// 正式文件与音质边车不跟着族走：它们各自成家、各看各的年纪。
 fn purge_stale_staging_files(
@@ -1461,12 +1487,13 @@ where
     let audio_scanned = audio.files.len();
 
     let staging = staging_dir(audio_dir);
+    let staging_complete = audio.subtree_fully_listed(&staging);
     let purged = purge_stale_staging_files(
         &audio.files,
         &staging,
         STALE_STAGING_MAX_AGE,
         SystemTime::now(),
-        !audio_incomplete,
+        staging_complete,
     );
     let purged_files = purged.len();
     if !purged.is_empty() {
@@ -2618,10 +2645,23 @@ mod tests {
     fn scan_records_where_it_could_not_read() {
         let dir = tempfile::tempdir().unwrap();
         file(dir.path(), "audio/keep.m4a", 0);
-        let denied = dir.path().join("audio/staging");
+        let audio = dir.path().join("audio");
+        let denied = audio.join("staging");
         let scan = scan_denying(dir.path(), &denied);
+
         assert!(scan.incomplete);
         assert_eq!(scan.gap, Some(ScanGap::Dir), "整层目录打不开要记成 dir");
+        assert_eq!(
+            scan.gap_paths,
+            vec![denied.clone()],
+            "缺口路径要留下来，判断某一层看没看全靠它"
+        );
+        assert!(!scan.subtree_fully_listed(&audio), "缺口就在这棵子树里");
+        assert!(!scan.subtree_fully_listed(&denied), "缺口就是这层本身");
+        assert!(
+            scan.subtree_fully_listed(&audio.join("other")),
+            "缺口不在这棵子树里，这层看全了"
+        );
     }
 
     /// 用量一次给出字节、文件数、歌曲数；目录不存在算空的，不算没读全。
@@ -4511,9 +4551,62 @@ mod tests {
         assert_eq!(report.songs, 1);
     }
 
-    /// 音频树读不全时：过期暂存一个都不清，报告写明缺口在哪一层，用量标成「至少」。
+    /// staging 这一层没整个看见：见过的过期族看着「整族过期」也不能清。
     #[test]
-    fn maintenance_round_holds_back_staging_when_the_scan_is_incomplete() {
+    fn maintenance_round_holds_back_visible_staging_when_the_layer_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        let staging = audio.join("staging");
+        let old = STALE_STAGING_MAX_AGE.as_secs() + 60;
+        let expired = file(dir.path(), "audio/staging/1-lossless-normal.m4a.part", old);
+        let expired_meta = file(
+            dir.path(),
+            "audio/staging/1-lossless-normal.m4a.part.meta",
+            old,
+        );
+        file(dir.path(), "audio/keep.m4a", 0);
+        file(dir.path(), "covers/one.img", 0);
+
+        let report = maintain_with(
+            &audio,
+            &covers,
+            MaintenanceLimits::from_mb(1024, 512),
+            &HashMap::new(),
+            |path: &Path| -> ListingResult {
+                let mut listing = list_dir(path)?;
+                if path == staging.as_path() {
+                    // 这一层有条目读不到：族里可能还有一个成员没看见。
+                    listing.incomplete = true;
+                }
+                Ok(listing)
+            },
+        );
+
+        assert!(report.audio_incomplete);
+        assert_eq!(report.skipped_reason, "audio_incomplete");
+        assert_eq!(
+            report.audio_gap_label(),
+            "entries",
+            "报告要写清缺口落在哪一层"
+        );
+        assert_eq!(report.cover_gap_label(), "none");
+        assert_eq!(report.removed_files, 0, "这层没看全，过期族一件都不清");
+        assert!(
+            expired.exists() && expired_meta.exists(),
+            "过期暂存原样留着"
+        );
+
+        let summary = report.summary();
+        assert!(summary.audio.incomplete, "读不全的音频用量只是下界");
+        assert_eq!(summary.audio.songs, 1);
+        assert!(!summary.covers.incomplete, "封面树读全了");
+        assert_eq!(summary.covers.files, 1);
+    }
+
+    /// 缺口在别处、staging 整个看见了：过期族照清，别让一条坏目录冻住 7 天清扫。
+    #[test]
+    fn maintenance_round_still_purges_staging_when_the_gap_is_elsewhere() {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("audio");
         let covers = dir.path().join("covers");
@@ -4524,9 +4617,8 @@ mod tests {
             "audio/staging/1-lossless-normal.m4a.part.meta",
             old,
         );
-        file(dir.path(), "audio/keep.m4a", 0);
-        file(dir.path(), "covers/one.img", 0);
-        let denied = audio.join("staging");
+        file(dir.path(), "audio/other/hidden.m4a", 0);
+        let denied = audio.join("other");
 
         let report = maintain_with(
             &audio,
@@ -4537,22 +4629,9 @@ mod tests {
         );
 
         assert!(report.audio_incomplete);
-        assert_eq!(report.skipped_reason, "audio_incomplete");
-        assert_eq!(report.audio_gap_label(), "dir", "报告要写清缺口落在哪一层");
-        assert_eq!(report.cover_gap_label(), "none");
-        assert_eq!(report.removed_files, 0, "读不全时这一轮什么都不删");
-        assert!(
-            expired.exists() && expired_meta.exists(),
-            "过期暂存原样留着"
-        );
-
-        let summary = report.summary();
-        assert!(summary.audio.incomplete, "读不全的音频用量只是下界");
-        assert_eq!(summary.audio.bytes, 10, "只数看得到的 keep.m4a");
-        assert_eq!(summary.audio.files, 1);
-        assert_eq!(summary.audio.songs, 1);
-        assert!(!summary.covers.incomplete, "封面树读全了");
-        assert_eq!(summary.covers.files, 1);
+        assert_eq!(report.audio_gap_label(), "dir");
+        assert_eq!(report.removed_files, 2, "staging 整层看得见，过期族照清");
+        assert!(!expired.exists() && !expired_meta.exists());
     }
 
     /// 到期判定只看落盘结论——没到期不扫，已知超限不等到期，但也不能每拍重扫。
