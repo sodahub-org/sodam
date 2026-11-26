@@ -135,7 +135,8 @@ TrackItem + cache path
   10 分钟重试（播放中的文件会被租约挡住，重试不能按分钟来）。改上限若正撞上批量升级/清缓存，
   请求会记下来等收尾后补跑。
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
-  `skipped_reason`（`below_limit` / `blocked` / `*_incomplete` / `none`，#310）。
+  `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` / `*_incomplete`）
+  与 `over_limit` 字段（#310）。
   实际缓存命中更新音频 mtime，巡检的 `is_cached` 不刷新最近使用时间。
 - `CacheLease` 从下载/缓存命中，经后台返回值、音频命令一直传到播放器寿命结束，
   淘汰与手动清理都跳过被租用的音频及其 sidecar。同一缓存目标的下载写者串行化。
