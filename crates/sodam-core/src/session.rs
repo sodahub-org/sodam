@@ -218,6 +218,53 @@ fn stage_path(
     Ok((part, lease))
 }
 
+/// 一次下载尝试的暂存记账。
+///
+/// 成功落地时改记「加新减旧」（[`Self::land`]）；其他任何出口——失败、取消、截断、
+/// 没能换成更好的流——都在 drop 里只补这次尝试的差额。以后再加提前返回也不会漏账。
+struct StagedAttempt<'a> {
+    target: &'a std::path::Path,
+    /// 这次尝试开始前暂存族在盘上多大。
+    before: u64,
+    landed: bool,
+}
+
+impl<'a> StagedAttempt<'a> {
+    fn begin(target: &'a std::path::Path) -> Self {
+        Self {
+            target,
+            before: crate::cache::staged_family_bytes(target),
+            landed: false,
+        }
+    }
+
+    /// 字节已经落进正式缓存：按「加新减旧」记账，别再按暂存差额记一遍。
+    fn land(
+        &mut self,
+        audio: &std::path::Path,
+        sidecar: &std::path::Path,
+        old_audio_bytes: u64,
+        old_sidecar_bytes: u64,
+    ) {
+        crate::cache::note_download_landed(
+            self.before,
+            audio,
+            sidecar,
+            old_audio_bytes,
+            old_sidecar_bytes,
+        );
+        self.landed = true;
+    }
+}
+
+impl Drop for StagedAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.landed {
+            crate::cache::note_staged_change(self.target, self.before);
+        }
+    }
+}
+
 #[cfg(test)]
 mod part_tests {
     /// 曲目 id 拼进文件名后还要交给 remove_file。带 / 或 .. 的 id 必须被净化，
@@ -1118,13 +1165,11 @@ impl Session {
         // 失败不删暂存：留住的字节是下一次的起点（#243）。
         let (part, _part_lease) =
             stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal)?;
+        // 这次尝试的暂存记账：成功落地改记「加新减旧」，其余出口按这次差额收尾。
+        let mut staging = StagedAttempt::begin(&part);
         let report = match self.pumpkin.download_resumable(&song, &part) {
             Ok(report) => report,
-            Err(err) => {
-                // 失败留下的半截暂存也占磁盘：按盘上实际大小记一笔，下次续传只补差额。
-                crate::cache::settle_staged_family(&part);
-                return Err(classify(&err));
-            }
+            Err(err) => return Err(classify(&err)),
         };
         log_resumed_download(&report);
         // 档位 / 试听标记取自这次传输自己的 `stream_info`：它跟落盘字节来自
@@ -1140,7 +1185,6 @@ impl Session {
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if written == 0 || is_truncated_download(info.size, written) {
             let _ = std::fs::remove_file(&part);
-            crate::cache::settle_staged_family(&part);
             // 截断就是「传输没跑完」，属于典型的可重试；报成 Unpack 会把人引向磁盘问题。
             return Err(PlaybackFailure::new(
                 Stage::Transfer,
@@ -1166,7 +1210,6 @@ impl Session {
         }
         std::fs::rename(&part, &path).map_err(|err| {
             let _ = std::fs::remove_file(&part);
-            crate::cache::settle_staged_family(&part);
             PlaybackFailure::new(
                 Stage::Unpack,
                 Retryability::Never,
@@ -1180,13 +1223,7 @@ impl Session {
             encode_sidecar(&quality, written, preview, quality_rank, checked_rank);
         std::fs::write(&quality_path, sidecar_content).map_err(|err| {
             // 音频已经落地，只有边车没写成功：盘上多出来的照样要记账。
-            crate::cache::note_download_landed(
-                &part,
-                &path,
-                &quality_path,
-                old_audio_bytes,
-                old_sidecar_bytes,
-            );
+            staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
             PlaybackFailure::new(
                 Stage::Unpack,
                 Retryability::Never,
@@ -1194,13 +1231,7 @@ impl Session {
                 err.to_string(),
             )
         })?;
-        crate::cache::note_download_landed(
-            &part,
-            &path,
-            &quality_path,
-            old_audio_bytes,
-            old_sidecar_bytes,
-        );
+        staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
         // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
         // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
         crate::mem::release_malloc_pressure();
@@ -1316,6 +1347,8 @@ impl Session {
             &tag,
             crate::cache::DownloadPurpose::Upgrade,
         )?;
+        // 这次尝试的暂存记账：成功落地改记「加新减旧」，其余出口按这次差额收尾。
+        let mut staging = StagedAttempt::begin(&part);
 
         // 可续传路径，失败不清暂存：升级被掐断后，下次升级从缺口接着补（#243）。
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
@@ -1332,8 +1365,6 @@ impl Session {
             if current.preview {
                 record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
             }
-            // 升级失败留下的暂存也占磁盘：按实际大小记账，下次续传只补差额。
-            crate::cache::settle_staged_family(&part);
             classify(&err)
         })?;
         log_resumed_download(&report);
@@ -1343,7 +1374,6 @@ impl Session {
         let written = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
         if written == 0 || is_truncated_download(info.size, written) {
             let _ = std::fs::remove_file(&part);
-            crate::cache::settle_staged_family(&part);
             if current.preview {
                 record_preview_upgrade_attempt(&quality_path, &path, current.quality_rank);
             }
@@ -1361,7 +1391,6 @@ impl Session {
         // 核心安全护栏：试听流绝不允许覆盖已有非试听整曲缓存（即便试听流档位分数更高）
         if would_downgrade_to_preview(&info, &current) {
             let _ = std::fs::remove_file(&part);
-            crate::cache::settle_staged_family(&part);
             return Ok(UpgradeRun::not_improved(
                 current,
                 NotImprovedReason::PreviewOnly,
@@ -1376,7 +1405,6 @@ impl Session {
         // 若新流并不比本地这份更好，丢弃临时文件保留旧文件。怎么比见 `is_better_stream`。
         if !is_better_stream(&info, &current) {
             let _ = std::fs::remove_file(&part);
-            crate::cache::settle_staged_family(&part);
             let reason = finish_unimproved_upgrade(
                 &mut current,
                 &info,
@@ -1407,7 +1435,6 @@ impl Session {
         crate::cache::atomic_replace_cache(&part, &path, &quality_path, &sidecar_content).map_err(
             |err| {
                 let _ = std::fs::remove_file(&part);
-                crate::cache::settle_staged_family(&part);
                 PlaybackFailure::new(
                     Stage::Unpack,
                     Retryability::Never,
@@ -1416,13 +1443,7 @@ impl Session {
                 )
             },
         )?;
-        crate::cache::note_download_landed(
-            &part,
-            &path,
-            &quality_path,
-            old_audio_bytes,
-            old_sidecar_bytes,
-        );
+        staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
 
         crate::mem::release_malloc_pressure();
         Ok(UpgradeRun::improved(CachedTrack {

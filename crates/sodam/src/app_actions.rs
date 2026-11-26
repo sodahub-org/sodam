@@ -552,10 +552,7 @@ impl Root {
                     }
                     // 下载记账把占用推过九成时不等 60 秒那一拍：每拍只比一次数字，
                     // 真要跑的时候底层还会再确认一遍。
-                    let cache_limits = sodam_core::cache::MaintenanceLimits::from_mb(
-                        root.settings.audio_cache_limit_mb,
-                        sodam_core::cache::COVER_LIMIT_MB,
-                    );
+                    let cache_limits = root.cache_maintenance_limits();
                     if sodam_core::cache::ledger_pressure(root.cache_mark.as_ref(), cache_limits) {
                         root.maintain_cache_from_ledger(cx);
                     } else if now.saturating_duration_since(root.last_cache_check)
@@ -839,6 +836,13 @@ impl Root {
         self.run_cache_maintenance(CacheMaintenanceTrigger::Ledger, cx);
     }
 
+    fn cache_maintenance_limits(&self) -> sodam_core::cache::MaintenanceLimits {
+        sodam_core::cache::MaintenanceLimits::from_mb(
+            self.settings.audio_cache_limit_mb,
+            sodam_core::cache::COVER_LIMIT_MB,
+        )
+    }
+
     fn run_cache_maintenance(&mut self, trigger: CacheMaintenanceTrigger, cx: &mut Context<Self>) {
         // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
         // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
@@ -852,10 +856,7 @@ impl Root {
             return;
         }
         self.cache_maintenance_pending = false;
-        let limits = sodam_core::cache::MaintenanceLimits::from_mb(
-            self.settings.audio_cache_limit_mb,
-            sodam_core::cache::COVER_LIMIT_MB,
-        );
+        let limits = self.cache_maintenance_limits();
         // 到期判定只读内存里的上次结论：没到点、也没超限，这一拍什么都不做。
         // 心跳从此只付一次比较，不再每分钟重扫两棵树。
         let due = match trigger {
