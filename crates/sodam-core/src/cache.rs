@@ -930,10 +930,20 @@ pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
 
+/// 被替换掉的旧文件：正式音频与它的边车各多大。
+#[derive(Default)]
+struct ReplacedBytes {
+    audio: u64,
+    sidecar: u64,
+}
+
 /// 两次看盘之间的增量账。
 ///
 /// 只累计「上次真看盘之后盘上净多了多少」：每次下载尝试只记这次长出来（或缩掉）的部分，
 /// 扫描一完成就整本换掉，绝不反过来覆盖扫描结论。
+///
+/// 下载途中正好赶上一次看盘时，这次尝试记的差额可能把扫描已经算过的一小截再加一遍；
+/// 最多多算这一首当时写进去的那点，下一轮扫描就纠正，方向偏大不偏小。
 #[derive(Default)]
 struct CacheLedger {
     /// 上次看盘之后的净增量：新增减去被换掉、删掉的旧文件。可以为负。
@@ -960,14 +970,13 @@ impl CacheLedger {
         staged_before: u64,
         audio_bytes: u64,
         sidecar_bytes: u64,
-        old_audio_bytes: u64,
-        old_sidecar_bytes: u64,
+        replaced: ReplacedBytes,
     ) {
         self.delta = self
             .delta
             .saturating_add(size_change(staged_before, audio_bytes))
-            .saturating_sub(as_i64(old_audio_bytes))
-            .saturating_add(size_change(old_sidecar_bytes, sidecar_bytes));
+            .saturating_sub(as_i64(replaced.audio))
+            .saturating_add(size_change(replaced.sidecar, sidecar_bytes));
     }
 
     fn reset(&mut self) {
@@ -994,18 +1003,18 @@ fn ledger() -> &'static Mutex<CacheLedger> {
 }
 
 /// 账本净增量的镜像：心跳每一拍都要读，别在渲染线程上抢账本的锁。
-static PENDING_CACHE_BYTES: AtomicI64 = AtomicI64::new(0);
+static PENDING_AUDIO_BYTES: AtomicI64 = AtomicI64::new(0);
 
 fn with_ledger<R>(f: impl FnOnce(&mut CacheLedger) -> R) -> R {
     let mut ledger = ledger().lock().unwrap_or_else(|err| err.into_inner());
     let result = f(&mut ledger);
-    PENDING_CACHE_BYTES.store(ledger.pending(), Ordering::Relaxed);
+    PENDING_AUDIO_BYTES.store(ledger.pending(), Ordering::Relaxed);
     result
 }
 
 /// 上次看盘之后又写进来的音频字节（净增量，可为负）。
-fn pending_cache_bytes() -> i64 {
-    PENDING_CACHE_BYTES.load(Ordering::Relaxed)
+fn pending_audio_bytes() -> i64 {
+    PENDING_AUDIO_BYTES.load(Ordering::Relaxed)
 }
 
 /// 一个暂存目标对应的整族文件：交付目标自己，加上 libresoda 按同一目标推导的那些名字。
@@ -1060,8 +1069,10 @@ pub(crate) fn note_download_landed(
             staged_before,
             audio_bytes,
             sidecar_bytes,
-            old_audio_bytes,
-            old_sidecar_bytes,
+            ReplacedBytes {
+                audio: old_audio_bytes,
+                sidecar: old_sidecar_bytes,
+            },
         );
     });
 }
@@ -1096,7 +1107,7 @@ pub fn ledger_pressure(mark: Option<&MaintenanceMark>, limits: MaintenanceLimits
         // 没有结论时 `maintenance_due` 本来就要求跑一轮，这里不重复排。
         return false;
     };
-    ledger_says_near_limit(mark.audio_bytes, pending_cache_bytes(), limits.audio_bytes)
+    ledger_says_near_limit(mark.audio_bytes, pending_audio_bytes(), limits.audio_bytes)
 }
 
 /// 这一拍要不要真跑一轮维护。
@@ -4471,9 +4482,15 @@ mod tests {
     #[test]
     fn ledger_landing_counts_new_minus_old() {
         let mut ledger = CacheLedger::default();
-        let audio = PathBuf::from("audio/a.m4a");
-        let sidecar = PathBuf::from("audio/a.quality");
-        ledger.land(0, 1_000, 40, 800, 30);
+        ledger.land(
+            0,
+            1_000,
+            40,
+            ReplacedBytes {
+                audio: 800,
+                sidecar: 30,
+            },
+        );
         assert_eq!(
             ledger.pending(),
             1_000 + 40 - 800 - 30,
@@ -4485,7 +4502,7 @@ mod tests {
     #[test]
     fn ledger_resume_after_a_scan_counts_only_the_growth() {
         let mut ledger = CacheLedger::default();
-        ledger.land(500, 1_000, 0, 0, 0);
+        ledger.land(500, 1_000, 0, ReplacedBytes::default());
         assert_eq!(ledger.pending(), 500, "不能把盘上的 1000 再加一遍");
     }
 
@@ -4493,9 +4510,7 @@ mod tests {
     #[test]
     fn ledger_landing_records_full_file_when_nothing_transferred() {
         let mut ledger = CacheLedger::default();
-        let audio = PathBuf::from("audio/a.m4a");
-        let sidecar = PathBuf::from("audio/a.quality");
-        ledger.land(0, 700, 20, 0, 0);
+        ledger.land(0, 700, 20, ReplacedBytes::default());
         assert_eq!(ledger.pending(), 720);
     }
 
@@ -4503,7 +4518,15 @@ mod tests {
     #[test]
     fn ledger_never_reports_negative_usage() {
         let mut ledger = CacheLedger::default();
-        ledger.land(0, 100, 10, 5_000, 40);
+        ledger.land(
+            0,
+            100,
+            10,
+            ReplacedBytes {
+                audio: 5_000,
+                sidecar: 40,
+            },
+        );
         assert!(ledger.pending() < 0, "旧文件减过头时账本可以为负");
         assert_eq!(
             3_000u64.saturating_add_signed(ledger.pending()),
@@ -4541,6 +4564,12 @@ mod tests {
     /// 暂存族枚举与 libresoda 的命名表对得上：交付目标加五个派生名。
     #[test]
     fn staged_family_lists_every_staged_name() {
+        for suffix in STAGED_SUFFIXES {
+            assert!(
+                suffix.starts_with(".m4a"),
+                "staged_family_paths 靠这个前缀拼名字，缺了会静默少算：{suffix}"
+            );
+        }
         let target = PathBuf::from("audio/staging/1-lossless-normal.m4a");
         let paths = staged_family_paths(&target);
         assert_eq!(paths.len(), 1 + STAGED_SUFFIXES.len());
