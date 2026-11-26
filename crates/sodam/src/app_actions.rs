@@ -809,7 +809,7 @@ impl Root {
         cx.notify();
     }
 
-    /// 心跳与启动用：按到期规则问一句，没到点、也没超限就什么都不做。
+    /// 心跳与启动用：按到期规则问一句；欠着补跑的话，这一拍就补。
     pub(crate) fn check_cache_maintenance(&mut self, cx: &mut Context<Self>) {
         self.run_cache_maintenance(MaintenanceTrigger::Due, cx);
     }

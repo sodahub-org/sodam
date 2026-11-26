@@ -99,7 +99,7 @@ impl CacheCheck {
         self.owed
     }
 
-    /// 这一拍该怎么办。
+    /// 这一拍该怎么办。被挡下的强制请求在这里记一笔，真跑一轮时销账。
     pub fn ask(&mut self, ask: MaintenanceAsk<'_>) -> MaintenanceDecision {
         // 欠着的强制请求按强制算：补跑不等到期。
         let forced = ask.trigger == MaintenanceTrigger::Forced || self.owed;
@@ -117,7 +117,7 @@ impl CacheCheck {
             MaintenanceTrigger::Ledger => ledger_pressure(ask.mark, ask.limits, ask.pending_audio),
         };
         // 欠着的强制请求不看各自的到期规则：挡路的刚结束，这一拍就补。
-        if !run && !self.owed {
+        if !run && !forced {
             return MaintenanceDecision::Skip;
         }
         // 真跑一轮就销账：这一轮读的是新上限，欠的强制请求已经兑现。
@@ -383,11 +383,24 @@ mod tests {
         );
     }
 
-    /// 触发来源 × 挡路条件（八种组合）× 到期与否 × 账本越线与否，逐个对照期望。
+    /// 造一个「欠着一笔强制请求」的判断：先让一次强制请求撞上挡路。
+    fn owed_check() -> CacheCheck {
+        let mut check = CacheCheck::default();
+        let fresh = state_mark(false, now());
+        assert_eq!(
+            check.ask(input(MaintenanceTrigger::Forced, blocked(), &fresh, 0)),
+            MaintenanceDecision::Defer
+        );
+        check
+    }
+
+    /// 触发来源 × 挡路条件（八种组合）× 到期与否 × 账本越线与否 × 有没有欠账，
+    /// 共 192 种输入，逐个对照期望。
     #[test]
     fn every_combination_lands_on_the_expected_decision() {
         let limits = limits();
         let now = now();
+        let seeded = owed_check();
         for due in [false, true] {
             for pressure in [false, true] {
                 let mark = state_mark(due, now);
@@ -409,35 +422,36 @@ mod tests {
                         clearing: mask & 2 != 0,
                         upgrading: mask & 4 != 0,
                     };
-                    for trigger in [
-                        MaintenanceTrigger::Due,
-                        MaintenanceTrigger::Forced,
-                        MaintenanceTrigger::Ledger,
-                    ] {
-                        let got = CacheCheck::default().ask(input(
-                            trigger,
-                            blockers,
-                            &mark,
-                            pending_audio,
-                        ));
-                        let want = if blockers.any() {
-                            if trigger == MaintenanceTrigger::Forced {
-                                MaintenanceDecision::Defer
+                    for owed in [false, true] {
+                        for trigger in [
+                            MaintenanceTrigger::Due,
+                            MaintenanceTrigger::Forced,
+                            MaintenanceTrigger::Ledger,
+                        ] {
+                            // 强制请求（含欠着的那笔）不看各自的到期规则。
+                            let forced = owed || trigger == MaintenanceTrigger::Forced;
+                            let want = if blockers.any() {
+                                if forced {
+                                    MaintenanceDecision::Defer
+                                } else {
+                                    MaintenanceDecision::Skip
+                                }
+                            } else if forced
+                                || (trigger == MaintenanceTrigger::Due && due)
+                                || (trigger == MaintenanceTrigger::Ledger && pressure)
+                            {
+                                MaintenanceDecision::Run
                             } else {
                                 MaintenanceDecision::Skip
-                            }
-                        } else {
-                            match trigger {
-                                MaintenanceTrigger::Forced => MaintenanceDecision::Run,
-                                MaintenanceTrigger::Due if due => MaintenanceDecision::Run,
-                                MaintenanceTrigger::Ledger if pressure => MaintenanceDecision::Run,
-                                _ => MaintenanceDecision::Skip,
-                            }
-                        };
-                        assert_eq!(
-                            got, want,
-                            "trigger={trigger:?} blockers={blockers:?} due={due} pressure={pressure}"
-                        );
+                            };
+
+                            let mut check = if owed { seeded } else { CacheCheck::default() };
+                            let got = check.ask(input(trigger, blockers, &mark, pending_audio));
+                            assert_eq!(
+                                got, want,
+                                "trigger={trigger:?} blockers={blockers:?} owed={owed} due={due} pressure={pressure}"
+                            );
+                        }
                     }
                 }
             }
