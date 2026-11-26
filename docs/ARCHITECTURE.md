@@ -134,9 +134,19 @@ TrackItem + cache path
   30 分钟查一次；上一轮有子树读不全时也按 30 分钟重查（那次的字节只是下界）；已知超限时
   10 分钟重试（播放中的文件会被租约挡住，重试不能按分钟来）。改上限若正撞上批量升级/清缓存，
   请求会记下来等收尾后补跑。
+  两次看盘之间的写入另有一本进程内的增量账（`cache::CacheLedger`）：点播、预取、升级每落下
+  一份音频（含边车）就按盘上实际大小记一笔，续传/重试只补差额，换文件按「加新减旧」算，
+  失败留下的半截暂存也按实际大小记。账本只用来把检查提前：心跳每拍读一次净增量，上次看盘
+  还没到九成、这本账把已知占用推过九成时立刻跑一轮，不等 60 秒那一拍；扫描一开始账本就整本
+  作废，新数字以这一轮扫描为准，所以手动删目录、换缓存位置下一轮自然纠正。停在九成以上时
+  不再按账本反复触发，仍由上面的密集档兜住——否则删不动时写一首就会扫一遍盘。
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
-  `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` / `*_incomplete`）
-  与 `over_limit` 字段（#310）。
+  `audio_bytes` / `skipped_reason`（`none` / `below_limit` / `blocked` / `over_limit` /
+  `*_incomplete`）与 `over_limit` 字段（#310；`audio_bytes` 是这一轮扫完、删完之后的音频树
+  总量，日志里就能和磁盘上的实际占用对账）。
+  规模基准一条命令：`cargo run --release -p sodam-core --example cache_bench`，造
+  1000 / 5000 / 20000 个文件各跑一轮，输出耗时、扫描文件数、删除数；入口是
+  `cache::maintain_in`，不碰全局缓存根。
   实际缓存命中更新音频 mtime，巡检的 `is_cached` 不刷新最近使用时间。
 - `CacheLease` 从下载/缓存命中，经后台返回值、音频命令一直传到播放器寿命结束，
   淘汰与手动清理都跳过被租用的音频及其 sidecar。同一缓存目标的下载写者串行化。
