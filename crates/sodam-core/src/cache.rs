@@ -944,7 +944,7 @@ pub(crate) struct Replaced {
     pub sidecar: u64,
 }
 
-/// 一次落地写进正式缓存的确切字节：动手之前量好，写完之后填进来。
+/// 一次落地写进正式缓存的确切字节：正常路径先量后写；边车写坏了按实际落盘量补。
 pub(crate) struct Landing {
     /// 这次尝试开始前暂存族在盘上多大（含马上会被清掉的残留交付目标）。
     pub staged_before: u64,
