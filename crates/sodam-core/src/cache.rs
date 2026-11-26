@@ -2,6 +2,7 @@
 
 use std::collections::{hash_map, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -927,9 +928,16 @@ pub fn sweep_legacy_residue() -> usize {
     gate.advance(sweep_legacy_residue_once(&root_dir().join("audio")))
 }
 
-/// staging 子目录名。下载把暂存放这里（`session.rs` 的 `staging_dir` 用同一份名字），
+/// staging 子目录名。下载把暂存放这里（`session.rs` 的暂存目标也用它），
 /// 维护把超过保留期的残留从这里清走。
 pub(crate) const STAGING_DIR_NAME: &str = "staging";
+
+/// 音频树里的暂存子目录：可续传的临时文件放这里，维护按保留期从这里清残留。
+///
+/// 只暴露目录本身，不暴露它的名字：以后换布局，调用方不用跟着改。
+pub fn staging_dir(audio_dir: &Path) -> PathBuf {
+    audio_dir.join(STAGING_DIR_NAME)
+}
 
 /// 暂存残留保留 7 天，和 libresoda 自己的过期清扫同一条口径（#243）；
 /// 过了 24 小时新鲜窗就不再受保护，配额超额时按 LRU 先走。
@@ -1020,6 +1028,133 @@ pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
+
+/// 被替换掉的旧文件：正式音频与它的边车各多大。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Replaced {
+    pub audio: u64,
+    pub sidecar: u64,
+}
+
+/// 一次落地写进正式缓存的确切字节：正常路径先量后写；边车写坏了按实际落盘量补。
+pub(crate) struct Landing {
+    /// 这次尝试开始前暂存族在盘上多大（含马上会被清掉的残留交付目标）。
+    pub staged_before: u64,
+    /// 落地的音频字节。服务器判「早就下完了」、这次传输量为 0 时，是盘上完整文件的大小。
+    pub audio: u64,
+    /// 落地的边车字节。
+    pub sidecar: u64,
+    /// 被换掉的旧文件。
+    pub replaced: Replaced,
+}
+
+/// 上次真看盘之后的音频净增量（字节）。
+///
+/// 只累计「又多了多少」：每次下载尝试只加这次长出来（或缩掉）的部分；真看盘一开始
+/// 就清零，扫描结论永远是基准。只算音频——下载只往音频树写，封面有固定上限，不掺进来。
+///
+/// 两个方向都会有误差，但都只影响「提前多少」，不改扫描结论，下一轮扫描自然纠正：
+/// - 偏大：下载途中正好赶上一次看盘，这次尝试记的差额可能把扫描已经算过的一小截
+///   再加一遍；
+/// - 偏小：落地时减掉的旧文件若是上次看盘之后才出现（比如进程重启后账本从零开始），
+///   减掉就等于凭空少算那一份。
+static AUDIO_DELTA: AtomicI64 = AtomicI64::new(0);
+
+fn as_i64(bytes: u64) -> i64 {
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
+/// `after` 比 `before` 多了多少：负数表示缩了。续传、覆盖都只按这个差额记账。
+fn size_change(before: u64, after: u64) -> i64 {
+    as_i64(after).saturating_sub(as_i64(before))
+}
+
+/// 一次下载落进正式缓存时的净变化：暂存长到交付大小、旧音频与旧边车被换掉。
+fn landed_delta(landing: Landing) -> i64 {
+    size_change(landing.staged_before, landing.audio)
+        .saturating_sub(as_i64(landing.replaced.audio))
+        .saturating_add(size_change(landing.replaced.sidecar, landing.sidecar))
+}
+
+/// 上次看盘之后又写进来的音频字节（净增量，可为负）。
+pub(crate) fn pending_audio_bytes() -> i64 {
+    AUDIO_DELTA.load(Ordering::Relaxed)
+}
+
+/// 一个暂存目标对应的整族文件：交付目标自己，加上 libresoda 按同一目标推导的那些名字。
+fn staged_family_paths(target: &Path) -> Vec<PathBuf> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut paths = vec![target.to_owned()];
+    for suffix in STAGED_SUFFIXES {
+        // 后缀表统一带 `.m4a` 前缀（暂存目标自己已经带上了），拼上去时摘掉它。
+        let tail = suffix.strip_prefix(".m4a").unwrap_or(suffix);
+        paths.push(target.with_file_name(format!("{name}{tail}")));
+    }
+    paths
+}
+
+/// 一整族暂存文件在盘上占的字节数：交付目标、密文、记录与锁。
+///
+/// 下载开始前量一次，失败或结束时再量一次，两次的差额就是要记的增量。
+pub(crate) fn staged_family_bytes(target: &Path) -> u64 {
+    staged_family_paths(target)
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .fold(0u64, |sum, meta| sum.saturating_add(meta.len()))
+}
+
+/// 一次尝试结束（失败、取消、重试、没换成更好流）：只把暂存族这次的差额记进账。
+///
+/// 不能把整族再加一遍——跨过一次看盘之后，`before` 那部分已经在扫描结论里了。
+/// 缩了也照记（负数），旧的大数不会一直挂着。只 stat，不读内容。
+pub(crate) fn note_staged_change(target: &Path, before: u64) {
+    let after = staged_family_bytes(target);
+    AUDIO_DELTA.fetch_add(size_change(before, after), Ordering::Relaxed);
+}
+
+/// 一次下载把字节落进正式缓存（点播与升级共用）。
+pub(crate) fn note_download_landed(landing: Landing) {
+    AUDIO_DELTA.fetch_add(landed_delta(landing), Ordering::Relaxed);
+}
+
+/// 量一个文件有多大，取不到当 0。
+///
+/// 用在两处，误差都不改扫描结论，下一轮扫描自然纠正：
+/// - 被换掉的旧文件：取不到就少减，账偏大；
+/// - 写失败后半截的边车：取不到就少记，账偏小。
+pub(crate) fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// 这次真看盘：账本整本作废，扫描结果就是新的起点。
+pub(crate) fn reset_cache_accounting() {
+    AUDIO_DELTA.store(0, Ordering::Relaxed);
+}
+
+/// 上一轮扫描的数字加上这本账，够不够把检查提前。
+///
+/// 只在「上次看盘还没到九成、这次写进来的字节把它推上去」时成立：上次看盘本身
+/// 就在九成以上时交给 [`maintenance_due`] 的密集档——一轮扫完账本就清零，
+/// 停在高位由那里的 30 分钟间隔兜住，不会写一首就扫一遍盘。
+fn ledger_says_near_limit(mark_audio_bytes: u64, pending: i64, limit_bytes: u64) -> bool {
+    if pending <= 0 {
+        return false;
+    }
+    near_limit(mark_audio_bytes.saturating_add_signed(pending), limit_bytes)
+        && !near_limit(mark_audio_bytes, limit_bytes)
+}
+
+/// 账本有没有把音频占用推过九成、而上次看盘还没到九成。
+pub fn ledger_pressure(mark: Option<&MaintenanceMark>, limits: MaintenanceLimits) -> bool {
+    let Some(mark) = mark else {
+        // 没有结论时 `maintenance_due` 本来就要求跑一轮，这里不重复排。
+        return false;
+    };
+    ledger_says_near_limit(mark.audio_bytes, pending_audio_bytes(), limits.audio_bytes)
+}
 
 /// 这一拍要不要真跑一轮维护。
 ///
@@ -1115,6 +1250,8 @@ pub fn maintain(
     limits: MaintenanceLimits,
     last_seen: &HashMap<PathBuf, SystemTime>,
 ) -> MaintenanceReport {
+    // 这次真看盘：账本整本作废。扫描的结论从这一轮起是新的基准，账本只记它之后的增量。
+    reset_cache_accounting();
     sweep_legacy_residue();
     let audio_dir = crate::audio::cache_dir();
     let covers_dir = crate::audio::cover_cache_dir();
@@ -1125,6 +1262,7 @@ pub fn maintain(
         let elapsed = report.elapsed.as_millis().to_string();
         let scanned = report.scanned_files.to_string();
         let removed = report.removed_files.to_string();
+        let audio_bytes = report.audio_bytes.to_string();
         let over_limit = u8::from(report.over_limit).to_string();
         log_event(
             LogLevel::Info,
@@ -1134,12 +1272,27 @@ pub fn maintain(
                 ("duration_ms", elapsed.as_str()),
                 ("scanned_files", scanned.as_str()),
                 ("removed_files", removed.as_str()),
+                ("audio_bytes", audio_bytes.as_str()),
                 ("skipped_reason", report.skipped_reason),
                 ("over_limit", over_limit.as_str()),
             ],
         );
     }
     report
+}
+
+/// 在指定目录上跑一轮维护：规模基准与测试用。
+///
+/// 正式入口 [`maintain`] 固定读全局缓存根，还会先跑一次进程级的旧残留巡检、把账本清零、
+/// 写维护日志；这条入口只做「扫两棵树、淘汰、统计」这一轮本身，不写日志、不清账本、
+/// 不碰全局缓存根。它仍会经过封面告警门和租约表——和任何一轮维护一样。
+pub fn maintain_in(
+    audio_dir: &Path,
+    covers_dir: &Path,
+    limits: MaintenanceLimits,
+    last_seen: &HashMap<PathBuf, SystemTime>,
+) -> MaintenanceReport {
+    maintain_with(audio_dir, covers_dir, limits, last_seen, list_dir)
 }
 
 /// 顶层 `.m4a` 才算一首歌：sidecar、暂存、封面原图都不是。
@@ -1168,10 +1321,10 @@ where
     let audio_incomplete = audio.incomplete;
     let audio_scanned = audio.files.len();
 
-    let staging_dir = audio_dir.join(STAGING_DIR_NAME);
+    let staging = staging_dir(audio_dir);
     let purged = purge_stale_staging_files(
         &audio.files,
-        &staging_dir,
+        &staging,
         STALE_STAGING_MAX_AGE,
         SystemTime::now(),
     );
@@ -2036,7 +2189,7 @@ pub fn atomic_replace_cache(
 /// 共用一个 `.part` 名就会打架：一个刚把文件清空，另一个接着往后面写，
 /// 最后换上去的就是一张对不上的图。
 fn unique_tag() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{}-{seq}", std::process::id())
@@ -4397,5 +4550,145 @@ mod tests {
         assert!(report.over_limit, "播放中的那组还压在上限之上");
         assert_eq!(report.skipped_reason, "over_limit");
         drop(lease);
+    }
+
+    /// 失败、重试只补差额：第一次 400、续传到 900，两次加起来是 900，不是 1300。
+    #[test]
+    fn size_change_counts_only_growth() {
+        assert_eq!(size_change(0, 400) + size_change(400, 900), 900);
+        assert_eq!(size_change(900, 600), -300, "缩了记负数，旧的大数不会挂着");
+    }
+
+    /// 落进正式缓存：暂存只记这次长到交付大小的部分，正式文件再按「加新减旧」算。
+    #[test]
+    fn landed_delta_counts_new_minus_old() {
+        assert_eq!(
+            landed_delta(Landing {
+                staged_before: 0,
+                audio: 1_000,
+                sidecar: 40,
+                replaced: Replaced {
+                    audio: 800,
+                    sidecar: 30
+                }
+            }),
+            1_000 + 40 - 800 - 30,
+            "换高音质的净变化正好是加新减旧"
+        );
+    }
+
+    /// 断点续传跨过一次看盘：暂存那 500 已经在扫描结论里，这次只记长到 1000 的差额。
+    #[test]
+    fn landed_delta_resume_after_a_scan_counts_only_the_growth() {
+        assert_eq!(
+            landed_delta(Landing {
+                staged_before: 500,
+                audio: 1_000,
+                sidecar: 0,
+                replaced: Replaced::default()
+            }),
+            500,
+            "不能把盘上的 1000 再加一遍"
+        );
+    }
+
+    /// 服务器判「早就下完了」（这次传输量为 0）也要按盘上完整文件记账，不能记成 0。
+    #[test]
+    fn landed_delta_records_full_file_when_nothing_transferred() {
+        assert_eq!(
+            landed_delta(Landing {
+                staged_before: 0,
+                audio: 700,
+                sidecar: 20,
+                replaced: Replaced::default()
+            }),
+            720
+        );
+    }
+
+    /// 旧文件比新文件还大时账会变成负数；往外报已知占用时按 0 封底，不报负的占用。
+    #[test]
+    fn landed_delta_never_reports_negative_usage() {
+        let delta = landed_delta(Landing {
+            staged_before: 0,
+            audio: 100,
+            sidecar: 10,
+            replaced: Replaced {
+                audio: 5_000,
+                sidecar: 40,
+            },
+        });
+        assert!(delta < 0, "旧文件减过头时账本可以为负");
+        assert_eq!(
+            3_000u64.saturating_add_signed(delta),
+            0,
+            "已知占用按 0 封底"
+        );
+    }
+
+    /// 越线判定：上次看盘没到九成、账本把它推上去才提前跑；已经在上面的交给密集档。
+    #[test]
+    fn ledger_pressure_only_fires_when_crossing_from_below() {
+        let limit = 1_000u64;
+        assert!(ledger_says_near_limit(500, 400, limit), "从五成推到九成");
+        assert!(!ledger_says_near_limit(500, 300, limit), "还不到九成不跑");
+        assert!(
+            !ledger_says_near_limit(900, 50, limit),
+            "上次看盘就贴着上限：交给 maintenance_due 的密集档，别写一首扫一遍"
+        );
+        assert!(!ledger_says_near_limit(500, 0, limit));
+        assert!(
+            !ledger_says_near_limit(500, -100, limit),
+            "账变成负数不触发"
+        );
+    }
+
+    /// 暂存族枚举与 libresoda 的命名表对得上：交付目标加五个派生名。
+    #[test]
+    fn staged_family_lists_every_staged_name() {
+        for suffix in STAGED_SUFFIXES {
+            assert!(
+                suffix.starts_with(".m4a"),
+                "staged_family_paths 靠这个前缀拼名字，缺了会静默少算：{suffix}"
+            );
+        }
+        let target = PathBuf::from("audio/staging/1-lossless-normal.m4a");
+        let paths = staged_family_paths(&target);
+        assert_eq!(paths.len(), 1 + STAGED_SUFFIXES.len());
+        for expected in [
+            "audio/staging/1-lossless-normal.m4a",
+            "audio/staging/1-lossless-normal.m4a.part",
+            "audio/staging/1-lossless-normal.m4a.part.meta",
+            "audio/staging/1-lossless-normal.m4a.part.meta.tmp",
+            "audio/staging/1-lossless-normal.m4a.part.lock",
+            "audio/staging/1-lossless-normal.m4a.dec.tmp",
+        ] {
+            assert!(paths.contains(&PathBuf::from(expected)), "缺少 {expected}");
+        }
+    }
+
+    /// 暂存族按盘上真实文件量字节：几份真文件相加，0 字节的锁不影响。
+    #[test]
+    fn staged_family_bytes_sums_real_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("1-lossless-normal.m4a");
+        std::fs::write(&base, [0u8; 4]).unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.part"), [0u8; 100]).unwrap();
+        std::fs::write(
+            dir.path().join("1-lossless-normal.m4a.part.meta"),
+            [0u8; 30],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.dec.tmp"), [0u8; 10]).unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.part.lock"), b"").unwrap();
+        assert_eq!(staged_family_bytes(&base), 144);
+
+        let only_lock = dir.path().join("2-lossless-normal.m4a");
+        std::fs::write(dir.path().join("2-lossless-normal.m4a.part.lock"), b"").unwrap();
+        assert_eq!(
+            staged_family_bytes(&only_lock),
+            0,
+            "只有 0 字节的锁，量出来还是 0"
+        );
     }
 }
