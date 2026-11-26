@@ -156,12 +156,18 @@ fn part_file_name(track_id: &str, tag: &str, purpose: crate::cache::DownloadPurp
     )
 }
 
-/// 暂存文件单独放一个子目录，别和正式缓存混在一起。
-/// 档位标签可以是用户自定义值，`auto-normal` 这种恰好会撞上正常下载的暂存名；
-/// 放子目录后，清理暂存就不会删掉别人已经下好的正式缓存。
-/// 目录名与维护侧（`cache::STAGING_DIR_NAME`）共用一份。
-fn staging_dir(audio_dir: &std::path::Path) -> std::path::PathBuf {
-    audio_dir.join(crate::cache::STAGING_DIR_NAME)
+/// 这组暂存对应的交付目标：下载与升级共用，量字节、清残留都认它。
+///
+/// 暂存放单独的子目录，别和正式缓存混在一起：档位标签可以是用户自定义值，
+/// `auto-normal` 这种恰好会撞上正常下载的暂存名；放子目录后，清理暂存就不会
+/// 删掉别人已经下好的正式缓存。
+fn staging_target(
+    audio_dir: &std::path::Path,
+    track_id: &str,
+    tag: &str,
+    purpose: crate::cache::DownloadPurpose,
+) -> std::path::PathBuf {
+    crate::cache::staging_dir(audio_dir).join(part_file_name(track_id, tag, purpose))
 }
 
 /// 准备这组暂存目标：清掉上次被杀留下的交付目标，再拿租约挡住缓存维护。
@@ -180,7 +186,7 @@ fn stage_path(
 ) -> Result<(std::path::PathBuf, crate::cache::CacheLease), crate::failure::PlaybackFailure> {
     use crate::failure::{PlaybackFailure, RecoveryAction, Retryability, Stage};
 
-    let stage = staging_dir(dir);
+    let stage = crate::cache::staging_dir(dir);
     // 建不出暂存目录就没法下载：直接报确定的失败，别拿着一条父目录都不存在的
     // 路径往下走。错误里带上路径，报问题时不用回头猜是哪一层缓存目录。
     std::fs::create_dir_all(&stage).map_err(|err| {
@@ -191,8 +197,7 @@ fn stage_path(
             format!("{}: {err}", stage.display()),
         )
     })?;
-    let name = part_file_name(track_id, tag, purpose);
-    let part = stage.join(&name);
+    let part = stage.join(part_file_name(track_id, tag, purpose));
     // 只清交付目标：上次被杀若停在「libresoda 已交付、本侧还没改名到正式缓存」，
     // 这个文件就是残留，而 Windows 的 rename 不覆盖既有文件，不清掉会挡住这次交付。
     // 此时调用方已持有该用途的下载锁。删不掉记日志，但日志不是护栏：
@@ -230,10 +235,11 @@ struct StagedAttempt<'a> {
 }
 
 impl<'a> StagedAttempt<'a> {
-    fn begin(target: &'a std::path::Path) -> Self {
+    /// `before` 必须赶在 [`stage_path`] 之前量：那一步会清掉上次留下的交付目标。
+    fn begin(target: &'a std::path::Path, before: u64) -> Self {
         Self {
             target,
-            before: crate::cache::staged_family_bytes(target),
+            before,
             landed: false,
         }
     }
@@ -241,15 +247,15 @@ impl<'a> StagedAttempt<'a> {
     /// 字节已经落进正式缓存：按「加新减旧」记账，别再按暂存差额记一遍。
     fn land(
         &mut self,
-        audio: &std::path::Path,
-        sidecar: &std::path::Path,
+        audio_bytes: u64,
+        sidecar_bytes: u64,
         old_audio_bytes: u64,
         old_sidecar_bytes: u64,
     ) {
         crate::cache::note_download_landed(
             self.before,
-            audio,
-            sidecar,
+            audio_bytes,
+            sidecar_bytes,
             old_audio_bytes,
             old_sidecar_bytes,
         );
@@ -330,7 +336,7 @@ mod part_tests {
     #[test]
     fn stage_path_discards_stale_target_but_keeps_resumable_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let stage = super::staging_dir(dir.path());
+        let stage = crate::cache::staging_dir(dir.path());
         std::fs::create_dir_all(&stage).unwrap();
         let stale = stage.join("123-lossless-normal.m4a");
         let stale_part = stage.join("123-lossless-normal.m4a.part");
@@ -1163,10 +1169,14 @@ impl Session {
         // 暂存名固定为「曲目-档位-用途」，重复下载复用同一套名字与锁；
         // 正常下载与升级分开，两条路并发下同一首时互不撞锁。
         // 失败不删暂存：留住的字节是下一次的起点（#243）。
-        let (part, _part_lease) =
-            stage_path(&dir, &track.id, &tag, crate::cache::DownloadPurpose::Normal)?;
+        let purpose = crate::cache::DownloadPurpose::Normal;
+        let staged_before = {
+            let target = staging_target(&dir, &track.id, &tag, purpose);
+            crate::cache::staged_family_bytes(&target)
+        };
+        let (part, _part_lease) = stage_path(&dir, &track.id, &tag, purpose)?;
         // 这次尝试的暂存记账：成功落地改记「加新减旧」，其余出口按这次差额收尾。
-        let mut staging = StagedAttempt::begin(&part);
+        let mut staging = StagedAttempt::begin(&part, staged_before);
         let report = match self.pumpkin.download_resumable(&song, &part) {
             Ok(report) => report,
             Err(err) => return Err(classify(&err)),
@@ -1221,9 +1231,10 @@ impl Session {
         // 用户可能刚补上权益或签名服务刚恢复。退避从「后台升级仍拿回试听」才开始记。
         let sidecar_content =
             encode_sidecar(&quality, written, preview, quality_rank, checked_rank);
+        let sidecar_bytes = sidecar_content.len() as u64;
         std::fs::write(&quality_path, sidecar_content).map_err(|err| {
             // 音频已经落地，只有边车没写成功：盘上多出来的照样要记账。
-            staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
+            staging.land(written, sidecar_bytes, old_audio_bytes, old_sidecar_bytes);
             PlaybackFailure::new(
                 Stage::Unpack,
                 Retryability::Never,
@@ -1231,7 +1242,7 @@ impl Session {
                 err.to_string(),
             )
         })?;
-        staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
+        staging.land(written, sidecar_bytes, old_audio_bytes, old_sidecar_bytes);
         // 无损整曲下载 + 解密会在内存里同时持有加密数据、明文、mdat 多份缓冲，
         // 结束后把已释放的页归还系统，避免 macOS malloc 保留导致 RSS 长期虚高。
         crate::mem::release_malloc_pressure();
@@ -1341,14 +1352,14 @@ impl Session {
         };
 
         // 升级用自己的暂存名，和点播下载并行不撞 libresoda 的目标锁。
-        let (part, _part_lease) = stage_path(
-            &dir,
-            &track.id,
-            &tag,
-            crate::cache::DownloadPurpose::Upgrade,
-        )?;
+        let purpose = crate::cache::DownloadPurpose::Upgrade;
+        let staged_before = {
+            let target = staging_target(&dir, &track.id, &tag, purpose);
+            crate::cache::staged_family_bytes(&target)
+        };
+        let (part, _part_lease) = stage_path(&dir, &track.id, &tag, purpose)?;
         // 这次尝试的暂存记账：成功落地改记「加新减旧」，其余出口按这次差额收尾。
-        let mut staging = StagedAttempt::begin(&part);
+        let mut staging = StagedAttempt::begin(&part, staged_before);
 
         // 可续传路径，失败不清暂存：升级被掐断后，下次升级从缺口接着补（#243）。
         // 若指定了目标具体档位，创建临时会话或设置档位偏好以获取更高档位
@@ -1421,6 +1432,7 @@ impl Session {
         debug_assert!(!info.is_preview, "试听流不该走到整曲替换");
         let quality = describe_quality(&info);
         let sidecar_content = encode_sidecar(&quality, written, false, new_rank, checked_rank);
+        let sidecar_bytes = sidecar_content.len() as u64;
 
         // N1 修复：在执行原子替换重命名序列前，获取 download_lock(&path)，
         // 保证在极其短暂的重命名窗口期内与点播下载互斥，防止交错写同一组文件。
@@ -1443,7 +1455,7 @@ impl Session {
                 )
             },
         )?;
-        staging.land(&path, &quality_path, old_audio_bytes, old_sidecar_bytes);
+        staging.land(written, sidecar_bytes, old_audio_bytes, old_sidecar_bytes);
 
         crate::mem::release_malloc_pressure();
         Ok(UpgradeRun::improved(CachedTrack {
@@ -2614,5 +2626,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.stage, crate::failure::Stage::Input);
         assert_eq!(err.retryability, crate::failure::Retryability::Never);
+    }
+
+    /// 守卫的三条出口：失败按差额收尾、落地只记一次、真看盘清零。
+    #[test]
+    fn staged_attempt_settles_every_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("1-lossless-normal.m4a");
+        std::fs::write(&target, [0u8; 7]).unwrap();
+
+        crate::cache::reset_cache_accounting();
+        {
+            let _attempt = StagedAttempt::begin(&target, 0);
+        }
+        assert_eq!(
+            crate::cache::pending_audio_bytes(),
+            7,
+            "失败出口：drop 只记这次长出来的差额"
+        );
+
+        crate::cache::reset_cache_accounting();
+        {
+            let mut attempt = StagedAttempt::begin(&target, 7);
+            // 落地时暂存已经被搬走：删掉目标模拟那一步。
+            std::fs::remove_file(&target).unwrap();
+            attempt.land(9, 3, 0, 0);
+        }
+        assert_eq!(
+            crate::cache::pending_audio_bytes(),
+            5,
+            "落地出口：记长到交付大小的差额与边车，land 之后 drop 不再记"
+        );
+
+        crate::cache::reset_cache_accounting();
+        assert_eq!(crate::cache::pending_audio_bytes(), 0, "看盘之后账本清零");
     }
 }

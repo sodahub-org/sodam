@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use sodam_core::cache::{maintain_in, MaintenanceLimits, STAGING_DIR_NAME};
+use sodam_core::cache::{maintain_in, staging_dir, MaintenanceLimits, COVER_LIMIT_MB};
 
 const TIERS: [usize; 3] = [1_000, 5_000, 20_000];
 const FILE_BYTES: usize = 8;
@@ -41,7 +41,8 @@ fn main() {
 /// 五分之一缩略图，其余是封面原图。音频与边车都超过 24 小时（可以淘汰），暂存全部
 /// 超过 7 天保留期（这一轮会清掉），封面都很新（这一档不淘汰封面）。
 fn build(audio: &Path, covers: &Path, total: usize) -> MaintenanceLimits {
-    std::fs::create_dir_all(audio.join(STAGING_DIR_NAME)).expect("建音频暂存目录");
+    let stage_dir = staging_dir(audio);
+    std::fs::create_dir_all(&stage_dir).expect("建音频暂存目录");
     std::fs::create_dir_all(covers.join("original")).expect("建封面原图目录");
 
     let songs = total / 4;
@@ -61,9 +62,7 @@ fn build(audio: &Path, covers: &Path, total: usize) -> MaintenanceLimits {
     }
     for index in 0..staging {
         write(
-            &audio
-                .join(STAGING_DIR_NAME)
-                .join(format!("{index:08}.m4a.part")),
+            &stage_dir.join(format!("{index:08}.m4a.part")),
             staging_age,
             index,
         );
@@ -79,11 +78,13 @@ fn build(audio: &Path, covers: &Path, total: usize) -> MaintenanceLimits {
         );
     }
 
-    // 音频上限取这一档音频总量的一半：淘汰只删装不下的那一半，删除数是定数。
+    // 音频上限取「歌曲 + 边车 + 暂存」总量的一半：暂存先按 7 天保留期整批清掉，
+    // 剩下的歌曲与边车（总量的一半）再按最旧优先淘汰到上限以下，删掉其中的四成。
+    // 两个比例都是定数，同一份输入每次的删除数一样。
     let audio_bytes = (songs + sidecars + staging) as u64 * FILE_BYTES as u64;
     MaintenanceLimits {
         audio_bytes: audio_bytes / 2,
-        cover_bytes: 512 * 1024 * 1024,
+        cover_bytes: COVER_LIMIT_MB * 1024 * 1024,
     }
 }
 

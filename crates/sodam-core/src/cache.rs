@@ -808,9 +808,16 @@ pub fn sweep_legacy_residue() -> usize {
     gate.advance(sweep_legacy_residue_once(&root_dir().join("audio")))
 }
 
-/// staging 子目录名。下载把暂存放这里（`session.rs` 的 `staging_dir` 用同一份名字），
-/// 维护把超过保留期的残留从这里清走；规模基准也按这个名字造暂存文件。
-pub const STAGING_DIR_NAME: &str = "staging";
+/// staging 子目录名。下载把暂存放这里（`session.rs` 的暂存目标也用它），
+/// 维护把超过保留期的残留从这里清走。
+pub(crate) const STAGING_DIR_NAME: &str = "staging";
+
+/// 音频树里的暂存子目录：可续传的临时文件放这里，维护按保留期从这里清残留。
+///
+/// 只暴露目录本身，不暴露它的名字：以后换布局，调用方不用跟着改。
+pub fn staging_dir(audio_dir: &Path) -> PathBuf {
+    audio_dir.join(STAGING_DIR_NAME)
+}
 
 /// 暂存残留保留 7 天，和 libresoda 自己的过期清扫同一条口径（#243）；
 /// 过了 24 小时新鲜窗就不再受保护，配额超额时按 LRU 先走。
@@ -937,56 +944,14 @@ struct ReplacedBytes {
     sidecar: u64,
 }
 
-/// 两次看盘之间的增量账。
+/// 上次真看盘之后的音频净增量（字节）。
 ///
-/// 只累计「上次真看盘之后盘上净多了多少」：每次下载尝试只记这次长出来（或缩掉）的部分，
-/// 扫描一完成就整本换掉，绝不反过来覆盖扫描结论。
+/// 只累计「又多了多少」：每次下载尝试只加这次长出来（或缩掉）的部分；真看盘一开始
+/// 就清零，扫描结论永远是基准。只算音频——下载只往音频树写，封面有固定上限，不掺进来。
 ///
 /// 下载途中正好赶上一次看盘时，这次尝试记的差额可能把扫描已经算过的一小截再加一遍；
 /// 最多多算这一首当时写进去的那点，下一轮扫描就纠正，方向偏大不偏小。
-#[derive(Default)]
-struct CacheLedger {
-    /// 上次看盘之后的净增量：新增减去被换掉、删掉的旧文件。可以为负。
-    delta: i64,
-}
-
-impl CacheLedger {
-    fn add(&mut self, bytes: i64) {
-        self.delta = self.delta.saturating_add(bytes);
-    }
-
-    /// 暂存族这次长出来（或缩掉）的部分。续传、重试、失败都只看自己这次的差额。
-    fn note_staged(&mut self, before: u64, after: u64) {
-        self.add(size_change(before, after));
-    }
-
-    /// 一次下载落进正式缓存：暂存从 `staged_before` 长到 `audio_bytes`，再整份搬到正式缓存，
-    /// 中间没有多出第二份；正式文件与边车再按「加新减旧」算。
-    ///
-    /// 旧文件记在上一轮扫描结论里，这里减掉才是这次替换的真实变化；万一它没被上一轮
-    /// 扫描记到（扫完才写、进程又重启过），会多减一份，数字暂时偏小，下一轮扫描就准了。
-    fn land(
-        &mut self,
-        staged_before: u64,
-        audio_bytes: u64,
-        sidecar_bytes: u64,
-        replaced: ReplacedBytes,
-    ) {
-        self.delta = self
-            .delta
-            .saturating_add(size_change(staged_before, audio_bytes))
-            .saturating_sub(as_i64(replaced.audio))
-            .saturating_add(size_change(replaced.sidecar, sidecar_bytes));
-    }
-
-    fn reset(&mut self) {
-        self.delta = 0;
-    }
-
-    fn pending(&self) -> i64 {
-        self.delta
-    }
-}
+static AUDIO_DELTA: AtomicI64 = AtomicI64::new(0);
 
 fn as_i64(bytes: u64) -> i64 {
     i64::try_from(bytes).unwrap_or(i64::MAX)
@@ -997,24 +962,21 @@ fn size_change(before: u64, after: u64) -> i64 {
     as_i64(after).saturating_sub(as_i64(before))
 }
 
-fn ledger() -> &'static Mutex<CacheLedger> {
-    static LEDGER: OnceLock<Mutex<CacheLedger>> = OnceLock::new();
-    LEDGER.get_or_init(Mutex::default)
-}
-
-/// 账本净增量的镜像：心跳每一拍都要读，别在渲染线程上抢账本的锁。
-static PENDING_AUDIO_BYTES: AtomicI64 = AtomicI64::new(0);
-
-fn with_ledger<R>(f: impl FnOnce(&mut CacheLedger) -> R) -> R {
-    let mut ledger = ledger().lock().unwrap_or_else(|err| err.into_inner());
-    let result = f(&mut ledger);
-    PENDING_AUDIO_BYTES.store(ledger.pending(), Ordering::Relaxed);
-    result
+/// 一次下载落进正式缓存时的净变化：暂存长到交付大小、旧音频与旧边车被换掉。
+fn landed_delta(
+    staged_before: u64,
+    audio_bytes: u64,
+    sidecar_bytes: u64,
+    replaced: ReplacedBytes,
+) -> i64 {
+    size_change(staged_before, audio_bytes)
+        .saturating_sub(as_i64(replaced.audio))
+        .saturating_add(size_change(replaced.sidecar, sidecar_bytes))
 }
 
 /// 上次看盘之后又写进来的音频字节（净增量，可为负）。
-fn pending_audio_bytes() -> i64 {
-    PENDING_AUDIO_BYTES.load(Ordering::Relaxed)
+pub(crate) fn pending_audio_bytes() -> i64 {
+    AUDIO_DELTA.load(Ordering::Relaxed)
 }
 
 /// 一个暂存目标对应的整族文件：交付目标自己，加上 libresoda 按同一目标推导的那些名字。
@@ -1045,27 +1007,25 @@ pub(crate) fn staged_family_bytes(target: &Path) -> u64 {
 /// 一次尝试结束（失败、取消、重试、没换成更好流）：只把暂存族这次的差额记进账。
 ///
 /// 不能把整族再加一遍——跨过一次看盘之后，`before` 那部分已经在扫描结论里了。
-/// 缩了也照记（负数），旧的大数不会一直挂着。只 stat，不读内容；锁只包住记账那行。
+/// 缩了也照记（负数），旧的大数不会一直挂着。只 stat，不读内容。
 pub(crate) fn note_staged_change(target: &Path, before: u64) {
     let after = staged_family_bytes(target);
-    with_ledger(|ledger| ledger.note_staged(before, after));
+    AUDIO_DELTA.fetch_add(size_change(before, after), Ordering::Relaxed);
 }
 
 /// 一次下载把字节落进正式缓存（点播与升级共用）。
 ///
-/// `staged_before` 是这次尝试开始前暂存族的大小，`old_*` 是替换前正式文件与边车的大小；
-/// 调用方都要在动手之前量好。
+/// `staged_before` 是这次尝试开始前暂存族的大小；`audio_bytes` / `sidecar_bytes` 是落地的
+/// 实际字节数；`old_*` 是替换前正式文件与边车的大小。调用方都要在动手之前量好。
 pub(crate) fn note_download_landed(
     staged_before: u64,
-    audio_path: &Path,
-    sidecar_path: &Path,
+    audio_bytes: u64,
+    sidecar_bytes: u64,
     old_audio_bytes: u64,
     old_sidecar_bytes: u64,
 ) {
-    let audio_bytes = file_len(audio_path);
-    let sidecar_bytes = file_len(sidecar_path);
-    with_ledger(|ledger| {
-        ledger.land(
+    AUDIO_DELTA.fetch_add(
+        landed_delta(
             staged_before,
             audio_bytes,
             sidecar_bytes,
@@ -1073,17 +1033,19 @@ pub(crate) fn note_download_landed(
                 audio: old_audio_bytes,
                 sidecar: old_sidecar_bytes,
             },
-        );
-    });
+        ),
+        Ordering::Relaxed,
+    );
 }
 
+/// 量一个文件有多大。取不到当 0：只用来量被换掉的旧文件，少减一份账只会偏大，不会偏小。
 pub(crate) fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 /// 这次真看盘：账本整本作废，扫描结果就是新的起点。
-fn reset_cache_accounting() {
-    with_ledger(CacheLedger::reset);
+pub(crate) fn reset_cache_accounting() {
+    AUDIO_DELTA.store(0, Ordering::Relaxed);
 }
 
 /// 上一轮扫描的数字加上这本账，够不够把检查提前。
@@ -1100,8 +1062,6 @@ fn ledger_says_near_limit(mark_audio_bytes: u64, pending: i64, limit_bytes: u64)
 }
 
 /// 账本有没有把音频占用推过九成、而上次看盘还没到九成。
-///
-/// 只算音频：下载只往音频树写，封面有自己的固定上限，不掺进这笔账。
 pub fn ledger_pressure(mark: Option<&MaintenanceMark>, limits: MaintenanceLimits) -> bool {
     let Some(mark) = mark else {
         // 没有结论时 `maintenance_due` 本来就要求跑一轮，这里不重复排。
@@ -1238,8 +1198,8 @@ pub fn maintain(
 /// 在指定目录上跑一轮维护：规模基准与测试用。
 ///
 /// 正式入口 [`maintain`] 固定读全局缓存根，还会先跑一次进程级的旧残留巡检、把账本清零、
-/// 写维护日志；这条入口只做「扫两棵树、淘汰、统计」这一轮本身，不碰任何全局状态，
-/// 让调用方自己指定目录、反复量耗时。
+/// 写维护日志；这条入口只做「扫两棵树、淘汰、统计」这一轮本身，不写日志、不清账本、
+/// 不碰全局缓存根。它仍会经过封面告警门和租约表——和任何一轮维护一样。
 pub fn maintain_in(
     audio_dir: &Path,
     covers_dir: &Path,
@@ -1275,10 +1235,10 @@ where
     let audio_incomplete = audio.incomplete;
     let audio_scanned = audio.files.len();
 
-    let staging_dir = audio_dir.join(STAGING_DIR_NAME);
+    let staging = staging_dir(audio_dir);
     let purged = purge_stale_staging_files(
         &audio.files,
-        &staging_dir,
+        &staging,
         STALE_STAGING_MAX_AGE,
         SystemTime::now(),
     );
@@ -4460,39 +4420,26 @@ mod tests {
         drop(lease);
     }
 
-    /// 断点续传只补差额：第一次失败 400、续传到 900，账上是 900，不是两笔相加。
+    /// 失败、重试只补差额：第一次 400、续传到 900，两次加起来是 900，不是 1300。
     #[test]
-    fn ledger_resume_counts_only_growth() {
-        let mut ledger = CacheLedger::default();
-        ledger.note_staged(0, 400);
-        ledger.note_staged(400, 900);
-        assert_eq!(ledger.pending(), 900, "同一个暂存族只补这次长出来的部分");
-    }
-
-    /// 两首同时下载各算各的：每笔都拿自己的起点算差额，加总不串。
-    #[test]
-    fn ledger_keeps_concurrent_downloads_apart() {
-        let mut ledger = CacheLedger::default();
-        ledger.note_staged(0, 300);
-        ledger.note_staged(100, 400);
-        assert_eq!(ledger.pending(), 600, "300 + 300");
+    fn size_change_counts_only_growth() {
+        assert_eq!(size_change(0, 400) + size_change(400, 900), 900);
+        assert_eq!(size_change(900, 600), -300, "缩了记负数，旧的大数不会挂着");
     }
 
     /// 落进正式缓存：暂存只记这次长到交付大小的部分，正式文件再按「加新减旧」算。
     #[test]
-    fn ledger_landing_counts_new_minus_old() {
-        let mut ledger = CacheLedger::default();
-        ledger.land(
-            0,
-            1_000,
-            40,
-            ReplacedBytes {
-                audio: 800,
-                sidecar: 30,
-            },
-        );
+    fn landed_delta_counts_new_minus_old() {
         assert_eq!(
-            ledger.pending(),
+            landed_delta(
+                0,
+                1_000,
+                40,
+                ReplacedBytes {
+                    audio: 800,
+                    sidecar: 30
+                }
+            ),
             1_000 + 40 - 800 - 30,
             "换高音质的净变化正好是加新减旧"
         );
@@ -4500,25 +4447,24 @@ mod tests {
 
     /// 断点续传跨过一次看盘：暂存那 500 已经在扫描结论里，这次只记长到 1000 的差额。
     #[test]
-    fn ledger_resume_after_a_scan_counts_only_the_growth() {
-        let mut ledger = CacheLedger::default();
-        ledger.land(500, 1_000, 0, ReplacedBytes::default());
-        assert_eq!(ledger.pending(), 500, "不能把盘上的 1000 再加一遍");
+    fn landed_delta_resume_after_a_scan_counts_only_the_growth() {
+        assert_eq!(
+            landed_delta(500, 1_000, 0, ReplacedBytes::default()),
+            500,
+            "不能把盘上的 1000 再加一遍"
+        );
     }
 
     /// 服务器判「早就下完了」（这次传输量为 0）也要按盘上完整文件记账，不能记成 0。
     #[test]
-    fn ledger_landing_records_full_file_when_nothing_transferred() {
-        let mut ledger = CacheLedger::default();
-        ledger.land(0, 700, 20, ReplacedBytes::default());
-        assert_eq!(ledger.pending(), 720);
+    fn landed_delta_records_full_file_when_nothing_transferred() {
+        assert_eq!(landed_delta(0, 700, 20, ReplacedBytes::default()), 720);
     }
 
-    /// 旧文件比新文件还大时账会变成负数；算已知占用时按 0 封底，不报负的占用。
+    /// 旧文件比新文件还大时账会变成负数；往外报已知占用时按 0 封底，不报负的占用。
     #[test]
-    fn ledger_never_reports_negative_usage() {
-        let mut ledger = CacheLedger::default();
-        ledger.land(
+    fn landed_delta_never_reports_negative_usage() {
+        let delta = landed_delta(
             0,
             100,
             10,
@@ -4527,21 +4473,12 @@ mod tests {
                 sidecar: 40,
             },
         );
-        assert!(ledger.pending() < 0, "旧文件减过头时账本可以为负");
+        assert!(delta < 0, "旧文件减过头时账本可以为负");
         assert_eq!(
-            3_000u64.saturating_add_signed(ledger.pending()),
+            3_000u64.saturating_add_signed(delta),
             0,
             "已知占用按 0 封底"
         );
-    }
-
-    /// 看盘之后整本换掉：删空缓存目录、换缓存位置都靠这一条自己纠正。
-    #[test]
-    fn ledger_reset_drops_everything() {
-        let mut ledger = CacheLedger::default();
-        ledger.note_staged(0, 900);
-        ledger.reset();
-        assert_eq!(ledger.pending(), 0);
     }
 
     /// 越线判定：上次看盘没到九成、账本把它推上去才提前跑；已经在上面的交给密集档。
@@ -4583,5 +4520,30 @@ mod tests {
         ] {
             assert!(paths.contains(&PathBuf::from(expected)), "缺少 {expected}");
         }
+    }
+
+    /// 暂存族按盘上真实文件量字节：几份真文件相加，0 字节的锁不影响。
+    #[test]
+    fn staged_family_bytes_sums_real_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("1-lossless-normal.m4a");
+        std::fs::write(&base, [0u8; 4]).unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.part"), [0u8; 100]).unwrap();
+        std::fs::write(
+            dir.path().join("1-lossless-normal.m4a.part.meta"),
+            [0u8; 30],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.dec.tmp"), [0u8; 10]).unwrap();
+        std::fs::write(dir.path().join("1-lossless-normal.m4a.part.lock"), b"").unwrap();
+        assert_eq!(staged_family_bytes(&base), 144);
+
+        let only_lock = dir.path().join("2-lossless-normal.m4a");
+        std::fs::write(dir.path().join("2-lossless-normal.m4a.part.lock"), b"").unwrap();
+        assert_eq!(
+            staged_family_bytes(&only_lock),
+            0,
+            "只有 0 字节的锁，量出来还是 0"
+        );
     }
 }
