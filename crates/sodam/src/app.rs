@@ -984,6 +984,7 @@ impl Root {
             prefetch_gate: PrefetchGate::default(),
             cache_summary: (0, 0, 0, 0),
             cache_summary_request_seq: 0,
+            // 启动期读一次（和上面的设置载入同一类）：只有一个时间戳和两个计数。
             cache_mark: sodam_core::cache::load_mark(),
             cache_maintenance_running: false,
             cache_clearing: false,
@@ -1039,7 +1040,9 @@ impl Root {
         root.maintain_cache(false, cx);
         // 未登录直接停在设置页，不走 `on_nav_changed`：这里补一次统计，
         // 否则设置页会一直显示 0（启动那一轮维护可能按到期规则跳过）。
-        if root.nav == Nav::Settings {
+        // 维护这轮真跑起来了就不再单独扫：它的盘点结果会直接落进 cache_summary，
+        // 再发一次统计只会多扫两棵树、还把这一轮的数字判成过期。
+        if root.nav == Nav::Settings && !root.cache_maintenance_running {
             root.refresh_cache_stats(cx);
         }
         if logged_in {

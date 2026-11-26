@@ -519,7 +519,7 @@ impl CoverTrimAlert {
 
 /// 上报门：只在动作变化时放行。
 ///
-/// 扫描一直不完整、动作一直是 `skip` 时，每轮维护（约 60 秒）都写一条 Warn 就是刷屏；
+/// 扫描一直不完整、动作一直是 `skip` 时，每轮维护都写一条 Warn 就是刷屏；
 /// 日志出口的折叠只吃「连续且完全相同」的行，字段里的字节数一变就断。所以由这里记住
 /// 上次报告的动作，同一个动作只报一次；扫描恢复完整（`None`）后复位，下次出问题再报。
 ///
@@ -710,9 +710,8 @@ fn sweep_legacy_residue_once(audio_root: &Path) -> Option<usize> {
 }
 
 /// 首轮巡检的连续不完整轮数上限：到顶就放弃，进程内不再重试。
-/// 5 轮 ≈ 5 分钟（按主心跳 60 秒一轮维护算，见 app_actions 的 maintain_cache），
-/// 目录长期读不到时不至于每 60 秒一次全量扫盘永不停止——那正是进程级
-/// 一次性门要省的开销。
+/// 5 轮 ≈ 一天半（常规 6 小时一轮维护），目录长期读不到时不至于每轮都白扫
+/// 一遍永不停止——那正是进程级一次性门要省的开销。
 const SWEEP_MAX_INCOMPLETE_ROUNDS: usize = 5;
 
 /// 首轮巡检的门：进程级状态（连续不完整轮数 + 是否已结束）独立成结构体，
@@ -733,7 +732,7 @@ impl SweepGate {
 
     /// 门是否已结束（完成或放弃）。
     ///
-    /// 调用方先问一句再扫：门关了就别再列目录，省掉每轮维护（约 60 秒一次）
+    /// 调用方先问一句再扫：门关了就别再列目录，省掉每轮维护
     /// 白付的 read_dir 与逐文件 metadata。
     fn is_finished(&self) -> bool {
         self.finished
@@ -778,8 +777,8 @@ impl SweepGate {
 
 /// 音频根下旧格式暂存残留的启动巡检，返回删除的文件数。
 ///
-/// 只在启动后的首轮维护实际执行：维护约 60 秒一轮，跨过年龄门槛的老残留
-/// 不会每分钟变多，每轮重扫几乎全是空跑。
+/// 只在启动后的首轮维护实际执行：维护常规 6 小时一轮，跨过年龄门槛的老残留
+/// 不会每轮变多，每轮重扫几乎全是空跑。
 ///
 /// 门用互斥锁 + [`std::sync::Mutex::try_lock`] 串行化：拿不到锁说明另一轮
 /// 巡检正在进行，本轮空转返回，不排队干等。锁中毒按「拿回状态继续跑」处理，
@@ -905,6 +904,12 @@ pub struct MaintenanceMark {
 /// 检查也要 6 小时起步，再密就回到「每分钟扫一次」的老问题。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// 接近上限（已用 ≥ 90%）时的加密检查间隔。
+///
+/// 配额是软上限：贴着额度时还在下载，按常规间隔一查就等于超着一整天。这一档只
+/// 在快满时生效，平时仍按 [`MAINTENANCE_INTERVAL`]。
+const MAINTENANCE_NEAR_LIMIT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// 已知超限后的重试下限：播放中的文件被租约挡着时这一轮可能一个都没删掉，
 /// 不设下限就会每拍重扫，等于把 #310 的尖峰按分钟复现。
 const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
@@ -914,9 +919,12 @@ const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
 
 /// 这一拍要不要真跑一轮维护。
 ///
-/// 两条触发：距上次维护超过 [`MAINTENANCE_INTERVAL`]，或上次盘点已知超限
-/// （超限按 [`MAINTENANCE_PRESSURE_RETRY`] 兜底重试）。没有记录（首次运行、
-/// 记录损坏、用户清空过缓存根）按到期处理，跑一轮就能重新立账。
+/// 三档触发，越接近上限查得越密：
+/// - 已知超限：过了 [`MAINTENANCE_PRESSURE_RETRY`] 就重试（挡住删除时不能每拍重扫）；
+/// - 已用 ≥ 90%：过了 [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 就查一次；
+/// - 其余：过了 [`MAINTENANCE_INTERVAL`] 才查。
+///
+/// 没有记录（首次运行、记录损坏、用户清空过缓存根）按到期处理，跑一轮就能重新立账。
 pub fn maintenance_due(
     mark: Option<&MaintenanceMark>,
     limits: MaintenanceLimits,
@@ -933,7 +941,17 @@ pub fn maintenance_due(
     if over_limit {
         return elapsed >= MAINTENANCE_PRESSURE_RETRY;
     }
-    elapsed >= MAINTENANCE_INTERVAL
+    if elapsed >= MAINTENANCE_INTERVAL {
+        return true;
+    }
+    let near = near_limit(mark.audio_bytes, limits.audio_bytes)
+        || near_limit(mark.cover_bytes, limits.cover_bytes);
+    near && elapsed >= MAINTENANCE_NEAR_LIMIT_INTERVAL
+}
+
+/// 已用是否摸到上限的九成。
+fn near_limit(known: u64, limit: u64) -> bool {
+    known.saturating_mul(10) >= limit.saturating_mul(9)
 }
 
 /// 一轮维护的结论：设置页的数字、界面要同步的删除清单、日志要的指标都在这里。
@@ -1067,10 +1085,13 @@ where
         "audio_incomplete"
     } else if cover_incomplete {
         "covers_incomplete"
-    } else if removed_files == 0 {
-        "below_limit"
-    } else {
+    } else if removed_files > 0 {
         "none"
+    } else if audio_bytes > limits.audio_bytes || cover_bytes > limits.cover_bytes {
+        // 超了却一个都没删掉：多半是租约或锁挡住了，别在日志里写成「没超限」。
+        "blocked"
+    } else {
+        "below_limit"
     };
 
     MaintenanceReport {
@@ -4005,6 +4026,25 @@ mod tests {
         };
         assert!(maintenance_due(Some(&stale), limits, now), "到点要扫");
 
+        let near = MaintenanceMark {
+            completed_at: now - MAINTENANCE_NEAR_LIMIT_INTERVAL,
+            audio_bytes: limits.audio_bytes / 10 * 9 + 1,
+            cover_bytes: 0,
+        };
+        assert!(
+            maintenance_due(Some(&near), limits, now),
+            "已经贴着上限：不能按常规间隔等一整天"
+        );
+        let near_but_fresh = MaintenanceMark {
+            completed_at: now - Duration::from_secs(60),
+            audio_bytes: limits.audio_bytes / 10 * 9 + 1,
+            cover_bytes: 0,
+        };
+        assert!(
+            !maintenance_due(Some(&near_but_fresh), limits, now),
+            "刚查过就别再查"
+        );
+
         let over = MaintenanceMark {
             completed_at: now - MAINTENANCE_PRESSURE_RETRY,
             audio_bytes: limits.audio_bytes + 1,
@@ -4050,5 +4090,96 @@ mod tests {
 
         std::fs::write(dir.path().join(MAINTENANCE_MARK_FILE), b"broken").unwrap();
         assert_eq!(load_mark_in(dir.path()), None);
+    }
+
+    /// #310 验收：代表规模（1000 个封面文件、1400 个音频/暂存文件）下，
+    /// 一轮维护对每棵树只遍历一次，四个数字来自同一次盘点。
+    #[test]
+    fn maintenance_round_scans_each_tree_once_at_representative_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        std::fs::create_dir_all(audio.join(STAGING_DIR_NAME)).unwrap();
+        std::fs::create_dir_all(covers.join("original")).unwrap();
+        for index in 0..500 {
+            std::fs::write(audio.join(format!("{index}.m4a")), [0u8; 8]).unwrap();
+            std::fs::write(audio.join(format!("{index}.quality")), [0u8; 8]).unwrap();
+            std::fs::write(covers.join(format!("{index:016}-160.img")), [0u8; 8]).unwrap();
+            std::fs::write(covers.join(format!("original/{index:016}.img")), [0u8; 8]).unwrap();
+        }
+        for index in 0..400 {
+            std::fs::write(audio.join(format!("staging/{index}.m4a.part")), [0u8; 8]).unwrap();
+        }
+
+        let visits = std::cell::RefCell::new(Vec::new());
+        let report = maintain_with(
+            &audio,
+            &covers,
+            MaintenanceLimits::from_mb(1024, 512),
+            &HashMap::new(),
+            |path| {
+                visits.borrow_mut().push(path.to_path_buf());
+                list_dir(path)
+            },
+        );
+
+        let audio_visits = visits
+            .borrow()
+            .iter()
+            .filter(|path| path.as_path() == audio.as_path())
+            .count();
+        let cover_visits = visits
+            .borrow()
+            .iter()
+            .filter(|path| path.as_path() == covers.as_path())
+            .count();
+        assert_eq!(audio_visits, 1, "1400 个文件的音频树一轮只扫一遍");
+        assert_eq!(cover_visits, 1, "1000 个文件的封面树一轮只扫一遍");
+        assert_eq!(report.scanned_files, 2400);
+        assert_eq!(report.songs, 500);
+        assert_eq!(report.cover_files, 1000);
+        assert_eq!(report.audio_bytes, 1400 * 8);
+        assert_eq!(report.cover_bytes, 1000 * 8);
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.skipped_reason, "below_limit");
+    }
+
+    /// 超了却全被租约挡住：报 `blocked`，别在日志里写成「没超限」。
+    #[test]
+    fn maintenance_round_reports_blocked_when_everything_is_leased() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        let playing = file(dir.path(), "audio/playing.m4a", 0);
+        file(dir.path(), "audio/playing.quality", 0);
+        let lease = CacheLease::acquire(&playing);
+
+        let report = maintain_with(
+            &audio,
+            &covers,
+            MaintenanceLimits {
+                audio_bytes: 0,
+                cover_bytes: 512 * 1024 * 1024,
+            },
+            &HashMap::new(),
+            list_dir,
+        );
+
+        assert_eq!(report.removed_files, 0, "租约保护的整组一个都不能删");
+        assert_eq!(report.skipped_reason, "blocked");
+        assert_eq!(report.audio_bytes, 20, "受保护的整组仍算在总量里");
+        assert!(playing.exists());
+        drop(lease);
+    }
+
+    /// 记录文件的坏值一律当没有记录：多一段、1970 之前、离谱的时间戳都不认。
+    #[test]
+    fn parse_mark_rejects_bad_values() {
+        assert!(parse_mark("1700000000\t12\t34\n").is_some());
+        assert!(parse_mark("1700000000\t12\t34\textra").is_none());
+        assert!(parse_mark("-1\t12\t34").is_none());
+        assert!(parse_mark("4000000001\t12\t34").is_none());
+        assert!(parse_mark("").is_none());
+        assert!(parse_mark("1700000000\t12").is_none());
     }
 }
