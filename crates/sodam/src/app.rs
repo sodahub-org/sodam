@@ -642,8 +642,10 @@ pub struct Root {
     /// 上次维护的结论（完成时刻 + 当时的占用）：到期判定只做一次比较。
     ///
     /// 启动时从缓存根读回来，每轮维护结束后由后台写回——进程重启不清零，
-    /// 也就不会「每次启动 60 秒后必扫一遍」（#310）。
+    /// 也就不会「每次启动 60 秒后必扫一遍」。
     pub(crate) cache_mark: Option<sodam_core::cache::MaintenanceMark>,
+    /// 被批量升级/清缓存挡下来的强制维护请求：挡路的收尾后要在心跳里补跑。
+    pub(crate) cache_maintenance_pending: bool,
     pub(crate) cache_maintenance_running: bool,
     pub(crate) cache_clearing: bool,
     pub(crate) batch_upgrade_target: sodam_core::quality::QualityIntent,
@@ -986,6 +988,7 @@ impl Root {
             cache_summary_request_seq: 0,
             // 启动期读一次（和上面的设置载入同一类）：只有一个时间戳和两个计数。
             cache_mark: sodam_core::cache::load_mark(),
+            cache_maintenance_pending: false,
             cache_maintenance_running: false,
             cache_clearing: false,
             batch_upgrade_target: sodam_core::quality::QualityIntent::Tier("lossless".into()),

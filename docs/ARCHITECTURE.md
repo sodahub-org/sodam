@@ -131,7 +131,9 @@ TrackItem + cache path
   未超上限的树连分组排序都不做。进设置页另有一次一次性统计扫描（`audio::cache_stats`），
   与维护这条路径无关。心跳每 60 秒只问一次「到期没」：上次维护的完成时刻与当时的占用
   落盘在缓存根的 `maintenance.tsv`（进程重启不清零），常规 6 小时一轮；已用摸到九成时
-  30 分钟查一次；已知超限时 10 分钟重试（播放中的文件会被租约挡住，重试不能按分钟来）。
+  30 分钟查一次；上一轮有子树读不全时也按 30 分钟重查（那次的字节只是下界）；已知超限时
+  10 分钟重试（播放中的文件会被租约挡住，重试不能按分钟来）。改上限若正撞上批量升级/清缓存，
+  请求会记下来等收尾后补跑。
   维护日志 `cache_maintenance` 记 `duration_ms` / `scanned_files` / `removed_files` /
   `skipped_reason`（`below_limit` / `blocked` / `*_incomplete` / `none`，#310）。
   实际缓存命中更新音频 mtime，巡检的 `is_cached` 不刷新最近使用时间。

@@ -539,7 +539,12 @@ impl Root {
                     }
                     if now.saturating_duration_since(root.last_cache_check) >= CACHE_MAINTENANCE {
                         root.last_cache_check = now;
-                        root.check_cache_maintenance(cx);
+                        // 被挡下来的强制请求优先补跑；没有就按到期规则问一句。
+                        if root.cache_maintenance_pending {
+                            root.maintain_cache_now(cx);
+                        } else {
+                            root.check_cache_maintenance(cx);
+                        }
                     }
                     root.load_more_recommendation(cx);
                     next_interval = if hot || root.volume_scrub.scrubbing() {
@@ -796,7 +801,7 @@ impl Root {
         cx.notify();
     }
 
-    /// 心跳与启动用：按到期规则问一句，没到点、也没超限就什么都不做（#310）。
+    /// 心跳与启动用：按到期规则问一句，没到点、也没超限就什么都不做。
     pub(crate) fn check_cache_maintenance(&mut self, cx: &mut Context<Self>) {
         self.run_cache_maintenance(false, cx);
     }
@@ -810,8 +815,14 @@ impl Root {
         // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
         // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
         if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
+            // 改上限这类强制请求被挡住时记一笔：挡路的收尾后在心跳里补跑，
+            // 否则新上限要等常规间隔才生效（旧标记还在，可能一直看着像「没超」）。
+            if force {
+                self.cache_maintenance_pending = true;
+            }
             return;
         }
+        self.cache_maintenance_pending = false;
         let limits = sodam_core::cache::MaintenanceLimits::from_mb(
             self.settings.audio_cache_limit_mb,
             sodam_core::cache::COVER_LIMIT_MB,
