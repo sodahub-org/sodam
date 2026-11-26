@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn dir_usage_and_count_extension_classify_files_correctly() {
+    fn cache_usage_classifies_bytes_files_and_songs() {
         let dir = std::env::temp_dir().join(format!("sodam-cache-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("original")).expect("mkdir");
@@ -1228,13 +1228,13 @@ mod tests {
         std::fs::write(dir.join("b.part"), [0u8; 50]).expect("part");
         std::fs::write(dir.join("original/full.img"), [0u8; 25]).expect("cover");
 
+        let usage = crate::cache::CacheUsage::scan(&dir);
         // 字节：递归含子目录，全部文件都算（100 + 12 + 50 + 25）
-        let (bytes, files) = dir_usage(&dir);
-        assert_eq!(bytes, 187, "应含子目录与边车/part");
-        assert_eq!(files, 4);
-        // 歌曲数：只数 .m4a（边车/part 不算歌）
-        assert_eq!(count_extension(&dir, "m4a"), 1);
-        assert_eq!(count_extension(&dir, "img"), 0, "只看顶层");
+        assert_eq!(usage.bytes, 187, "应含子目录与边车/part");
+        assert_eq!(usage.files, 4);
+        // 歌曲数：只数顶层 .m4a（边车/part 不算歌）
+        assert_eq!(usage.songs, 1);
+        assert!(!usage.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
