@@ -273,15 +273,17 @@ impl ScanGap {
 ///
 /// `incomplete` 记录「有地方没读到」：目录打不开、条目读错、元数据取不到。
 /// 这种情况下 `files` 只是可读部分的视图，总量偏小，不能当成完整统计。
-/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用；`gap_paths` 按目录记下每一处
-/// 缺口（元数据缺口记它所在的目录，同一处只留一条），用来判断「某一层是不是整个看见了」
-/// ——只看层名不够。
+/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用；`gap_paths` 记下每一处缺口
+/// 的位置（目录缺口是目录本身，元数据缺口是那个文件），用来判断「某一层是不是整个
+/// 看见了」——只看层名不够。同一目录的元数据缺口只留第一条，路径不重复堆。
 #[derive(Default)]
 pub(crate) struct Scan {
     pub(crate) files: Vec<ScannedFile>,
     pub(crate) incomplete: bool,
     pub(crate) gap: Option<ScanGap>,
     pub(crate) gap_paths: Vec<PathBuf>,
+    /// 已经记过元数据缺口的目录：同一层反复读不到只留第一条文件路径。
+    metadata_gap_dirs: HashSet<PathBuf>,
 }
 
 impl Scan {
@@ -293,16 +295,19 @@ impl Scan {
 
     /// 记一处扫描缺口；只保留第一处的层名，`incomplete` 与 `gap` 一起置上。
     ///
-    /// 缺口按目录记：元数据缺口落在文件上，但判断某一层看没看全只比目录前缀，
-    /// 存它所在的目录就够；同一处反复读不到只留一条，半坏的挂载点不会白存几千条路径。
+    /// 缺口路径保留原样：目录缺口记目录本身，元数据缺口记那个文件——判断某一层看没看全
+    /// 要分得清「这层没打开」和「这层里有个文件读不到」，兄弟文件的缺口不该连累整层。
+    /// 同一目录反复读不到元数据只留第一条，半坏的挂载点不会白存几千条路径。
     fn mark_incomplete(&mut self, gap: ScanGap, path: &Path) {
         self.incomplete = true;
-        let at = match gap {
-            ScanGap::Metadata => path.parent().unwrap_or(path),
-            ScanGap::Dir | ScanGap::Entry => path,
-        };
-        if !self.gap_paths.iter().any(|seen| seen.as_path() == at) {
-            self.gap_paths.push(at.to_owned());
+        match gap {
+            ScanGap::Metadata => {
+                let dir = path.parent().unwrap_or(path);
+                if self.metadata_gap_dirs.insert(dir.to_owned()) {
+                    self.gap_paths.push(path.to_owned());
+                }
+            }
+            ScanGap::Dir | ScanGap::Entry => self.gap_paths.push(path.to_owned()),
         }
         if self.gap.is_none() {
             self.gap = Some(gap);
@@ -2733,21 +2738,33 @@ mod tests {
         assert!(!empty.unreadable(), "目录不存在是空的，不是读不到");
     }
 
-    /// 缺口按目录记：同一处反复读不到只留一条，元数据缺口也只存所在目录。
+    /// 同一目录的元数据缺口只留第一条，但兄弟文件的缺口不能算到整层头上。
     #[test]
     fn scan_gaps_keep_one_entry_per_directory() {
+        let staging = Path::new("/cache/audio/staging");
         let mut scan = Scan::default();
         scan.mark_incomplete(ScanGap::Metadata, Path::new("/cache/audio/a.m4a"));
         scan.mark_incomplete(ScanGap::Metadata, Path::new("/cache/audio/b.m4a"));
-        assert_eq!(scan.gap_paths, vec![PathBuf::from("/cache/audio")]);
+        assert_eq!(scan.gap_paths, vec![PathBuf::from("/cache/audio/a.m4a")]);
         assert_eq!(scan.gap, Some(ScanGap::Metadata), "层名仍是第一处");
+        assert!(
+            scan.subtree_fully_listed(staging),
+            "兄弟文件的元数据缺口不算 staging 的缺口"
+        );
 
-        scan.mark_incomplete(ScanGap::Dir, Path::new("/cache/audio/staging"));
+        scan.mark_incomplete(ScanGap::Metadata, Path::new("/cache/audio/staging/x.part"));
+        assert!(
+            !scan.subtree_fully_listed(staging),
+            "staging 里的文件读不到，这层就不算看全"
+        );
+
+        scan.mark_incomplete(ScanGap::Dir, Path::new("/cache/audio/other"));
         assert_eq!(
             scan.gap_paths,
             vec![
-                PathBuf::from("/cache/audio"),
-                PathBuf::from("/cache/audio/staging")
+                PathBuf::from("/cache/audio/a.m4a"),
+                PathBuf::from("/cache/audio/staging/x.part"),
+                PathBuf::from("/cache/audio/other"),
             ]
         );
     }

@@ -152,8 +152,9 @@ TrackItem + cache path
   维护报告与进设置页的一次性统计（`audio::cache_stats`）都产出它。读不全时这几个数只是下界，
   设置页写成「至少 X」并跟一句「有缓存文件暂时读不到，数字可能偏小；稍后会自动重试」，
   不写具体原因（代码只知道没读到，分不清是被别的程序占着还是没权限）；整棵树一个文件都没
-  读到时那一段写「读不到」而不是 0 B（`CacheUsage::unreadable`），两棵树都这样就不再写总数。
-  手动清空返回 `cache::ClearReport`，提示里说清这一轮有没有读全。
+  读到时那一段写「读不到」而不是 0 B（`CacheUsage::unreadable`），两棵树都读不到才整行说
+  读不到，一棵读不到、另一棵是空的时候只报读得到的那棵。手动清空返回 `cache::ClearReport`，
+  提示里说清这一轮有没有读全。
   规模基准一条命令：`cargo run --release -p sodam-core --example cache_bench`，造
   1000 / 5000 / 20000 个文件各跑一轮，输出耗时、扫描文件数、删除数；入口是
   `cache::maintain_in`，不碰全局缓存根。

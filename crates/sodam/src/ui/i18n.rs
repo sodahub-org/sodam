@@ -531,6 +531,8 @@ impl Language {
             "至少 {}（歌曲 {} 首 {} / 封面读不到）" => {
                 "At least {} ({} songs {} / covers can't be read)"
             }
+            "歌曲读不到（封面 {} 张 {}）" => "Songs can't be read ({} covers {})",
+            "歌曲 {} 首 {}（封面读不到）" => "{} songs {} (covers can't be read)",
             "暂时读不到缓存占用，稍后会自动重试" => {
                 "Cache usage can't be read right now. Retrying automatically."
             }

@@ -24,35 +24,57 @@ fn human_bytes(bytes: u64) -> String {
 
 /// 缓存用量那一行：读全了写「共」，读不全写「至少」。
 ///
-/// 读不全又一个字节都没读到时，不写「至少 0 B」这种等于没说的数，直接说读不到；
-/// 只有一棵树读不到、另一棵读得到时，读不到的那一段写「读不到」，同样不写 0 B。
+/// 整棵树一个文件都没读到时那一段写「读不到」，不写 0 B；两棵树都读不到才整行说读不到。
+/// 只有一棵读不到、另一棵是空的时候没有总数可写，只报读得到的那棵。
 fn cache_usage_line(language: Language, usage: CacheUsageSummary) -> String {
     let total = usage.total_bytes();
     let incomplete = usage.incomplete();
-    if incomplete && total == 0 {
+    let audio_hidden = usage.audio.unreadable();
+    let covers_hidden = usage.covers.unreadable();
+    if audio_hidden && covers_hidden {
         return language
             .text("暂时读不到缓存占用，稍后会自动重试")
             .to_string();
     }
-    if usage.audio.unreadable() {
-        return language.textf(
-            "至少 {}（歌曲读不到 / 封面 {} 张 {}）",
-            &[
-                human_bytes(total),
-                usage.covers.files.to_string(),
-                human_bytes(usage.covers.bytes),
-            ],
-        );
+    if audio_hidden {
+        return if total == 0 {
+            language.textf(
+                "歌曲读不到（封面 {} 张 {}）",
+                &[
+                    usage.covers.files.to_string(),
+                    human_bytes(usage.covers.bytes),
+                ],
+            )
+        } else {
+            language.textf(
+                "至少 {}（歌曲读不到 / 封面 {} 张 {}）",
+                &[
+                    human_bytes(total),
+                    usage.covers.files.to_string(),
+                    human_bytes(usage.covers.bytes),
+                ],
+            )
+        };
     }
-    if usage.covers.unreadable() {
-        return language.textf(
-            "至少 {}（歌曲 {} 首 {} / 封面读不到）",
-            &[
-                human_bytes(total),
-                usage.audio.songs.to_string(),
-                human_bytes(usage.audio.bytes),
-            ],
-        );
+    if covers_hidden {
+        return if total == 0 {
+            language.textf(
+                "歌曲 {} 首 {}（封面读不到）",
+                &[
+                    usage.audio.songs.to_string(),
+                    human_bytes(usage.audio.bytes),
+                ],
+            )
+        } else {
+            language.textf(
+                "至少 {}（歌曲 {} 首 {} / 封面读不到）",
+                &[
+                    human_bytes(total),
+                    usage.audio.songs.to_string(),
+                    human_bytes(usage.audio.bytes),
+                ],
+            )
+        };
     }
     let args = [
         human_bytes(total),
@@ -1642,6 +1664,17 @@ mod tests {
         let text = cache_usage_line(Language::Chinese, covers_hidden);
         assert!(text.contains("封面读不到"), "{text}");
         assert!(!text.contains("0 B"), "读不到的树不能写成 0 B：{text}");
+
+        // 另一棵是空的时候没有总数可写：报读得到的那棵，别整行说读不到。
+        let audio_hidden_empty_covers = both(usage(0, 0, 0, true), usage(0, 0, 0, false));
+        let text = cache_usage_line(Language::Chinese, audio_hidden_empty_covers);
+        assert_eq!(text, "歌曲读不到（封面 0 张 0 B）", "{text}");
+        assert!(!text.contains("至少"), "{text}");
+
+        let covers_hidden_empty_audio = both(usage(0, 0, 0, false), usage(0, 0, 0, true));
+        let text = cache_usage_line(Language::Chinese, covers_hidden_empty_audio);
+        assert_eq!(text, "歌曲 0 首 0 B（封面读不到）", "{text}");
+        assert!(!text.contains("至少"), "{text}");
 
         let english = cache_usage_line(Language::English, audio_hidden);
         assert!(english.contains("can't be read"), "{english}");
