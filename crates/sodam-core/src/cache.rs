@@ -273,8 +273,9 @@ impl ScanGap {
 ///
 /// `incomplete` 记录「有地方没读到」：目录打不开、条目读错、元数据取不到。
 /// 这种情况下 `files` 只是可读部分的视图，总量偏小，不能当成完整统计。
-/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用；`gap_paths` 记下每一处
-/// 缺口的位置，用来判断「某一层是不是整个看见了」——只看层名不够。
+/// `gap` 是第一次没读到的位置落在哪一层，给报告与日志用；`gap_paths` 按目录记下每一处
+/// 缺口（元数据缺口记它所在的目录，同一处只留一条），用来判断「某一层是不是整个看见了」
+/// ——只看层名不够。
 #[derive(Default)]
 pub(crate) struct Scan {
     pub(crate) files: Vec<ScannedFile>,
@@ -291,9 +292,18 @@ impl Scan {
     }
 
     /// 记一处扫描缺口；只保留第一处的层名，`incomplete` 与 `gap` 一起置上。
+    ///
+    /// 缺口按目录记：元数据缺口落在文件上，但判断某一层看没看全只比目录前缀，
+    /// 存它所在的目录就够；同一处反复读不到只留一条，半坏的挂载点不会白存几千条路径。
     fn mark_incomplete(&mut self, gap: ScanGap, path: &Path) {
         self.incomplete = true;
-        self.gap_paths.push(path.to_owned());
+        let at = match gap {
+            ScanGap::Metadata => path.parent().unwrap_or(path),
+            ScanGap::Dir | ScanGap::Entry => path,
+        };
+        if !self.gap_paths.iter().any(|seen| seen.as_path() == at) {
+            self.gap_paths.push(at.to_owned());
+        }
         if self.gap.is_none() {
             self.gap = Some(gap);
         }
@@ -327,7 +337,11 @@ pub struct CacheUsage {
 impl CacheUsage {
     /// 扫一遍目录得到用量。和维护共用同一份递归扫描，不另写一套遍历。
     pub fn scan(dir: &Path) -> Self {
-        let scan = scan_files(dir);
+        Self::of_scan(dir, scan_files(dir))
+    }
+
+    /// 把一次扫描折成用量；一次性统计走这里，口径和维护报告保持一致。
+    fn of_scan(dir: &Path, scan: Scan) -> Self {
         let songs = scan
             .files
             .iter()
@@ -339,6 +353,13 @@ impl CacheUsage {
             songs,
             incomplete: scan.incomplete,
         }
+    }
+
+    /// 这棵树一个文件都没读到，而且确实有地方没读到：这个数不是 0，是不知道。
+    ///
+    /// 和「目录本来就是空的」分开：空的读全了（`incomplete` 为假），照实写 0。
+    pub fn unreadable(&self) -> bool {
+        self.incomplete && self.files == 0
     }
 }
 
@@ -825,7 +846,7 @@ where
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClearReport {
     pub removed: usize,
-    /// 这一轮有没有目录没读到：读不全时，没看到的那几个文件清不掉。
+    /// 这一轮有没有地方没读到（目录、条目或元数据）：读不全时，没看到的那几个文件清不掉。
     pub incomplete: bool,
 }
 
@@ -2689,6 +2710,46 @@ mod tests {
 
         let missing = CacheUsage::scan(&dir.path().join("missing"));
         assert_eq!(missing, CacheUsage::default(), "目录不存在是空的");
+    }
+
+    /// 整棵树一个文件都没读到，和真的空树要分得开：前者是「不知道」，不是 0。
+    #[test]
+    fn usage_tells_an_unreadable_tree_from_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), "audio/keep.m4a", 0);
+        let audio = dir.path().join("audio");
+        let denied = audio.join("staging");
+        file(dir.path(), "audio/staging/two.m4a.part", 0);
+
+        let partial = CacheUsage::of_scan(&audio, scan_denying(dir.path(), &denied));
+        assert!(partial.incomplete);
+        assert!(!partial.unreadable(), "读到了东西就不是整棵读不到");
+
+        let nothing = CacheUsage::of_scan(&audio, scan_with(dir.path(), denying(&audio)));
+        assert!(nothing.incomplete);
+        assert!(nothing.unreadable(), "一个文件都没读到，不能当成空树");
+
+        let empty = CacheUsage::scan(&dir.path().join("missing"));
+        assert!(!empty.unreadable(), "目录不存在是空的，不是读不到");
+    }
+
+    /// 缺口按目录记：同一处反复读不到只留一条，元数据缺口也只存所在目录。
+    #[test]
+    fn scan_gaps_keep_one_entry_per_directory() {
+        let mut scan = Scan::default();
+        scan.mark_incomplete(ScanGap::Metadata, Path::new("/cache/audio/a.m4a"));
+        scan.mark_incomplete(ScanGap::Metadata, Path::new("/cache/audio/b.m4a"));
+        assert_eq!(scan.gap_paths, vec![PathBuf::from("/cache/audio")]);
+        assert_eq!(scan.gap, Some(ScanGap::Metadata), "层名仍是第一处");
+
+        scan.mark_incomplete(ScanGap::Dir, Path::new("/cache/audio/staging"));
+        assert_eq!(
+            scan.gap_paths,
+            vec![
+                PathBuf::from("/cache/audio"),
+                PathBuf::from("/cache/audio/staging")
+            ]
+        );
     }
 
     /// 清空照常删看得到的文件，但要把「这轮没读全」交回去。

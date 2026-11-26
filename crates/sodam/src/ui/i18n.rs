@@ -525,6 +525,12 @@ impl Language {
             "至少 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => {
                 "At least {} ({} songs {}, {} covers {})"
             }
+            "至少 {}（歌曲读不到 / 封面 {} 张 {}）" => {
+                "At least {} (songs can't be read / {} covers {})"
+            }
+            "至少 {}（歌曲 {} 首 {} / 封面读不到）" => {
+                "At least {} ({} songs {} / covers can't be read)"
+            }
             "暂时读不到缓存占用，稍后会自动重试" => {
                 "Cache usage can't be read right now. Retrying automatically."
             }
@@ -538,12 +544,11 @@ impl Language {
             "已清理缓存：{} 个文件；有缓存文件暂时读不到，可能没清干净" => {
                 "Cleared {} cache files; some files couldn't be read, so a few may remain"
             }
-            "音频缓存上限：{}" => "Audio cache limit: {}",
-            "合计里还包含封面图片；封面另有 {} 上限" => {
-                "The total above also includes cover images; covers have their own {} limit"
+            "音频缓存上限：{}（合计还含封面，封面另有 {} 上限）" => {
+                "Audio cache limit: {} (the total also includes covers, which have their own {} limit)"
             }
-            "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留，所以占用会暂时超过上限" => {
-                "Older songs are cleaned up automatically; files in use are kept for now, so usage can temporarily go over the limit"
+            "自动清理较早使用的歌曲；占用偶尔会暂时超过上限" => {
+                "Older songs are cleaned up automatically; usage can briefly go over the limit"
             }
             "上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试" => {
                 "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet. Retrying automatically."
