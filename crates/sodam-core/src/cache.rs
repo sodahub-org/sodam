@@ -2648,6 +2648,8 @@ mod tests {
     fn scan_records_where_it_could_not_read() {
         let dir = tempfile::tempdir().unwrap();
         file(dir.path(), "audio/keep.m4a", 0);
+        // 目录得先存在，扫描才会去列它——不然拒绝闭包一次都不会被调用。
+        file(dir.path(), "audio/staging/two.m4a.part", 0);
         let audio = dir.path().join("audio");
         let denied = audio.join("staging");
         let scan = scan_denying(dir.path(), &denied);
