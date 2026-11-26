@@ -129,7 +129,12 @@ fn cache_blocked_hint(
         });
     }
     let mark = mark?;
-    (mark.audio_bytes > audio_limit_bytes && over).then(|| {
+    if mark.audio_bytes <= audio_limit_bytes || !over {
+        return None;
+    }
+    Some(if usage_hint_shown(usage) {
+        language.text("上次清理没能删到上限以下：有文件正在使用或暂时删不掉")
+    } else {
         language.text("上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试")
     })
 }
@@ -1785,9 +1790,17 @@ mod tests {
             incomplete: false,
         };
 
-        assert!(
-            cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024)
-                .is_some_and(|hint| hint.contains("上次清理没能删到上限以下"))
+        assert_eq!(
+            cache_blocked_hint(Language::Chinese, Some(&mark), over, 1024),
+            Some("上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试"),
+            "数字行下面那句没出现，重试承诺由这条自己说"
+        );
+
+        // 封面读不全但读到了数：数字行下面那句会出现，这条不重复重试承诺。
+        let over_with_cover_gap = both(usage(2048, 1, 1, false), usage(512, 2, 0, true));
+        assert_eq!(
+            cache_blocked_hint(Language::Chinese, Some(&mark), over_with_cover_gap, 1024),
+            Some("上次清理没能删到上限以下：有文件正在使用或暂时删不掉")
         );
         assert!(
             cache_blocked_hint(Language::Chinese, Some(&mark), cleared, 1024).is_none(),

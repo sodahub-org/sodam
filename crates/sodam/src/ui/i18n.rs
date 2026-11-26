@@ -553,6 +553,9 @@ impl Language {
             "自动清理较早使用的歌曲；占用偶尔会暂时超过上限" => {
                 "Older songs are cleaned up automatically; usage can briefly go over the limit"
             }
+            "上次清理没能删到上限以下：有文件正在使用或暂时删不掉" => {
+                "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet"
+            }
             "上次清理没能删到上限以下：有文件正在使用或暂时删不掉，稍后会自动重试" => {
                 "The last cleanup couldn't get under the limit: some files are in use or can't be removed yet. Retrying automatically."
             }
