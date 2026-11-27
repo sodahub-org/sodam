@@ -13,7 +13,8 @@ pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let Some(prompt) = root.close_prompt else {
         return div().into_any_element();
     };
-    let tray_available = prompt.tray_available;
+    // 现读而不是弹窗打开时快照：托盘可能在弹窗开着的时候下线。
+    let tray_available = root.tray_available_now();
     let remember = prompt.remember;
 
     let mut card = div()
@@ -60,7 +61,7 @@ pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 }))
                 .child(
                     div()
-                        .size(px(16.0))
+                        .size(px(theme::ICON))
                         .flex()
                         .items_center()
                         .justify_center()

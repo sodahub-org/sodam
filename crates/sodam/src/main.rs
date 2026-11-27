@@ -326,9 +326,9 @@ fn main() {
                     };
                     let root = app.clone();
                     cx.defer(move |cx| {
-                        let _ = window.update(cx, |_, _window, cx| {
+                        let _ = window.update(cx, |_, window, cx| {
                             root.update(cx, |root, cx| {
-                                root.handle_close_request(cx);
+                                root.request_close(window, cx);
                             });
                         });
                     });

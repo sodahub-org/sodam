@@ -123,6 +123,8 @@ struct Media {
 }
 
 struct Attached {
+    /// 注册时用的窗口句柄：窗口重建后 HWND 会变，变了就得重挂（#324）。
+    hwnd: Option<*mut c_void>,
     media: RefCell<Media>,
 }
 
@@ -132,8 +134,16 @@ impl Global for Attached {}
 ///
 /// 注册失败只记日志：拿不到媒体面板不该影响播放。
 pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
-    if cx.has_global::<Attached>() {
+    // 同一个窗口重复调用直接跳过；窗口重建后 HWND 变了，旧的控件还挂在已销毁的
+    // 窗口上，必须摘掉重来，否则 Windows 的媒体面板与媒体键会失联（#324）。
+    if cx
+        .try_global::<Attached>()
+        .is_some_and(|attached| attached.hwnd == hwnd)
+    {
         return;
+    }
+    if cx.has_global::<Attached>() {
+        cx.remove_global::<Attached>();
     }
     let (command_tx, commands) = std::sync::mpsc::channel::<Command>();
     let commands_pending = Arc::new(AtomicBool::new(false));
@@ -155,6 +165,7 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
         }
     };
     cx.set_global(Attached {
+        hwnd,
         media: RefCell::new(Media {
             controls,
             commands,

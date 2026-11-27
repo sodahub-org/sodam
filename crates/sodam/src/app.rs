@@ -359,8 +359,6 @@ pub(crate) struct BatchUpgradeProgress {
 /// 关窗询问弹窗的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosePrompt {
-    /// 弹窗弹出时托盘是否可用：「隐藏到托盘」只在可用时给。
-    pub tray_available: bool,
     /// 是否勾选了「记住我的选择」。
     pub remember: bool,
 }
@@ -1783,16 +1781,13 @@ impl Root {
         }
         let tray_available = self.tray_available_now();
         let stored = CloseAction::from_key(&self.settings.close_action);
-        // 配置里选了「收进托盘」但桌面没有托盘：降级成退出，并留一条可查的记录。
-        if !tray_available && stored == Some(CloseAction::Hide) {
-            log_event(
-                LogLevel::Info,
-                LogTopic::App,
-                "close_action_downgraded",
-                &[],
-            );
+        let action = CloseAction::decide(&self.settings.close_action, tray_available);
+        // 桌面没有托盘，按退出处理：配置里写的是「收进托盘」或根本没选过。
+        // 进程马上就走，界面上说不了话，留一条日志好排查。
+        if !tray_available && action == CloseAction::Quit && stored != Some(CloseAction::Quit) {
+            log_event(LogLevel::Info, LogTopic::App, "close_without_tray", &[]);
         }
-        match CloseAction::decide(&self.settings.close_action, tray_available) {
+        match action {
             // 收进托盘就是「窗口照常关掉、进程留着」：让平台自己关，不在这里重复销毁。
             CloseAction::Hide => true,
             CloseAction::Quit => {
@@ -1801,7 +1796,6 @@ impl Root {
             }
             CloseAction::Ask => {
                 self.close_prompt = Some(ClosePrompt {
-                    tray_available,
                     // 用户明确选了「每次询问」时，别替他勾上「记住」。
                     remember: stored != Some(CloseAction::Ask),
                 });
@@ -1821,6 +1815,11 @@ impl Root {
         let Some(prompt) = self.close_prompt.take() else {
             return;
         };
+        // 弹窗开着的时候托盘可能已经下线：这时「隐藏」会把用户关在门外，按退出处理。
+        let action = match action {
+            CloseAction::Hide if !self.tray_available_now() => CloseAction::Quit,
+            other => other,
+        };
         if prompt.remember {
             self.settings.close_action = action.key().to_string();
             self.save_settings();
@@ -1829,6 +1828,14 @@ impl Root {
             CloseAction::Quit => self.request_quit(cx),
             CloseAction::Hide => window.remove_window(),
             CloseAction::Ask => {}
+        }
+    }
+
+    /// 程序主动发起的关窗（自绘标题栏的关闭按钮、macOS 的 ⌘W）：按策略处理，
+    /// 放行时自己把窗口收掉——这两个入口没有平台关窗钩子替它们关窗。
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_close_request(cx) {
+            window.remove_window();
         }
     }
 

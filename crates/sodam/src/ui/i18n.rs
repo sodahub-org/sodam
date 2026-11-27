@@ -132,7 +132,7 @@ impl Language {
             "关闭按钮：退出应用" => "Close button: quit the app",
             "关闭按钮：隐藏到托盘" => "Close button: hide to tray",
             "关闭按钮：每次询问" => "Close button: ask every time",
-            "关闭汽水音乐？" => "Close SodaM?",
+            "关闭汽水音乐？" => "Close Qishui Music?",
             "关闭窗口后应用会继续在后台播放，可以从系统托盘重新打开。" => {
                 "The window closes but playback continues in the background; reopen it from the system tray."
             }

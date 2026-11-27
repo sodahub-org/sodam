@@ -450,14 +450,14 @@ impl CloseAction {
     ///
     /// * 用户选过就照办，但「收进托盘」在没有托盘时降级成退出——宁可退得保守，
     ///   也不留一个找不回来的进程。
-    /// * 用户没选过：有托盘就沿用原来的「收进托盘」，没托盘就问一次，
-    ///   顺便把「这个桌面没有托盘」讲清楚。
+    /// * 用户没选过：有托盘就沿用原来的「收进托盘」，没托盘就直接退出。
+    ///   收进一个看不见的地方才是 #324 的问题，不是退出。
     pub fn decide(stored: &str, tray_available: bool) -> Self {
         match Self::from_key(stored) {
             Some(Self::Hide) if !tray_available => Self::Quit,
             Some(action) => action,
             None if tray_available => Self::Hide,
-            None => Self::Ask,
+            None => Self::Quit,
         }
     }
 }
@@ -1788,9 +1788,9 @@ mod tests {
         assert_eq!(CloseAction::from_key("quit"), Some(CloseAction::Quit));
         assert_eq!(CloseAction::from_key("exit"), Some(CloseAction::Quit));
 
-        // 没选过：有托盘沿用「收进托盘」，没托盘问一次
+        // 没选过：有托盘沿用「收进托盘」，没托盘直接退出
         assert_eq!(CloseAction::decide("", true), CloseAction::Hide);
-        assert_eq!(CloseAction::decide("", false), CloseAction::Ask);
+        assert_eq!(CloseAction::decide("", false), CloseAction::Quit);
 
         // 选过就照办；只有「收进托盘」在没有托盘时降级成退出
         assert_eq!(CloseAction::decide("ask", false), CloseAction::Ask);
