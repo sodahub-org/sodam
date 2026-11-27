@@ -358,9 +358,9 @@ pub(crate) struct BatchUpgradeProgress {
 
 /// 关窗询问弹窗的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClosePrompt {
+pub(crate) struct ClosePrompt {
     /// 是否勾选了「记住我的选择」。
-    pub remember: bool,
+    pub(crate) remember: bool,
 }
 
 /// 根视图状态。
@@ -1766,7 +1766,7 @@ impl Root {
     }
 
     /// 托盘现在可用吗：Linux 看桌面有没有 StatusNotifier 宿主，其它平台恒为 true。
-    pub fn tray_available_now(&self) -> bool {
+    pub(crate) fn tray_available_now(&self) -> bool {
         self.tray_available.load(Ordering::Acquire)
     }
 

@@ -255,8 +255,15 @@ fn start_tray_service(
 fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
-    } else {
-        let _ = open_main_window(cx, app);
+    } else if let Err(error) = open_main_window(cx, app) {
+        // 托盘恢复窗口失败别静默吞掉：用户会看到「点了没反应」。
+        let detail = format!("{error:#}");
+        sodam_core::log_outlet::log_event(
+            sodam_core::log_outlet::LogLevel::Error,
+            sodam_core::log_outlet::LogTopic::App,
+            "open_main_window_failed",
+            &[("detail", detail.as_str())],
+        );
     }
     cx.activate(true);
 }
