@@ -2852,6 +2852,11 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
+                // 换队之后这条源就作废了：`play_from` 不推请求序号，迟到的这一页
+                // 会 append 进用户自己挑的队列里。
+                if !root.queue_origin.is_feed_like() {
+                    return;
+                }
                 match result {
                     Ok(batch) => {
                         let added = root.queue.append(batch.tracks);
