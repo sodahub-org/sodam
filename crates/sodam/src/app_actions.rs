@@ -155,6 +155,17 @@ pub(crate) enum ViewTakeover {
 }
 
 impl Root {
+    /// 只收自己这轮留下的切换态。
+    ///
+    /// `switching_queue` 是全局一个，谁都能写。清之前必须先认领：这期间用户可能已经
+    /// 开了别的加载（歌单 / 听歌模式 / 推荐），那个「正在加载」是他在等的东西，替
+    /// 他一撤，页面就先露出旧队列、等新的回来再跳一次。
+    fn clear_own_queue_switch(&mut self, origin: &QueueOrigin) {
+        if self.switching_queue.as_ref() == Some(origin) {
+            self.switching_queue = None;
+        }
+    }
+
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
@@ -1728,9 +1739,7 @@ impl Root {
         //
         // 只收自己这轮留下的那份：这期间用户可能已经点开了某张歌单，那个
         // 「正在加载」是他的，替他撤掉就会先露出旧内容、等歌单回来再跳一次。
-        if self.switching_queue.as_ref() == Some(&origin) {
-            self.switching_queue = None;
-        }
+        self.clear_own_queue_switch(&origin);
         if matches!(take_over, ViewTakeover::Keep) {
             // 用户已经自己走了：这份结果不属于他此刻在用的任何东西，整份丢掉。
             return;
@@ -2487,7 +2496,9 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
-                root.switching_queue = None;
+                // 只收自己这轮留下的切换态：这期间用户可能已经开了别的加载，
+                // 替他撤掉等于把他在等的那个页面弄丢。
+                root.clear_own_queue_switch(&QueueOrigin::Feed);
                 // 这一轮装载开始后界面被换走过：结果只落数据，不把界面拽回来（#330）。
                 let take_over = if root.nav_seq == load_nav_seq {
                     ViewTakeover::Take
@@ -2641,11 +2652,8 @@ impl Root {
         if self.loading_playlist {
             return;
         }
-        self.begin_queue_switch(
-            QueueOrigin::Playlist(playlist.id.clone()),
-            &playlist.title,
-            cx,
-        );
+        let switch_origin = QueueOrigin::Playlist(playlist.id.clone());
+        self.begin_queue_switch(switch_origin.clone(), &playlist.title, cx);
         self.loading_playlist = true;
         self.set_status("正在加载歌单「{}」…", std::slice::from_ref(&playlist.title));
         cx.notify();
@@ -2668,7 +2676,7 @@ impl Root {
                         root.new_playback_round();
                         root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
                         root.recommendation = None;
-                        root.switching_queue = None;
+                        root.clear_own_queue_switch(&switch_origin);
                         root.sync_queue_cache();
                         let covers: Vec<String> = root
                             .queue
@@ -2681,14 +2689,17 @@ impl Root {
                         root.start_track(true, cx);
                     }
                     Ok(_) => {
-                        root.switching_queue = None;
+                        root.clear_own_queue_switch(&switch_origin);
+                        // 停在歌词页上既没声音也没入口，回有重试的听歌模式页。
+                        root.set_nav(Nav::Scenes, cx);
                         root.set_status(
                             "歌单「{}」没有可播放曲目",
                             std::slice::from_ref(&playlist.title),
                         );
                     }
                     Err(err) => {
-                        root.switching_queue = None;
+                        root.clear_own_queue_switch(&switch_origin);
+                        root.set_nav(Nav::Scenes, cx);
                         let message = root.failure_text("加载歌单失败", &err, REMOTE_TEXT);
                         root.notify_error_once("playlist-load-failed", message);
                     }
@@ -6064,16 +6075,18 @@ mod view_takeover_tests {
     fn queue_switch_state_is_only_cleared_when_it_belongs_to_this_load() {
         let source = include_str!("app_actions.rs");
         let body = source
-            .split("pub(crate) fn activate_recommended_queue")
+            .split("fn clear_own_queue_switch")
             .nth(1)
-            .expect("activate_recommended_queue 应当存在");
-        let body = &body[..body
-            .find("pub(crate) fn sync_scenes_list")
-            .unwrap_or(body.len())];
+            .expect("clear_own_queue_switch 应当存在");
+        let end = body
+            .find("\n    pub fn ")
+            .or_else(|| body.find("\n    fn "))
+            .unwrap_or(body.len());
+        let body = &body[..end];
 
         let guard_at = body
-            .find("if self.switching_queue.as_ref() == Some(&origin)")
-            .expect("收切换态之前必须先确认它是自己这轮留下的");
+            .find("if self.switching_queue.as_ref() == Some(origin)")
+            .expect("收切换态之前必须先认领它是自己的");
         let clear_at = body
             .find("self.switching_queue = None;")
             .expect("切换态必须在这里终结");

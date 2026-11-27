@@ -297,6 +297,7 @@ impl Language {
                 "Prefer low (≈128k); the service falls back when unavailable"
             }
             "正在准备推荐队列…" => "Preparing recommendations…",
+            "推荐队列还没有加载" => "Recommendations haven't loaded yet",
             "正在准备播放…" => "Preparing playback…",
             "正在创建二维码…" => "Creating QR code…",
             "正在播放" => "Now Playing",

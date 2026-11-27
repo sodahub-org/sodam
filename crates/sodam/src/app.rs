@@ -389,7 +389,7 @@ pub struct Root {
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
-    /// 页签代数：`set_nav` / `go_back` 每换一次页面 +1（记在 `on_nav_changed`），
+    /// 换页计数：`set_nav` / `go_back` 每换一次页面 +1（记在 `on_nav_changed`），
     /// 后台装载回来比一下快照，变了就把结果丢掉（#330）。
     ///
     /// 快照取在装载自己那次切页**之后**：装载把界面带到加载页不算用户走开。
@@ -1088,6 +1088,9 @@ impl Root {
             if !query.trim().is_empty() {
                 root.search_field.set_text(query);
                 root.nav = Nav::Search;
+                // 直接写 `nav` 要自己补这一步：换页计数记在 `on_nav_changed` 里，
+                // 漏了它，启动那轮推荐装载回来就判不出人已经在搜索页（#330）。
+                root.on_nav_changed(cx);
                 root.run_search(cx);
             }
         }
