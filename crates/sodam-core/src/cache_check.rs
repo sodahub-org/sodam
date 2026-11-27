@@ -86,8 +86,7 @@ pub struct MaintenanceAsk<'a> {
 
 /// 「该不该清」的判断，外加一笔「被挡下的强制请求」的欠账。
 ///
-/// 欠账只记在这里：被挡下的强制请求记一笔，挡路的结束后的下一次检查不管到没到期都
-/// 补跑（心跳里那句到期判断被 60 秒门限闸着，所以最迟 60 秒），跑起来就销账。放在这里而不是界面里，是为了让「会不会补跑」也能被测到。
+/// 欠账记在这里而不是界面里，是为了让「会不会补跑」也能被测到。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheCheck {
     owed: bool,
@@ -476,7 +475,7 @@ mod tests {
         );
     }
 
-    /// 票面那张表逐格钉死：期望值全是字面量，不复用 `ask` 里的任何谓词。
+    /// 判定表逐格对照：期望值全是字面量，不复用 `ask` 里的任何判断。
     #[test]
     fn the_decision_table_is_pinned_cell_by_cell() {
         let limits = limits();
