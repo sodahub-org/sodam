@@ -121,6 +121,9 @@ pub struct Settings {
     /// Linux 下是否自绘窗口控制按钮：`auto`（默认，按桌面装饰能力）/ `always` / `never`。
     /// Windows 与 macOS 由系统负责，此项不生效。
     pub titlebar: String,
+    /// 关闭主窗口时的行为：`ask` / `hide` / `quit`。
+    /// 空串 = 没选过，按平台默认：有托盘就收进托盘，没托盘就退出（见 [`CloseAction::decide`]）。
+    pub close_action: String,
     /// 播放/暂停快捷键（gpui 的 keystroke 写法，如 `space`、`ctrl-left`）。
     /// 空串 = 用内置默认值 `DEFAULT_SHORTCUT_*`。
     pub shortcut_toggle: String,
@@ -409,6 +412,59 @@ impl TitlebarMode {
     }
 }
 
+/// 关闭主窗口时的行为。
+///
+/// 「收进托盘」成立的前提是桌面真有托盘可收：GNOME 3.26 起默认不提供
+/// StatusNotifier 宿主，收进去就成了一个看不见也退不掉的进程。
+/// 所以没有托盘时一律降级成退出，而不是把用户关在门外。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// 每次关窗都问一句。
+    Ask,
+    /// 收进托盘，后台继续播放。
+    Hide,
+    /// 直接退出应用。
+    Quit,
+}
+
+impl CloseAction {
+    /// 配置里的写法；空串或不认识的写法都算「没选过」。
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "hide" | "tray" => Some(Self::Hide),
+            "quit" | "exit" => Some(Self::Quit),
+            _ => None,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Hide => "hide",
+            Self::Quit => "quit",
+        }
+    }
+
+    /// 这次关窗实际该怎么做。规则只在这一处，别处别再解析一遍配置。
+    pub fn decide(stored: &str, tray_available: bool) -> Self {
+        Self::decide_from(Self::from_key(stored), tray_available)
+    }
+
+    /// 同 [`Self::decide`]，只是配置已经解析过：调用方还要用 `stored` 做别的判断时用它。
+    ///
+    /// * 用户选过就照办，只有「收进托盘」在没有托盘时降级成退出。
+    /// * 没选过：有托盘就沿用原来的「收进托盘」，没托盘就直接退出。
+    pub fn decide_from(stored: Option<Self>, tray_available: bool) -> Self {
+        match stored {
+            Some(Self::Hide) if !tray_available => Self::Quit,
+            Some(action) => action,
+            None if tray_available => Self::Hide,
+            None => Self::Quit,
+        }
+    }
+}
+
 /// 解析配置文本：先按整份解析；失败时做字段级容错（类型不对的字段丢掉补默认值，
 /// 其余照常生效），只有语法坏或结构对不上才报错。错误信息带大致行列位置
 /// （`line X column Y`——领域层不知道界面语言，位置信息用语言无关的技术写法）。
@@ -486,6 +542,7 @@ fn sanitize_config_value(value: &mut serde_json::Value) -> Vec<String> {
         "theme",
         "language",
         "titlebar",
+        "close_action",
         "shortcut_toggle",
         "shortcut_previous",
         "shortcut_next",
@@ -788,6 +845,7 @@ impl Default for Settings {
             theme: String::new(),
             language: String::new(),
             titlebar: String::new(),
+            close_action: String::new(),
             shortcut_toggle: String::new(),
             shortcut_previous: String::new(),
             shortcut_next: String::new(),
@@ -1410,6 +1468,7 @@ impl Settings {
             theme: _,
             language: _,
             titlebar: _,
+            close_action: _,
             shortcut_toggle: _,
             shortcut_previous: _,
             shortcut_next: _,
@@ -1719,6 +1778,39 @@ mod tests {
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.titlebar, "");
         assert_eq!(TitlebarMode::from_key(&loaded.titlebar), TitlebarMode::Auto);
+    }
+
+    /// 关闭按钮行为：没选过按平台默认，没托盘时绝不收进托盘。
+    #[test]
+    fn close_action_parses_and_degrades_without_tray() {
+        assert_eq!(CloseAction::from_key(""), None);
+        assert_eq!(CloseAction::from_key("nonsense"), None);
+        assert_eq!(CloseAction::from_key(" ASK "), Some(CloseAction::Ask));
+        assert_eq!(CloseAction::from_key("hide"), Some(CloseAction::Hide));
+        assert_eq!(CloseAction::from_key("tray"), Some(CloseAction::Hide));
+        assert_eq!(CloseAction::from_key("quit"), Some(CloseAction::Quit));
+        assert_eq!(CloseAction::from_key("exit"), Some(CloseAction::Quit));
+
+        // 没选过：有托盘沿用「收进托盘」，没托盘直接退出
+        assert_eq!(CloseAction::decide("", true), CloseAction::Hide);
+        assert_eq!(CloseAction::decide("", false), CloseAction::Quit);
+
+        // 选过就照办；只有「收进托盘」在没有托盘时降级成退出
+        assert_eq!(CloseAction::decide("ask", false), CloseAction::Ask);
+        assert_eq!(CloseAction::decide("quit", true), CloseAction::Quit);
+        assert_eq!(CloseAction::decide("hide", true), CloseAction::Hide);
+        assert_eq!(CloseAction::decide("hide", false), CloseAction::Quit);
+
+        // 旧配置没有 close_action 字段时读成空串，走平台默认
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"theme":"dark","language":"zh"}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.close_action, "");
+        assert_eq!(
+            CloseAction::decide(&loaded.close_action, true),
+            CloseAction::Hide
+        );
     }
 
     /// 快捷键：默认值、空串回退、老配置缺字段也能读。
@@ -2435,6 +2527,7 @@ mod tests {
             theme,
             language,
             titlebar,
+            close_action,
             shortcut_toggle,
             shortcut_previous,
             shortcut_next,
@@ -2497,6 +2590,9 @@ mod tests {
             changed("theme", |s| s.theme = format!("{theme}light")),
             changed("language", |s| s.language = format!("{language}en")),
             changed("titlebar", |s| s.titlebar = format!("{titlebar}always")),
+            changed("close_action", |s| {
+                s.close_action = format!("{close_action}quit")
+            }),
             changed("shortcut_toggle", |s| {
                 s.shortcut_toggle = format!("{shortcut_toggle}space")
             }),

@@ -15,7 +15,9 @@ use crate::ui::theme;
 use crate::ui::theme::ThemeKind;
 use crate::ui::unplayable_mark;
 
+pub use close_prompt::close_prompt;
 pub use login::login_modal;
+pub mod close_prompt;
 pub mod login;
 pub mod lyrics;
 pub mod scenes;

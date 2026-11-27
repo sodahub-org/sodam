@@ -163,7 +163,8 @@ pub mod linux {
     use super::*;
     use ksni::menu::StandardItem;
     use ksni::{Icon, MenuItem, Tray};
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     #[derive(Debug)]
     pub struct SodaTray {
@@ -177,10 +178,16 @@ pub mod linux {
         /// 封面缩略图（PNG 字节），按源路径缓存（同步每 500ms 一次，不必反复解码）。
         cover_cache: std::cell::RefCell<Option<(std::path::PathBuf, Vec<u8>)>>,
         icon_cache: OnceLock<Icon>,
+        /// 托盘宿主是否在线；Root 据此决定关窗时能不能收进托盘。
+        tray_available: Arc<AtomicBool>,
     }
 
     impl SodaTray {
-        pub fn new(tx: Sender<TrayCommand>, language: Language) -> Self {
+        pub fn new(
+            tx: Sender<TrayCommand>,
+            language: Language,
+            tray_available: Arc<AtomicBool>,
+        ) -> Self {
             Self {
                 tx,
                 language,
@@ -191,6 +198,7 @@ pub mod linux {
                 cover_path: None,
                 cover_cache: std::cell::RefCell::new(None),
                 icon_cache: OnceLock::new(),
+                tray_available,
             }
         }
 
@@ -267,6 +275,19 @@ pub mod linux {
         fn id(&self) -> String {
             // 避免 SNI 宿主按相同 id 缓存旧图标。
             format!("sodam-{}", std::process::id())
+        }
+
+        /// 桌面上的 StatusNotifierWatcher 上线了：托盘图标从此真的看得见。
+        fn watcher_online(&self) {
+            self.tray_available.store(true, Ordering::Release);
+        }
+
+        /// 宿主不在线（GNOME 默认如此）：图标不会出现，关窗必须按「没有托盘」处理。
+        ///
+        /// 返回 `true` 继续等宿主——桌面随时可能装好扩展，等到了就自动恢复。
+        fn watcher_offine(&self) -> bool {
+            self.tray_available.store(false, Ordering::Release);
+            true
         }
 
         fn title(&self) -> String {

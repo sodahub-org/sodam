@@ -3,6 +3,7 @@
 use super::*;
 use crate::ui::i18n::Language;
 use sodam_core::cache::{CacheUsageSummary, MaintenanceMark};
+use sodam_core::config::CloseAction;
 #[cfg(target_os = "linux")]
 use sodam_core::config::TitlebarMode;
 use std::sync::Arc;
@@ -298,6 +299,69 @@ fn account_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
+/// 设置页里的一行「单选」：标题 + 说明 + 选中勾。
+///
+/// 窗口按钮与关闭行为两处共用；`enabled = false` 时置灰且不可点。
+fn choice_row(
+    id: String,
+    title: &'static str,
+    hint: &'static str,
+    chosen: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let row = div()
+        .id(gpui::ElementId::Name(id.into()))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .when(chosen, |this| this.bg(theme::surface_selected()))
+        .when(!enabled, |this| this.opacity(0.45))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(if chosen {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(hint),
+                ),
+        )
+        .when(chosen, |this| {
+            this.child(
+                svg()
+                    .path(icons::path("check"))
+                    .size(px(theme::ICON))
+                    .text_color(theme::accent()),
+            )
+        });
+    if enabled {
+        row.cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(on_click)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
 /// Linux 专属：窗口控制按钮的显示策略。
 ///
 /// 只有 Linux 需要这个开关：Windows 一定会去掉系统标题栏、macOS 用系统红绿灯，
@@ -324,23 +388,13 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
     ]
     .into_iter()
     .map(|(mode, title, hint)| {
-        let chosen = mode == current;
-        div()
-            .id(gpui::ElementId::Name(
-                format!("titlebar-set-{}", mode.key()).into(),
-            ))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(theme::space::LG))
-            .px(px(theme::space::MD))
-            .py(px(theme::space::SM))
-            .rounded(px(theme::radius::ROW))
-            .cursor_pointer()
-            .when(chosen, |this| this.bg(theme::surface_selected()))
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+        choice_row(
+            format!("titlebar-set-{}", mode.key()),
+            title,
+            hint,
+            mode == current,
+            true,
+            cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.settings.titlebar = mode.key().to_string();
                 root.save_settings();
                 let status = match mode {
@@ -350,38 +404,8 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
                 };
                 root.set_status_text(status);
                 cx.notify();
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Body.size())
-                            .text_color(if chosen {
-                                theme::text()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::Text::Small.size())
-                            .text_color(theme::text_muted())
-                            .child(hint),
-                    ),
-            )
-            .when(chosen, |this| {
-                this.child(
-                    svg()
-                        .path(icons::path("check"))
-                        .size(px(theme::ICON))
-                        .text_color(theme::accent()),
-                )
-            })
-            .into_any_element()
+            }),
+        )
     })
     .collect();
 
@@ -417,6 +441,96 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
 #[cfg(not(target_os = "linux"))]
 fn window_controls_section(_root: &Root, _cx: &mut Context<Root>) -> Option<AnyElement> {
     None
+}
+
+/// 关闭主窗口时的行为：退出 / 收进托盘 / 每次询问。
+///
+/// 三端共用。没有托盘宿主时「隐藏到托盘」置灰：藏起来就找不回来了。
+fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
+    let tray_available = root.tray_available_now();
+    let stored = CloseAction::from_key(&root.settings.close_action);
+    let effective = CloseAction::decide_from(stored, tray_available);
+    // 选中态画用户存下来的那个；只有没选过时才画这次实际会怎么走。
+    // 存了「隐藏」但桌面没托盘时，那一行仍然带勾并置灰——说明它还在，只是暂时不可用。
+    let chosen = stored.unwrap_or(effective);
+    let rows: Vec<AnyElement> = [
+        (
+            CloseAction::Quit,
+            root.tr("退出应用"),
+            root.tr("直接结束进程，不再后台播放"),
+            true,
+        ),
+        (
+            CloseAction::Hide,
+            root.tr("隐藏到托盘继续播放"),
+            if tray_available {
+                root.tr("收进系统托盘，音乐继续播放")
+            } else {
+                root.tr("当前桌面没有系统托盘，这项暂时用不了")
+            },
+            tray_available,
+        ),
+        (
+            CloseAction::Ask,
+            root.tr("每次询问"),
+            root.tr("每次关闭都弹窗让你选"),
+            true,
+        ),
+    ]
+    .into_iter()
+    .map(|(action, title, hint, enabled)| {
+        choice_row(
+            format!("close-action-{}", action.key()),
+            title,
+            hint,
+            chosen == action,
+            enabled,
+            cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.settings.close_action = action.key().to_string();
+                root.save_settings();
+                let status = match action {
+                    CloseAction::Quit => root.tr("关闭按钮：退出应用").to_string(),
+                    CloseAction::Hide => root.tr("关闭按钮：隐藏到托盘").to_string(),
+                    CloseAction::Ask => root.tr("关闭按钮：每次询问").to_string(),
+                };
+                root.set_status_text(status);
+                cx.notify();
+            }),
+        )
+    })
+    .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(theme::space::XS))
+        .child(
+            div()
+                .text_size(theme::Text::Large.size())
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text())
+                .child(root.tr("关闭主窗口时")),
+        )
+        .child(
+            div()
+                .text_size(theme::Text::Small.size())
+                .text_color(theme::text_muted())
+                .child(match (tray_available, effective) {
+                    (true, _) => root.tr("点关闭按钮时怎么处理；托盘菜单里也能退出应用"),
+                    (false, CloseAction::Ask) => {
+                        root.tr("当前桌面没有系统托盘，弹窗里只会给「退出应用」")
+                    }
+                    (false, _) => root.tr("当前桌面没有系统托盘，关闭窗口会直接退出应用"),
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .children(rows),
+        )
+        .into_any_element()
 }
 
 fn search_history_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
@@ -1030,6 +1144,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         )
         .child(search_history_section(root, cx))
         .children(window_controls_section(root, cx))
+        .child(close_behavior_section(root, cx))
         .child(
             div()
                 .flex()
@@ -1606,6 +1721,32 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         }),
                 )
         })
+        // 设置页最下方的退出入口：没有托盘的桌面上，这里是唯一的退出口。
+        .child(
+            div()
+                .id("quit-app")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .h(px(theme::size::CONTROL))
+                .rounded(px(theme::radius::PILL))
+                .bg(theme::surface_elevated())
+                .border_1()
+                .border_color(theme::border())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::surface_hover()))
+                .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
+                    // 走退出闸门：先等设置写队列刷完，再真正退出（#198）。
+                    root.request_quit(cx);
+                }))
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(root.tr("退出应用")),
+                ),
+        )
         .into_any_element()
 }
 

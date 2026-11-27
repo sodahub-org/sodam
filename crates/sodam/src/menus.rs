@@ -5,8 +5,9 @@
 //! ⌘Q/⌘M/⌘W 在系统侧就是空白键，应用收不到任何动作。菜单项右侧显示的快捷键
 //! 取自 keymap 里对该 action 的绑定，所以「绑定 + 菜单项」缺一不可。
 //!
-//! ⌘W 只关窗不退出：应用是常驻托盘的（`QuitMode::Explicit`），关窗后可以从托盘
-//! 「显示主窗口」再打开，⌘Q 才真正退出进程。
+//! ⌘W 和红绿灯走同一套关窗策略：默认收进托盘（`QuitMode::Explicit` 下进程留着，
+//! 从托盘「显示主窗口」能再打开），设置里选了「退出应用」时 ⌘W 也退出进程。
+//! ⌘Q 始终是直接退出。
 
 use gpui::{actions, App, KeyBinding, Menu, MenuItem, WeakEntity, Window};
 
@@ -18,18 +19,26 @@ actions!(sodam, [QuitApp, MinimizeWindow, CloseWindow]);
 /// 注册动作处理器与菜单栏。启动时调用一次。
 pub fn install(cx: &mut App, language: Language, app: WeakEntity<Root>) {
     // 三个动作都走应用级监听器：⌘W 关掉窗口后没有窗口可派发，菜单仍要能退出。
+    let quit_app = app.clone();
     cx.on_action(move |_: &QuitApp, cx: &mut App| {
-        let Some(app) = app.upgrade() else {
+        let Some(app) = quit_app.upgrade() else {
             return;
         };
         // 先等启动期落盘做完再退（#198）；再按一次会直接退出。
         app.update(cx, |root, cx| root.request_quit(cx));
     });
     cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
-        with_main_window(cx, |window| window.minimize_window())
+        with_main_window(cx, |window, _| window.minimize_window())
     });
-    cx.on_action(|_: &CloseWindow, cx: &mut App| {
-        with_main_window(cx, |window| window.remove_window())
+    // ⌘W 和红绿灯走同一套关窗策略：设成「退出」时 ⌘W 也该退出。
+    let close_app = app.clone();
+    cx.on_action(move |_: &CloseWindow, cx: &mut App| {
+        let Some(app) = close_app.upgrade() else {
+            return;
+        };
+        with_main_window(cx, move |window, cx| {
+            app.update(cx, |root, cx| root.request_close(window, cx));
+        });
     });
 
     refresh(cx, language);
@@ -67,10 +76,10 @@ pub fn refresh(cx: &App, language: Language) {
 ///   （点菜单时才有值），照着它写会静默什么都不做。这里假设单窗口（sodam 主窗口）。
 /// * 操作要 defer 到本轮更新之后。菜单命令是在窗口更新过程中派发的，此时对同一个
 ///   窗口再调 `update` 会被拒，`let _ =` 会把这个失败吞掉。
-fn with_main_window(cx: &mut App, action: impl FnOnce(&mut Window) + 'static) {
+fn with_main_window(cx: &mut App, action: impl FnOnce(&mut Window, &mut App) + 'static) {
     if let Some(window) = cx.windows().first().copied() {
         cx.defer(move |cx| {
-            let _ = window.update(cx, |_, window, _| action(window));
+            let _ = window.update(cx, |_, window, cx| action(window, cx));
         });
     }
 }

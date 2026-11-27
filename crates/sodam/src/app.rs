@@ -13,7 +13,7 @@ use gpui::{
     Window,
 };
 use sodam_core::{
-    config::EnvCookieFill,
+    config::{CloseAction, EnvCookieFill},
     cover::{CoverStore, CoverWant, MAX_QUEUE},
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
@@ -30,8 +30,10 @@ use sodam_core::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+gpui::actions!(sodam, [CloseRequested]);
 
 /// 远程读取类失败的统一说法：读不到歌单、收藏、搜索、推荐都是这一句。
 pub(crate) const REMOTE_TEXT: &str = "出现了一点问题，检查网络后重试。";
@@ -354,6 +356,13 @@ pub(crate) struct BatchUpgradeProgress {
     pub(crate) total: usize,
 }
 
+/// 关窗询问弹窗的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClosePrompt {
+    /// 是否勾选了「记住我的选择」。
+    pub(crate) remember: bool,
+}
+
 /// 根视图状态。
 pub struct Root {
     pub nav: Nav,
@@ -571,6 +580,12 @@ pub struct Root {
     pub played_history: Vec<String>,
     /// 设置页里的登录 modal 是否展开。
     pub login_modal_open: bool,
+    /// 系统托盘是否可用：Linux 由 ksni 的 watcher 回调维护，其它平台恒为 true。
+    ///
+    /// 「关窗收进托盘」只在真的有托盘可收时才成立。
+    pub(crate) tray_available: Arc<AtomicBool>,
+    /// 关窗询问弹窗；`Some` 表示正弹着。
+    pub(crate) close_prompt: Option<ClosePrompt>,
     /// 队列右键菜单：被点中的行下标与鼠标位置。
     pub queue_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// 音质菜单锚点：播放条徽章被点中时的鼠标位置（`None` = 菜单关着）。
@@ -855,6 +870,10 @@ impl Root {
             queue_origin: QueueOrigin::None,
             played_history: Vec::new(),
             login_modal_open: false,
+            // Linux 启动时还不知道有没有托盘宿主，先按「没有」算；
+            // ksni 注册到 watcher 后会回调 watcher_online 打开它。
+            tray_available: Arc::new(AtomicBool::new(!cfg!(target_os = "linux"))),
+            close_prompt: None,
             queue_menu: None,
             quality_menu: None,
             track_menu: None,
@@ -1748,6 +1767,89 @@ impl Root {
         self.settings_writer.schedule(&self.settings);
     }
 
+    /// 托盘现在可用吗：Linux 看桌面有没有 StatusNotifier 宿主，其它平台恒为 true。
+    pub(crate) fn tray_available_now(&self) -> bool {
+        self.tray_available.load(Ordering::Acquire)
+    }
+
+    /// 关窗请求：平台关窗钩子、自绘标题栏的关闭按钮、macOS 的 ⌘W 都走这里。
+    ///
+    /// 返回值就是「窗口该不该关」：`true` 放行（收进托盘 = 窗口照常关掉、进程按
+    /// Explicit 模式留着），`false` 由这里接管（退出走闸门，或者先弹窗问一句）。
+    pub(crate) fn handle_close_request(&mut self, cx: &mut Context<Self>) -> bool {
+        // 弹窗已经开着：再点一次关闭不叠第二层。
+        if self.close_prompt.is_some() {
+            return false;
+        }
+        let tray_available = self.tray_available_now();
+        let stored = CloseAction::from_key(&self.settings.close_action);
+        let action = CloseAction::decide_from(stored, tray_available);
+        // 桌面没有托盘，按退出处理：配置里写的是「收进托盘」或根本没选过。
+        // 进程马上就走，界面上说不了话，留一条日志好排查。
+        if !tray_available && action == CloseAction::Quit && stored != Some(CloseAction::Quit) {
+            log_event(LogLevel::Info, LogTopic::App, "close_without_tray", &[]);
+        }
+        match action {
+            // 收进托盘就是「窗口照常关掉、进程留着」：让平台自己关，不在这里重复销毁。
+            CloseAction::Hide => true,
+            CloseAction::Quit => {
+                self.request_quit(cx);
+                false
+            }
+            CloseAction::Ask => {
+                self.close_prompt = Some(ClosePrompt {
+                    // 弹窗只在「每次询问」下出现，默认不勾「记住」：想让用户每次都选。
+                    // 真嫌烦的人可以在弹窗里勾上，那是他自己改的设置。
+                    remember: false,
+                });
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// 弹窗里选了「隐藏」或「退出」：勾了「记住我的选择」就先写进设置，然后照做。
+    pub(crate) fn resolve_close_prompt(
+        &mut self,
+        action: CloseAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = self.close_prompt.take() else {
+            return;
+        };
+        // 记住的是用户点的那个；降级只对这一次关窗生效，别拿瞬时状态改掉偏好。
+        if prompt.remember {
+            self.settings.close_action = action.key().to_string();
+            self.save_settings();
+        }
+        // 弹窗开着的时候托盘可能已经下线：这时「隐藏」会把用户关在门外，按退出处理。
+        let action = match action {
+            CloseAction::Hide if !self.tray_available_now() => CloseAction::Quit,
+            other => other,
+        };
+        match action {
+            CloseAction::Quit => self.request_quit(cx),
+            CloseAction::Hide => window.remove_window(),
+            CloseAction::Ask => {}
+        }
+    }
+
+    /// 程序主动发起的关窗（自绘标题栏的关闭按钮、macOS 的 ⌘W）：按策略处理，
+    /// 放行时自己把窗口收掉——这两个入口没有平台关窗钩子替它们关窗。
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_close_request(cx) {
+            window.remove_window();
+        }
+    }
+
+    /// 关掉弹窗，什么都不做。
+    pub(crate) fn cancel_close_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.close_prompt.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// 应用内主动退出（托盘「退出」、macOS ⌘Q）：先等设置写队列刷完，再真正退出（#198）。
     ///
     /// GPUI 只给 `on_app_quit` 的等待约 200ms；慢盘 / 杀软扫描 / 写锁被占时写不完。
@@ -2191,6 +2293,9 @@ impl Render for Root {
                 self.login_modal_open && self.settings.cookie.trim().is_empty(),
                 |this| this.child(crate::views::login_modal(self, cx)),
             )
+            .when(self.close_prompt.is_some(), |this| {
+                this.child(crate::views::close_prompt(self, cx))
+            })
             .when_some(ui::message::render(self, cx), |this, message| {
                 this.child(message)
             })

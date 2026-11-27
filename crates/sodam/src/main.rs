@@ -79,7 +79,7 @@ fn native_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
 }
 
 struct TraySignals {
-    media_commands: Option<Arc<AtomicBool>>,
+    media_commands: Arc<AtomicBool>,
     shortcuts_dirty: Arc<AtomicBool>,
     startup_save: StartupFailureSlot,
 }
@@ -95,8 +95,11 @@ fn start_tray_service(
     cx: &mut App,
     mut sync: impl FnMut(tray::TrayState) + 'static,
 ) {
+    // 宿主上下线是托盘线程写的；这里只读这个开关，变了才叫界面重绘。
+    let tray_flag = app.read(cx).tray_available.clone();
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
+        let mut tray_available = tray_flag.load(Ordering::Acquire);
         let mut tray_probe = LoopProbe::new("tray");
         let mut single_probe = LoopProbe::new_shared_tray("single");
         loop {
@@ -105,6 +108,13 @@ fn start_tray_service(
                 .await;
             tick = tick.wrapping_add(1);
             tray_probe.tick();
+
+            // 不重绘的话，设置页的置灰状态和关窗弹窗的选项会停在旧值。
+            let available = tray_flag.load(Ordering::Acquire);
+            if available != tray_available {
+                tray_available = available;
+                cx.update(|cx| app.update(cx, |_, cx| cx.notify()));
+            }
 
             if tick % 2 == 0 {
                 single_probe.check();
@@ -139,11 +149,7 @@ fn start_tray_service(
                 };
             }
 
-            if signals
-                .media_commands
-                .as_ref()
-                .is_some_and(|pending| pending.load(Ordering::Acquire))
-            {
+            if signals.media_commands.load(Ordering::Acquire) {
                 tray_probe.signal_app_entry();
                 cx.update(|cx| {
                     let commands = media::drain_commands(cx);
@@ -249,12 +255,43 @@ fn start_tray_service(
 fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
-    } else {
-        let app = app.clone();
-        let options = main_window_options(cx);
-        cx.open_window(options, |_window, _cx| app).ok();
+    } else if let Err(error) = open_main_window(cx, app) {
+        // 点了没反应最容易被当成卡死。日志写一条；界面这边没有窗口可画，
+        // 所以发一条 Error 级轻提示——它会在下次开窗时补弹一次。
+        let detail = format!("{error:#}");
+        sodam_core::log_outlet::log_event(
+            sodam_core::log_outlet::LogLevel::Error,
+            sodam_core::log_outlet::LogTopic::App,
+            "open_main_window_failed",
+            &[("detail", detail.as_str())],
+        );
+        app.update(cx, |root, cx| {
+            let text = root.tr("打开主窗口失败，重启应用再试").to_string();
+            root.notify_error_once("open-main-window-failed", text);
+            cx.notify();
+        });
     }
     cx.activate(true);
+}
+
+/// 建主窗口：系统媒体控制与关窗策略都挂在这里。
+///
+/// 关窗钩子是窗口级的，窗口每次重建都要重新注册。首次启动和托盘恢复
+/// 必须共用这一个入口，否则恢复出来的窗口又变回「关窗即消失」。
+fn open_main_window(cx: &mut App, app: &Entity<app::Root>) -> anyhow::Result<()> {
+    let options = main_window_options(cx);
+    let root = app.clone();
+    cx.open_window(options, move |window, cx| {
+        // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
+        media::attach(native_handle(window), cx);
+        // 关窗不直接销毁窗口：交给 Root 按「关闭按钮行为」决定退出还是收进托盘。
+        let close_root = root.clone();
+        window.on_window_should_close(cx, move |_window, cx| {
+            close_root.update(cx, |root, cx| root.handle_close_request(cx))
+        });
+        root
+    })
+    .map(|_| ())
 }
 
 fn main() {
@@ -286,13 +323,26 @@ fn main() {
             // 播放快捷键：应用内三键（可在设置页重绑）。
             let settings = app.read(cx).settings.clone();
             shortcuts::install(cx, &settings, app.clone());
-            let options = main_window_options(cx);
-            cx.open_window(options, |window, cx| {
-                // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
-                media::attach(native_handle(window), cx);
-                app.clone()
-            })
-            .expect("打开主窗口失败");
+            open_main_window(cx, &app).expect("打开主窗口失败");
+
+            // 自绘标题栏的关闭按钮派发这个动作：和平台关窗钩子共用一套策略。
+            // 动作可能是在窗口更新途中派发的，推到这一轮之后再动窗口。
+            cx.on_action({
+                let app = app.clone();
+                move |_: &app::CloseRequested, cx: &mut App| {
+                    let Some(window) = cx.windows().first().copied() else {
+                        return;
+                    };
+                    let root = app.clone();
+                    cx.defer(move |cx| {
+                        let _ = window.update(cx, |_, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.request_close(window, cx);
+                            });
+                        });
+                    });
+                }
+            });
 
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
@@ -304,6 +354,8 @@ fn main() {
                     let tray_service = ksni::TrayService::new(tray::linux::SodaTray::new(
                         tray_tx,
                         crate::ui::i18n::Language::system_locale(),
+                        // 宿主在不在由 ksni 的 watcher 回调写进这个开关。
+                        app.read(cx).tray_available.clone(),
                     ));
                     let tray_handle = tray_service.handle();
                     tray_service.spawn();
@@ -326,7 +378,7 @@ fn main() {
                     tray::create_status_item(tray_tx, crate::ui::i18n::Language::system_locale());
 
                 let signals = TraySignals {
-                    media_commands: media::command_signal(cx),
+                    media_commands: media::command_signal(),
                     shortcuts_dirty: app.read(cx).shortcuts_dirty.clone(),
                     startup_save: app.read(cx).settings_writer.startup_failure_slot(),
                 };
