@@ -851,6 +851,7 @@ impl Root {
             pending_audio: sodam_core::cache::pending_audio_bytes(),
             now: std::time::SystemTime::now(),
         });
+        // Skip 和 Defer 这一拍都不跑：Defer 的欠账 `ask` 已经记下了。
         if decision != MaintenanceDecision::Run {
             return;
         }
