@@ -150,7 +150,7 @@ fn should_auto_load_scene_page(
 pub(crate) enum ViewTakeover {
     /// 用户还在等这一份：换队列、换页面。
     Take,
-    /// 用户这期间自己换了页面或队列：整份结果丢掉。
+    /// 用户这期间自己换了页面：整份结果丢掉。
     Keep,
 }
 
@@ -1715,14 +1715,22 @@ impl Root {
         take_over: ViewTakeover,
         cx: &mut Context<Self>,
     ) {
-        // 队列已经就位，切换态必须在这里终结。
+        let origin = match source.scene.as_ref() {
+            Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
+            None => QueueOrigin::Feed,
+        };
+        // 队列已经就位，自己留下的切换态必须在这里终结。
         //
         // `switching_queue` 会让歌词页整页停在「正在切换」的加载态
         // （`lyrics_view` 开头的守卫）。原先只有推荐流在**加载回调**里清它，
         // 而听歌模式走的是 `start_scene_queue` → 本函数，回调里忘了清，
         // 于是点进「熟悉模式 / 新鲜模式」后歌词页永久转圈，但音频其实已经在放。
-        // 放在这里对所有调用方（推荐 / 听歌模式 / 探索电台上游）一并生效。
-        self.switching_queue = None;
+        //
+        // 只收自己这轮留下的那份：这期间用户可能已经点开了某张歌单，那个
+        // 「正在加载」是他的，替他撤掉就会先露出旧内容、等歌单回来再跳一次。
+        if self.switching_queue.as_ref() == Some(&origin) {
+            self.switching_queue = None;
+        }
         if matches!(take_over, ViewTakeover::Keep) {
             // 用户已经自己走了：这份结果不属于他此刻在用的任何东西，整份丢掉。
             return;
@@ -1731,10 +1739,7 @@ impl Root {
         self.played_history.clear();
         self.playback_error = None;
         self.new_playback_round();
-        self.queue_origin = match source.scene.as_ref() {
-            Some(scene) => QueueOrigin::FeedMode(scene.sub_queue_type.clone()),
-            None => QueueOrigin::Feed,
-        };
+        self.queue_origin = origin;
         // 推荐流固定列表循环：模式按钮在那边不显示，不能沿用歌单里的单曲循环。
         self.queue.mode = sodam_core::queue::PlayMode::ListLoop;
         self.queue.reset_shuffle_round();
@@ -2675,11 +2680,15 @@ impl Root {
                         root.open_lyrics(cx);
                         root.start_track(true, cx);
                     }
-                    Ok(_) => root.set_status(
-                        "歌单「{}」没有可播放曲目",
-                        std::slice::from_ref(&playlist.title),
-                    ),
+                    Ok(_) => {
+                        root.switching_queue = None;
+                        root.set_status(
+                            "歌单「{}」没有可播放曲目",
+                            std::slice::from_ref(&playlist.title),
+                        );
+                    }
                     Err(err) => {
+                        root.switching_queue = None;
                         let message = root.failure_text("加载歌单失败", &err, REMOTE_TEXT);
                         root.notify_error_once("playlist-load-failed", message);
                     }
@@ -6044,6 +6053,33 @@ mod view_takeover_tests {
         assert!(
             guard_at < nav_at,
             "失败跳页必须落在 take_over 判断里面，否则用户走开也会被拽回推荐页"
+        );
+    }
+
+    /// 守 #330：切换态只收自己这轮留下的那份。
+    ///
+    /// 无条件清 `switching_queue` 的话，用户这期间点开的歌单加载页会被提前撤掉：
+    /// 屏幕上先露出旧队列内容，等歌单回来再跳一次。
+    #[test]
+    fn queue_switch_state_is_only_cleared_when_it_belongs_to_this_load() {
+        let source = include_str!("app_actions.rs");
+        let body = source
+            .split("pub(crate) fn activate_recommended_queue")
+            .nth(1)
+            .expect("activate_recommended_queue 应当存在");
+        let body = &body[..body
+            .find("pub(crate) fn sync_scenes_list")
+            .unwrap_or(body.len())];
+
+        let guard_at = body
+            .find("if self.switching_queue.as_ref() == Some(&origin)")
+            .expect("收切换态之前必须先确认它是自己这轮留下的");
+        let clear_at = body
+            .find("self.switching_queue = None;")
+            .expect("切换态必须在这里终结");
+        assert!(
+            guard_at < clear_at,
+            "切换态只在 origin 对得上时才收，否则会撤掉用户自己的加载页"
         );
     }
 }
