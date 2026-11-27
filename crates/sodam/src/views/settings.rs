@@ -299,6 +299,69 @@ fn account_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
         .into_any_element()
 }
 
+/// 设置页里的一行「单选」：标题 + 说明 + 选中勾。
+///
+/// 窗口按钮与关闭行为两处共用；`enabled = false` 时置灰且不可点。
+fn choice_row(
+    id: String,
+    title: &'static str,
+    hint: &'static str,
+    chosen: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let row = div()
+        .id(gpui::ElementId::Name(id.into()))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::LG))
+        .px(px(theme::space::MD))
+        .py(px(theme::space::SM))
+        .rounded(px(theme::radius::ROW))
+        .when(chosen, |this| this.bg(theme::surface_selected()))
+        .when(!enabled, |this| this.opacity(0.45))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::space::XS))
+                .child(
+                    div()
+                        .text_size(theme::Text::Body.size())
+                        .text_color(if chosen {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(theme::Text::Small.size())
+                        .text_color(theme::text_muted())
+                        .child(hint),
+                ),
+        )
+        .when(chosen, |this| {
+            this.child(
+                svg()
+                    .path(icons::path("check"))
+                    .size(px(theme::ICON))
+                    .text_color(theme::accent()),
+            )
+        });
+    if enabled {
+        row.cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(on_click)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
 /// Linux 专属：窗口控制按钮的显示策略。
 ///
 /// 只有 Linux 需要这个开关：Windows 一定会去掉系统标题栏、macOS 用系统红绿灯，
@@ -325,23 +388,13 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
     ]
     .into_iter()
     .map(|(mode, title, hint)| {
-        let chosen = mode == current;
-        div()
-            .id(gpui::ElementId::Name(
-                format!("titlebar-set-{}", mode.key()).into(),
-            ))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(theme::space::LG))
-            .px(px(theme::space::MD))
-            .py(px(theme::space::SM))
-            .rounded(px(theme::radius::ROW))
-            .cursor_pointer()
-            .when(chosen, |this| this.bg(theme::surface_selected()))
-            .hover(|style| style.bg(theme::surface_hover()))
-            .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+        choice_row(
+            format!("titlebar-set-{}", mode.key()),
+            title,
+            hint,
+            mode == current,
+            true,
+            cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.settings.titlebar = mode.key().to_string();
                 root.save_settings();
                 let status = match mode {
@@ -351,38 +404,8 @@ fn window_controls_section(root: &Root, cx: &mut Context<Root>) -> Option<AnyEle
                 };
                 root.set_status_text(status);
                 cx.notify();
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Body.size())
-                            .text_color(if chosen {
-                                theme::text()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::Text::Small.size())
-                            .text_color(theme::text_muted())
-                            .child(hint),
-                    ),
-            )
-            .when(chosen, |this| {
-                this.child(
-                    svg()
-                        .path(icons::path("check"))
-                        .size(px(theme::ICON))
-                        .text_color(theme::accent()),
-                )
-            })
-            .into_any_element()
+            }),
+        )
     })
     .collect();
 
@@ -453,69 +476,24 @@ fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     ]
     .into_iter()
     .map(|(action, title, hint, enabled)| {
-        let chosen = effective == action && enabled;
-        let row = div()
-            .id(gpui::ElementId::Name(
-                format!("close-action-{}", action.key()).into(),
-            ))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(theme::space::LG))
-            .px(px(theme::space::MD))
-            .py(px(theme::space::SM))
-            .rounded(px(theme::radius::ROW))
-            .when(chosen, |this| this.bg(theme::surface_selected()))
-            .when(!enabled, |this| this.opacity(0.45))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .text_size(theme::Text::Body.size())
-                            .text_color(if chosen {
-                                theme::text()
-                            } else {
-                                theme::text_muted()
-                            })
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::Text::Tiny.size())
-                            .text_color(theme::text_faint())
-                            .child(hint),
-                    ),
-            )
-            .when(chosen, |this| {
-                this.child(
-                    svg()
-                        .path(icons::path("check"))
-                        .size(px(theme::ICON))
-                        .text_color(theme::accent()),
-                )
-            });
-        let row = if enabled {
-            row.cursor_pointer()
-                .hover(|style| style.bg(theme::surface_hover()))
-                .on_click(cx.listener(move |root, _event: &ClickEvent, _window, cx| {
-                    root.settings.close_action = action.key().to_string();
-                    root.save_settings();
-                    let status = match action {
-                        CloseAction::Quit => root.tr("关闭按钮：退出应用").to_string(),
-                        CloseAction::Hide => root.tr("关闭按钮：隐藏到托盘").to_string(),
-                        CloseAction::Ask => root.tr("关闭按钮：每次询问").to_string(),
-                    };
-                    root.set_status_text(status);
-                    cx.notify();
-                }))
-        } else {
-            row
-        };
-        row.into_any_element()
+        choice_row(
+            format!("close-action-{}", action.key()),
+            title,
+            hint,
+            effective == action && enabled,
+            enabled,
+            cx.listener(move |root, _event: &ClickEvent, _window, cx| {
+                root.settings.close_action = action.key().to_string();
+                root.save_settings();
+                let status = match action {
+                    CloseAction::Quit => root.tr("关闭按钮：退出应用").to_string(),
+                    CloseAction::Hide => root.tr("关闭按钮：隐藏到托盘").to_string(),
+                    CloseAction::Ask => root.tr("关闭按钮：每次询问").to_string(),
+                };
+                root.set_status_text(status);
+                cx.notify();
+            }),
+        )
     })
     .collect();
 

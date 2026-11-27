@@ -64,7 +64,7 @@ pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(4.0))
+                        .rounded(px(theme::radius::ART))
                         .border_1()
                         .border_color(if remember {
                             theme::accent()
@@ -76,7 +76,7 @@ pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                             this.child(
                                 svg()
                                     .path(icons::path("check"))
-                                    .size(px(12.0))
+                                    .size(px(theme::ICON_SM))
                                     .text_color(theme::accent_foreground()),
                             )
                         }),

@@ -35,9 +35,9 @@ pub fn install(cx: &mut App, language: Language, app: WeakEntity<Root>) {
         let Some(app) = close_app.upgrade() else {
             return;
         };
-        with_main_window(cx, move |window, cx| {
+        with_main_window(cx, move |_window, cx| {
             app.update(cx, |root, cx| {
-                root.handle_close_request(window, cx);
+                root.handle_close_request(cx);
             });
         });
     });

@@ -1774,23 +1774,17 @@ impl Root {
 
     /// 关窗请求：平台关窗钩子、自绘标题栏的关闭按钮、macOS 的 ⌘W 都走这里。
     ///
-    /// 返回 `false` 表示「窗口别自己关」，由这里按 [`CloseAction::decide`] 决定
-    /// 收进托盘还是退出。放行窗口会让它消失、进程却留下——正是 #324 的问题。
-    pub(crate) fn handle_close_request(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    /// 返回值就是「窗口该不该关」：`true` 放行（收进托盘 = 窗口照常关掉、进程按
+    /// Explicit 模式留着），`false` 由这里接管（退出走闸门，或者先弹窗问一句）。
+    pub(crate) fn handle_close_request(&mut self, cx: &mut Context<Self>) -> bool {
         // 弹窗已经开着：再点一次关闭不叠第二层。
         if self.close_prompt.is_some() {
             return false;
         }
         let tray_available = self.tray_available_now();
-        let action = CloseAction::decide(&self.settings.close_action, tray_available);
+        let stored = CloseAction::from_key(&self.settings.close_action);
         // 配置里选了「收进托盘」但桌面没有托盘：降级成退出，并留一条可查的记录。
-        if !tray_available
-            && CloseAction::from_key(&self.settings.close_action) == Some(CloseAction::Hide)
-        {
+        if !tray_available && stored == Some(CloseAction::Hide) {
             log_event(
                 LogLevel::Info,
                 LogTopic::App,
@@ -1798,18 +1792,23 @@ impl Root {
                 &[],
             );
         }
-        match action {
-            CloseAction::Quit => self.request_quit(cx),
-            CloseAction::Hide => window.remove_window(),
+        match CloseAction::decide(&self.settings.close_action, tray_available) {
+            // 收进托盘就是「窗口照常关掉、进程留着」：让平台自己关，不在这里重复销毁。
+            CloseAction::Hide => true,
+            CloseAction::Quit => {
+                self.request_quit(cx);
+                false
+            }
             CloseAction::Ask => {
                 self.close_prompt = Some(ClosePrompt {
                     tray_available,
-                    remember: true,
+                    // 用户明确选了「每次询问」时，别替他勾上「记住」。
+                    remember: stored != Some(CloseAction::Ask),
                 });
                 cx.notify();
+                false
             }
         }
-        false
     }
 
     /// 弹窗里选了「隐藏」或「退出」：勾了「记住我的选择」就先写进设置，然后照做。

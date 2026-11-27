@@ -95,8 +95,11 @@ fn start_tray_service(
     cx: &mut App,
     mut sync: impl FnMut(tray::TrayState) + 'static,
 ) {
+    // 宿主上下线是托盘线程写的；这里只读这个开关，变了才叫界面重绘（#324）。
+    let tray_flag = app.read(cx).tray_available.clone();
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
+        let mut tray_available = tray_flag.load(Ordering::Acquire);
         let mut tray_probe = LoopProbe::new("tray");
         let mut single_probe = LoopProbe::new_shared_tray("single");
         loop {
@@ -105,6 +108,13 @@ fn start_tray_service(
                 .await;
             tick = tick.wrapping_add(1);
             tray_probe.tick();
+
+            // 不重绘的话，设置页的置灰状态和关窗弹窗的选项会停在旧值。
+            let available = tray_flag.load(Ordering::Acquire);
+            if available != tray_available {
+                tray_available = available;
+                cx.update(|cx| app.update(cx, |_, cx| cx.notify()));
+            }
 
             if tick % 2 == 0 {
                 single_probe.check();
@@ -267,8 +277,8 @@ fn open_main_window(cx: &mut App, app: &Entity<app::Root>) -> anyhow::Result<()>
         media::attach(native_handle(window), cx);
         // 关窗不直接销毁窗口：交给 Root 按「关闭按钮行为」决定退出还是收进托盘（#324）。
         let close_root = root.clone();
-        window.on_window_should_close(cx, move |window, cx| {
-            close_root.update(cx, |root, cx| root.handle_close_request(window, cx))
+        window.on_window_should_close(cx, move |_window, cx| {
+            close_root.update(cx, |root, cx| root.handle_close_request(cx))
         });
         root
     })
@@ -316,9 +326,9 @@ fn main() {
                     };
                     let root = app.clone();
                     cx.defer(move |cx| {
-                        let _ = window.update(cx, |_, window, cx| {
+                        let _ = window.update(cx, |_, _window, cx| {
                             root.update(cx, |root, cx| {
-                                root.handle_close_request(window, cx);
+                                root.handle_close_request(cx);
                             });
                         });
                     });
