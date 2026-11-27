@@ -143,6 +143,18 @@ fn should_auto_load_scene_page(
     cards_empty && !cards_loading && !matches!(modes, SceneModesState::Failed)
 }
 
+/// 后台装载完成时，要不要把当前页面换成结果页。
+///
+/// 单独一个类型而不是再加一个 `bool`：它和 `autoplay` 挨着，两个裸 bool 在调用点
+/// 谁也读不出谁，而听歌模式那个调用点确实两次都是 `true`（#330）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ViewTakeover {
+    /// 界面还停在用户等的那一页：换过去。
+    Take,
+    /// 用户这期间自己换过页面：只落数据，页面不动。
+    Keep,
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -1546,11 +1558,7 @@ impl Root {
 
     /// 打开歌词播放页，并按需加载当前（或正在装载）歌曲的歌词。
     pub fn open_lyrics(&mut self, cx: &mut Context<Self>) {
-        let track = self
-            .pending_track
-            .clone()
-            .or_else(|| self.queue.current().cloned());
-        let Some(track) = track else {
+        let Some(track) = self.lyrics_target() else {
             self.set_status_text(self.tr("还没有正在播放的歌曲"));
             cx.notify();
             return;
@@ -1560,6 +1568,16 @@ impl Root {
         }
         self.set_nav(Nav::Lyrics, cx);
         self.load_lyrics(track, false, cx);
+    }
+
+    /// 该备歌词的那一版：待播曲目优先（还没进队列也要能显示），其次才是队列当前曲。
+    ///
+    /// 进播放页和后台装载不抢页面这两条路必须同一口径，否则用户回到播放页看到的
+    /// 还是上一首的歌词（#330）。
+    fn lyrics_target(&self) -> Option<TrackItem> {
+        self.pending_track
+            .clone()
+            .or_else(|| self.queue.current().cloned())
     }
 
     /// 原图没有渲染期自动入队口子，调用方在切歌、进播放页、清缓存、点重试时显式要。
@@ -1686,7 +1704,7 @@ impl Root {
 
     /// 把推荐流 / 听歌模式的曲目装进队列；`autoplay` 为假时停在待播状态。
     ///
-    /// `take_over_view` 为假表示这轮装载不是用户此刻在看的事：照常换队列、备歌词，
+    /// `take_over` 为 `Keep` 表示这轮装载不是用户此刻在看的事：照常换队列、备歌词，
     /// 但不改当前页面（#330）。
     pub(crate) fn activate_recommended_queue(
         &mut self,
@@ -1694,7 +1712,7 @@ impl Root {
         tracks: Vec<TrackItem>,
         label: &str,
         autoplay: bool,
-        take_over_view: bool,
+        take_over: ViewTakeover,
         cx: &mut Context<Self>,
     ) {
         // 队列已经就位，切换态必须在这里终结。
@@ -1725,11 +1743,14 @@ impl Root {
             .map(|track| track.cover.clone())
             .collect();
         self.ensure_covers(&covers, cx);
-        if take_over_view {
-            self.open_lyrics(cx);
-        } else if let Some(track) = self.queue.current().cloned() {
-            // 用户已经翻到别的页面：歌词照常备好，界面停在原地（#330）。
-            self.load_lyrics(track, false, cx);
+        match take_over {
+            ViewTakeover::Take => self.open_lyrics(cx),
+            ViewTakeover::Keep => {
+                // 用户已经翻到别的页面：歌词照常备好，界面停在原地（#330）。
+                if let Some(track) = self.lyrics_target() {
+                    self.load_lyrics(track, false, cx);
+                }
+            }
         }
         // 确认要写在切页之后：状态行在换页时清空，写在 `open_lyrics`
         // （内部 `set_nav(Nav::Lyrics)`）之前等于刚写上就被收走。不抢页面那条路
@@ -2030,7 +2051,7 @@ impl Root {
                             start.tracks,
                             root.tr("听歌模式"),
                             true,
-                            true,
+                            ViewTakeover::Take,
                             cx,
                         );
                     }
@@ -2436,10 +2457,10 @@ impl Root {
         // 切队列前先看看队列里是不是上一次的推荐内容，失败时保住它，不用开空白页。
         let cached = self.queue_origin == QueueOrigin::Feed && !self.queue.is_empty();
         self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
-        // 记下"装载期间用户有没有自己走开"的基线（#330）。快照必须取在
+        // 记下"装载期间界面有没有被换走"的基线（#330）。快照必须取在
         // `begin_queue_switch` 之后：把界面带到加载页是这个装载自己的动作，
         // 之后再变代数才说明人换了页面。
-        let nav_intent = self.nav_intent_seq;
+        let load_nav_seq = self.nav_seq;
         self.set_status_text(self.tr("正在加载推荐队列…"));
         cx.notify();
 
@@ -2471,8 +2492,12 @@ impl Root {
                 }
                 root.loading_recommendation = false;
                 root.switching_queue = None;
-                // 这一轮装载开始后用户自己切过页面：结果只落数据，不把界面拽回来（#330）。
-                let take_over_view = root.nav_intent_seq == nav_intent;
+                // 这一轮装载开始后界面被换走过：结果只落数据，不把界面拽回来（#330）。
+                let take_over = if root.nav_seq == load_nav_seq {
+                    ViewTakeover::Take
+                } else {
+                    ViewTakeover::Keep
+                };
                 match result {
                     Some(Ok(start)) => {
                         root.recommendation_error = None;
@@ -2481,13 +2506,13 @@ impl Root {
                             start.tracks,
                             root.tr("推荐"),
                             autoplay,
-                            take_over_view,
+                            take_over,
                             cx,
                         );
                     }
                     Some(Err(err)) => {
                         let message = root.failure_text("加载推荐队列失败", &err, REMOTE_TEXT);
-                        root.recommendation_failed(message, cached, take_over_view, cx);
+                        root.recommendation_failed(message, cached, take_over, cx);
                     }
                     None => {
                         let message = root.tr(REMOTE_TEXT).to_string();
@@ -2497,7 +2522,7 @@ impl Root {
                             "加载推荐队列超时（界面已停止等待）",
                             format_args!("deadline={}s", RECOMMENDATION_DEADLINE.as_secs()),
                         );
-                        root.recommendation_failed(message, cached, take_over_view, cx);
+                        root.recommendation_failed(message, cached, take_over, cx);
                     }
                 }
                 cx.notify();
@@ -2509,13 +2534,13 @@ impl Root {
     /// 推荐队列装载失败后的统一落地：进入**可重试的终端态**，而不是停在转圈页。
     ///
     /// 网络错误 / 超时 / 无数据三种情况都走这里。调用点已经用 `load_seq` 过滤过
-    /// 过期结果，所以这里不再判断请求序号。`take_over_view` 为假表示用户已经
-    /// 自己切走了：失败只汇报，不把他拽到推荐页（#330）。
+    /// 过期结果，所以这里不再判断请求序号。`take_over` 为 `Keep` 表示界面已经被
+    /// 人换走了：失败只汇报，不把他拽到推荐页（#330）。
     fn recommendation_failed(
         &mut self,
         message: String,
         had_cached_recommendation: bool,
-        take_over_view: bool,
+        take_over: ViewTakeover,
         cx: &mut Context<Self>,
     ) {
         self.recommendation_error = Some(message.clone());
@@ -2533,7 +2558,7 @@ impl Root {
             self.pending_track = None;
             self.sync_queue_cache();
         }
-        if take_over_view {
+        if matches!(take_over, ViewTakeover::Take) {
             self.set_nav(Nav::Home, cx);
         }
         self.notify_error_once("recommendation-load-failed", message);
@@ -3159,9 +3184,6 @@ impl Root {
         if self.nav == nav {
             return;
         }
-        // 换页就算一次「人已经不在原来那页」：后台装载回来时靠这个代数判断要不要
-        // 抢页面（#330）。装载自己那次切页由调用方把快照取在它之后，不算走开。
-        self.nav_intent_seq = self.nav_intent_seq.wrapping_add(1);
         self.nav_history.push(self.nav);
         if self.nav_history.len() > 50 {
             self.nav_history.remove(0);
@@ -3644,10 +3666,6 @@ impl Root {
             Nav::Home
         };
         let nav = self.nav_history.pop().unwrap_or(fallback);
-        // 返回也是人自己换了页面：这里不经过 `set_nav`，代数要单独记一次（#330）。
-        if nav != self.nav {
-            self.nav_intent_seq = self.nav_intent_seq.wrapping_add(1);
-        }
         self.nav = nav;
         self.on_nav_changed(cx);
         cx.notify();
@@ -3657,6 +3675,10 @@ impl Root {
     ///
     /// 未登录时其他页面一律进不去（登录入口在设置 → 账户）。
     pub fn on_nav_changed(&mut self, cx: &mut Context<Self>) {
+        // 换页代数就记在这一处：`set_nav` 和 `go_back` 是仅有的两条换页入口，都走这里。
+        // 挂在 `set_nav` 上会漏掉返回，正是 #248 那个形状；后台装载回来时靠它判断
+        // 界面有没有被换走（#330）。
+        self.nav_seq = self.nav_seq.wrapping_add(1);
         // 进设置页要重扫缓存统计和升级预估。`set_nav` 和 `go_back` 都走这里；
         // 只挂在 `set_nav` 上会让「从详情页返回」那条路继续显示旧数字（#248）。
         if matches!(self.nav, Nav::Settings) {
