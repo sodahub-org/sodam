@@ -2030,6 +2030,10 @@ impl Root {
         let scene_name = self.scene_display_text(&scene.sub_queue_type, &scene.text);
         self.begin_queue_switch(origin.clone(), &scene_name, cx);
         self.loading_recommendation = true;
+        // 在飞的推荐装载到此作废：它回来时 `loading_recommendation` 已经由这次
+        // 听歌模式接管，不能让旧回调把加载态清掉——清了之后心跳就会去起翻页，
+        // 把 `recommendation_request_seq` 推走，本次结果回来直接判过期。
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
         self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
         let request_seq = self.recommendation_request_seq;
         self.set_status_text(self.localized("正在加载「{}」队列…", &[scene_name]));
@@ -2048,6 +2052,9 @@ impl Root {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
                 if root.recommendation_request_seq != request_seq {
+                    // 有更新的请求接过去了：队列和页面都别动，但自己那次切换态还得
+                    // 收——没人收得走它，歌词页会一直停在「正在加载…」。
+                    root.clear_own_queue_switch(&origin);
                     return;
                 }
                 root.loading_recommendation = false;
@@ -6072,6 +6079,20 @@ mod view_takeover_tests {
         );
     }
 
+    /// 切出某个函数的函数体：源码字符串守卫都要按函数看，不然会扫到隔壁。
+    fn body_of<'a>(source: &'a str, owner: &str) -> &'a str {
+        let body = source
+            .split(owner)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{owner} 应当存在"));
+        let end = ["\n    pub fn ", "\n    pub(crate) fn ", "\n    fn "]
+            .iter()
+            .filter_map(|marker| body.find(marker))
+            .min()
+            .unwrap_or(body.len());
+        &body[..end]
+    }
+
     /// 守 #330：装载回调里不许裸清切换态，一律走 `clear_own_queue_switch`。
     ///
     /// 裸清等于替别人撤加载页：用户这期间点开的歌单会被提前收掉，屏幕上先露出
@@ -6086,21 +6107,34 @@ mod view_takeover_tests {
             "pub fn start_scene_card",
             "pub fn start_scene_playlist",
         ] {
-            let body = source
-                .split(owner)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{owner} 应当存在"));
-            let end = ["\n    pub fn ", "\n    pub(crate) fn ", "\n    fn "]
-                .iter()
-                .filter_map(|marker| body.find(marker))
-                .min()
-                .unwrap_or(body.len());
-            let body = &body[..end];
             assert!(
-                !body.contains("switching_queue = None"),
+                !body_of(source, owner).contains("switching_queue = None"),
                 "{owner} 里不许裸清切换态，走 clear_own_queue_switch"
             );
         }
+    }
+
+    /// 守 #330：听歌模式接管加载态时，在飞的推荐装载必须一起作废。
+    ///
+    /// 不作废的话旧回调回来会把 `loading_recommendation` 清掉，心跳接着去起翻页、
+    /// 把 `recommendation_request_seq` 推走，本次结果回来直接判过期，它自己那次
+    /// 切换态就没人收了。
+    #[test]
+    fn scene_load_invalidates_a_pending_recommendation() {
+        let body = body_of(include_str!("app_actions.rs"), "pub fn start_scene_queue");
+        body.find("self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);")
+            .expect("接管加载态的同时必须把在飞的推荐装载作废");
+
+        let bump_at = body
+            .find("self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);")
+            .expect("每次装载都要推进请求序号");
+        let capture_at = body
+            .find("let request_seq = self.recommendation_request_seq;")
+            .expect("回调要拿本次装载的请求序号");
+        assert!(
+            bump_at < capture_at,
+            "序号先推进再记，否则本次装载自己就被判成过期"
+        );
     }
 }
 
