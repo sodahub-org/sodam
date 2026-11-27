@@ -3000,7 +3000,10 @@ impl Root {
         self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
         self.loading_recommendation = false;
         self.recommendation_error = None;
-        self.switching_queue = None;
+        // 清空队列也要把在飞的装载作废：歌单 / 电台回调不看 `recommendation_load_seq`，
+        // 它们回来照样会 `queue.replace` + 开播，把旧账号的曲目塞回空队列，人也被从
+        // 设置页拽回歌词页。这里同时清掉 `switching_queue`。
+        self.abandon_queue_switch();
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
         self.invalidate_identity_conclusions();
