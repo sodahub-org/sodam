@@ -154,6 +154,15 @@ pub(crate) enum ViewTakeover {
     Keep,
 }
 
+/// 这一轮装载的归属票据：要不要接管，以及它对应的是哪一次换队列。
+///
+/// 两个值总是一起用——判接管本身就要认代数；拆成两个参数只会在调用点上写反。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LoadTicket {
+    pub take_over: ViewTakeover,
+    pub switch_seq: u64,
+}
+
 impl Root {
     /// 只收自己那一次切换态。
     ///
@@ -1735,8 +1744,7 @@ impl Root {
         tracks: Vec<TrackItem>,
         label: &str,
         autoplay: bool,
-        take_over: ViewTakeover,
-        switch_seq: u64,
+        ticket: LoadTicket,
         cx: &mut Context<Self>,
     ) {
         let origin = match source.scene.as_ref() {
@@ -1751,8 +1759,8 @@ impl Root {
         // 于是点进「熟悉模式 / 新鲜模式」后歌词页永久转圈，但音频其实已经在放。
         //
         // 只收自己那一次：这期间用户可能已经点开了某张歌单，那个「正在加载」是他的。
-        self.clear_own_queue_switch(switch_seq);
-        if matches!(take_over, ViewTakeover::Keep) {
+        self.clear_own_queue_switch(ticket.switch_seq);
+        if matches!(ticket.take_over, ViewTakeover::Keep) {
             // 用户已经自己走了：这份结果不属于他此刻在用的任何东西，整份丢掉。
             return;
         }
@@ -2079,8 +2087,10 @@ impl Root {
                             start.tracks,
                             root.tr("听歌模式"),
                             true,
-                            ViewTakeover::Take,
-                            switch_seq,
+                            LoadTicket {
+                                take_over: ViewTakeover::Take,
+                                switch_seq,
+                            },
                             cx,
                         );
                     }
@@ -2536,8 +2546,10 @@ impl Root {
                             start.tracks,
                             root.tr("推荐"),
                             autoplay,
-                            take_over,
-                            switch_seq,
+                            LoadTicket {
+                                take_over,
+                                switch_seq,
+                            },
                             cx,
                         );
                     }
