@@ -10,6 +10,7 @@ use futures_lite::StreamExt;
 use gpui::prelude::*;
 use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
+use sodam_core::cache_check::{Blockers, MaintenanceAsk, MaintenanceDecision, MaintenanceTrigger};
 use sodam_core::config::EnvCookieFill;
 use sodam_core::cover::CoverOutcome;
 use sodam_core::failure::{
@@ -59,19 +60,6 @@ enum BatchUpgradeNotice {
     Status(String),
     Success(String),
     Warning(String),
-}
-
-/// 这一轮缓存维护是哪种触发。
-///
-/// 三种来源的「被挡住怎么办」不同，用一个枚举写清楚，别在调用点传布尔。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CacheMaintenanceTrigger {
-    /// 心跳 / 启动：按到期规则问一句。
-    Due,
-    /// 用户改了上限：被挡住也要记下来，挡路的收尾后立刻补跑。
-    Forced,
-    /// 下载记账把占用推过九成：被挡住不记账，下一拍账本还在自然重试。
-    Ledger,
 }
 
 // 失败优先于成功：有失败就让用户看见；全零只走普通状态兜底。
@@ -551,20 +539,20 @@ impl Root {
                         root.spawn_prefetch(cx);
                     }
                     // 下载记账把占用推过九成时不等 60 秒那一拍：每拍只比一次数字，
-                    // 真要跑的时候底层还会再确认一遍。
+                    // 真要跑的时候决策函数还会再确认一遍。
                     let cache_limits = root.cache_maintenance_limits();
-                    if sodam_core::cache::ledger_pressure(root.cache_mark.as_ref(), cache_limits) {
+                    if sodam_core::cache_check::ledger_pressure(
+                        root.cache_mark.as_ref(),
+                        cache_limits,
+                        sodam_core::cache::pending_audio_bytes(),
+                    ) {
                         root.maintain_cache_from_ledger(cx);
                     } else if now.saturating_duration_since(root.last_cache_check)
                         >= CACHE_MAINTENANCE
                     {
                         root.last_cache_check = now;
-                        // 被挡下来的强制请求优先补跑；没有就按到期规则问一句。
-                        if root.cache_maintenance_pending {
-                            root.maintain_cache_now(cx);
-                        } else {
-                            root.check_cache_maintenance(cx);
-                        }
+                        // 被挡下的强制请求由决策函数记着，这一拍按到期规则问一句就行。
+                        root.check_cache_maintenance(cx);
                     }
                     root.load_more_recommendation(cx);
                     next_interval = if hot || root.volume_scrub.scrubbing() {
@@ -821,19 +809,19 @@ impl Root {
         cx.notify();
     }
 
-    /// 心跳与启动用：按到期规则问一句，没到点、也没超限就什么都不做。
+    /// 心跳与启动用：按到期规则问一句；欠着补跑的话，这一拍就补。
     pub(crate) fn check_cache_maintenance(&mut self, cx: &mut Context<Self>) {
-        self.run_cache_maintenance(CacheMaintenanceTrigger::Due, cx);
+        self.run_cache_maintenance(MaintenanceTrigger::Due, cx);
     }
 
     /// 用户改了缓存上限这种必须立刻收口的场合：跳过到期判定。
     pub(crate) fn maintain_cache_now(&mut self, cx: &mut Context<Self>) {
-        self.run_cache_maintenance(CacheMaintenanceTrigger::Forced, cx);
+        self.run_cache_maintenance(MaintenanceTrigger::Forced, cx);
     }
 
     /// 下载记账说占用越过了九成：不等例行检查，马上看一次盘。
     pub(crate) fn maintain_cache_from_ledger(&mut self, cx: &mut Context<Self>) {
-        self.run_cache_maintenance(CacheMaintenanceTrigger::Ledger, cx);
+        self.run_cache_maintenance(MaintenanceTrigger::Ledger, cx);
     }
 
     fn cache_maintenance_limits(&self) -> sodam_core::cache::MaintenanceLimits {
@@ -843,38 +831,30 @@ impl Root {
         )
     }
 
-    fn run_cache_maintenance(&mut self, trigger: CacheMaintenanceTrigger, cx: &mut Context<Self>) {
-        // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
-        // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
-        if self.cache_maintenance_running || self.cache_clearing || self.batch_upgrading {
-            // 改上限这类强制请求被挡住时记一笔：挡路的收尾后在心跳里补跑，
-            // 否则新上限要等常规间隔才生效（旧标记还在，可能一直看着像「没超」）。
-            // 账本触发的不用记：下一拍账本还在，自然会再问一次。
-            if trigger == CacheMaintenanceTrigger::Forced {
-                self.cache_maintenance_pending = true;
-            }
-            return;
-        }
+    fn run_cache_maintenance(&mut self, trigger: MaintenanceTrigger, cx: &mut Context<Self>) {
         let limits = self.cache_maintenance_limits();
-        // 到期判定只读内存里的上次结论：没到点、也没超限，这一拍什么都不做。
-        // 心跳从此只付一次比较，不再每分钟重扫两棵树。
-        let due = match trigger {
-            CacheMaintenanceTrigger::Due => sodam_core::cache::maintenance_due(
-                self.cache_mark.as_ref(),
-                limits,
-                std::time::SystemTime::now(),
-            ),
-            CacheMaintenanceTrigger::Forced => true,
-            // 从心跳判定到走到这里之间，账本可能已经被一轮维护清掉了：再问一次，别白扫。
-            CacheMaintenanceTrigger::Ledger => {
-                sodam_core::cache::ledger_pressure(self.cache_mark.as_ref(), limits)
-            }
-        };
-        if !due {
+        // 挡路、到期、欠账、越线都由 `cache_check` 给结论，这里只照着做。
+        // 心跳那行的 `ledger_pressure` 预检只决定这一拍走 Ledger 还是 Due，
+        // 用的是同一个判据函数；真要跑时 `ask` 会按同样的输入再确认一次。
+        let decision = self.cache_check.ask(MaintenanceAsk {
+            trigger,
+            // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个
+            // 以「文件已被删」失败。巡检每 60 秒一拍，等批量收尾再收。
+            blockers: Blockers {
+                running: self.cache_maintenance_running,
+                clearing: self.cache_clearing,
+                upgrading: self.batch_upgrading,
+            },
+            mark: self.cache_mark.as_ref(),
+            limits,
+            // 账本增量由这里读、传进去：判断那边不碰全局原子，测试才好造数。
+            pending_audio: sodam_core::cache::pending_audio_bytes(),
+            now: std::time::SystemTime::now(),
+        });
+        // Skip 和 Defer 这一拍都不跑：Defer 的欠账 `ask` 已经记下了。
+        if decision != MaintenanceDecision::Run {
             return;
         }
-        // 真要跑才清：账本触发重查后不跑的这一次，别把之前被挡下的强制请求吞掉。
-        self.cache_maintenance_pending = false;
         self.cache_maintenance_running = true;
         self.cache_summary_request_seq = self.cache_summary_request_seq.wrapping_add(1);
         let stats_seq = self.cache_summary_request_seq;

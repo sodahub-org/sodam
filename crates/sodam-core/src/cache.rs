@@ -1161,25 +1161,10 @@ pub struct MaintenanceMark {
     ///
     /// 读不全时两个字节数只是下界，不能当成一次完整的盘点把下一次检查推到常规间隔：
     /// 没读到的那部分可能让缓存停在额度之上。带这个标记的下一轮按
-    /// [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 重查：既不放到常规间隔，也不按
-    /// [`MAINTENANCE_PRESSURE_RETRY`] 反复扫。
+    /// [`crate::cache_check::MAINTENANCE_NEAR_LIMIT_INTERVAL`] 重查：既不放到常规间隔，
+    /// 也不按 [`crate::cache_check::MAINTENANCE_PRESSURE_RETRY`] 反复扫。
     pub incomplete: bool,
 }
-
-/// 常规维护间隔：缓存是「别无限涨」的软约束，按小时级检查就够，不必每分钟重算
-/// 一遍树。取 6 小时是和 Kodi 的图片缓存同一档：它的「无活可干」下一次
-/// 检查也要 6 小时起步，再密就回到「每分钟扫一次」的老问题。
-pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-
-/// 把检查调密的间隔，两种情况共用：已用 ≥ 90%，或上一轮有子树读不全。
-///
-/// 配额是软上限：贴着额度时还在下载，按常规间隔一查就等于超着一整天；读不全的
-/// 字节又只是下界，同样不能按常规间隔放走。其余情况仍按 [`MAINTENANCE_INTERVAL`]。
-pub const MAINTENANCE_NEAR_LIMIT_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-/// 已知超限后的重试下限：播放中的文件被租约挡着时这一轮可能一个都没删掉，
-/// 不设下限就会每拍重扫，等于把尖峰按分钟复现。
-pub const MAINTENANCE_PRESSURE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// 记录上次维护结论的文件名，放在缓存根目录（音频、封面两棵树之外，扫描不会碰到它）。
 const MAINTENANCE_MARK_FILE: &str = "maintenance.tsv";
@@ -1232,7 +1217,7 @@ fn landed_delta(landing: Landing) -> i64 {
 }
 
 /// 上次看盘之后又写进来的音频字节（净增量，可为负）。
-pub(crate) fn pending_audio_bytes() -> i64 {
+pub fn pending_audio_bytes() -> i64 {
     AUDIO_DELTA.load(Ordering::Relaxed)
 }
 
@@ -1287,71 +1272,6 @@ pub(crate) fn file_len(path: &Path) -> u64 {
 /// 这次真看盘：账本整本作废，扫描结果就是新的起点。
 pub(crate) fn reset_cache_accounting() {
     AUDIO_DELTA.store(0, Ordering::Relaxed);
-}
-
-/// 上一轮扫描的数字加上这本账，够不够把检查提前。
-///
-/// 只在「上次看盘还没到九成、这次写进来的字节把它推上去」时成立：上次看盘本身
-/// 就在九成以上时交给 [`maintenance_due`] 的密集档——一轮扫完账本就清零，
-/// 停在高位由那里的 30 分钟间隔兜住，不会写一首就扫一遍盘。
-fn ledger_says_near_limit(mark_audio_bytes: u64, pending: i64, limit_bytes: u64) -> bool {
-    if pending <= 0 {
-        return false;
-    }
-    near_limit(mark_audio_bytes.saturating_add_signed(pending), limit_bytes)
-        && !near_limit(mark_audio_bytes, limit_bytes)
-}
-
-/// 账本有没有把音频占用推过九成、而上次看盘还没到九成。
-pub fn ledger_pressure(mark: Option<&MaintenanceMark>, limits: MaintenanceLimits) -> bool {
-    let Some(mark) = mark else {
-        // 没有结论时 `maintenance_due` 本来就要求跑一轮，这里不重复排。
-        return false;
-    };
-    ledger_says_near_limit(mark.audio_bytes, pending_audio_bytes(), limits.audio_bytes)
-}
-
-/// 这一拍要不要真跑一轮维护。
-///
-/// 越接近上限查得越密：
-/// - 已知超限：过了 [`MAINTENANCE_PRESSURE_RETRY`] 就重试（挡住删除时不能每拍重扫）；
-/// - 上一轮读不全：过了 [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 就重查（下界不能当真）；
-/// - 已用 ≥ 90%：同样过了 [`MAINTENANCE_NEAR_LIMIT_INTERVAL`] 就查一次；
-/// - 其余：过了 [`MAINTENANCE_INTERVAL`] 才查。
-///
-/// 没有记录（首次运行、记录损坏、用户清空过缓存根）按到期处理，跑一轮就能重新立账。
-pub fn maintenance_due(
-    mark: Option<&MaintenanceMark>,
-    limits: MaintenanceLimits,
-    now: SystemTime,
-) -> bool {
-    let Some(mark) = mark else {
-        return true;
-    };
-    let Ok(elapsed) = now.duration_since(mark.completed_at) else {
-        // 时钟回拨：记录看起来在未来。当成到期跑一次，落盘时会改回当前时刻。
-        return true;
-    };
-    let over_limit = mark.audio_bytes > limits.audio_bytes || mark.cover_bytes > limits.cover_bytes;
-    if over_limit {
-        return elapsed >= MAINTENANCE_PRESSURE_RETRY;
-    }
-    // 读不全的字节数只是下界：不能按常规间隔等，也不能当成刚刚完整盘点过。
-    // 但也不能按超限的 10 分钟来——目录长期读不到时会变成每 10 分钟扫一遍。
-    if mark.incomplete {
-        return elapsed >= MAINTENANCE_NEAR_LIMIT_INTERVAL;
-    }
-    if elapsed >= MAINTENANCE_INTERVAL {
-        return true;
-    }
-    let near = near_limit(mark.audio_bytes, limits.audio_bytes)
-        || near_limit(mark.cover_bytes, limits.cover_bytes);
-    near && elapsed >= MAINTENANCE_NEAR_LIMIT_INTERVAL
-}
-
-/// 已用是否摸到上限的九成。
-fn near_limit(known: u64, limit: u64) -> bool {
-    known.saturating_mul(10) >= limit.saturating_mul(9)
 }
 
 /// 一轮维护的结论：设置页的数字、界面要同步的删除清单、日志要的指标都在这里。
@@ -4721,108 +4641,6 @@ mod tests {
         assert!(!expired.exists() && !expired_meta.exists());
     }
 
-    /// 到期判定只看落盘结论——没到期不扫，已知超限不等到期，但也不能每拍重扫。
-    #[test]
-    fn maintenance_due_follows_interval_and_pressure() {
-        let limits = MaintenanceLimits::from_mb(10, 512);
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
-        assert!(maintenance_due(None, limits, now), "没有记录要跑一轮立账");
-
-        let fresh = MaintenanceMark {
-            completed_at: now - Duration::from_secs(60),
-            audio_bytes: 1,
-            cover_bytes: 1,
-            incomplete: false,
-        };
-        assert!(
-            !maintenance_due(Some(&fresh), limits, now),
-            "刚跑完、没超限：这一拍什么都不做"
-        );
-
-        let stale = MaintenanceMark {
-            completed_at: now - MAINTENANCE_INTERVAL,
-            audio_bytes: 1,
-            cover_bytes: 1,
-            incomplete: false,
-        };
-        assert!(maintenance_due(Some(&stale), limits, now), "到点要扫");
-
-        let near = MaintenanceMark {
-            completed_at: now - MAINTENANCE_NEAR_LIMIT_INTERVAL,
-            audio_bytes: limits.audio_bytes / 10 * 9 + 1,
-            cover_bytes: 0,
-            incomplete: false,
-        };
-        assert!(
-            maintenance_due(Some(&near), limits, now),
-            "已经贴着上限：不能按常规间隔等一整天"
-        );
-        let near_but_fresh = MaintenanceMark {
-            completed_at: now - Duration::from_secs(60),
-            audio_bytes: limits.audio_bytes / 10 * 9 + 1,
-            cover_bytes: 0,
-            incomplete: false,
-        };
-        assert!(
-            !maintenance_due(Some(&near_but_fresh), limits, now),
-            "刚查过就别再查"
-        );
-
-        let incomplete = MaintenanceMark {
-            completed_at: now - Duration::from_secs(60),
-            audio_bytes: 1,
-            cover_bytes: 1,
-            incomplete: true,
-        };
-        assert!(
-            !maintenance_due(Some(&incomplete), limits, now),
-            "读不全的盘点按密集档重试，别每拍重扫"
-        );
-        let incomplete_retry = MaintenanceMark {
-            completed_at: now - MAINTENANCE_NEAR_LIMIT_INTERVAL,
-            audio_bytes: 1,
-            cover_bytes: 1,
-            incomplete: true,
-        };
-        assert!(
-            maintenance_due(Some(&incomplete_retry), limits, now),
-            "读不全的字节只是下界，不能把下一次检查推到常规间隔"
-        );
-
-        let over = MaintenanceMark {
-            completed_at: now - MAINTENANCE_PRESSURE_RETRY,
-            audio_bytes: limits.audio_bytes + 1,
-            cover_bytes: 0,
-            incomplete: false,
-        };
-        assert!(
-            maintenance_due(Some(&over), limits, now),
-            "已知超限不等到期"
-        );
-
-        let just_retried = MaintenanceMark {
-            completed_at: now - Duration::from_secs(30),
-            audio_bytes: limits.audio_bytes + 1,
-            cover_bytes: 0,
-            incomplete: false,
-        };
-        assert!(
-            !maintenance_due(Some(&just_retried), limits, now),
-            "播放中的文件挡住删除时，也不能每拍重扫"
-        );
-
-        let rewound = MaintenanceMark {
-            completed_at: now + Duration::from_secs(3600),
-            audio_bytes: 0,
-            cover_bytes: 0,
-            incomplete: false,
-        };
-        assert!(
-            maintenance_due(Some(&rewound), limits, now),
-            "时钟回拨当成到期，别让维护永久停摆"
-        );
-    }
-
     /// 维护结论落盘后读得回来；内容坏了当作没有记录，最坏多扫一轮。
     #[test]
     fn maintenance_mark_round_trips_on_disk() {
@@ -5047,23 +4865,6 @@ mod tests {
             3_000u64.saturating_add_signed(delta),
             0,
             "已知占用按 0 封底"
-        );
-    }
-
-    /// 越线判定：上次看盘没到九成、账本把它推上去才提前跑；已经在上面的交给密集档。
-    #[test]
-    fn ledger_pressure_only_fires_when_crossing_from_below() {
-        let limit = 1_000u64;
-        assert!(ledger_says_near_limit(500, 400, limit), "从五成推到九成");
-        assert!(!ledger_says_near_limit(500, 300, limit), "还不到九成不跑");
-        assert!(
-            !ledger_says_near_limit(900, 50, limit),
-            "上次看盘就贴着上限：交给 maintenance_due 的密集档，别写一首扫一遍"
-        );
-        assert!(!ledger_says_near_limit(500, 0, limit));
-        assert!(
-            !ledger_says_near_limit(500, -100, limit),
-            "账变成负数不触发"
         );
     }
 

@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod cache;
+pub mod cache_check;
 pub mod color;
 pub mod config;
 pub mod config_watch;
