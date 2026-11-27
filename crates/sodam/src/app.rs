@@ -424,7 +424,8 @@ pub struct Root {
     /// 还是真实内容，属于视图归属的导航状态，不该被一次超时或旧请求回写（#55）。
     pub switching_queue: Option<QueueOrigin>,
     pub switching_label: String,
-    /// 换队列的代数：每次 `begin_queue_switch` 或一次显式换队 +1。
+    /// 换队列的代数：每次 `begin_queue_switch` 或一次显式换队 +1，和 `nav_seq` 一样
+    /// 只是个只增的计数。
     ///
     /// `switching_queue` 是全局一个，光比对 origin 认不出「同源的新一次装载」；
     /// 装载回来拿自己的代数比一下，对不上就说明这次切换已经不归自己了。
