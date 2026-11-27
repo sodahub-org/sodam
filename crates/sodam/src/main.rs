@@ -264,9 +264,10 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
             "open_main_window_failed",
             &[("detail", detail.as_str())],
         );
+        // 状态行只在窗口里画，这时根本没有窗口：用会在下次开窗补弹一次的轻提示。
         app.update(cx, |root, cx| {
             let text = root.tr("打开主窗口失败，重启应用再试").to_string();
-            root.set_status_text(text);
+            root.notify_error_once("open-main-window-failed", text);
             cx.notify();
         });
     }
