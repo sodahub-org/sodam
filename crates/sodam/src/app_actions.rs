@@ -2028,7 +2028,7 @@ impl Root {
             return;
         }
         let scene_name = self.scene_display_text(&scene.sub_queue_type, &scene.text);
-        self.begin_queue_switch(origin, &scene_name, cx);
+        self.begin_queue_switch(origin.clone(), &scene_name, cx);
         self.loading_recommendation = true;
         self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
         let request_seq = self.recommendation_request_seq;
@@ -2054,7 +2054,7 @@ impl Root {
                 match result {
                     Ok(start) => {
                         // 听歌模式和电台是用户点卡片显式进来的，路径上不补这一层；
-                        // #330 只收回推荐流那条自动装载。
+                        // 这次只收回推荐流那条自动装载。
                         root.activate_recommended_queue(
                             start.source,
                             start.tracks,
@@ -2070,7 +2070,7 @@ impl Root {
                         //
                         // 并且和推荐流保持一致——回到有重试入口的页面（听歌模式列表），
                         // 而不是留在已经停播的歌词页上。
-                        root.switching_queue = None;
+                        root.clear_own_queue_switch(&origin);
                         root.set_nav(Nav::Scenes, cx);
                         let message = root.failure_text("加载听歌模式队列失败", &err, REMOTE_TEXT);
                         root.notify_error_once("scene-queue-load-failed", message);
@@ -2462,7 +2462,7 @@ impl Root {
         // 切队列前先看看队列里是不是上一次的推荐内容，失败时保住它，不用开空白页。
         let cached = self.queue_origin == QueueOrigin::Feed && !self.queue.is_empty();
         self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
-        // 记下"装载期间界面有没有被换走"的基线（#330）。快照必须取在
+        // 记下"装载期间界面有没有被换走"的基线。快照必须取在
         // `begin_queue_switch` 之后：把界面带到加载页是这个装载自己的动作，
         // 之后再变代数才说明人换了页面。
         let load_nav_seq = self.nav_seq;
@@ -2496,11 +2496,12 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
-                // 只收自己这轮留下的切换态：这期间用户可能已经开了别的加载，
-                // 替他撤掉等于把他在等的那个页面弄丢。
+                // 这份结果还算不算用户在等的：期间没人接手这次切换，而且人还站在
+                // 装载把他带到的那一页上。两个都成立才接管，否则就是抢。
+                let still_ours = root.switching_queue.as_ref() == Some(&QueueOrigin::Feed)
+                    && root.nav == Nav::Lyrics;
                 root.clear_own_queue_switch(&QueueOrigin::Feed);
-                // 这一轮装载开始后界面被换走过：结果只落数据，不把界面拽回来（#330）。
-                let take_over = if root.nav_seq == load_nav_seq {
+                let take_over = if root.nav_seq == load_nav_seq || still_ours {
                     ViewTakeover::Take
                 } else {
                     ViewTakeover::Keep
@@ -2542,7 +2543,7 @@ impl Root {
     ///
     /// 网络错误 / 超时 / 无数据三种情况都走这里。调用点已经用 `load_seq` 过滤过
     /// 过期结果，所以这里不再判断请求序号。`take_over` 为 `Keep` 表示界面已经被
-    /// 人换走了：失败只汇报，不把他拽到推荐页（#330）。
+    /// 人换走了：失败只汇报，不把他拽到推荐页。
     fn recommendation_failed(
         &mut self,
         message: String,
@@ -2585,11 +2586,8 @@ impl Root {
                 let Some(radio) = card.radio.clone() else {
                     return;
                 };
-                self.begin_queue_switch(
-                    QueueOrigin::Radio(radio.radio_id.clone()),
-                    &card.playlist.title,
-                    cx,
-                );
+                let switch_origin = QueueOrigin::Radio(radio.radio_id.clone());
+                self.begin_queue_switch(switch_origin.clone(), &card.playlist.title, cx);
                 self.loading_playlist = true;
                 self.set_status(
                     "正在加载电台「{}」…",
@@ -2607,7 +2605,7 @@ impl Root {
                     let result = work.await;
                     let _ = this.update(cx, |root, cx| {
                         root.loading_playlist = false;
-                        root.switching_queue = None;
+                        root.clear_own_queue_switch(&switch_origin);
                         match result {
                             Ok(tracks) if !tracks.is_empty() => {
                                 root.queue.replace(tracks, 0);
@@ -2654,6 +2652,7 @@ impl Root {
         }
         let switch_origin = QueueOrigin::Playlist(playlist.id.clone());
         self.begin_queue_switch(switch_origin.clone(), &playlist.title, cx);
+        let load_nav_seq = self.nav_seq;
         self.loading_playlist = true;
         self.set_status("正在加载歌单「{}」…", std::slice::from_ref(&playlist.title));
         cx.notify();
@@ -2691,7 +2690,11 @@ impl Root {
                     Ok(_) => {
                         root.clear_own_queue_switch(&switch_origin);
                         // 停在歌词页上既没声音也没入口，回有重试的听歌模式页。
-                        root.set_nav(Nav::Scenes, cx);
+                        // 只在人还停在本次装载带出来的那一页时才跳：他要是自己去翻
+                        // 别的页面了，这一个迟到的结果不该把他拽回来。
+                        if root.nav_seq == load_nav_seq {
+                            root.set_nav(Nav::Scenes, cx);
+                        }
                         root.set_status(
                             "歌单「{}」没有可播放曲目",
                             std::slice::from_ref(&playlist.title),
@@ -2699,7 +2702,9 @@ impl Root {
                     }
                     Err(err) => {
                         root.clear_own_queue_switch(&switch_origin);
-                        root.set_nav(Nav::Scenes, cx);
+                        if root.nav_seq == load_nav_seq {
+                            root.set_nav(Nav::Scenes, cx);
+                        }
                         let message = root.failure_text("加载歌单失败", &err, REMOTE_TEXT);
                         root.notify_error_once("playlist-load-failed", message);
                     }
@@ -3688,7 +3693,7 @@ impl Root {
     pub fn on_nav_changed(&mut self, cx: &mut Context<Self>) {
         // 换页代数就记在这一处：`set_nav` 和 `go_back` 是仅有的两条换页入口，都走这里。
         // 挂在 `set_nav` 上会漏掉返回，正是 #248 那个形状；后台装载回来时靠它判断
-        // 界面有没有被换走（#330）。
+        // 界面有没有被换走。
         self.nav_seq = self.nav_seq.wrapping_add(1);
         // 进设置页要重扫缓存统计和升级预估。`set_nav` 和 `go_back` 都走这里；
         // 只挂在 `set_nav` 上会让「从详情页返回」那条路继续显示旧数字（#248）。
@@ -6067,33 +6072,35 @@ mod view_takeover_tests {
         );
     }
 
-    /// 守 #330：切换态只收自己这轮留下的那份。
+    /// 守 #330：装载回调里不许裸清切换态，一律走 `clear_own_queue_switch`。
     ///
-    /// 无条件清 `switching_queue` 的话，用户这期间点开的歌单加载页会被提前撤掉：
-    /// 屏幕上先露出旧队列内容，等歌单回来再跳一次。
+    /// 裸清等于替别人撤加载页：用户这期间点开的歌单会被提前收掉，屏幕上先露出
+    /// 旧队列内容，等歌单回来再跳一次。这条守着所有会写切换态的装载路径。
     #[test]
-    fn queue_switch_state_is_only_cleared_when_it_belongs_to_this_load() {
+    fn queue_switch_state_is_never_cleared_bare_in_load_paths() {
         let source = include_str!("app_actions.rs");
-        let body = source
-            .split("fn clear_own_queue_switch")
-            .nth(1)
-            .expect("clear_own_queue_switch 应当存在");
-        let end = body
-            .find("\n    pub fn ")
-            .or_else(|| body.find("\n    fn "))
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        let guard_at = body
-            .find("if self.switching_queue.as_ref() == Some(origin)")
-            .expect("收切换态之前必须先认领它是自己的");
-        let clear_at = body
-            .find("self.switching_queue = None;")
-            .expect("切换态必须在这里终结");
-        assert!(
-            guard_at < clear_at,
-            "切换态只在 origin 对得上时才收，否则会撤掉用户自己的加载页"
-        );
+        for owner in [
+            "pub fn start_recommendation",
+            "pub(crate) fn activate_recommended_queue",
+            "pub fn start_scene_queue",
+            "pub fn start_scene_card",
+            "pub fn start_scene_playlist",
+        ] {
+            let body = source
+                .split(owner)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{owner} 应当存在"));
+            let end = ["\n    pub fn ", "\n    pub(crate) fn ", "\n    fn "]
+                .iter()
+                .filter_map(|marker| body.find(marker))
+                .min()
+                .unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                !body.contains("switching_queue = None"),
+                "{owner} 里不许裸清切换态，走 clear_own_queue_switch"
+            );
+        }
     }
 }
 
