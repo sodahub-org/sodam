@@ -445,11 +445,14 @@ fn window_controls_section(_root: &Root, _cx: &mut Context<Root>) -> Option<AnyE
 
 /// 关闭主窗口时的行为：退出 / 收进托盘 / 每次询问。
 ///
-/// 三端共用。没有托盘宿主时「隐藏到托盘」直接置灰——收进一个不存在的托盘，
-/// 正是让用户找不到窗口的做法（#324）。
+/// 三端共用。没有托盘宿主时「隐藏到托盘」置灰：藏起来就找不回来了。
 fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     let tray_available = root.tray_available_now();
-    let effective = CloseAction::decide(&root.settings.close_action, tray_available);
+    let stored = CloseAction::from_key(&root.settings.close_action);
+    let effective = CloseAction::decide_from(stored, tray_available);
+    // 选中态画用户存下来的那个；只有没选过时才画这次实际会怎么走。
+    // 存了「隐藏」但桌面没托盘时，那一行仍然带勾并置灰——说明它还在，只是暂时不可用。
+    let chosen = stored.unwrap_or(effective);
     let rows: Vec<AnyElement> = [
         (
             CloseAction::Quit,
@@ -463,7 +466,7 @@ fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             if tray_available {
                 root.tr("收进系统托盘，音乐继续播放")
             } else {
-                root.tr("当前桌面没有系统托盘，这项不可用")
+                root.tr("当前桌面没有系统托盘，关闭时会直接退出")
             },
             tray_available,
         ),
@@ -480,7 +483,7 @@ fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             format!("close-action-{}", action.key()),
             title,
             hint,
-            effective == action && enabled,
+            chosen == action,
             enabled,
             cx.listener(move |root, _event: &ClickEvent, _window, cx| {
                 root.settings.close_action = action.key().to_string();
@@ -512,10 +515,12 @@ fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             div()
                 .text_size(theme::Text::Small.size())
                 .text_color(theme::text_muted())
-                .child(if tray_available {
-                    root.tr("点关闭按钮时怎么处理；托盘菜单里也能退出应用")
-                } else {
-                    root.tr("当前桌面没有系统托盘，关闭窗口会直接退出应用")
+                .child(match (tray_available, effective) {
+                    (true, _) => root.tr("点关闭按钮时怎么处理；托盘菜单里也能退出应用"),
+                    (false, CloseAction::Ask) => {
+                        root.tr("当前桌面没有系统托盘，弹窗里只会给「退出应用」")
+                    }
+                    (false, _) => root.tr("当前桌面没有系统托盘，关闭窗口会直接退出应用"),
                 }),
         )
         .child(
@@ -1716,7 +1721,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                         }),
                 )
         })
-        // 设置页最下方的退出入口：没有托盘的桌面上，这里是唯一的退出口（#324）。
+        // 设置页最下方的退出入口：没有托盘的桌面上，这里是唯一的退出口。
         .child(
             div()
                 .id("quit-app")

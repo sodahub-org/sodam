@@ -182,7 +182,7 @@ fn caption_button(
     let base = base.on_click(move |_, window, cx| match area {
         WindowControlArea::Min => window.minimize_window(),
         WindowControlArea::Max => window.zoom_window(),
-        // 关闭按钮不直接销毁窗口：走动作，交给 Root 按「关闭按钮行为」处理（#324）。
+        // 关闭按钮不直接销毁窗口：走动作，交给 Root 按「关闭按钮行为」处理。
         WindowControlArea::Close => {
             window.dispatch_action(Box::new(crate::app::CloseRequested), cx)
         }

@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Global};
 use sodam_core::log_outlet::{log_event, LogLevel, LogTopic};
@@ -123,30 +123,37 @@ struct Media {
 }
 
 struct Attached {
-    /// 注册时用的窗口句柄：窗口重建后 HWND 会变，变了就得重挂（#324）。
+    /// 注册时用的窗口句柄：窗口重建后 HWND 会变，变了就得重挂。
     hwnd: Option<*mut c_void>,
     media: RefCell<Media>,
 }
 
 impl Global for Attached {}
 
+/// 命令哨兵在进程里只有一份。
+///
+/// 托盘循环启动时就把这个 `Arc` 存进 `TraySignals`，之后不再刷新；窗口重建时
+/// 媒体控制会重挂，若那时换一个新哨兵，循环看的还是旧的那个，媒体键的命令就没人取。
+fn commands_pending() -> Arc<AtomicBool> {
+    static SIGNAL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    SIGNAL
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
 /// 注册系统媒体控制。窗口建好之后调用（Windows 的 SMTC 需要 HWND）。
 ///
-/// 注册失败只记日志：拿不到媒体面板不该影响播放。
+/// 注册失败只记日志：拿不到媒体面板不该影响播放。窗口重建后 HWND 会变，
+/// 旧控件还挂在已销毁的窗口上，得摘掉重来——但先建新的，成功了再替换。
 pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
-    // 同一个窗口重复调用直接跳过；窗口重建后 HWND 变了，旧的控件还挂在已销毁的
-    // 窗口上，必须摘掉重来，否则 Windows 的媒体面板与媒体键会失联（#324）。
     if cx
         .try_global::<Attached>()
         .is_some_and(|attached| attached.hwnd == hwnd)
     {
         return;
     }
-    if cx.has_global::<Attached>() {
-        cx.remove_global::<Attached>();
-    }
     let (command_tx, commands) = std::sync::mpsc::channel::<Command>();
-    let commands_pending = Arc::new(AtomicBool::new(false));
+    let commands_pending = commands_pending();
     let controls = match Controls::new(
         hwnd,
         CommandSender::new(command_tx, commands_pending.clone()),
@@ -161,9 +168,13 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
                 "attach_failed",
                 &[("detail", detail.as_str())],
             );
+            // 新的没建起来就留着旧的：总比媒体面板直接消失强。
             return;
         }
     };
+    if cx.has_global::<Attached>() {
+        cx.remove_global::<Attached>();
+    }
     cx.set_global(Attached {
         hwnd,
         media: RefCell::new(Media {
@@ -179,8 +190,7 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
 
 /// 托盘循环在进 app 前先看这个哨兵。
 pub(crate) fn command_signal(cx: &App) -> Option<Arc<AtomicBool>> {
-    cx.try_global::<Attached>()
-        .map(|attached| attached.media.borrow().commands_pending.clone())
+    cx.has_global::<Attached>().then(commands_pending)
 }
 
 /// 取走桌面媒体控件发来的命令，并清掉托盘用的哨兵。

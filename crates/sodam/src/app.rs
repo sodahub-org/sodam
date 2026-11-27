@@ -582,7 +582,7 @@ pub struct Root {
     pub login_modal_open: bool,
     /// 系统托盘是否可用：Linux 由 ksni 的 watcher 回调维护，其它平台恒为 true。
     ///
-    /// 「关窗收进托盘」只在真的有托盘可收时才成立（#324）。
+    /// 「关窗收进托盘」只在真的有托盘可收时才成立。
     pub(crate) tray_available: Arc<AtomicBool>,
     /// 关窗询问弹窗；`Some` 表示正弹着。
     pub(crate) close_prompt: Option<ClosePrompt>,
@@ -1781,7 +1781,7 @@ impl Root {
         }
         let tray_available = self.tray_available_now();
         let stored = CloseAction::from_key(&self.settings.close_action);
-        let action = CloseAction::decide(&self.settings.close_action, tray_available);
+        let action = CloseAction::decide_from(stored, tray_available);
         // 桌面没有托盘，按退出处理：配置里写的是「收进托盘」或根本没选过。
         // 进程马上就走，界面上说不了话，留一条日志好排查。
         if !tray_available && action == CloseAction::Quit && stored != Some(CloseAction::Quit) {
@@ -1816,15 +1816,16 @@ impl Root {
         let Some(prompt) = self.close_prompt.take() else {
             return;
         };
+        // 记住的是用户点的那个；降级只对这一次关窗生效，别拿瞬时状态改掉偏好。
+        if prompt.remember {
+            self.settings.close_action = action.key().to_string();
+            self.save_settings();
+        }
         // 弹窗开着的时候托盘可能已经下线：这时「隐藏」会把用户关在门外，按退出处理。
         let action = match action {
             CloseAction::Hide if !self.tray_available_now() => CloseAction::Quit,
             other => other,
         };
-        if prompt.remember {
-            self.settings.close_action = action.key().to_string();
-            self.save_settings();
-        }
         match action {
             CloseAction::Quit => self.request_quit(cx),
             CloseAction::Hide => window.remove_window(),

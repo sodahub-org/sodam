@@ -1,12 +1,11 @@
-//! 关窗询问弹窗：点关闭按钮时问一句「退出还是收进托盘」（#324）。
+//! 关窗询问弹窗：点关闭按钮时问一句「退出还是收进托盘」。
 
 use super::*;
 use sodam_core::config::CloseAction;
 
 /// 关窗询问：居中卡片 + 两个选择 + 取消。
 ///
-/// 托盘不可用时不给「隐藏到托盘」——收进一个不存在的托盘，正是把用户
-/// 关在门外的做法（#324）。
+/// 托盘不可用时不给「隐藏到托盘」：藏起来就找不回来了。
 pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
     use gpui::deferred;
 
@@ -33,7 +32,7 @@ pub fn close_prompt(root: &Root, cx: &mut Context<Root>) -> AnyElement {
                 .text_size(theme::Text::Title.size())
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(theme::text())
-                .child(root.tr("关闭汽水音乐？")),
+                .child(root.tr("关闭 SodaM？")),
         )
         .child(
             div()

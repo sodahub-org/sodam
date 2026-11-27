@@ -415,7 +415,7 @@ impl TitlebarMode {
 /// 关闭主窗口时的行为。
 ///
 /// 「收进托盘」成立的前提是桌面真有托盘可收：GNOME 3.26 起默认不提供
-/// StatusNotifier 宿主，收进去就成了一个看不见也退不掉的进程（#324）。
+/// StatusNotifier 宿主，收进去就成了一个看不见也退不掉的进程。
 /// 所以没有托盘时一律降级成退出，而不是把用户关在门外。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -446,14 +446,17 @@ impl CloseAction {
         }
     }
 
-    /// 这次关窗实际该怎么做。
-    ///
-    /// * 用户选过就照办，但「收进托盘」在没有托盘时降级成退出——宁可退得保守，
-    ///   也不留一个找不回来的进程。
-    /// * 用户没选过：有托盘就沿用原来的「收进托盘」，没托盘就直接退出。
-    ///   收进一个看不见的地方才是 #324 的问题，不是退出。
+    /// 这次关窗实际该怎么做。规则只在这一处，别处别再解析一遍配置。
     pub fn decide(stored: &str, tray_available: bool) -> Self {
-        match Self::from_key(stored) {
+        Self::decide_from(Self::from_key(stored), tray_available)
+    }
+
+    /// 同 [`Self::decide`]，只是配置已经解析过：调用方还要用 `stored` 做别的判断时用它。
+    ///
+    /// * 用户选过就照办，只有「收进托盘」在没有托盘时降级成退出。
+    /// * 没选过：有托盘就沿用原来的「收进托盘」，没托盘就直接退出。
+    pub fn decide_from(stored: Option<Self>, tray_available: bool) -> Self {
+        match stored {
             Some(Self::Hide) if !tray_available => Self::Quit,
             Some(action) => action,
             None if tray_available => Self::Hide,
@@ -1777,7 +1780,7 @@ mod tests {
         assert_eq!(TitlebarMode::from_key(&loaded.titlebar), TitlebarMode::Auto);
     }
 
-    /// 关闭按钮行为：没选过按平台默认，没托盘时绝不收进托盘（#324）。
+    /// 关闭按钮行为：没选过按平台默认，没托盘时绝不收进托盘。
     #[test]
     fn close_action_parses_and_degrades_without_tray() {
         assert_eq!(CloseAction::from_key(""), None);

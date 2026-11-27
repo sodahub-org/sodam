@@ -126,13 +126,18 @@ impl Language {
             "直接结束进程，不再后台播放" => "End the process; nothing keeps playing in the background",
             "隐藏到托盘继续播放" => "Hide to tray and keep playing",
             "收进系统托盘，音乐继续播放" => "Move to the system tray; music keeps playing",
-            "当前桌面没有系统托盘，这项不可用" => "No system tray on this desktop, so this option is unavailable",
+            "当前桌面没有系统托盘，关闭时会直接退出" => {
+                "No system tray on this desktop, so closing quits the app"
+            }
+            "当前桌面没有系统托盘，弹窗里只会给「退出应用」" => {
+                "No system tray on this desktop; the dialog only offers quitting"
+            }
             "每次询问" => "Ask every time",
             "每次关闭都弹窗让你选" => "Show a dialog on every close",
             "关闭按钮：退出应用" => "Close button: quit the app",
             "关闭按钮：隐藏到托盘" => "Close button: hide to tray",
             "关闭按钮：每次询问" => "Close button: ask every time",
-            "关闭汽水音乐？" => "Close Qishui Music?",
+            "关闭 SodaM？" => "Close SodaM?",
             "关闭窗口后应用会继续在后台播放，可以从系统托盘重新打开。" => {
                 "The window closes but playback continues in the background; reopen it from the system tray."
             }

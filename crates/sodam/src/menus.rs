@@ -5,8 +5,9 @@
 //! ⌘Q/⌘M/⌘W 在系统侧就是空白键，应用收不到任何动作。菜单项右侧显示的快捷键
 //! 取自 keymap 里对该 action 的绑定，所以「绑定 + 菜单项」缺一不可。
 //!
-//! ⌘W 只关窗不退出：应用是常驻托盘的（`QuitMode::Explicit`），关窗后可以从托盘
-//! 「显示主窗口」再打开，⌘Q 才真正退出进程。
+//! ⌘W 和红绿灯走同一套关窗策略：默认收进托盘（`QuitMode::Explicit` 下进程留着，
+//! 从托盘「显示主窗口」能再打开），设置里选了「退出应用」时 ⌘W 也退出进程。
+//! ⌘Q 始终是直接退出。
 
 use gpui::{actions, App, KeyBinding, Menu, MenuItem, WeakEntity, Window};
 
@@ -29,7 +30,7 @@ pub fn install(cx: &mut App, language: Language, app: WeakEntity<Root>) {
     cx.on_action(|_: &MinimizeWindow, cx: &mut App| {
         with_main_window(cx, |window, _| window.minimize_window())
     });
-    // ⌘W 和红绿灯走同一套关窗策略：设成「退出」时 ⌘W 也该退出（#324）。
+    // ⌘W 和红绿灯走同一套关窗策略：设成「退出」时 ⌘W 也该退出。
     let close_app = app.clone();
     cx.on_action(move |_: &CloseWindow, cx: &mut App| {
         let Some(app) = close_app.upgrade() else {

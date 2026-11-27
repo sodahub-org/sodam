@@ -178,8 +178,7 @@ pub mod linux {
         /// 封面缩略图（PNG 字节），按源路径缓存（同步每 500ms 一次，不必反复解码）。
         cover_cache: std::cell::RefCell<Option<(std::path::PathBuf, Vec<u8>)>>,
         icon_cache: OnceLock<Icon>,
-        /// 托盘宿主是否在线。GNOME 默认没有宿主，此时「关窗收进托盘」会把用户
-        /// 关在门外，所以这个开关要交给 Root 决定关窗行为（#324）。
+        /// 托盘宿主是否在线；Root 据此决定关窗时能不能收进托盘。
         tray_available: Arc<AtomicBool>,
     }
 

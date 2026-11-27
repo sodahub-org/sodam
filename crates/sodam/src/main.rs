@@ -95,7 +95,7 @@ fn start_tray_service(
     cx: &mut App,
     mut sync: impl FnMut(tray::TrayState) + 'static,
 ) {
-    // 宿主上下线是托盘线程写的；这里只读这个开关，变了才叫界面重绘（#324）。
+    // 宿主上下线是托盘线程写的；这里只读这个开关，变了才叫界面重绘。
     let tray_flag = app.read(cx).tray_available.clone();
     cx.spawn(async move |cx| {
         let mut tick = 0u32;
@@ -268,14 +268,14 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
 /// 建主窗口：系统媒体控制与关窗策略都挂在这里。
 ///
 /// 关窗钩子是窗口级的，窗口每次重建都要重新注册。首次启动和托盘恢复
-/// 必须共用这一个入口，否则恢复出来的窗口又变回「关窗即消失」（#324）。
+/// 必须共用这一个入口，否则恢复出来的窗口又变回「关窗即消失」。
 fn open_main_window(cx: &mut App, app: &Entity<app::Root>) -> anyhow::Result<()> {
     let options = main_window_options(cx);
     let root = app.clone();
     cx.open_window(options, move |window, cx| {
         // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
         media::attach(native_handle(window), cx);
-        // 关窗不直接销毁窗口：交给 Root 按「关闭按钮行为」决定退出还是收进托盘（#324）。
+        // 关窗不直接销毁窗口：交给 Root 按「关闭按钮行为」决定退出还是收进托盘。
         let close_root = root.clone();
         window.on_window_should_close(cx, move |_window, cx| {
             close_root.update(cx, |root, cx| root.handle_close_request(cx))
@@ -316,7 +316,7 @@ fn main() {
             shortcuts::install(cx, &settings, app.clone());
             open_main_window(cx, &app).expect("打开主窗口失败");
 
-            // 自绘标题栏的关闭按钮派发这个动作：和平台关窗钩子共用一套策略（#324）。
+            // 自绘标题栏的关闭按钮派发这个动作：和平台关窗钩子共用一套策略。
             // 动作可能是在窗口更新途中派发的，推到这一轮之后再动窗口。
             cx.on_action({
                 let app = app.clone();
@@ -345,7 +345,7 @@ fn main() {
                     let tray_service = ksni::TrayService::new(tray::linux::SodaTray::new(
                         tray_tx,
                         crate::ui::i18n::Language::system_locale(),
-                        // 宿主在不在由 ksni 的 watcher 回调写进这个开关（#324）。
+                        // 宿主在不在由 ksni 的 watcher 回调写进这个开关。
                         app.read(cx).tray_available.clone(),
                     ));
                     let tray_handle = tray_service.handle();
