@@ -256,7 +256,7 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
     } else if let Err(error) = open_main_window(cx, app) {
-        // 托盘恢复窗口失败别静默吞掉：用户会看到「点了没反应」。
+        // 点了没反应最容易被当成卡死：日志之外，状态行也说一句。
         let detail = format!("{error:#}");
         sodam_core::log_outlet::log_event(
             sodam_core::log_outlet::LogLevel::Error,
@@ -264,6 +264,11 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
             "open_main_window_failed",
             &[("detail", detail.as_str())],
         );
+        app.update(cx, |root, cx| {
+            let text = root.tr("打开主窗口失败，重启应用再试").to_string();
+            root.set_status_text(text);
+            cx.notify();
+        });
     }
     cx.activate(true);
 }

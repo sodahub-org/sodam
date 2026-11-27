@@ -145,6 +145,9 @@ impl Language {
                 "This desktop has no system tray, so a hidden window could not be brought back. The only option is to quit."
             }
             "记住我的选择" => "Remember my choice",
+            "打开主窗口失败，重启应用再试" => {
+                "Could not open the main window. Restart the app and try again"
+            }
             "隐藏到托盘" => "Hide to tray",
             "主题已恢复为跟随系统" => "Theme restored to system",
             "「{}」没有可用歌词" => "No lyrics available for {}",

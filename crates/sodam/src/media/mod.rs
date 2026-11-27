@@ -130,11 +130,11 @@ struct Attached {
 
 impl Global for Attached {}
 
-/// 命令哨兵在进程里只有一份。
+/// 命令哨兵：进程里只有一份，托盘循环进 app 前看它。
 ///
-/// 托盘循环启动时就把这个 `Arc` 存进 `TraySignals`，之后不再刷新；窗口重建时
-/// 媒体控制会重挂，若那时换一个新哨兵，循环看的还是旧的那个，媒体键的命令就没人取。
-fn commands_pending() -> Arc<AtomicBool> {
+/// 循环启动时就把这个 `Arc` 存进 `TraySignals`，之后不再刷新；窗口重建时媒体控制
+/// 会重挂，若那时换一个新哨兵，循环看的还是旧的那个，媒体键的命令就没人取。
+pub(crate) fn command_signal() -> Arc<AtomicBool> {
     static SIGNAL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     SIGNAL
         .get_or_init(|| Arc::new(AtomicBool::new(false)))
@@ -153,7 +153,7 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
         return;
     }
     let (command_tx, commands) = std::sync::mpsc::channel::<Command>();
-    let commands_pending = commands_pending();
+    let commands_pending = command_signal();
     let controls = match Controls::new(
         hwnd,
         CommandSender::new(command_tx, commands_pending.clone()),
@@ -186,14 +186,6 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
             last_position: 0.0,
         }),
     });
-}
-
-/// 托盘循环在进 app 前先看这个哨兵。
-///
-/// 和媒体控制有没有挂上无关：第一次 attach 失败、之后重试成功时，
-/// 循环也得看得见新来的命令。
-pub(crate) fn command_signal() -> Arc<AtomicBool> {
-    commands_pending()
 }
 
 /// 取走桌面媒体控件发来的命令，并清掉托盘用的哨兵。
