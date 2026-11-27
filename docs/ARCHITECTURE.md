@@ -154,7 +154,7 @@ TrackItem + cache path
   `audio_incomplete` / `covers_incomplete`）、`audio_gap` / `cover_gap`（每棵树首处缺口：
   `none` / `dir` / `entries` / `metadata`）、`audio_incomplete`（0/1，为 1 时 `audio_bytes`
   只是下界）与 `over_limit`。`audio_bytes` 是这一轮扫描后、成功删除扣减后的音频树总量，
-  不重新扫盘；没有并发写入时能和磁盘占用对账，下载恰好跨过扫描/删除时可能有偏差。
+  不重新扫盘；扫描完整且没有并发写入时能和磁盘占用对账，下载恰好跨过扫描/删除时可能有偏差。
   耗时与扫描数不含首轮旧残留巡检。
   两棵树的用量统一用 `cache::CacheUsage` 表示：字节、文件数、歌曲数，加一个「这轮读全了没有」；
   维护报告与进设置页的一次性统计都产出它。读不全时这几个数只是下界，设置页写成「至少 X」；
