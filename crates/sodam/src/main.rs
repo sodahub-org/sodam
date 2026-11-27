@@ -256,7 +256,8 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
     } else if let Err(error) = open_main_window(cx, app) {
-        // 点了没反应最容易被当成卡死：日志之外，状态行也说一句。
+        // 点了没反应最容易被当成卡死。日志写一条；界面这边没有窗口可画，
+        // 所以发一条 Error 级轻提示——它会在下次开窗时补弹一次。
         let detail = format!("{error:#}");
         sodam_core::log_outlet::log_event(
             sodam_core::log_outlet::LogLevel::Error,
@@ -264,7 +265,6 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
             "open_main_window_failed",
             &[("detail", detail.as_str())],
         );
-        // 状态行只在窗口里画，这时根本没有窗口：用会在下次开窗补弹一次的轻提示。
         app.update(cx, |root, cx| {
             let text = root.tr("打开主窗口失败，重启应用再试").to_string();
             root.notify_error_once("open-main-window-failed", text);
