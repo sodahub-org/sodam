@@ -66,7 +66,7 @@ pub enum MaintenanceDecision {
     Run,
     /// 什么都不做，下一拍再说。
     Skip,
-    /// 先不跑，但记下这一笔：挡路的结束后由下一拍心跳补上。
+    /// 先不跑，但记下这一笔：挡路的结束后，下一次检查（心跳里最迟 60 秒）补上。
     Defer,
 }
 
@@ -86,8 +86,8 @@ pub struct MaintenanceAsk<'a> {
 
 /// 「该不该清」的判断，外加一笔「被挡下的强制请求」的欠账。
 ///
-/// 欠账只记在这里：被挡下的强制请求记一笔，挡路的结束后的下一拍不管到没到期都
-/// 补跑，跑起来就销账。放在这里而不是界面里，是为了让「会不会补跑」也能被测到。
+/// 欠账只记在这里：被挡下的强制请求记一笔，挡路的结束后的下一次检查不管到没到期都
+/// 补跑（心跳里那句到期判断被 60 秒门限闸着，所以最迟 60 秒），跑起来就销账。放在这里而不是界面里，是为了让「会不会补跑」也能被测到。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheCheck {
     owed: bool,
@@ -476,7 +476,135 @@ mod tests {
         );
     }
 
-    /// 被挡下的强制请求记一笔，挡路的结束后的下一拍就补跑，不等下一轮到期。
+    /// 票面那张表逐格钉死：期望值全是字面量，不复用 `ask` 里的任何谓词。
+    #[test]
+    fn the_decision_table_is_pinned_cell_by_cell() {
+        let limits = limits();
+        let now = now();
+        let fresh = state_mark(false, now);
+        let stale = state_mark(true, now);
+        let hot = limits.audio_bytes as i64;
+
+        // (说明, 触发, 挡着没, 欠着没, 上次结论, 账本增量, 期望)
+        let cases = [
+            (
+                "到点要跑",
+                MaintenanceTrigger::Due,
+                false,
+                false,
+                &stale,
+                0,
+                MaintenanceDecision::Run,
+            ),
+            (
+                "没到点不跑",
+                MaintenanceTrigger::Due,
+                false,
+                false,
+                &fresh,
+                0,
+                MaintenanceDecision::Skip,
+            ),
+            (
+                "强制直接跑",
+                MaintenanceTrigger::Forced,
+                false,
+                false,
+                &fresh,
+                0,
+                MaintenanceDecision::Run,
+            ),
+            (
+                "账本从下面推过九成：提前跑",
+                MaintenanceTrigger::Ledger,
+                false,
+                false,
+                &fresh,
+                hot,
+                MaintenanceDecision::Run,
+            ),
+            (
+                "账本没越线不跑",
+                MaintenanceTrigger::Ledger,
+                false,
+                false,
+                &fresh,
+                0,
+                MaintenanceDecision::Skip,
+            ),
+            (
+                "强制被挡：记一笔回头补",
+                MaintenanceTrigger::Forced,
+                true,
+                false,
+                &fresh,
+                0,
+                MaintenanceDecision::Defer,
+            ),
+            (
+                "例行被挡：跳过，不记账",
+                MaintenanceTrigger::Due,
+                true,
+                false,
+                &fresh,
+                0,
+                MaintenanceDecision::Skip,
+            ),
+            (
+                "账本被挡：跳过，不记账",
+                MaintenanceTrigger::Ledger,
+                true,
+                false,
+                &fresh,
+                hot,
+                MaintenanceDecision::Skip,
+            ),
+            (
+                "欠着又没挡：直接补跑",
+                MaintenanceTrigger::Due,
+                false,
+                true,
+                &fresh,
+                0,
+                MaintenanceDecision::Run,
+            ),
+            (
+                "欠着还被挡：账继续挂着",
+                MaintenanceTrigger::Due,
+                true,
+                true,
+                &fresh,
+                0,
+                MaintenanceDecision::Defer,
+            ),
+            (
+                "欠着碰上账本触发：照样跑",
+                MaintenanceTrigger::Ledger,
+                false,
+                true,
+                &fresh,
+                0,
+                MaintenanceDecision::Run,
+            ),
+        ];
+
+        for (name, trigger, is_blocked, owed, mark, pending_audio, want) in cases {
+            let blockers = if is_blocked {
+                blocked()
+            } else {
+                Blockers::default()
+            };
+            let mut check = if owed {
+                owed_check()
+            } else {
+                CacheCheck::default()
+            };
+            let got = check.ask(input(trigger, blockers, mark, pending_audio));
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// 被挡下的强制请求记一笔，挡路的结束后的下一次检查就补跑，不等常规间隔。
     #[test]
     fn blocked_forced_request_is_retried_on_the_next_tick() {
         let fresh = state_mark(false, now());
@@ -495,7 +623,7 @@ mod tests {
         );
         assert!(check.owed());
 
-        // 挡路的结束：下一拍心跳（按到期规则问的）就得补跑，不用等到期。
+        // 挡路的结束：下一次按到期规则问的拍子（心跳里最迟 60 秒）就得补跑。
         assert_eq!(
             check.ask(input(
                 MaintenanceTrigger::Due,

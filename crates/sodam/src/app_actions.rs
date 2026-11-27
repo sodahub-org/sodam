@@ -833,8 +833,9 @@ impl Root {
 
     fn run_cache_maintenance(&mut self, trigger: MaintenanceTrigger, cx: &mut Context<Self>) {
         let limits = self.cache_maintenance_limits();
-        // 「这一拍该不该跑」整段判断在 `cache_check` 里：挡路条件、到期规则、账本越线、
-        // 被挡下的强制请求要不要补，都由它给结论。这里只照着做。
+        // 挡路、到期、欠账、越线都由 `cache_check` 给结论，这里只照着做。
+        // 心跳那行的 `ledger_pressure` 预检只决定这一拍走 Ledger 还是 Due，
+        // 用的是同一个判据函数；真要跑时 `ask` 会按同样的输入再确认一次。
         let decision = self.cache_check.ask(MaintenanceAsk {
             trigger,
             // 批量升级期间不收缩缓存：被淘汰的正好是还没轮到的那几首，剩下的会一个接一个

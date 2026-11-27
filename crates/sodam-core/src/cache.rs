@@ -1218,8 +1218,7 @@ fn landed_delta(landing: Landing) -> i64 {
 
 /// 上次看盘之后又写进来的音频字节（净增量，可为负）。
 ///
-/// 账本由这里记；界面每拍先读它做预检，真要问的时候再读一次、把数传给
-/// `cache_check` 的判断（那边只收数，不碰全局原子）。
+/// 「这一拍要不要跑」的判断只收数、不读全局原子：调用方读这里的值传进去。
 pub fn pending_audio_bytes() -> i64 {
     AUDIO_DELTA.load(Ordering::Relaxed)
 }
