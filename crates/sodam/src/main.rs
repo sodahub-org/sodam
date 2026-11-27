@@ -250,11 +250,29 @@ fn show_window(cx: &mut App, app: &Entity<app::Root>) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
     } else {
-        let app = app.clone();
-        let options = main_window_options(cx);
-        cx.open_window(options, |_window, _cx| app).ok();
+        let _ = open_main_window(cx, app);
     }
     cx.activate(true);
+}
+
+/// 建主窗口：系统媒体控制与关窗策略都挂在这里。
+///
+/// 关窗钩子是窗口级的，窗口每次重建都要重新注册。首次启动和托盘恢复
+/// 必须共用这一个入口，否则恢复出来的窗口又变回「关窗即消失」（#324）。
+fn open_main_window(cx: &mut App, app: &Entity<app::Root>) -> anyhow::Result<()> {
+    let options = main_window_options(cx);
+    let root = app.clone();
+    cx.open_window(options, move |window, cx| {
+        // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
+        media::attach(native_handle(window), cx);
+        // 关窗不直接销毁窗口：交给 Root 按「关闭按钮行为」决定退出还是收进托盘（#324）。
+        let close_root = root.clone();
+        window.on_window_should_close(cx, move |window, cx| {
+            close_root.update(cx, |root, cx| root.handle_close_request(window, cx))
+        });
+        root
+    })
+    .map(|_| ())
 }
 
 fn main() {
@@ -286,13 +304,26 @@ fn main() {
             // 播放快捷键：应用内三键（可在设置页重绑）。
             let settings = app.read(cx).settings.clone();
             shortcuts::install(cx, &settings, app.clone());
-            let options = main_window_options(cx);
-            cx.open_window(options, |window, cx| {
-                // 系统媒体控制要等窗口存在：Windows 的 SMTC 挂在 HWND 上。
-                media::attach(native_handle(window), cx);
-                app.clone()
-            })
-            .expect("打开主窗口失败");
+            open_main_window(cx, &app).expect("打开主窗口失败");
+
+            // 自绘标题栏的关闭按钮派发这个动作：和平台关窗钩子共用一套策略（#324）。
+            // 动作可能是在窗口更新途中派发的，推到这一轮之后再动窗口。
+            cx.on_action({
+                let app = app.clone();
+                move |_: &app::CloseRequested, cx: &mut App| {
+                    let Some(window) = cx.windows().first().copied() else {
+                        return;
+                    };
+                    let root = app.clone();
+                    cx.defer(move |cx| {
+                        let _ = window.update(cx, |_, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.handle_close_request(window, cx);
+                            });
+                        });
+                    });
+                }
+            });
 
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
@@ -304,6 +335,8 @@ fn main() {
                     let tray_service = ksni::TrayService::new(tray::linux::SodaTray::new(
                         tray_tx,
                         crate::ui::i18n::Language::system_locale(),
+                        // 宿主在不在由 ksni 的 watcher 回调写进这个开关（#324）。
+                        app.read(cx).tray_available.clone(),
                     ));
                     let tray_handle = tray_service.handle();
                     tray_service.spawn();

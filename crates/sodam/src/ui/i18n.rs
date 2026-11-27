@@ -115,6 +115,32 @@ impl Language {
             "窗口按钮：自动（跟随桌面）" => "Window controls: auto (follow desktop)",
             "窗口按钮：总是显示" => "Window controls: always shown",
             "窗口按钮：不显示" => "Window controls: hidden",
+            "关闭主窗口时" => "When closing the main window",
+            "点关闭按钮时怎么处理；托盘菜单里也能退出应用" => {
+                "What the close button does; you can also quit from the tray menu"
+            }
+            "当前桌面没有系统托盘，关闭窗口会直接退出应用" => {
+                "This desktop has no system tray, so closing the window quits the app"
+            }
+            "退出应用" => "Quit app",
+            "直接结束进程，不再后台播放" => "End the process; nothing keeps playing in the background",
+            "隐藏到托盘继续播放" => "Hide to tray and keep playing",
+            "收进系统托盘，音乐继续播放" => "Move to the system tray; music keeps playing",
+            "当前桌面没有系统托盘，这项不可用" => "No system tray on this desktop, so this option is unavailable",
+            "每次询问" => "Ask every time",
+            "每次关闭都弹窗让你选" => "Show a dialog on every close",
+            "关闭按钮：退出应用" => "Close button: quit the app",
+            "关闭按钮：隐藏到托盘" => "Close button: hide to tray",
+            "关闭按钮：每次询问" => "Close button: ask every time",
+            "关闭汽水音乐？" => "Close SodaM?",
+            "关闭窗口后应用会继续在后台播放，可以从系统托盘重新打开。" => {
+                "The window closes but playback continues in the background; reopen it from the system tray."
+            }
+            "当前桌面没有系统托盘，隐藏后将无法找回窗口，所以只能退出。" => {
+                "This desktop has no system tray, so a hidden window could not be brought back. The only option is to quit."
+            }
+            "记住我的选择" => "Remember my choice",
+            "隐藏到托盘" => "Hide to tray",
             "主题已恢复为跟随系统" => "Theme restored to system",
             "「{}」没有可用歌词" => "No lyrics available for {}",
             "「{}」歌词已加载" => "Lyrics loaded for {}",

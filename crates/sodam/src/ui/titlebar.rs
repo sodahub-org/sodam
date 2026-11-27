@@ -179,10 +179,13 @@ fn caption_button(
     // Windows 由 WM_NCHITTEST 把控制区映射成 HTMINBUTTON 等消息；Linux 后端
     // 不处理控制区，这里直接调用窗口 API，避免两个平台各点一次。
     #[cfg(target_os = "linux")]
-    let base = base.on_click(move |_, window, _| match area {
+    let base = base.on_click(move |_, window, cx| match area {
         WindowControlArea::Min => window.minimize_window(),
         WindowControlArea::Max => window.zoom_window(),
-        WindowControlArea::Close => window.remove_window(),
+        // 关闭按钮不直接销毁窗口：走动作，交给 Root 按「关闭按钮行为」处理（#324）。
+        WindowControlArea::Close => {
+            window.dispatch_action(Box::new(crate::app::CloseRequested), cx)
+        }
         _ => {}
     });
 

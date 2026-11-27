@@ -283,7 +283,10 @@ TrackItem + cache path
   `scripts/check-x86-64-baseline.sh` 扫一遍产物兜底。
 - 安装内容：`/usr/bin/sodam`、desktop entry、hicolor icon。
 - GUI 通过 `scripts/run.sh` 启动时带 `MemoryMax=2G` 护栏。
-- 托盘和窗口关闭逻辑使用显式退出模式：关闭主窗口保留进程，退出走托盘菜单。
+- 托盘和窗口关闭逻辑使用显式退出模式：窗口关闭不直接结束进程，关窗行为由
+  `CloseAction`（退出 / 收进托盘 / 每次询问）决定，默认有托盘就收进托盘。
+  没有托盘宿主时（GNOME 默认如此）一律不收起，改为退出或问一次，避免留下
+  看不见也退不掉的进程（#324）。
 - 应用内退出（托盘 / ⌘Q）先过 `sodam-core` 的退出闸门：状态行提示「正在保存…」，
   等设置写队列 `flush()` 刷干净（排队中的改动、启动回存、登出摘 Cookie 都在里头）
   再 `cx.quit()`；最长等 3 秒，到点强制退出并写日志。再次点击退出立即退出；
