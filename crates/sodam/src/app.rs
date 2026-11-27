@@ -1796,8 +1796,9 @@ impl Root {
             }
             CloseAction::Ask => {
                 self.close_prompt = Some(ClosePrompt {
-                    // 用户明确选了「每次询问」时，别替他勾上「记住」。
-                    remember: stored != Some(CloseAction::Ask),
+                    // 弹窗只在「每次询问」下出现，默认不勾「记住」：想让用户每次都选。
+                    // 真嫌烦的人可以在弹窗里勾上，那是他自己改的设置。
+                    remember: false,
                 });
                 cx.notify();
                 false
