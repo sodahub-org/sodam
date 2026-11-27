@@ -126,8 +126,8 @@ impl Language {
             "直接结束进程，不再后台播放" => "End the process; nothing keeps playing in the background",
             "隐藏到托盘继续播放" => "Hide to tray and keep playing",
             "收进系统托盘，音乐继续播放" => "Move to the system tray; music keeps playing",
-            "当前桌面没有系统托盘，关闭时会直接退出" => {
-                "No system tray on this desktop, so closing quits the app"
+            "当前桌面没有系统托盘，这项暂时用不了" => {
+                "No system tray on this desktop, so this option is unavailable for now"
             }
             "当前桌面没有系统托盘，弹窗里只会给「退出应用」" => {
                 "No system tray on this desktop; the dialog only offers quitting"

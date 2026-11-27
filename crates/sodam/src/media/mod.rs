@@ -189,8 +189,11 @@ pub fn attach(hwnd: Option<*mut c_void>, cx: &mut App) {
 }
 
 /// 托盘循环在进 app 前先看这个哨兵。
-pub(crate) fn command_signal(cx: &App) -> Option<Arc<AtomicBool>> {
-    cx.has_global::<Attached>().then(commands_pending)
+///
+/// 和媒体控制有没有挂上无关：第一次 attach 失败、之后重试成功时，
+/// 循环也得看得见新来的命令。
+pub(crate) fn command_signal() -> Arc<AtomicBool> {
+    commands_pending()
 }
 
 /// 取走桌面媒体控件发来的命令，并清掉托盘用的哨兵。

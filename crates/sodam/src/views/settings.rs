@@ -466,7 +466,7 @@ fn close_behavior_section(root: &Root, cx: &mut Context<Root>) -> AnyElement {
             if tray_available {
                 root.tr("收进系统托盘，音乐继续播放")
             } else {
-                root.tr("当前桌面没有系统托盘，关闭时会直接退出")
+                root.tr("当前桌面没有系统托盘，这项暂时用不了")
             },
             tray_available,
         ),

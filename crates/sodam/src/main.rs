@@ -79,7 +79,7 @@ fn native_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
 }
 
 struct TraySignals {
-    media_commands: Option<Arc<AtomicBool>>,
+    media_commands: Arc<AtomicBool>,
     shortcuts_dirty: Arc<AtomicBool>,
     startup_save: StartupFailureSlot,
 }
@@ -149,11 +149,7 @@ fn start_tray_service(
                 };
             }
 
-            if signals
-                .media_commands
-                .as_ref()
-                .is_some_and(|pending| pending.load(Ordering::Acquire))
-            {
+            if signals.media_commands.load(Ordering::Acquire) {
                 tray_probe.signal_app_entry();
                 cx.update(|cx| {
                     let commands = media::drain_commands(cx);
@@ -369,7 +365,7 @@ fn main() {
                     tray::create_status_item(tray_tx, crate::ui::i18n::Language::system_locale());
 
                 let signals = TraySignals {
-                    media_commands: media::command_signal(cx),
+                    media_commands: media::command_signal(),
                     shortcuts_dirty: app.read(cx).shortcuts_dirty.clone(),
                     startup_save: app.read(cx).settings_writer.startup_failure_slot(),
                 };
