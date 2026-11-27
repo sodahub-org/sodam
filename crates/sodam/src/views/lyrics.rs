@@ -412,11 +412,7 @@ pub(crate) fn lyrics_view(root: &Root, window: &Window, cx: &mut Context<Root>) 
             .into_any_element();
     }
 
-    let Some(track) = root
-        .pending_track
-        .clone()
-        .or_else(|| root.queue.current().cloned())
-    else {
+    let Some(track) = root.current_track() else {
         return div()
             .flex()
             .flex_col()

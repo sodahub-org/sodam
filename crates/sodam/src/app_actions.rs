@@ -143,15 +143,14 @@ fn should_auto_load_scene_page(
     cards_empty && !cards_loading && !matches!(modes, SceneModesState::Failed)
 }
 
-/// 后台装载完成时，要不要把当前页面换成结果页。
+/// 后台装载回来的这份结果，还归不归用户此刻在用的东西。
 ///
-/// 单独一个类型而不是再加一个 `bool`：它和 `autoplay` 挨着，两个裸 bool 在调用点
-/// 谁也读不出谁，而听歌模式那个调用点确实两次都是 `true`（#330）。
+/// 用类型不用裸 `bool`：它和 `autoplay` 并排，两个开关在两个调用点上读不出谁是谁。
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ViewTakeover {
-    /// 界面还停在用户等的那一页：换过去。
+    /// 用户还在等这一份：换队列、换页面。
     Take,
-    /// 用户这期间自己换过页面：只落数据，页面不动。
+    /// 用户这期间自己换了页面或队列：整份结果丢掉。
     Keep,
 }
 
@@ -1558,7 +1557,7 @@ impl Root {
 
     /// 打开歌词播放页，并按需加载当前（或正在装载）歌曲的歌词。
     pub fn open_lyrics(&mut self, cx: &mut Context<Self>) {
-        let Some(track) = self.lyrics_target() else {
+        let Some(track) = self.current_track() else {
             self.set_status_text(self.tr("还没有正在播放的歌曲"));
             cx.notify();
             return;
@@ -1570,11 +1569,12 @@ impl Root {
         self.load_lyrics(track, false, cx);
     }
 
-    /// 该备歌词的那一版：待播曲目优先（还没进队列也要能显示），其次才是队列当前曲。
+    /// 界面上该当成"当前曲"的那首：正在装载的优先（还没进队列也要显示），
+    /// 其次才是队列当前曲。
     ///
-    /// 进播放页和后台装载不抢页面这两条路必须同一口径，否则用户回到播放页看到的
-    /// 还是上一首的歌词（#330）。
-    fn lyrics_target(&self) -> Option<TrackItem> {
+    /// 播放页、歌词页、补原图都按这个口径取曲目；各写一遍的话，改一处漏一处，
+    /// 用户就会看到封面和歌词对不上。
+    pub(crate) fn current_track(&self) -> Option<TrackItem> {
         self.pending_track
             .clone()
             .or_else(|| self.queue.current().cloned())
@@ -1704,9 +1704,8 @@ impl Root {
 
     /// 把推荐流 / 听歌模式的曲目装进队列；`autoplay` 为假时停在待播状态。
     ///
-    /// `take_over` 为 `Keep` 表示这轮装载不是用户此刻在看的事：照常换队列、备歌词，
-    /// 但不改当前页面（#330）。它只管页面归谁——`autoplay` 仍然按调用方给的意思走，
-    /// 启动那次本来就是不自动开播的。
+    /// `take_over` 为 `Keep` 表示这轮装载不是用户此刻在用的东西：整份结果丢掉，
+    /// 队列、页面、歌词一样都不动——他已经自己找了别的在听，再塞进来就是抢。
     pub(crate) fn activate_recommended_queue(
         &mut self,
         source: RecommendationSource,
@@ -1724,6 +1723,10 @@ impl Root {
         // 于是点进「熟悉模式 / 新鲜模式」后歌词页永久转圈，但音频其实已经在放。
         // 放在这里对所有调用方（推荐 / 听歌模式 / 探索电台上游）一并生效。
         self.switching_queue = None;
+        if matches!(take_over, ViewTakeover::Keep) {
+            // 用户已经自己走了：这份结果不属于他此刻在用的任何东西，整份丢掉。
+            return;
+        }
         self.queue.replace(tracks, 0);
         self.played_history.clear();
         self.playback_error = None;
@@ -1744,18 +1747,9 @@ impl Root {
             .map(|track| track.cover.clone())
             .collect();
         self.ensure_covers(&covers, cx);
-        match take_over {
-            ViewTakeover::Take => self.open_lyrics(cx),
-            ViewTakeover::Keep => {
-                // 用户已经翻到别的页面：歌词照常备好，界面停在原地（#330）。
-                if let Some(track) = self.lyrics_target() {
-                    self.load_lyrics(track, false, cx);
-                }
-            }
-        }
+        self.open_lyrics(cx);
         // 确认要写在切页之后：状态行在换页时清空，写在 `open_lyrics`
-        // （内部 `set_nav(Nav::Lyrics)`）之前等于刚写上就被收走。不抢页面那条路
-        // 没有切页，状态行不会被清，顺序照旧。
+        // （内部 `set_nav(Nav::Lyrics)`）之前等于刚写上就被收走。
         self.set_status("已切换到{}队列", &[label.to_string()]);
         if autoplay {
             self.start_track(true, cx);
@@ -2170,11 +2164,7 @@ impl Root {
         if self.lyrics_return_nav.is_none() {
             self.lyrics_return_nav = Some(Nav::Home);
         }
-        if let Some(track) = self
-            .pending_track
-            .clone()
-            .or_else(|| self.queue.current().cloned())
-        {
+        if let Some(track) = self.current_track() {
             self.ensure_playback_assets(track, cx);
         }
         cx.notify();
@@ -2545,21 +2535,21 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         self.recommendation_error = Some(message.clone());
-        // 上次成功加载的推荐内容还在队列里就留着，别把可用内容清空。
-        //
-        // 注意：`begin_queue_switch` 已经把引擎停了，所以这里只是**保住列表**，
-        // 不会自动续播；用户点重试或播放才重新出声。
-        if !had_cached_recommendation {
-            self.recommendation = None;
-            self.queue = Queue::new(Vec::new());
-            // 队列都没了，上一轮的扫描游标与「整圈无候选」结论不再成立。
-            self.new_playback_round();
-            self.queue_origin = QueueOrigin::None;
-            self.played_history.clear();
-            self.pending_track = None;
-            self.sync_queue_cache();
-        }
         if matches!(take_over, ViewTakeover::Take) {
+            // 上次成功加载的推荐内容还在队列里就留着，别把可用内容清空。
+            //
+            // 注意：`begin_queue_switch` 已经把引擎停了，所以这里只是**保住列表**，
+            // 不会自动续播；用户点重试或播放才重新出声。
+            if !had_cached_recommendation {
+                self.recommendation = None;
+                self.queue = Queue::new(Vec::new());
+                // 队列都没了，上一轮的扫描游标与「整圈无候选」结论不再成立。
+                self.new_playback_round();
+                self.queue_origin = QueueOrigin::None;
+                self.played_history.clear();
+                self.pending_track = None;
+                self.sync_queue_cache();
+            }
             self.set_nav(Nav::Home, cx);
         }
         self.notify_error_once("recommendation-load-failed", message);
