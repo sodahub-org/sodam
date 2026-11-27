@@ -389,6 +389,11 @@ pub struct Root {
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
+    /// 切页代数：每换一次可见页面 +1，后台装载完成时靠它判断"这期间用户有没有走开"（#330）。
+    ///
+    /// 装载开始时把快照取在自己那次切页**之后**，所以装载自己把界面带到加载页不算
+    /// 用户走开；之后再变就说明人已经去了别的页面，结果只更新数据，不抢页面。
+    pub(crate) nav_intent_seq: u64,
     pub lyrics_return_nav: Option<Nav>,
     pub theme: ThemeKind,
     pub theme_follows_system: bool,
@@ -859,6 +864,7 @@ impl Root {
                 Nav::Settings
             },
             nav_history: Vec::new(),
+            nav_intent_seq: 0,
             lyrics_return_nav: if logged_in { Some(Nav::Home) } else { None },
             theme,
             theme_follows_system,
