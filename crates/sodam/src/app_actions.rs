@@ -1705,7 +1705,8 @@ impl Root {
     /// 把推荐流 / 听歌模式的曲目装进队列；`autoplay` 为假时停在待播状态。
     ///
     /// `take_over` 为 `Keep` 表示这轮装载不是用户此刻在看的事：照常换队列、备歌词，
-    /// 但不改当前页面（#330）。
+    /// 但不改当前页面（#330）。它只管页面归谁——`autoplay` 仍然按调用方给的意思走，
+    /// 启动那次本来就是不自动开播的。
     pub(crate) fn activate_recommended_queue(
         &mut self,
         source: RecommendationSource,
@@ -2044,7 +2045,7 @@ impl Root {
                 root.loading_recommendation = false;
                 match result {
                     Ok(start) => {
-                        // 听歌模式是用户点卡片显式进来的，这里照旧允许它换页；
+                        // 听歌模式和电台是用户点卡片显式进来的，路径上不补这一层；
                         // #330 只收回推荐流那条自动装载。
                         root.activate_recommended_queue(
                             start.source,
@@ -5999,6 +6000,60 @@ mod recommendation_gate_tests {
         assert!(
             retry_at < feed_at,
             "重试判断必须排在「已是推荐队列」之前，否则不会被命中"
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_takeover_tests {
+    /// 守 #330：装载自己那次切页不能算进"用户走开了"。
+    ///
+    /// 快照必须取在 `begin_queue_switch` 之后。取在前面的话，启动那一下就会被判成
+    /// "界面已经换了"，用户什么都没做也进不了播放页——正好是要修的症状的反面。
+    /// 窗口里造不出 `Root`（gpui 的 `test-support` 不在依赖里），只能盯源码顺序。
+    #[test]
+    fn snapshot_is_taken_after_the_switch_this_load_does() {
+        let source = include_str!("app_actions.rs");
+        let body = source
+            .split("pub fn start_recommendation")
+            .nth(1)
+            .expect("start_recommendation 应当存在");
+        let body = &body[..body.find("fn recommendation_failed").unwrap_or(body.len())];
+
+        let switch_at = body
+            .find("begin_queue_switch(QueueOrigin::Feed")
+            .expect("推荐装载必须先切到加载页");
+        let snapshot_at = body
+            .find("let load_nav_seq = self.nav_seq;")
+            .expect("装载必须记下开始时的页签代数");
+        assert!(
+            switch_at < snapshot_at,
+            "快照要取在 begin_queue_switch 之后：装载自己切到加载页不算用户走开"
+        );
+    }
+
+    /// 守 #330：失败落地不能把人拽回推荐页。
+    ///
+    /// `set_nav(Nav::Home)` 必须落在 `take_over` 判断里面，否则用户自己切走的页面
+    /// 照样会被顶掉。
+    #[test]
+    fn failure_only_switches_pages_when_the_view_is_taken_over() {
+        let source = include_str!("app_actions.rs");
+        let body = source
+            .split("fn recommendation_failed")
+            .nth(1)
+            .expect("recommendation_failed 应当存在");
+        let body = &body[..body.find("pub fn start_scene_card").unwrap_or(body.len())];
+
+        let guard_at = body
+            .find("matches!(take_over, ViewTakeover::Take)")
+            .expect("失败跳页必须先看 take_over");
+        let nav_at = body
+            .find("self.set_nav(Nav::Home")
+            .expect("失败终态仍然要能回到推荐页");
+        assert!(
+            guard_at < nav_at,
+            "失败跳页必须落在 take_over 判断里面，否则用户走开也会被拽回推荐页"
         );
     }
 }
