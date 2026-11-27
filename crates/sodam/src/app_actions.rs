@@ -163,6 +163,14 @@ pub(crate) struct LoadTicket {
     pub switch_seq: u64,
 }
 
+/// 这张票还归不归自己：代数没被推走才算数。
+///
+/// 剥成纯函数是为了能脱离 `Root` 测——`Root` 要 gpui 的 `Context`，单测里造不出来，
+/// 而「认领不到就不许落账」正是最该钉住的那条。
+fn owns_queue_switch(current: u64, ticket: u64) -> bool {
+    current == ticket
+}
+
 impl Root {
     /// 只收自己那一次切换态，并回答「这次装载还在台上吗」。
     ///
@@ -177,7 +185,7 @@ impl Root {
     /// （`play_from`）。这种结果整份作废：队列和页面都不许动，动了盖掉的正是他
     /// 此刻在听的那一份。
     fn clear_own_queue_switch(&mut self, switch_seq: u64) -> bool {
-        if self.queue_switch_seq != switch_seq {
+        if !owns_queue_switch(self.queue_switch_seq, switch_seq) {
             return false;
         }
         self.switching_queue = None;
@@ -1765,10 +1773,7 @@ impl Root {
         // 而听歌模式走的是 `start_scene_queue` → 本函数，回调里忘了清，
         // 于是点进「熟悉模式 / 新鲜模式」后歌词页永久转圈，但音频其实已经在放。
         //
-        // 只收自己那一次：这期间用户可能已经点开了某张歌单，那个「正在加载」是他的。
-        //
-        // 收不到自己那一次说明这轮已经被顶掉——用户自己换了队（`play_from`），或者
-        // 更晚的装载接手了。整份结果丢掉：拿旧队列盖掉他此刻在听的，正是 #330。
+        // 认领不到就整份丢掉：这轮已经被顶掉，队列、页面、歌词一样都不动。
         if !self.clear_own_queue_switch(ticket.switch_seq) {
             return;
         }
@@ -2061,6 +2066,7 @@ impl Root {
         }
         let scene_name = self.scene_display_text(&scene.sub_queue_type, &scene.text);
         let switch_seq = self.begin_queue_switch(origin, &scene_name, cx);
+        let load_nav_seq = self.nav_seq;
         self.loading_recommendation = true;
         // 在飞的推荐装载到此作废：它回来时 `loading_recommendation` 已经由这次
         // 听歌模式接管，不能让旧回调把加载态清掉——清了之后心跳就会去起翻页，
@@ -2113,10 +2119,12 @@ impl Root {
                         // 并且和推荐流保持一致——回到有重试入口的页面（听歌模式列表），
                         // 而不是留在已经停播的歌词页上。
                         //
-                        // 只在还是当前那次装载时说话：代数被 `play_from` 推走说明他
-                        // 已经自己换了队，这一个迟到的失败不该把他拽回听歌模式页。
+                        // 只在还认领得到、而且人还停在这一页时才跳：票被推走说明他
+                        // 自己换了队，`nav_seq` 变了说明他翻去了别处，都不该把他拽回来。
                         if root.clear_own_queue_switch(switch_seq) {
-                            root.set_nav(Nav::Scenes, cx);
+                            if root.nav_seq == load_nav_seq {
+                                root.set_nav(Nav::Scenes, cx);
+                            }
                             let message =
                                 root.failure_text("加载听歌模式队列失败", &err, REMOTE_TEXT);
                             root.notify_error_once("scene-queue-load-failed", message);
@@ -2278,6 +2286,9 @@ impl Root {
         }
         self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
         let switch_seq = self.queue_switch_seq;
+        // 新一次换队从干净的加载态开始：歌单 / 电台共用一个 `loading_playlist`，
+        // 上一轮那个已经被这次顶掉，它回来也没资格再动这个 flag。
+        self.loading_playlist = false;
         self.switching_queue = Some(origin.clone());
         self.switching_label = label.to_string();
         self.set_nav(Nav::Lyrics, cx);
@@ -2546,16 +2557,20 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
-                // 这份结果还算不算用户在等的：这期间没人接手这次切换（代数还是
-                // 自己那一次），而且人还站在装载把他带到的那一页上。都成立才接管，
-                // 否则就是抢——用户自己换了队（`play_from`）之后尤其不能动。
-                let owns_switch = root.clear_own_queue_switch(switch_seq);
-                let take_over =
-                    if owns_switch && (root.nav == Nav::Lyrics || root.nav_seq == load_nav_seq) {
-                        ViewTakeover::Take
-                    } else {
-                        ViewTakeover::Keep
-                    };
+                // 这轮已经不归自己了（用户自己换了队，或者更晚的装载接手了）：
+                // 成功也好失败也好都不许说话——失败报出去会写进 `recommendation_error`，
+                // 下次进推荐页反而要人手点重试。
+                if !root.clear_own_queue_switch(switch_seq) {
+                    cx.notify();
+                    return;
+                }
+                // 页面也是判据：从播放页出去别处、又自己绕回来，不是「他一直没走开」，
+                // 只是恰好停在同一页上。全程没换过页才接管。
+                let take_over = if root.nav_seq == load_nav_seq {
+                    ViewTakeover::Take
+                } else {
+                    ViewTakeover::Keep
+                };
                 match result {
                     Some(Ok(start)) => {
                         root.recommendation_error = None;
@@ -2639,8 +2654,14 @@ impl Root {
                 let Some(radio) = card.radio.clone() else {
                     return;
                 };
+                // 一次只装一份：和 `start_scene_playlist` 同一条进门规矩。少了这道，
+                // 第二次点卡会和第一次同时跑，`loading_playlist` 归谁说不清。
+                if self.loading_playlist {
+                    return;
+                }
                 let switch_origin = QueueOrigin::Radio(radio.radio_id.clone());
                 let switch_seq = self.begin_queue_switch(switch_origin, &card.playlist.title, cx);
+                let load_nav_seq = self.nav_seq;
                 self.loading_playlist = true;
                 self.set_status(
                     "正在加载电台「{}」…",
@@ -2657,11 +2678,9 @@ impl Root {
                 cx.spawn(async move |this, cx| {
                     let result = work.await;
                     let _ = this.update(cx, |root, cx| {
-                        root.loading_playlist = false;
-                        // 代数对不上说明这轮已经被顶掉——用户自己换了队（`play_from`）
-                        // 或者更晚的装载接手了。整份结果丢掉，别拿电台曲目盖掉他此刻
-                        // 在听的那一份。
+                        // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
                         if root.clear_own_queue_switch(switch_seq) {
+                            root.loading_playlist = false;
                             match result {
                                 Ok(tracks) if !tracks.is_empty() => {
                                     root.queue.replace(tracks, 0);
@@ -2683,6 +2702,11 @@ impl Root {
                                     root.start_track(true, cx);
                                 }
                                 Ok(_) => {
+                                    // 引擎已经停了、队列没换：留在歌词页就是一首不响的旧歌，
+                                    // 页面上也没有重试入口。和歌单那条一致，回到有重试的页面。
+                                    if root.nav_seq == load_nav_seq {
+                                        root.set_nav(Nav::Scenes, cx);
+                                    }
                                     let message = root.localized(
                                         "电台「{}」没有可播放曲目",
                                         std::slice::from_ref(&card.playlist.title),
@@ -2690,6 +2714,9 @@ impl Root {
                                     root.notify_warning_once("radio-empty", message);
                                 }
                                 Err(err) => {
+                                    if root.nav_seq == load_nav_seq {
+                                        root.set_nav(Nav::Scenes, cx);
+                                    }
                                     let message =
                                         root.failure_text("加载电台失败", &err, REMOTE_TEXT);
                                     root.notify_error_once("radio-load-failed", message);
@@ -2725,11 +2752,9 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
-                root.loading_playlist = false;
-                // 代数对不上说明这轮已经被顶掉——用户自己换了队（`play_from`）
-                // 或者更晚的装载接手了。整份结果丢掉，别拿歌单曲目盖掉他此刻
-                // 在听的那一份。
+                // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
                 if root.clear_own_queue_switch(switch_seq) {
+                    root.loading_playlist = false;
                     match result {
                         Ok(tracks) if !tracks.is_empty() => {
                             root.queue.replace(tracks, 0);
@@ -5027,6 +5052,9 @@ impl Root {
             if incoming.cookie.trim().is_empty() {
                 self.clear_identity_state(cx);
             } else {
+                // 换号但保留当前播放：队列不清，可在飞的歌单 / 电台装载必须作废。
+                // 不推这一格的话，旧账号的装载回来照样认领得到，把旧队列顶掉。
+                self.abandon_queue_switch();
                 self.invalidate_identity_conclusions();
                 // A 的账号信息（昵称/VIP）不再代表当前身份：先清空，刷新成功写入
                 // B 的信息；刷新失败时 VIP 状态按未知处理，不按 A 的算（#185 审计）。
@@ -6092,6 +6120,8 @@ mod recommendation_gate_tests {
 
 #[cfg(test)]
 mod view_takeover_tests {
+    use super::owns_queue_switch;
+
     /// 守 #330：装载自己那次切页不能算进"用户走开了"。
     ///
     /// 快照必须取在 `begin_queue_switch` 之后。取在前面的话，启动那一下就会被判成
@@ -6176,6 +6206,20 @@ mod view_takeover_tests {
                 "{owner} 里不许裸清切换态，走 clear_own_queue_switch"
             );
         }
+    }
+
+    /// 守 #330：票被推走之后，旧装载一张都不许落账。
+    ///
+    /// 这条是真跑判定的：`clear_own_queue_switch` 只做一件事——用 `owns_queue_switch`
+    /// 比代数，比不过就整份丢掉。源码守卫管「调用点有没有用它」，这里管「它自己认不认
+    /// 旧票」。
+    #[test]
+    fn a_superseded_ticket_never_lands() {
+        assert!(owns_queue_switch(7, 7), "票是自己的才落账");
+        assert!(
+            !owns_queue_switch(8, 7),
+            "代数被推走之后，旧装载的票一张都不许落账"
+        );
     }
 
     /// 守 #330：装载结果只有在还认领得到自己那次换队时才许动队列。
