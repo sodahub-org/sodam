@@ -155,15 +155,27 @@ pub(crate) enum ViewTakeover {
 }
 
 impl Root {
-    /// 只收自己这轮留下的切换态。
+    /// 只收自己那一次切换态。
     ///
     /// `switching_queue` 是全局一个，谁都能写。清之前必须先认领：这期间用户可能已经
     /// 开了别的加载（歌单 / 听歌模式 / 推荐），那个「正在加载」是他在等的东西，替
     /// 他一撤，页面就先露出旧队列、等新的回来再跳一次。
-    fn clear_own_queue_switch(&mut self, origin: &QueueOrigin) {
-        if self.switching_queue.as_ref() == Some(origin) {
+    ///
+    /// 认的是代数不是 origin：同一张听歌模式连点两次，origin 一样但这是两次装载，
+    /// 先回来的那次不能把后一次的状态收走。
+    fn clear_own_queue_switch(&mut self, switch_seq: u64) {
+        if self.queue_switch_seq == switch_seq {
             self.switching_queue = None;
         }
+    }
+
+    /// 用户显式换队：谁还在等的那次切换到此为止。
+    ///
+    /// `play_from` 换掉队列时不走 `begin_queue_switch`，任在飞的装载都不是用户此刻
+    /// 在等的东西——推它一把代数，那些装载回来就会闭嘴，不会再把队列顶掉。
+    fn abandon_queue_switch(&mut self) {
+        self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
+        self.switching_queue = None;
     }
 
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
@@ -1724,6 +1736,7 @@ impl Root {
         label: &str,
         autoplay: bool,
         take_over: ViewTakeover,
+        switch_seq: u64,
         cx: &mut Context<Self>,
     ) {
         let origin = match source.scene.as_ref() {
@@ -1737,9 +1750,8 @@ impl Root {
         // 而听歌模式走的是 `start_scene_queue` → 本函数，回调里忘了清，
         // 于是点进「熟悉模式 / 新鲜模式」后歌词页永久转圈，但音频其实已经在放。
         //
-        // 只收自己这轮留下的那份：这期间用户可能已经点开了某张歌单，那个
-        // 「正在加载」是他的，替他撤掉就会先露出旧内容、等歌单回来再跳一次。
-        self.clear_own_queue_switch(&origin);
+        // 只收自己那一次：这期间用户可能已经点开了某张歌单，那个「正在加载」是他的。
+        self.clear_own_queue_switch(switch_seq);
         if matches!(take_over, ViewTakeover::Keep) {
             // 用户已经自己走了：这份结果不属于他此刻在用的任何东西，整份丢掉。
             return;
@@ -2028,7 +2040,7 @@ impl Root {
             return;
         }
         let scene_name = self.scene_display_text(&scene.sub_queue_type, &scene.text);
-        self.begin_queue_switch(origin.clone(), &scene_name, cx);
+        let switch_seq = self.begin_queue_switch(origin, &scene_name, cx);
         self.loading_recommendation = true;
         // 在飞的推荐装载到此作废：它回来时 `loading_recommendation` 已经由这次
         // 听歌模式接管，不能让旧回调把加载态清掉——清了之后心跳就会去起翻页，
@@ -2054,7 +2066,7 @@ impl Root {
                 if root.recommendation_request_seq != request_seq {
                     // 有更新的请求接过去了：队列和页面都别动，但自己那次切换态还得
                     // 收——没人收得走它，歌词页会一直停在「正在加载…」。
-                    root.clear_own_queue_switch(&origin);
+                    root.clear_own_queue_switch(switch_seq);
                     return;
                 }
                 root.loading_recommendation = false;
@@ -2068,6 +2080,7 @@ impl Root {
                             root.tr("听歌模式"),
                             true,
                             ViewTakeover::Take,
+                            switch_seq,
                             cx,
                         );
                     }
@@ -2077,7 +2090,7 @@ impl Root {
                         //
                         // 并且和推荐流保持一致——回到有重试入口的页面（听歌模式列表），
                         // 而不是留在已经停播的歌词页上。
-                        root.clear_own_queue_switch(&origin);
+                        root.clear_own_queue_switch(switch_seq);
                         root.set_nav(Nav::Scenes, cx);
                         let message = root.failure_text("加载听歌模式队列失败", &err, REMOTE_TEXT);
                         root.notify_error_once("scene-queue-load-failed", message);
@@ -2229,13 +2242,15 @@ impl Root {
         origin: QueueOrigin,
         label: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         // 推荐流没有播放模式（按钮也不显示），统一按列表循环推进，
         // 避免上一张歌单留下的单曲循环让流停在同一首。
         if origin.is_feed_like() {
             self.queue.mode = sodam_core::queue::PlayMode::ListLoop;
             self.queue.reset_shuffle_round();
         }
+        self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
+        let switch_seq = self.queue_switch_seq;
         self.switching_queue = Some(origin.clone());
         self.switching_label = label.to_string();
         self.set_nav(Nav::Lyrics, cx);
@@ -2252,6 +2267,7 @@ impl Root {
         self.loading_lyrics = false;
         self.playback_error = None;
         self.new_playback_round();
+        switch_seq
     }
 
     /// 歌词滚动过渡的时长范围与换算。
@@ -2468,7 +2484,7 @@ impl Root {
         let load_seq = self.recommendation_load_seq;
         // 切队列前先看看队列里是不是上一次的推荐内容，失败时保住它，不用开空白页。
         let cached = self.queue_origin == QueueOrigin::Feed && !self.queue.is_empty();
-        self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
+        let switch_seq = self.begin_queue_switch(QueueOrigin::Feed, self.tr("推荐队列"), cx);
         // 记下"装载期间界面有没有被换走"的基线。快照必须取在
         // `begin_queue_switch` 之后：把界面带到加载页是这个装载自己的动作，
         // 之后再变代数才说明人换了页面。
@@ -2505,9 +2521,8 @@ impl Root {
                 root.loading_recommendation = false;
                 // 这份结果还算不算用户在等的：期间没人接手这次切换，而且人还站在
                 // 装载把他带到的那一页上。两个都成立才接管，否则就是抢。
-                let still_ours = root.switching_queue.as_ref() == Some(&QueueOrigin::Feed)
-                    && root.nav == Nav::Lyrics;
-                root.clear_own_queue_switch(&QueueOrigin::Feed);
+                let still_ours = root.queue_switch_seq == switch_seq && root.nav == Nav::Lyrics;
+                root.clear_own_queue_switch(switch_seq);
                 let take_over = if root.nav_seq == load_nav_seq || still_ours {
                     ViewTakeover::Take
                 } else {
@@ -2522,6 +2537,7 @@ impl Root {
                             root.tr("推荐"),
                             autoplay,
                             take_over,
+                            switch_seq,
                             cx,
                         );
                     }
@@ -2594,7 +2610,7 @@ impl Root {
                     return;
                 };
                 let switch_origin = QueueOrigin::Radio(radio.radio_id.clone());
-                self.begin_queue_switch(switch_origin.clone(), &card.playlist.title, cx);
+                let switch_seq = self.begin_queue_switch(switch_origin, &card.playlist.title, cx);
                 self.loading_playlist = true;
                 self.set_status(
                     "正在加载电台「{}」…",
@@ -2612,7 +2628,7 @@ impl Root {
                     let result = work.await;
                     let _ = this.update(cx, |root, cx| {
                         root.loading_playlist = false;
-                        root.clear_own_queue_switch(&switch_origin);
+                        root.clear_own_queue_switch(switch_seq);
                         match result {
                             Ok(tracks) if !tracks.is_empty() => {
                                 root.queue.replace(tracks, 0);
@@ -2658,7 +2674,7 @@ impl Root {
             return;
         }
         let switch_origin = QueueOrigin::Playlist(playlist.id.clone());
-        self.begin_queue_switch(switch_origin.clone(), &playlist.title, cx);
+        let switch_seq = self.begin_queue_switch(switch_origin, &playlist.title, cx);
         let load_nav_seq = self.nav_seq;
         self.loading_playlist = true;
         self.set_status("正在加载歌单「{}」…", std::slice::from_ref(&playlist.title));
@@ -2682,7 +2698,7 @@ impl Root {
                         root.new_playback_round();
                         root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
                         root.recommendation = None;
-                        root.clear_own_queue_switch(&switch_origin);
+                        root.clear_own_queue_switch(switch_seq);
                         root.sync_queue_cache();
                         let covers: Vec<String> = root
                             .queue
@@ -2695,7 +2711,7 @@ impl Root {
                         root.start_track(true, cx);
                     }
                     Ok(_) => {
-                        root.clear_own_queue_switch(&switch_origin);
+                        root.clear_own_queue_switch(switch_seq);
                         // 停在歌词页上既没声音也没入口，回有重试的听歌模式页。
                         // 只在人还停在本次装载带出来的那一页时才跳：他要是自己去翻
                         // 别的页面了，这一个迟到的结果不该把他拽回来。
@@ -2708,7 +2724,7 @@ impl Root {
                         );
                     }
                     Err(err) => {
-                        root.clear_own_queue_switch(&switch_origin);
+                        root.clear_own_queue_switch(switch_seq);
                         if root.nav_seq == load_nav_seq {
                             root.set_nav(Nav::Scenes, cx);
                         }
@@ -2727,6 +2743,11 @@ impl Root {
         let Some(source) = self.recommendation.clone() else {
             return;
         };
+        // 队列已经不是推荐流那一份了（用户自己点了搜索/歌单/电台）：这条源作废，
+        // 否则还不够 6 首时心跳会把旧的推荐歌追进用户自己的队列。
+        if !self.queue_origin.is_feed_like() {
+            return;
+        }
         if !source.has_more || self.loading_recommendation || self.settings.cookie.trim().is_empty()
         {
             return;
@@ -4118,6 +4139,8 @@ impl Root {
             .map(|track| track.title.clone())
             .unwrap_or_default();
         let covers: Vec<String> = tracks.iter().map(|track| track.cover.clone()).collect();
+        // 用户自己挑的队列：在飞的装载到这儿一律作废，回来时不许再把队列顶掉。
+        self.abandon_queue_switch();
         self.queue.replace(tracks, index);
         // 换了一轮队列：上一轮的扫描游标与「整圈无候选」结论不再成立。
         self.new_playback_round();

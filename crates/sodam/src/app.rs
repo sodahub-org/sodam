@@ -424,6 +424,11 @@ pub struct Root {
     /// 还是真实内容，属于视图归属的导航状态，不该被一次超时或旧请求回写（#55）。
     pub switching_queue: Option<QueueOrigin>,
     pub switching_label: String,
+    /// 换队列的代数：每次 `begin_queue_switch` 或一次显式换队 +1。
+    ///
+    /// `switching_queue` 是全局一个，光比对 origin 认不出「同源的新一次装载」；
+    /// 装载回来拿自己的代数比一下，对不上就说明这次切换已经不归自己了。
+    pub(crate) queue_switch_seq: u64,
     /// 推荐队列请求的序号（装载与分页共用）。
     ///
     /// **只在真正发起新请求时递增**：拿它判断「结果是否过期」，所以超时兜底不能动它，
@@ -895,6 +900,7 @@ impl Root {
             loading_recommendation: false,
             recommendation_error: None,
             switching_queue: None,
+            queue_switch_seq: 0,
             switching_label: language.text("推荐队列").to_string(),
             recommendation_request_seq: 0,
             recommendation_load_seq: 0,
