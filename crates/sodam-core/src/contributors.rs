@@ -1,6 +1,9 @@
 //! 设置页贡献者墙：contrib.rocks 组合图的生命周期状态机与拉取。
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::cache::aged_out;
@@ -10,6 +13,16 @@ const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 一张图算新鲜多久：拿到后满一天才允许自动重拉（#334）。
 pub const CONTRIBUTORS_TTL: Duration = Duration::from_secs(86_400);
+/// DNS 解析单独限时（#336）。ureq 2.12 的整体 timeout 盖不住解析——官方文档
+/// 自己写明「Slow DNS resolution may cause a request to exceed the timeout,
+/// because the DNS request cannot be interrupted」。所以这段必须自己兜：
+/// 自定义 Resolver 把解析丢进辅助线程，主线程限时收结果。
+pub const DNS_TIMEOUT: Duration = Duration::from_secs(3);
+/// TCP 建连限时（#336）。ureq 默认 30 秒，太宽。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 整个请求限时（#336）；读不单独设——`.timeout()` 会把 `timeout_read` 盖掉，
+/// 一起设只剩整体这条生效，读跟着整个请求的截止时间走。
+pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一轮最多自动试几次；用完停手，只等用户点重试或图过期重开（#336）。
 pub const MAX_ATTEMPTS: u8 = 3;
 /// 第 1、2 次失败之后分别等多久再自动试。表长绑死为 `MAX_ATTEMPTS - 1`：
@@ -133,24 +146,78 @@ fn is_svg(bytes: &[u8]) -> bool {
     (body.starts_with(b"<svg") || body.starts_with(b"<?xml")) && body.ends_with(b"</svg>")
 }
 
+/// 把 [`DNS_TIMEOUT`] 兜进拉图请求：解析这段 ureq 管不了，只能包成
+/// [`ureq::Resolver`] 自己限时。
+struct DeadlineResolver;
+
+impl ureq::Resolver for DeadlineResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let netloc = netloc.to_owned();
+        spawn_with_timeout(
+            move || {
+                netloc
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+            },
+            DNS_TIMEOUT,
+        )
+    }
+}
+
+/// 把一段可能卡死的网络工作丢进辅助线程，主线程只等 `timeout`：到点就报
+/// TimedOut，不等它自己回来（`ToSocketAddrs` 没有可中断的 API）。
+/// 超时后辅助线程还没干完也没人收了，随它自然结束，不影响下一次请求。
+fn spawn_with_timeout<T: Send>(
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    timeout: Duration,
+) -> std::io::Result<T> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            Err(std::io::Error::new(ErrorKind::TimedOut, "DNS 解析超时"))
+        }
+        // 解析线程自己没了（panic / 提前退出），结果永远等不来，按出错收。
+        Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+            ErrorKind::Interrupted,
+            "解析线程中途退出",
+        )),
+    }
+}
+
 /// 下载 contrib.rocks 动态生成的 SVG；返回原始矢量字节。
+///
+/// 三段超时各自生效（#336）：DNS [`DNS_TIMEOUT`]（解析自己兜，见
+/// [`DeadlineResolver`]）、TCP 建连 [`CONNECT_TIMEOUT`]、整体
+/// [`TOTAL_TIMEOUT`]；读不单独设，响应体跟着整体截止时间走。
 pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
-    let response = ureq::get(CONTRIBUTORS_URL)
-        .timeout(Duration::from_secs(12))
-        .call()
-        .ok()?;
+    let agent = ureq::AgentBuilder::new()
+        .resolver(DeadlineResolver)
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(TOTAL_TIMEOUT)
+        .build();
+    let response = agent.get(CONTRIBUTORS_URL).call().ok()?;
+    // 门槛是「最多 4 MiB」，所以多读一字节才能分清「正好读满」和「读满还没
+    // 结束」：后者是截断，判失败，不写缓存（2/5 的写盘只在成功路径发生）。
     let mut bytes = Vec::new();
     response
         .into_reader()
-        .take(MAX_IMAGE_BYTES)
+        .take(MAX_IMAGE_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
     is_svg(&bytes).then_some(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     const IMG: u8 = 7;
     const HOUR: u64 = 3_600;
@@ -178,6 +245,42 @@ mod tests {
         ));
         assert!(!is_svg(b""));
         assert!(!is_svg(b"<html>not an image</html>"));
+    }
+
+    /// 三段超时钉死数值（#336 / #339 Testing Decisions：每个数值只有一处定义）。
+    #[test]
+    fn three_timeouts_are_pinned() {
+        assert_eq!(DNS_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(TOTAL_TIMEOUT, Duration::from_secs(10));
+    }
+
+    /// 解析限时真的限时：活儿睡一秒，期限 10 毫秒——到点报 TimedOut 回来，
+    /// 不干等系统解析自己结束（DNS 卡住时 3 秒内失败的那条保障）。
+    #[test]
+    fn spawn_with_timeout_cuts_off_a_hanging_resolution() {
+        let started = Instant::now();
+        let result = spawn_with_timeout(
+            || {
+                thread::sleep(Duration::from_secs(1));
+                Ok(Vec::<u8>::new())
+            },
+            Duration::from_millis(10),
+        );
+        let err = result.expect_err("超期的解析必须按失败收");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "到点就回来，不等活儿干完"
+        );
+    }
+
+    /// 解析正常完成时结果原样带回，限时机制不碰成功的路。
+    #[test]
+    fn spawn_with_timeout_passes_through_a_finished_resolution() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 443));
+        let result = spawn_with_timeout(|| Ok(vec![addr]), Duration::from_secs(1));
+        assert_eq!(result.expect("正常完成不该报错"), vec![addr]);
     }
 
     /// 首次进设置页：没图、没账 —— 该拉一次；开跑之后同一帧再问就不拉。
