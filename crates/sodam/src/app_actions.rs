@@ -7033,6 +7033,12 @@ mod queue_switch_callback_tests {
     use ctor::ctor;
     use gpui::{AppContext, TestAppContext};
 
+    /// 测试沙箱目录：ctor 建它，写 config.json 和 `SODAM_CONFIG_PATH`
+    /// 都从这里取，防止改一处漏一处。
+    fn sandbox_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()))
+    }
+
     /// 环境操作全部集中在 ctor：测试线程起来之前，全进程没有并发读者，
     /// 这是唯一能安全改环境的时刻。
     ///
@@ -7043,7 +7049,7 @@ mod queue_switch_callback_tests {
     /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
     #[ctor(unsafe)]
     fn point_test_env_at_the_sandbox() {
-        let dir = std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
+        let dir = sandbox_dir();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建立测试沙箱目录");
         std::env::set_var("SODAM_CONFIG_PATH", dir.join("config.json"));
@@ -7073,9 +7079,9 @@ mod queue_switch_callback_tests {
 
     /// 在首个用例构造 `Root` 之前写沙箱 config.json。
     ///
-    /// config.json 的内容写盘放在这里跑；ctor 只做目录准备和环境改动，
-    /// ctor 阶段做 `fs::write` 时 Windows 上崩过一次（进程收尾
-    /// `STATUS_ACCESS_VIOLATION`，其余平台全绿）。
+    /// config.json 的内容在首个用例里写；ctor 里只建目录、改环境。
+    /// Windows 上 ctor 里加 `fs::write` 后出现过进程收尾崩溃
+    /// （`STATUS_ACCESS_VIOLATION`），原因没查实，写盘因此挪走。
     ///
     /// config.json 写死签名器不可达、不留 Cookie，`Root::new` 读它之后
     /// 就是「未登录 + 签名器不通」。写不进去（磁盘满等）就 panic：与其让
@@ -7083,8 +7089,7 @@ mod queue_switch_callback_tests {
     fn write_sandbox_config() {
         static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         DONE.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
+            let dir = sandbox_dir();
             std::fs::write(
                 dir.join("config.json"),
                 r#"{"signer_url": "http://127.0.0.1:1", "cookie": ""}"#,
