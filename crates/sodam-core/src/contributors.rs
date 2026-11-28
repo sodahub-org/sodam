@@ -167,7 +167,7 @@ impl ureq::Resolver for DeadlineResolver {
 /// 把一段可能卡死的网络工作丢进辅助线程，主线程只等 `timeout`：到点就报
 /// TimedOut，不等它自己回来（`ToSocketAddrs` 没有可中断的 API）。
 /// 超时后辅助线程还没干完也没人收了，随它自然结束，不影响下一次请求。
-fn spawn_with_timeout<T: Send>(
+fn spawn_with_timeout<T: Send + 'static>(
     work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
     timeout: Duration,
 ) -> std::io::Result<T> {
@@ -188,6 +188,20 @@ fn spawn_with_timeout<T: Send>(
     }
 }
 
+/// 读门槛（#343）：「最多 4 MiB」，所以多读一字节才能分清「正好读满」和
+/// 「读满还没结束」——后者是截断，判失败，不写缓存（写盘只在成功路径发生）。
+fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// 下载 contrib.rocks 动态生成的 SVG；返回原始矢量字节。
 ///
 /// 三段超时各自生效（#336）：DNS [`DNS_TIMEOUT`]（解析自己兜，见
@@ -200,17 +214,7 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
         .timeout(TOTAL_TIMEOUT)
         .build();
     let response = agent.get(CONTRIBUTORS_URL).call().ok()?;
-    // 门槛是「最多 4 MiB」，所以多读一字节才能分清「正好读满」和「读满还没
-    // 结束」：后者是截断，判失败，不写缓存（2/5 的写盘只在成功路径发生）。
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        return None;
-    }
+    let bytes = read_capped(response.into_reader())?;
     is_svg(&bytes).then_some(bytes)
 }
 
@@ -279,8 +283,26 @@ mod tests {
     #[test]
     fn spawn_with_timeout_passes_through_a_finished_resolution() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 443));
-        let result = spawn_with_timeout(|| Ok(vec![addr]), Duration::from_secs(1));
+        let result = spawn_with_timeout(move || Ok(vec![addr]), Duration::from_secs(1));
         assert_eq!(result.expect("正常完成不该报错"), vec![addr]);
+    }
+
+    /// 截断判据（#343）：正好读满 4 MiB 收；多一个字节（读满还没结束）拒。
+    /// `>` 写成 `>=`、`+1` 漏掉，这里都会红。
+    #[test]
+    fn read_capped_enforces_the_four_mib_cap() {
+        let at_cap = read_capped(std::io::repeat(b'a').take(MAX_IMAGE_BYTES)).unwrap();
+        assert_eq!(at_cap.len() as u64, MAX_IMAGE_BYTES);
+        assert!(read_capped(std::io::repeat(b'a').take(MAX_IMAGE_BYTES + 1)).is_none());
+    }
+
+    /// 短于门槛的响应体原样带回：截断判据不碰 4 MiB 以内的内容，收不收由
+    /// is_svg 的收尾门槛说话（截断的 SVG 被拒由它自己的测试承载）。
+    #[test]
+    fn read_capped_passes_shorter_bodies_through() {
+        let body: &[u8] =
+            b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        assert_eq!(read_capped(body).unwrap(), body);
     }
 
     /// 首次进设置页：没图、没账 —— 该拉一次；开跑之后同一帧再问就不拉。
