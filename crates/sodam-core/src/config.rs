@@ -72,14 +72,54 @@ pub enum LoadOutcome {
     Corrupt { error: String },
 }
 
+/// 一条签名服务（#321）：地址 + 可选 token。
+///
+/// 展示名由地址推导（`signers::signer_display_name`），不单独落盘；
+/// token 是敏感信息，只存本地配置文件，界面一律掩码显示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignerService {
+    /// 签名端点地址（libmssdk 的 `/sign`）。
+    pub url: String,
+    /// 该服务的 token（`Authorization: Bearer`），服务端没开鉴权时留空。
+    #[serde(default)]
+    pub token: String,
+}
+
 /// 与 libresoda / libmssdk 对接需要的全部设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// 签名服务地址（libmssdk 的 `/sign`，VIP 整曲必需）。
+    ///
+    /// #321 起它不再是独立配置项，而是 [`Self::signers`] 激活项的**镜像**：
+    /// 会话与界面读这里，切换服务由 [`Self::normalize_signers`] 同步。
     pub signer_url: String,
-    /// 签名服务 token（`Authorization: Bearer`），服务端没开鉴权时留空。
+    /// 签名服务 token（`Authorization: Bearer`），服务端没开鉴权时留空。同上，镜像激活项。
     pub signer_token: String,
+    /// 签名服务列表（#321）：可在设置页选择 / 切换 / 增删。
+    /// 空列表按旧配置迁移（见 [`Self::normalize_signers`]）；内置公共项始终在场。
+    #[serde(default)]
+    pub signers: Vec<SignerService>,
+    /// 激活服务在 [`Self::signers`] 里的下标，越界时由归一化钳回 0。
+    #[serde(default)]
+    pub active_signer: usize,
+    /// 文件是**旧扁平签名配置**（加载时没有服务列表，只有 `signer_url/token`）。
+    /// 仅运行期标记，不落盘：`QISHUI_SIGNER_URL/TOKEN` 环境变量只对这类配置
+    /// 生效（PR #348 二轮审查：已保存服务列表的配置绝不能拿到指向别的服务的
+    /// 环境变量凭据，详见 [`Self::apply_signer_env`]）。
+    #[serde(skip)]
+    pub flat_signer_config: bool,
+    /// 加载时文件里的 `signer_token` 是否**显式为空**（PR #348 三轮审查）：
+    /// 归一化会先给缺 token 的默认条目补上出厂值，env token 的「补空」判定
+    /// 要看加载时的原始状态，否则用户「URL 用默认、token 用 env」的用法失效。
+    #[serde(skip)]
+    pub flat_signer_token_was_empty: bool,
+    /// 环境变量选定过签名服务（PR #348 三轮审查）：只记**资格**，不记任何
+    /// 凭据。旧扁平配置 + env URL 首次启动时置位并随迁移落盘——迁移把列表
+    /// 写进文件后配置不再是扁平的，靠这个标志保留 env 覆盖资格（token 轮换
+    /// 继续生效）；面板里的显式选择会清掉它（显式选择优先于 env）。
+    #[serde(default)]
+    pub signer_env_selected: bool,
     /// 登录 Cookie（扫码登录成功后写入）。
     pub cookie: String,
     /// 设备指纹：必须与签名器一致（签名器 `/config` 可查）。
@@ -261,6 +301,13 @@ pub const DEFAULT_SIGNER_URL: &str = "https://signer.lingchuanbio.com/sign";
 /// 上面那台服务的 token（等同取流能力，别外传；换服务时在设置里替换）。
 pub const DEFAULT_SIGNER_TOKEN: &str = "b356ad402bc31ee9e5a99cfdbf41eaa39961a562251c3359";
 
+/// 内置社区公共签名服务（issue #321 楼主提供）：与默认签名服务同等待遇——
+/// 始终在场、置顶展示、不可删除、可一键恢复；token 随内置常量携带。
+pub const BUILTIN_COMMUNITY_SIGNER_URL: &str = "https://signer.xxx91n.com/sign";
+
+/// 内置社区公共签名服务的 token（随代码常量分发，不在日志 / 状态行 / 界面出现）。
+pub const BUILTIN_COMMUNITY_SIGNER_TOKEN: &str = "79a91f8685c343e2cc6ade18ada6ccaadcd17578cf1cea59";
+
 /// 换服务前的那台内置实例，2026-10 起已下线。
 /// 老版本的默认值会落进 config.json，所以读取时要把它们迁到当前默认值，
 /// 否则老用户会一直指着一台死掉的服务。
@@ -375,11 +422,19 @@ fn sanitize_config_value(value: &mut serde_json::Value) -> Vec<String> {
     // 放过去会让整份配置解析失败（#185）。
     let is_f32 = |value: &serde_json::Value| serde_json::from_value::<f32>(value.clone()).is_ok();
     let is_u64 = |value: &serde_json::Value| serde_json::from_value::<u64>(value.clone()).is_ok();
+    let is_usize =
+        |value: &serde_json::Value| serde_json::from_value::<usize>(value.clone()).is_ok();
     // 字符串数组：元素类型也要对得上。
     let is_string_array = |value: &serde_json::Value| {
         value
             .as_array()
             .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+    };
+    // 签名服务列表（#321）：整体按目标类型校验，条目里的坏字段交给
+    // `SignerService` 自己的 `serde(default)`；整表类型不对就丢掉整表，
+    // 让默认值（含内置项保障）兜底，不连累其它字段（PR #348 审查意见）。
+    let is_signer_list = |value: &serde_json::Value| {
+        serde_json::from_value::<Vec<SignerService>>(value.clone()).is_ok()
     };
     for key in [
         "signer_url",
@@ -406,6 +461,8 @@ fn sanitize_config_value(value: &mut serde_json::Value) -> Vec<String> {
         drop_unless(key, &is_f32);
     }
     drop_unless("audio_cache_limit_mb", &is_u64);
+    drop_unless("active_signer", &is_usize);
+    drop_unless("signers", &is_signer_list);
     for key in ["search_history_enabled", "detailed_logs"] {
         drop_unless(key, &is_bool);
     }
@@ -434,8 +491,10 @@ fn write_settings_backup_locked(path: &Path, settings: &Settings) -> std::io::Re
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
+    // 备份与主文件同一套规则：env 覆盖的镜像凭据不进备份（PR #348 三轮审查）。
+    let snapshot = settings.persisted_snapshot();
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(&serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?)?;
+    file.write_all(&serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?)?;
     file.persist(&backup).map_err(|err| err.error)?;
     Ok(())
 }
@@ -628,8 +687,11 @@ pub fn load_for_startup(path: &Path) -> StartupLoad {
                 }
                 None => {
                     // 不生成设备身份、不回存：坏文件在磁盘上原样保留。
+                    // 签名服务列表同样要归一化（PR #348 二轮审查）：面板拿到
+                    // 可用列表，两台内置项在场，用户还能选服务、测延时。
                     let mut defaults = Settings::default();
                     defaults.normalize_playback();
+                    defaults.normalize_signers();
                     StartupLoad {
                         settings: defaults,
                         recovery: Some(StartupRecovery::FellBackToDefaults { error }),
@@ -677,6 +739,11 @@ impl Default for Settings {
         Self {
             signer_url: DEFAULT_SIGNER_URL.to_string(),
             signer_token: DEFAULT_SIGNER_TOKEN.to_string(),
+            signers: Vec::new(),
+            active_signer: 0,
+            flat_signer_config: false,
+            flat_signer_token_was_empty: false,
+            signer_env_selected: false,
             cookie: String::new(),
             device_id: String::new(),
             iid: String::new(),
@@ -735,7 +802,12 @@ impl Settings {
                     "config_corrupt",
                     &[("error", error.as_str())],
                 );
-                return Self::default();
+                // 默认值同样过一遍签名服务列表归一化（#321）：设置页面板拿到的
+                // 永远是可用列表，坏文件路径也不例外。（`Default` 自带内置默认
+                // 地址，无需环境变量补全。）
+                let mut settings = Self::default();
+                settings.normalize_signers();
+                return settings;
             }
             LoadOutcome::NotFound(settings) => Self::prepare_loaded(settings, false),
             LoadOutcome::Loaded { settings, migrated } => Self::prepare_loaded(settings, migrated),
@@ -793,7 +865,9 @@ impl Settings {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return LoadOutcome::NotFound(Self::default());
+                let mut settings = Self::default();
+                settings.normalize_signers();
+                return LoadOutcome::NotFound(settings);
             }
             Err(err) => {
                 return LoadOutcome::Corrupt {
@@ -804,9 +878,28 @@ impl Settings {
         match parse_settings_text(&text) {
             Ok(settings) => {
                 let (mut settings, migrated) = settings.migrated();
+                // 旧扁平配置标记（PR #348 二轮审查）：文件里没有服务列表时才允许
+                // `QISHUI_SIGNER_*` 环境变量补全签名服务（运行期，见
+                // [`Self::apply_signer_env`]）；归一化只用文件里的值，绝不把
+                // 环境变量凭据写进配置文件。token 的「显式留空」状态在归一化
+                // 补出厂值之前记下（PR #348 三轮审查）；扁平配置 + env URL 在
+                // 这里就置 env 选中资格，随迁移落盘，迁移后覆盖继续生效。
+                settings.flat_signer_config = settings.signers.is_empty();
+                settings.flat_signer_token_was_empty = settings.signer_token.trim().is_empty();
+                if settings.flat_signer_config
+                    && std::env::var("QISHUI_SIGNER_URL")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    settings.signer_env_selected = true;
+                }
                 settings.normalize_playback();
                 settings.normalize_search_history();
-                LoadOutcome::Loaded { settings, migrated }
+                let signers_migrated = settings.normalize_signers();
+                LoadOutcome::Loaded {
+                    settings,
+                    migrated: migrated || signers_migrated,
+                }
             }
             Err(error) => LoadOutcome::Corrupt { error },
         }
@@ -883,7 +976,18 @@ impl Settings {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         Self::debug_delay_before_write();
-        self.save_to_locked(path)
+        // 落盘前归一化（PR #348 三轮审查）：签名 env 覆盖只存在于内存镜像，
+        // 序列化前把镜像同步回激活项——env 凭据绝不进 config.json（主题保存、
+        // 热重载备份、启动回存都走这里，无需各自记挂）。
+        let snapshot = self.persisted_snapshot();
+        snapshot.save_to_locked(path)
+    }
+
+    /// 落盘用的快照：归一化后的副本。内存里的 env 覆盖（镜像字段）不进盘。
+    fn persisted_snapshot(&self) -> Settings {
+        let mut snapshot = self.clone();
+        snapshot.normalize_signers();
+        snapshot
     }
 
     /// 登出落盘：把**盘上最新那份配置**摘掉 Cookie 再写回去（#197）。
@@ -1071,6 +1175,232 @@ impl Settings {
         self.audio_cache_limit_mb = self.audio_cache_limit_mb.clamp(1024, 1024 * 1024);
     }
 
+    /// 签名服务的环境变量补全（`QISHUI_SIGNER_URL` / `QISHUI_SIGNER_TOKEN`）。
+    ///
+    /// **只在内存生效，绝不落盘**：调用点是启动合并（[`Self::merged_with_env`]）
+    /// 与热重载（config_watch），两条路都不写配置文件；自动迁移/回存用的设置
+    /// 里没有这些值（PR #348 二轮审查：token 轮换后不能被存盘的旧值压住）。
+    ///
+    /// 凭据只流向环境变量**指向的那个服务**，绝不写进别的服务条目：
+    /// - 环境变量给了 URL：列表里同地址条目的 token 运行期改用 env 值；列表里
+    ///   没有这个地址且文件是旧扁平配置时，镜像字段整体指向 env 服务
+    ///   （env 没给 token 就留空——绝不把别的服务的 token 带过去）。
+    /// - 只给了 TOKEN：仅当旧扁平配置且镜像 token 为空时补上（文件里的值优先）。
+    /// - 已保存服务列表的配置，镜像不做任何 env 改写（列表未含 env 服务时
+    ///   环境变量凭据无处可去，宁可不用也不能发给别的服务）。
+    pub(crate) fn apply_signer_env(&mut self) {
+        let env_url = std::env::var("QISHUI_SIGNER_URL").ok();
+        let env_token = std::env::var("QISHUI_SIGNER_TOKEN").ok();
+        let env_url = env_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let env_token = env_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if let Some(url) = env_url {
+            // 同地址条目（PR #348 三轮审查）：**env 给了 token 才改**——
+            // env 只给了 URL 时保留文件里已存的 token，绝不拿空串抹掉它。
+            // env token 只进运行镜像（落盘前归一化会剥掉），不留在可序列化
+            // 的服务条目里。
+            if let Some(index) = self
+                .signers
+                .iter()
+                .position(|service| service.url.trim() == url)
+            {
+                if self.active_signer == index {
+                    self.signer_url = url;
+                    if let Some(token) = &env_token {
+                        self.signer_token = token.clone();
+                    }
+                }
+                // env 服务不是激活项：镜像不动（凭据不能发给环境变量没指名
+                // 的服务）；用户可在面板里自己切过去。
+                return;
+            }
+            // 列表里没有这个地址：旧扁平配置、或 env 选中过（迁移后资格保留）
+            // 时镜像指向 env 服务。env 没给 token 就留空——绝不继承别的服务
+            // 的 token（PR #348 二轮审查）。
+            if self.flat_signer_config || self.signer_env_selected {
+                self.signer_url = url;
+                self.signer_token = env_token.unwrap_or_default();
+                self.signer_env_selected = true;
+            }
+        } else if let Some(token) = env_token {
+            // 只有 token：旧扁平配置且加载时文件 token 显式为空（文件里的
+            // 非空值优先），或 env 选中过（迁移后资格保留，轮换即时生效）。
+            if (self.flat_signer_config
+                && (self.signer_token.trim().is_empty() || self.flat_signer_token_was_empty))
+                || (self.signer_env_selected && !self.flat_signer_config)
+            {
+                self.signer_token = token;
+                self.signer_env_selected = true;
+            }
+        }
+    }
+
+    /// 地址是否是内置公共签名服务（#321）：默认签名服务与社区公共服务两台。
+    /// 内置项在服务列表里不可删除。
+    pub fn is_builtin_signer(url: &str) -> bool {
+        let url = url.trim();
+        url == DEFAULT_SIGNER_URL || url == BUILTIN_COMMUNITY_SIGNER_URL
+    }
+
+    /// 两台内置公共签名服务的出厂值（顺序即置顶顺序：默认 → 社区公共）。
+    fn builtin_signer_pairs() -> [(&'static str, &'static str); 2] {
+        [
+            (DEFAULT_SIGNER_URL, DEFAULT_SIGNER_TOKEN),
+            (BUILTIN_COMMUNITY_SIGNER_URL, BUILTIN_COMMUNITY_SIGNER_TOKEN),
+        ]
+    }
+
+    /// 签名服务列表归一化（#321），返回是否发生了改动：
+    ///
+    /// 1. **迁移**：列表为空时，把旧配置的 `signer_url` / `signer_token` 收进来当第一项
+    ///    （它就是用户当前在用的服务）；`signer_url` 为空（用户手动清空过）则不收。
+    /// 2. **内置项保障**：两台内置公共签名服务始终在场——被手改删掉时按默认值补回。
+    /// 3. **去重**：同地址只留第一条，空地址条目丢弃。
+    /// 4. **下标钳位**：`active_signer` 越界时回到 0。
+    /// 5. **镜像同步**：`signer_url` / `signer_token` 始终等于激活项——会话与界面
+    ///    读这两个字段，切换服务只要改下标再归一化，下游（session、环境变量补全、
+    ///    会话输入比对）一处不用动。
+    pub fn normalize_signers(&mut self) -> bool {
+        let mut changed = false;
+
+        // 激活服务在任何列表改动之前先按地址捕获（PR #348 审查意见）：下面的
+        // 旧配置迁移插入、去重 retain、内置置顶重排都会移动下标，事后按旧下标
+        // 取会把别的服务当成激活项（如 [默认, 社区, 空, A, B]、active=3，
+        // retain 删掉空条目后下标 3 指向的是 B 而不是真正的激活项 A）。
+        let original_active = if self.active_signer < self.signers.len() {
+            Some(self.signers[self.active_signer].url.trim().to_string())
+        } else {
+            None
+        };
+
+        // 旧配置迁移（#321）：收进列表的条目就是用户当前在用的服务，记住它的
+        // 地址，重排后仍激活它（此时 `original_active` 必为 None：列表原本为空）。
+        let mut migrated_active_url: Option<String> = None;
+        if self.signers.is_empty() && !self.signer_url.trim().is_empty() {
+            let url = self.signer_url.trim().to_string();
+            migrated_active_url = Some(url.clone());
+            self.signers.push(SignerService {
+                url,
+                token: self.signer_token.trim().to_string(),
+            });
+            changed = true;
+        }
+
+        // 条目级旧默认地址迁移（PR #348 三轮审查）：列表条目里也可能存着
+        // 旧默认地址——比如「旧扁平配置先落了列表再升级」的文件，落盘前
+        // 归一化会把扁平值收进列表。规则与 `migrated()` 的扁平迁移一致：
+        // 只认「等于旧默认值」的地址，用户自己填的别的地址原样保留。
+        for service in self.signers.iter_mut() {
+            if service.url.trim() == LEGACY_SIGNER_URL {
+                service.url = DEFAULT_SIGNER_URL.to_string();
+                if service.token.trim() == LEGACY_SIGNER_TOKEN {
+                    service.token = DEFAULT_SIGNER_TOKEN.to_string();
+                }
+                changed = true;
+            } else if service.url.trim() == PREVIOUS_SIGNER_URL {
+                service.url = DEFAULT_SIGNER_URL.to_string();
+                changed = true;
+            }
+        }
+
+        let before = self.signers.len();
+        let mut seen: Vec<String> = Vec::with_capacity(before);
+        self.signers.retain(|service| {
+            let url = service.url.trim();
+            if url.is_empty() || seen.iter().any(|item| item == url) {
+                return false;
+            }
+            seen.push(url.to_string());
+            true
+        });
+        if self.signers.len() != before {
+            changed = true;
+        }
+
+        // 内置项保障：两台内置公共签名服务始终在场——被手改删掉时按默认值补回
+        //（默认服务在前，社区公共服务在后，各自携带内置 token 常量）。
+        for (url, token) in Self::builtin_signer_pairs() {
+            if !self.signers.iter().any(|service| service.url.trim() == url) {
+                self.signers.push(SignerService {
+                    url: url.to_string(),
+                    token: token.to_string(),
+                });
+                changed = true;
+            }
+        }
+
+        // 内置项置顶（#321）：两台内置服务固定按「默认 → 社区公共」排在最前，
+        // 与「内置」标签一起把它们和用户自添服务区分开。
+        // 重排会移动下标：激活项由最前面按地址捕获的 URL 在最终列表里重新定位。
+        let previous = self.signers.clone();
+        let (mut builtins, rest): (Vec<SignerService>, Vec<SignerService>) = self
+            .signers
+            .drain(..)
+            .partition(|service| Self::is_builtin_signer(&service.url));
+        let mut reordered = Vec::with_capacity(builtins.len() + rest.len());
+        for (url, _) in Self::builtin_signer_pairs() {
+            if let Some(position) = builtins.iter().position(|s| s.url.trim() == url) {
+                reordered.push(builtins.remove(position));
+            }
+        }
+        reordered.extend(rest);
+        self.signers = reordered;
+        if self.signers != previous {
+            changed = true;
+        }
+
+        // 迁移兼容（#321）：用户配置里已有的内置服务条目（如预设流程时代 token 留空
+        // 的 xxx91n）与内置项同址合并后，token 为空就补上内置值——「内置 token 生效」；
+        // 用户自己填过非空 token 的条目原样保留（那是明确的用户意图，恢复内置可重置）。
+        for (url, token) in Self::builtin_signer_pairs() {
+            if let Some(service) = self
+                .signers
+                .iter_mut()
+                .find(|service| service.url.trim() == url)
+            {
+                if service.token.trim().is_empty() {
+                    service.token = token.to_string();
+                    changed = true;
+                }
+            }
+        }
+
+        // 激活项定位（PR #348 审查意见）：最初捕获的地址在最终列表里找到就用
+        // 那个位置（同址去重时落到保留的第一条，激活的还是同一个服务）；
+        // 找不到（激活条目地址为空被丢弃）回 0；旧格式迁移收进的条目按迁移
+        // 地址定位（重排后内置项在前，迁移条目不在 0）。
+        let lookup_url = original_active
+            .filter(|url| !url.is_empty())
+            .or(migrated_active_url);
+        let resolved = lookup_url.and_then(|url| {
+            self.signers
+                .iter()
+                .position(|service| service.url.trim() == url)
+        });
+        let target = resolved.unwrap_or(0);
+        if self.active_signer != target {
+            self.active_signer = target;
+            changed = true;
+        }
+
+        let active = &self.signers[self.active_signer];
+        if self.signer_url != active.url || self.signer_token != active.token {
+            self.signer_url = active.url.clone();
+            self.signer_token = active.token.clone();
+            changed = true;
+        }
+
+        changed
+    }
+
     /// 搜索历史最多保留 10 条；去空白、去重，最近搜索保持在前。
     pub const SEARCH_HISTORY_LIMIT: usize = 10;
 
@@ -1213,6 +1543,7 @@ impl Settings {
     /// 否则外部文件没带身份时会在后台悄悄轮换一份。
     pub fn merged_with_env(self) -> Self {
         let mut settings = self.fill_empty_from_env(EnvCookieFill::Allow);
+        settings.apply_signer_env();
         settings.ensure_login_device();
         settings
     }
@@ -1228,9 +1559,9 @@ impl Settings {
         if cookie_fill == EnvCookieFill::Allow {
             Self::fill_slot_from_env(&mut self.cookie, ENV_COOKIE_KEY);
         }
+        // 签名服务的环境变量补全单独走 [`Self::apply_signer_env`]：凭据只能
+        // 流向环境变量指向的那个服务，且只在内存生效（见该函数注释）。
         let pairs = [
-            ("QISHUI_SIGNER_URL", &mut self.signer_url),
-            ("QISHUI_SIGNER_TOKEN", &mut self.signer_token),
             ("SODA_DEVICE_ID", &mut self.device_id),
             ("SODA_IID", &mut self.iid),
             ("SODA_FP", &mut self.fp),
@@ -1311,6 +1642,34 @@ mod tests {
         std::env::set_var(ENV_LOGIN_DEVICE_ID, device);
         std::env::set_var(ENV_LOGIN_INSTALL_ID, install);
         (device_guard, install_guard)
+    }
+
+    /// 设置环境变量并在离开作用域时还原到设值前的状态（本机原本设过也不丢）。
+    struct RestoredEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl RestoredEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        /// 显式移除一个环境变量（离开作用域时还原到移除前的状态）。
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+    impl Drop for RestoredEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
@@ -1443,6 +1802,350 @@ mod tests {
         assert!(loaded.is_ready_for_vip());
         assert!(!Settings::default().is_ready_for_vip());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧配置只有 signer_url/token：读取时迁移为列表第一项并保持激活（#321）。
+    #[test]
+    fn migrates_flat_signer_into_list() {
+        let mut settings = Settings {
+            signer_url: "http://signer.example.com:8899/sign".into(),
+            signer_token: "my-own-token".into(),
+            ..Default::default()
+        };
+        assert!(settings.normalize_signers());
+
+        // 两台内置项置顶（默认服务 → 社区公共服务），用户迁移来的服务排其后且仍激活。
+        assert_eq!(settings.signers.len(), 3);
+        assert_eq!(settings.signers[0].url, DEFAULT_SIGNER_URL);
+        assert_eq!(settings.signers[1].url, BUILTIN_COMMUNITY_SIGNER_URL);
+        assert_eq!(
+            settings.signers[2].url,
+            "http://signer.example.com:8899/sign"
+        );
+        assert_eq!(settings.signers[2].token, "my-own-token");
+        assert_eq!(settings.active_signer, 2);
+        // 镜像字段与激活项一致。
+        assert_eq!(settings.signer_url, settings.signers[2].url);
+        assert_eq!(settings.signer_token, settings.signers[2].token);
+    }
+
+    /// 内置公共签名服务被手改删掉时自动补回默认值（不可删除，可一键恢复）。
+    #[test]
+    fn builtin_signer_always_stays_in_list() {
+        let mut settings = Settings {
+            signers: vec![SignerService {
+                url: "http://signer.example.com/sign".into(),
+                token: String::new(),
+            }],
+            active_signer: 0,
+            ..Default::default()
+        };
+        assert!(settings.normalize_signers());
+        // 两台内置项都被补回，且带各自的内置 token 常量。
+        assert_eq!(settings.signers.len(), 3);
+        assert_eq!(settings.signers[0].url, DEFAULT_SIGNER_URL);
+        assert_eq!(settings.signers[0].token, DEFAULT_SIGNER_TOKEN);
+        assert_eq!(settings.signers[1].url, BUILTIN_COMMUNITY_SIGNER_URL);
+        assert_eq!(settings.signers[1].token, BUILTIN_COMMUNITY_SIGNER_TOKEN);
+    }
+
+    /// 同地址去重取第一条、空地址丢弃、越界下标钳回 0（#321）。
+    #[test]
+    fn signers_dedupe_clamp_and_mirror_active() {
+        let mut settings = Settings {
+            signers: vec![
+                SignerService {
+                    url: "  ".into(),
+                    token: String::new(),
+                },
+                SignerService {
+                    url: "http://a.example.com/sign".into(),
+                    token: "a".into(),
+                },
+                SignerService {
+                    url: "http://a.example.com/sign".into(),
+                    token: "b".into(),
+                },
+            ],
+            active_signer: 9,
+            ..Default::default()
+        };
+        assert!(settings.normalize_signers());
+        assert_eq!(settings.signers.len(), 3); // 空地址丢弃 + 同址去重 + 两台内置项
+                                               // 内置项置顶后，越界下标钳回 0 落在默认服务上，镜像同步。
+        assert!(Settings::is_builtin_signer(&settings.signers[0].url));
+        assert_eq!(settings.signers[2].url, "http://a.example.com/sign");
+        assert_eq!(settings.signers[2].token, "a");
+        assert_eq!(settings.active_signer, 0);
+        assert_eq!(settings.signer_url, settings.signers[0].url);
+        assert_eq!(settings.signer_token, settings.signers[0].token);
+    }
+
+    /// 迁移兼容（#321）：用户配置里已有社区公共服务条目（预设流程时代 token 留空）
+    /// ——同址归并后内置 token 生效，激活项指向保持不变。
+    #[test]
+    fn existing_community_entry_gets_builtin_token() {
+        let mut settings = Settings {
+            signers: vec![
+                SignerService {
+                    url: DEFAULT_SIGNER_URL.into(),
+                    token: DEFAULT_SIGNER_TOKEN.into(),
+                },
+                SignerService {
+                    url: BUILTIN_COMMUNITY_SIGNER_URL.into(),
+                    token: String::new(),
+                },
+            ],
+            active_signer: 1,
+            signer_url: BUILTIN_COMMUNITY_SIGNER_URL.into(),
+            signer_token: String::new(),
+            ..Default::default()
+        };
+        assert!(settings.normalize_signers());
+        assert_eq!(settings.signers.len(), 2);
+        // 内置 token 生效。
+        assert_eq!(settings.signers[1].token, BUILTIN_COMMUNITY_SIGNER_TOKEN);
+        // 激活指向保持（仍指向社区公共服务）。
+        assert_eq!(settings.active_signer, 1);
+        assert_eq!(settings.signer_url, BUILTIN_COMMUNITY_SIGNER_URL);
+        assert_eq!(settings.signer_token, BUILTIN_COMMUNITY_SIGNER_TOKEN);
+    }
+
+    /// 用户自己给内置地址填了非空 token：那是明确的用户意图，原样保留
+    /// （「恢复内置」可随时重置为出厂值）。
+    #[test]
+    fn user_supplied_builtin_token_is_kept() {
+        let mut settings = Settings {
+            signers: vec![SignerService {
+                url: BUILTIN_COMMUNITY_SIGNER_URL.into(),
+                token: "my-instance-token".into(),
+            }],
+            active_signer: 0,
+            ..Default::default()
+        };
+        assert!(settings.normalize_signers());
+        assert_eq!(settings.signers[1].token, "my-instance-token");
+        assert_eq!(settings.signers[0].token, DEFAULT_SIGNER_TOKEN);
+    }
+
+    /// 已归一化的列表再跑一遍应当无事发生（幂等），热重载反复走不会抖动。
+    #[test]
+    fn normalize_signers_is_idempotent() {
+        let mut settings = Settings::default();
+        settings.normalize_signers();
+        let snapshot = settings.clone();
+        assert!(!settings.normalize_signers());
+        assert_eq!(settings, snapshot);
+    }
+
+    /// 激活项在任何列表改动之前按地址捕获（PR #348 审查意见）：去重删掉
+    /// 激活项之前的条目后旧下标会移位，事后按下标取会把别的服务当成激活项。
+    #[test]
+    fn normalize_signers_tracks_active_service_by_url() {
+        let signers = |active: usize| Settings {
+            signers: vec![
+                SignerService {
+                    url: DEFAULT_SIGNER_URL.into(),
+                    token: DEFAULT_SIGNER_TOKEN.into(),
+                },
+                SignerService {
+                    url: BUILTIN_COMMUNITY_SIGNER_URL.into(),
+                    token: BUILTIN_COMMUNITY_SIGNER_TOKEN.into(),
+                },
+                SignerService {
+                    url: "  ".into(),
+                    token: String::new(),
+                },
+                SignerService {
+                    url: "http://a.example.com/sign".into(),
+                    token: "a".into(),
+                },
+                SignerService {
+                    url: "http://b.example.com/sign".into(),
+                    token: "b".into(),
+                },
+            ],
+            active_signer: active,
+            ..Default::default()
+        };
+
+        // active=3（A）：空地址条目（下标 2）删掉后 A、B 各前移一位，A 落在下标 2，
+        // 归一化按地址定位后激活的仍是 A，而不是移位后下标 3 指到的 B。
+        let mut settings = signers(3);
+        settings.signer_url = settings.signers[3].url.clone();
+        settings.signer_token = "a".into();
+        assert!(settings.normalize_signers());
+        assert_eq!(settings.signers.len(), 4);
+        assert_eq!(settings.signers[2].url, "http://a.example.com/sign");
+        assert_eq!(settings.active_signer, 2);
+        assert_eq!(settings.signer_url, "http://a.example.com/sign");
+        assert_eq!(settings.signer_token, "a");
+
+        // active=4（B）：去掉空条目后 B 从 4 移到 3，激活的仍是 B（旧逻辑会把
+        // 越界下标钳回 0，悄悄切到默认服务）。
+        let mut settings = signers(4);
+        settings.signer_url = settings.signers[4].url.clone();
+        settings.signer_token = "b".into();
+        assert!(settings.normalize_signers());
+        assert_eq!(settings.signers.len(), 4);
+        assert_eq!(settings.signers[3].url, "http://b.example.com/sign");
+        assert_eq!(settings.active_signer, 3);
+        assert_eq!(settings.signer_url, "http://b.example.com/sign");
+        assert_eq!(settings.signer_token, "b");
+    }
+
+    /// 字段容错（PR #348 审查意见）：`active_signer` / `signers` 类型不对时
+    /// 丢字段补默认值，不连累同一份文件里的其它字段（尤其 Cookie）。
+    #[test]
+    fn sanitizer_drops_wrong_typed_signer_fields() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            r#"{"cookie":"sessionid_ss=x","theme":"dark","active_signer":-1,"signers":"oops"}"#,
+        )
+        .unwrap();
+        let dropped = sanitize_config_value(&mut value);
+        assert!(dropped.contains(&"active_signer".to_string()));
+        assert!(dropped.contains(&"signers".to_string()));
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.cookie, "sessionid_ss=x");
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.active_signer, 0);
+        assert!(settings.signers.is_empty());
+
+        // 类型正确时照常保留；列表条目缺 token 由 SignerService 的默认值兜底。
+        let mut ok: serde_json::Value = serde_json::from_str(
+            r#"{"signers":[{"url":"http://a.example.com/sign"}],"active_signer":0}"#,
+        )
+        .unwrap();
+        assert!(sanitize_config_value(&mut ok).is_empty());
+        let settings: Settings = serde_json::from_value(ok).unwrap();
+        assert_eq!(settings.signers.len(), 1);
+        assert_eq!(settings.signers[0].url, "http://a.example.com/sign");
+        assert_eq!(settings.active_signer, 0);
+    }
+
+    /// 签名 env 补全（PR #348 二轮/三轮审查）的安全规则：
+    /// ① 只在内存生效——落盘（主文件与备份）前归一化剥掉镜像里的 env 凭据；
+    /// ② 凭据只流向 env 指向的服务——已保存列表里别的服务拿不到 env token；
+    /// ③ env 只给 URL 不给 token 时保留文件里已存的 token（不拿空串抹掉）；
+    /// ④ 迁移后靠 `signer_env_selected` 资格标志保留 env 覆盖（token 轮换
+    ///    继续生效），面板显式选择清掉该标志。
+    #[test]
+    fn env_signer_completion_is_runtime_only_and_scoped() {
+        let _lock = crate::env_test_lock();
+        let _url = RestoredEnv::set("QISHUI_SIGNER_URL", "https://env-signer.example/sign");
+        let _token = RestoredEnv::set("QISHUI_SIGNER_TOKEN", "env-token");
+
+        // ① 旧扁平配置（显式空串）：镜像运行期指向 env 服务，落盘文件里
+        //    绝不出现 env 凭据（迁移只写文件里的值 + 内置项保障）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"cookie":"sessionid_ss=x","signer_url":"","signer_token":""}"#,
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path).merged_with_env();
+        assert_eq!(loaded.signer_url, "https://env-signer.example/sign");
+        assert_eq!(loaded.signer_token, "env-token");
+        assert!(loaded.flat_signer_config);
+        assert!(loaded.signer_env_selected, "env 选中资格置位");
+        assert!(!loaded
+            .signers
+            .iter()
+            .any(|service| service.url == "https://env-signer.example/sign"));
+        // 落盘内容没有 env 凭据（资格标志在，凭据不在）。
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(!text.contains("env-signer.example"), "{text}");
+        assert!(!text.contains("env-token"), "{text}");
+        assert!(text.contains("\"signer_env_selected\": true"), "{text}");
+
+        // ② 迁移后（文件已有列表）env 覆盖继续生效（PR #348 三轮审查）：
+        //    二次启动读同一份文件，env URL 不在列表里，凭资格标志覆盖镜像。
+        let second = Settings::load_from(&path).merged_with_env();
+        assert_eq!(second.signer_url, "https://env-signer.example/sign");
+        assert_eq!(second.signer_token, "env-token");
+
+        // ③ env 服务在列表里且是激活项：env 给了 token 才改镜像；只给 URL
+        //    时保留文件里已存的 token（不拿空串抹掉）。
+        let mut saved = Settings {
+            signers: vec![
+                SignerService {
+                    url: DEFAULT_SIGNER_URL.into(),
+                    token: DEFAULT_SIGNER_TOKEN.into(),
+                },
+                SignerService {
+                    url: "https://env-signer.example/sign".into(),
+                    token: "saved-token".into(),
+                },
+            ],
+            active_signer: 1,
+            ..Default::default()
+        };
+        saved.flat_signer_config = false;
+        saved.normalize_signers();
+        let merged = saved.clone().merged_with_env();
+        assert_eq!(merged.signer_token, "env-token");
+        let env_entry = &merged.signers[merged
+            .signers
+            .iter()
+            .position(|service| service.url == "https://env-signer.example/sign")
+            .expect("env 条目应在列表里")];
+        assert_eq!(env_entry.token, "saved-token", "可序列化条目不收 env token");
+        // 落盘：env token 不进文件（条目 token 与镜像都归位）。
+        let path2 = dir.path().join("theme-save.json");
+        merged.save_to(&path2).expect("save");
+        let text2 = std::fs::read_to_string(&path2).expect("read back");
+        assert!(!text2.contains("env-token"), "{text2}");
+        assert!(text2.contains("saved-token"), "{text2}");
+
+        // ④ env URL 不在列表里、也没有 env 资格：凭据无处可去，宁可不用——
+        //    镜像与列表原样（绝不能把 A 的 token 发给激活的 B）。
+        let _url = RestoredEnv::set("QISHUI_SIGNER_URL", "https://other-env.example/sign");
+        let saved_without_env = Settings {
+            signers: vec![
+                SignerService {
+                    url: DEFAULT_SIGNER_URL.into(),
+                    token: DEFAULT_SIGNER_TOKEN.into(),
+                },
+                SignerService {
+                    url: "https://plain-https.example/sign".into(),
+                    token: String::new(),
+                },
+            ],
+            active_signer: 1,
+            signer_url: "https://plain-https.example/sign".into(),
+            ..Default::default()
+        };
+        let merged = saved_without_env.merged_with_env();
+        assert_eq!(merged.signer_url, "https://plain-https.example/sign");
+        assert!(merged
+            .signers
+            .iter()
+            .find(|service| service.url == "https://plain-https.example/sign")
+            .unwrap()
+            .token
+            .is_empty());
+    }
+
+    /// 旧扁平配置「URL 用默认服务、token 显式留空 + 只给 QISHUI_SIGNER_TOKEN」
+    /// （PR #348 三轮审查）：归一化会先给默认条目补出厂 token，env token 的
+    /// 补空判定必须看**加载时的原始状态**，否则这个用法第一次启动就失效。
+    #[test]
+    fn env_token_only_applies_when_file_token_was_empty() {
+        let _lock = crate::env_test_lock();
+        let _token = RestoredEnv::set("QISHUI_SIGNER_TOKEN", "env-token");
+        let _url = RestoredEnv::remove("QISHUI_SIGNER_URL");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"signer_token":""}"#).expect("write");
+        let merged = Settings::load_from(&path).merged_with_env();
+        assert_eq!(merged.signer_token, "env-token");
+        // 文件里显式给过 token：env 不覆盖（文件值优先）。
+        let path2 = dir.path().join("explicit.json");
+        std::fs::write(&path2, r#"{"signer_token":"saved-token"}"#).expect("write");
+        let merged = Settings::load_from(&path2).merged_with_env();
+        assert_eq!(merged.signer_token, "saved-token");
     }
 
     /// 老版本把旧默认地址写进了 config.json，读取时要自动换成当前默认值并落盘。
@@ -1680,11 +2383,14 @@ mod tests {
         assert_eq!(legacy.quality, "");
         assert_eq!(legacy.quality_intent(), QualityIntent::Auto);
         assert_eq!(legacy.quality_source(), QualitySource::Unknown);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("读回"),
-            r#"{"quality":"","login_device_id":"1234567890123456","login_install_id":"123456789012345"}"#,
-            "没有别的迁移时不应改写文件"
+        // #321：签名服务列表的迁移（扁平字段 → 列表 + 内置项）属于「别的迁移」，
+        // 会改写文件；但音质相关的旧写法必须原样保留。
+        let rewritten = std::fs::read_to_string(&path).expect("读回");
+        assert!(
+            rewritten.contains(r#""quality": """#) || rewritten.contains(r#""quality":""#),
+            "音质字段在"
         );
+        assert!(rewritten.contains(r#""signers""#), "签名服务列表已迁移落盘");
 
         // 缺来源字段的具体档位旧配置：正常读取，来源为未知
         std::fs::write(&path, r#"{"quality":"lossless"}"#).expect("写入旧配置");
@@ -1763,18 +2469,18 @@ mod tests {
 
         let _lock = crate::env_test_lock();
         let _cookie_guard = EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
-        let _signer_guard = EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
+        let _signer_guard = EnvGuard::set("SODA_FP", "fp-from-env");
 
-        // 签名地址有内置默认值，先清空，才能验证「Skip 只跳过 Cookie、其余字段照补」。
-        let mut base = Settings::default();
-        base.signer_url.clear();
+        // 设备指纹有内置默认值？没有——默认是空串，正好验证「Skip 只跳过
+        // Cookie、其余字段照补」。签名服务的 env 补全走 apply_signer_env（另测）。
+        let base = Settings::default();
 
         let skipped = base.clone().fill_empty_from_env(EnvCookieFill::Skip);
         assert!(
             skipped.cookie.is_empty(),
             "登出记号置位时不能用环境变量补 Cookie"
         );
-        assert_eq!(skipped.signer_url, "https://signer.example");
+        assert_eq!(skipped.fp, "fp-from-env");
 
         // 对照：没有记号时照旧补 Cookie，证明跳过不是「环境变量没设」造成的。
         let allowed = base.fill_empty_from_env(EnvCookieFill::Allow);
@@ -1806,7 +2512,9 @@ mod tests {
         match Settings::try_load_from(&path) {
             LoadOutcome::Loaded { settings, migrated } => {
                 assert_eq!(settings.cookie, "sessionid_ss=x");
-                assert!(!migrated);
+                // #321：扁平的 signer_url/token 首载会迁移成服务列表，算一次迁移。
+                assert!(migrated, "签名服务列表迁移应记为 migrated");
+                assert!(!settings.signers.is_empty());
             }
             _ => panic!("合法 JSON 应为 Loaded"),
         }
@@ -1829,7 +2537,10 @@ mod tests {
         std::fs::write(&path, bad).unwrap();
 
         let loaded = Settings::load_from(&path);
-        assert_eq!(loaded, Settings::default());
+        // 坏文件回退默认值继续；默认值经签名服务列表归一化后与加载结果一致（#321）。
+        let mut expected = Settings::default();
+        expected.normalize_signers();
+        assert_eq!(loaded, expected);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             bad,

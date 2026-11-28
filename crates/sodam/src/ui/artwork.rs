@@ -73,20 +73,33 @@ fn loading_placeholder(size: f32, radius: f32) -> AnyElement {
 
 /// 渲染封面。
 ///
-/// `path` 是已经下载到本地的封面文件（见 `sodam_core::Session::cover_path`）；
-/// 没有封面时画一个抬升面 + 音符图标。
+/// `path` 是已经下载到本地的封面文件（见 `sodam_core::Session::cover_path`）。
+/// 调用方传入的路径都来自 `Root::covers` / `Root::original_covers` 内存表：
+/// 表项在下载完成回执时验证过存在，淘汰删文件时由 `drop_removed_covers`
+/// 同步清除。这里不做每帧 `path.exists()`（#135：渲染路径上的每次 stat 都
+/// 是白做的系统调用），直接按表项渲染；但后台封面任务回执与淘汰删文件之间
+/// 有竞态窗口——路径入表后文件可能已被清掉（PR #348 审查意见），所以挂上
+/// `with_fallback` 占位：读图失败的帧显示占位块，不出现空白，也不需要
+/// 每帧 stat。
 pub fn cover(path: Option<PathBuf>, size: f32, radius: f32) -> AnyElement {
-    match path.filter(|path| path.exists()) {
-        Some(path) => cover_img(path, size, radius).into_any_element(),
+    match path {
+        Some(path) => cover_img(path, size, radius)
+            .with_fallback(move || cover_placeholder(size, radius))
+            .into_any_element(),
         None => cover_placeholder(size, radius),
     }
 }
 
 /// 大尺寸封面：缺图、以及**解码中**都显示旋转圆圈。
+///
+/// 存在性判断同样交给调用方的内存表（见 [`cover`] 注释），不在渲染路径 stat。
+/// 读图失败（文件已被缓存清理删掉）落回静态占位块：转圈是「解码中」的
+/// 过渡态，文件没了就该停。
 pub fn cover_loading(path: Option<PathBuf>, size: f32, radius: f32) -> AnyElement {
-    match path.filter(|path| path.exists()) {
+    match path {
         Some(path) => cover_img(path, size, radius)
             .with_loading(move || loading_placeholder(size, radius))
+            .with_fallback(move || cover_placeholder(size, radius))
             .into_any_element(),
         None => loading_placeholder(size, radius),
     }

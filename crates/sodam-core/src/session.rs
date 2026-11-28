@@ -1001,6 +1001,13 @@ impl Session {
         self.settings.shortcut_next = settings.shortcut_next.clone();
         self.settings.search_history_enabled = settings.search_history_enabled;
         self.settings.search_history = settings.search_history.clone();
+        // 签名服务列表与激活下标同步（PR #348 审查意见）：添加/删除非激活服务
+        // 不重建会话（激活的 URL/token 不变，`session_inputs_differ` 为 false），
+        // 但登录保存（`apply_login_cookie` → `apply`）会用会话副本整体落盘——
+        // 不同步就会拿旧列表覆盖新列表：刚加的服务消失、刚删的服务回来。
+        // 镜像字段（signer_url/signer_token）仍归 `adopt` 路径管，这里不动。
+        self.settings.signers = settings.signers.clone();
+        self.settings.active_signer = settings.active_signer;
     }
 
     pub fn settings(&self) -> &Settings {

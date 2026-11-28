@@ -228,34 +228,71 @@ impl Language {
             "用户 {} · {}" => "User {} · {}",
             "语言已恢复为跟随系统" => "Language restored to system",
             "共 {}（歌曲 {} 首 {} / 封面 {} 张 {}）" => "Total {} ({} songs {}, {} covers {})",
-            "签名服务：{}" => "Signer: {}",
+            "签名服务：{}" => "Signing service: {}",
             "配置：{}" => "Config: {}",
             "加载更多探索歌单（当前 {} 张）" => "Load More Playlists ({} loaded)",
             "会话 {}…" => "Session {}…",
             "下一首播放" => "Play Next",
             "关闭" => "Close",
+            // 签名服务面板（#321）：文案克制，延续减负风格；token 不出现在任何文案里。
+            "测速" => "Test",
+            "全部测速" => "Test All",
+            "测速中…" => "Testing…",
+            "设为当前" => "Set active",
+            "删除" => "Remove",
+            "当前" => "Active",
+            "内置" => "Built-in",
+            "添加服务" => "Add Service",
+            "服务地址" => "Service URL",
+            "Token（可选，只存本机配置）" => "Token (optional, stored locally only)",
+            "添加" => "Add",
+            "恢复内置签名服务" => "Restore built-in signers",
+            "内置签名服务不可删除，可随时一键恢复" => {
+                "Built-in signers can't be removed and can be restored anytime"
+            }
+            "{} ms" => "{} ms",
+            "签名服务已切换，若播放异常请检查登录状态与设备指纹" => {
+                "Signer switched. If playback misbehaves, check your sign-in state and device fingerprint."
+            }
+            "已添加签名服务 {}" => "Added signer {}",
+            "已更新签名服务 {}" => "Updated signer {}",
+            "已删除签名服务 {}" => "Removed signer {}",
+            "已恢复内置签名服务" => "Built-in signers restored",
+            "请先填写签名服务地址" => "Enter a signer URL first",
+            "签名服务地址要以 http(s):// 开头" => "Signer URL must start with http(s)://",
+            "签名服务地址不能包含用户名密码（user:pass@host）" => {
+                "Signer URL can't contain credentials (user:pass@host)"
+            }
+            "签名服务地址缺少主机名" => "Signer URL is missing a host name",
+            "明文 http 只能指向本机（127.0.0.1 / localhost / ::1）；远程服务请用 https" => {
+                "Plain http is only allowed for localhost (127.0.0.1 / localhost / ::1); use https for remote signers"
+            }
+            "已切换签名服务；点播放即可用新服务装载这首歌" => {
+                "Signer switched; press play to load this track with the new service"
+            }
+            // 旧版式（设置页 12 块平铺）自带的说明行文案，随版式回退恢复（#93 回退）。
             "已固定主题；可随时切换深色或浅色" => "Theme pinned; switch anytime",
             "已固定语言；可随时切换中文或 English" => {
                 "Language pinned; switch anytime"
             }
+            "当前跟随系统偏好，手动选择后会固定主题" => {
+                "Following system; choose a theme to pin it"
+            }
+            "当前跟随系统语言；手动选择后会固定语言" => {
+                "Following system; choose a language to pin it"
+            }
+            "当前档位由手动选择" => "Current tier was manually selected",
             "扫码登录" => "QR Login",
-            "优先 Hi-Res 无损；没有可用档位时由服务端回退" => {
-                "Prefer Hi-Res lossless; the service falls back when unavailable"
+            // 档位回退说明合并为一条（#93 §5.2）：六条「优先 X；没有可用档位时由服务端回退」
+            // 是同一句复制，改为一处出现的通用说明。
+            "不设上限，按账号权益和单曲可用档位取最高" => {
+                "No cap; uses the best tier your account and each track allow"
             }
-            "优先无损；没有可用无损时由服务端回退" => {
-                "Prefer lossless; the service falls back when unavailable"
-            }
-            "优先杜比全景声；没有可用档位时由服务端回退" => {
-                "Prefer Dolby Atmos; the service falls back when unavailable"
-            }
-            "优先极高（≈320k）；没有可用档位时由服务端回退" => {
-                "Prefer high (≈320k); the service falls back when unavailable"
-            }
-            "优先较高；没有可用档位时由服务端回退" => {
-                "Prefer medium; the service falls back when unavailable"
-            }
-            "优先流畅（≈128k）；没有可用档位时由服务端回退" => {
-                "Prefer low (≈128k); the service falls back when unavailable"
+            "全部测速" => "Test All",
+            "内置公共签名服务不可删除" => "The built-in public signers can't be removed",
+            "恢复内置公共签名" => "Restore Built-in Signers",
+            "没有可用档位时自动回退可用档位" => {
+                "Falls back to an available tier when the selected one is unavailable"
             }
             "正在准备推荐队列…" => "Preparing recommendations…",
             "正在准备播放…" => "Preparing playback…",
@@ -307,9 +344,6 @@ impl Language {
             "去登录" => "Sign In",
             "退出登录" => "Sign Out",
             "主题" => "Theme",
-            "当前跟随系统偏好，手动选择后会固定主题" => {
-                "Following system; choose a theme to pin it"
-            }
             "语言" => "Language",
             "跟随系统" => "System",
             "音质偏好" => "Audio Quality",
@@ -318,11 +352,26 @@ impl Language {
             "已降档：所选 {}，实际 {}" => "Lower tier than selected: chose {}, got {}",
             "高于所选：所选 {}，实际 {}" => "Higher tier than selected: chose {}, got {}",
             "不符" => "Mismatch",
-            "不设上限，按账号权益和单曲可用档位取最高" => {
-                "No cap; uses the best tier your account and each track allow"
+            // 「自动」说明与档位回退说明合并进档位菜单（#93 §2.2），不再单独成句。
+            "音质" => "Quality",
+            "外观与语言" => "Appearance & Language",
+            "播放与快捷键" => "Playback & Shortcuts",
+            "存储" => "Storage",
+            "高级与关于" => "Advanced & About",
+            "缓存占用" => "Cache usage",
+            "容量上限" => "Cache limit",
+            "缓存详情" => "Cache details",
+            "诊断日志详情" => "Diagnostic log details",
+            "关于" => "About",
+            "签名服务" => "Signing service",
+            "配置路径" => "Config path",
+            "更改" => "Change",
+            "未开启" => "Off",
+            "清除诊断日志不会清空歌曲缓存" => {
+                "Clearing diagnostic logs never clears the song cache"
             }
-            "自动 = 取当前账号能拿到的最高档，单曲没有该档位时自动降一档" => {
-                "Auto = the best tier your account can get; steps down one tier when a track lacks it"
+            "自动选择账号可用的最高音质" => {
+                "Auto picks the best tier your account allows"
             }
             "若不是你选的，点「自动」即可恢复跟随账号权益" => {
                 "Not your choice? Pick Auto to follow your account again"
@@ -330,9 +379,8 @@ impl Language {
             "当前档位由程序推导，点「自动」即可恢复跟随账号权益" => {
                 "Current tier was automatically derived; pick Auto to follow your account again"
             }
-            "当前档位由手动选择" => "Current tier was manually selected",
             "手动选择" => "Manual",
-            "程序推导" => "Derived",
+            "程序推导" => "Program-derived",
             "来源未知" => "Unknown",
             "已缓存的歌曲会保持原来的档位；想按新权益重取，清空缓存或换一首" => {
                 "Cached songs keep their original tier; clear the cache or switch tracks to refetch"
@@ -342,9 +390,9 @@ impl Language {
             "Hi-Res" => "Hi-Res",
             "杜比全景声" => "Dolby Atmos",
             "无损" => "Lossless",
-            "极高" => "High",
-            "较高" => "Medium",
-            "流畅" => "Low",
+            "极高" => "Very High",
+            "较高" => "High",
+            "流畅" => "Standard",
             "省流" => "Data saver",
             "未知" => "Unknown",
             "缓存" => "Cache",
@@ -353,16 +401,14 @@ impl Language {
             }
             "清除歌曲缓存" => "Clear Song Cache",
             "其他" => "Other",
-            "维护者" => "Maintainer",
             "贡献者" => "Contributors",
             "正在加载贡献者…" => "Loading contributors…",
             "加载失败，点击重试" => "Failed to load. Click to retry.",
-            "签名服务：{}" => "Signer: {}",
-            "（未配置）" => "(not configured)",
+            "签名服务：{}" => "Signing service: {}",
+            "未配置" => "Not configured",
             "配置：{}" => "Config: {}",
             "编辑" => "Edit",
             "GitHub: {}" => "GitHub: {}",
-            "Author: ZephyrCheung" => "Author: ZephyrCheung",
             "歌手" => "Artist",
             "时长" => "Time",
             "这里还没有内容" => "Nothing here yet",
@@ -519,15 +565,13 @@ impl Language {
             "自动清理较早使用的歌曲；正在播放或下载的文件暂时保留" => "Older songs are removed automatically; files in use are kept until released",
             "清空缓存" => "Clear Cache",
             "正在清理…" => "Clearing…",
-            "批量升级缓存" => "Batch Upgrade Cache",
+            "升级已缓存歌曲" => "Upgrade Cached Songs",
             "将已有低档位缓存重新拉取为更高音质，失败不会损坏旧缓存" => {
                 "Re-fetch cached audio at a higher quality without affecting existing files on failure"
             }
-            "没有可升级的缓存歌曲：已达目标、无更高档位或当前缓存条件不支持升级" => {
-                "No cached songs to upgrade: already at the target, no higher quality available, or the cache does not support upgrading"
-            }
+            "没有可升级的缓存歌曲" => "No cached songs to upgrade",
             "{} 首歌曲可升级 · 预估流量 {} · 存储变化 {}" => {
-                "{} songs can be upgraded · Est. traffic {} · Storage change {}"
+                "{} songs can be upgraded · Estimated data usage {} · Storage change {}"
             }
             "{} 首旧缓存未记录档位" => {
                 "{} legacy caches have no recorded quality tier"
@@ -571,7 +615,7 @@ impl Language {
             }
             "音频输出长时间无响应，请重试播放" => "Audio output stopped responding. Try playing again.",
             "音频线程已退出，请重启应用" => "The audio worker stopped. Please restart the app.",
-            "签名服务：{}" => "Signer: {}",
+            "签名服务：{}" => "Signing service: {}",
             "配置：{}" => "Config: {}",
             "创建二维码失败，可点「重新获取二维码」重试" => {
                 "Failed to create QR code. Try again."
@@ -614,9 +658,6 @@ impl Language {
             "正在搜索…" => "Searching…",
             "从队列移除" => "Remove from Queue",
             "这首歌暂时没有歌词" => "No lyrics for this track",
-            "当前跟随系统语言；手动选择后会固定语言" => {
-                "Following system; choose a language to pin it"
-            }
             _ => return None,
         })
     }

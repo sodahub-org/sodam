@@ -306,15 +306,29 @@ pub fn text() -> Rgba {
 }
 
 /// 次要文本。
+///
+/// 深色主题用 #8C8C8C：对 #0A0A0A 底的对比度约 5.9:1（WCAG AA ≥4.5），
+/// 旧的共用 #737373 只有约 4.2:1；浅色主题深灰对浅底本来就达标，不动。
 pub fn text_muted() -> Rgba {
-    tint(hex(0x737373), TEXT_TINT)
+    tint(
+        if is_dark() {
+            hex(0x8C8C8C)
+        } else {
+            hex(0x737373)
+        },
+        TEXT_TINT,
+    )
 }
 
 /// 三级文本。
+///
+/// 深色主题用 #7A7A7A：对 #0A0A0A 底约 4.6:1，达到 AA 正文线；
+/// 旧的 #525252 只有约 2.5:1，是队列时长、进度时间等小字可读性问题的主源头。
+/// 浅色主题保持 #737373 不变。层级仍是 text > muted > faint。
 pub fn text_faint() -> Rgba {
     tint(
         if is_dark() {
-            hex(0x525252)
+            hex(0x7A7A7A)
         } else {
             hex(0x737373)
         },
@@ -527,6 +541,15 @@ pub fn nav_row() -> Pixels {
 mod tests {
     use super::*;
 
+    /// 主题是进程级全局状态（`CURRENT_THEME`），依赖它的测试共用这把锁串行
+    /// 执行：一个测试切主题（如 WCAG 测试遍历 Light/Dark）时，另一个测试
+    /// 可能正在按当时主题读色值，读到一半被换主题会间歇性失败
+    /// （PR #348 审查意见：Rust 测试默认并行跑）。
+    fn theme_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// 相对亮度（WCAG），用来比较两种颜色在感知上的"重量"。
     fn luminance(color: Rgba) -> f32 {
         let channel = |c: f32| {
@@ -547,6 +570,7 @@ mod tests {
     /// 一致性由调用点保证；这里守住两者的**层级差**。
     #[test]
     fn dimmed_color_is_weaker_than_lit() {
+        let _guard = theme_lock().lock().unwrap_or_else(|err| err.into_inner());
         // 视图里两者都取 `lyric_dim()`，这里直接验证它与 `accent` 的层级关系：
         // 未点亮必须比已唱到更弱，且差距足够看得出来。
         let dim = luminance(lyric_dim());
@@ -562,11 +586,41 @@ mod tests {
     /// 未点亮色必须能与纯背景区分开，否则歌词读不清。
     #[test]
     fn dimmed_lyric_stays_readable() {
+        let _guard = theme_lock().lock().unwrap_or_else(|err| err.into_inner());
         let (_, _, lightness) = rgba_to_hsl(lyric_dim());
         if is_dark() {
             assert!(lightness > 0.20, "深色主题下未点亮色太暗：{}", lightness);
         } else {
             assert!(lightness < 0.85, "浅色主题下未点亮色太亮：{}", lightness);
         }
+    }
+
+    /// WCAG 对比度，复用上面的相对亮度。
+    fn contrast_ratio(fore: Rgba, back: Rgba) -> f32 {
+        let l1 = luminance(fore);
+        let l2 = luminance(back);
+        let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// `text_muted` / `text_faint` 是队列时长、进度条时间、说明灰字这类
+    /// Tiny/Small 正文色，对两主题底色的对比度不得低于 WCAG AA 正文线
+    /// （4.5:1），防止日后调色回退（见 `text_muted` / `text_faint` 注释）。
+    #[test]
+    fn muted_and_faint_meet_wcag_aa_on_both_backgrounds() {
+        let _guard = theme_lock().lock().unwrap_or_else(|err| err.into_inner());
+        for theme in [ThemeKind::Dark, ThemeKind::Light] {
+            set_theme(theme);
+            let background = bg();
+            for (name, color) in [("text_muted", text_muted()), ("text_faint", text_faint())] {
+                let ratio = contrast_ratio(color, background);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme:?} 主题下 {name} 对比背景 {ratio:.2}:1，低于 AA 4.5:1"
+                );
+            }
+        }
+        // 测试进程共用全局主题状态，结束时还原为默认深色。
+        set_theme(ThemeKind::Dark);
     }
 }

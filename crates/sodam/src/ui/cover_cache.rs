@@ -140,6 +140,11 @@ impl Global for Installed {}
 /// 封面缓存。`cover()` 在渲染时拿不到 `cx`，所以实例通过 `Global` 暴露。
 pub struct CoverImageCache {
     items: HashMap<Key, Cached>,
+    /// 这台机器上查询过的全部 (资源, 边长) 组合（PR #348 三轮审查）：
+    /// gpui 的 asset 缓存按这个 key 记结果（含失败），而失败结果可能还没进
+    /// `items` 就被下载成功的回调撞上——失效时要把**查询过**的 key 全部
+    /// 从 gpui 缓存里清掉，不能只看 items 里已落账的那些。
+    touched: Vec<Key>,
     bytes: usize,
     /// 见过的最大的窗口像素字节数（预算会向它看齐）。
     screen: usize,
@@ -153,11 +158,54 @@ impl CoverImageCache {
         }
         let entity = cx.new(|_cx| Self {
             items: HashMap::new(),
+            touched: Vec::new(),
             bytes: 0,
             screen: 0,
         });
         cx.set_global(Installed(entity.clone()));
         entity
+    }
+
+    /// 这个路径的封面重新下好了：清掉它之前留下的**失败**缓存条目，并把
+    /// gpui 侧的对应 asset 一并移除（PR #348 二轮审查）。不清的话读错误会
+    /// 永久滞留——`load_at` 缓存错误、`evict` 排除失败条目、gpui 的 asset
+    /// 缓存也只认第一次结果，重新下好的封面在同一尺寸上永远拿不回来。
+    /// 失败条目没有纹理要还（`drop_image` 分支只是防御），不需要 window。
+    pub fn invalidate_failed(&mut self, path: &Path, cx: &mut App) {
+        let resource = Resource::from(path.to_path_buf());
+        // gpui 侧按「查询过」的全部边长清 asset（PR #348 三轮审查）：失败结果
+        // 可能还在解码任务里没落进 items，只清 items 会漏——在飞解码回来会
+        // 把旧失败重新发布到 asset 缓存，路径已被替换也救不回来。
+        let edges: Vec<u32> = self
+            .touched
+            .iter()
+            .filter(|(res, _)| *res == resource)
+            .map(|(_, edge)| *edge)
+            .collect();
+        for edge in &edges {
+            cx.remove_asset::<AssetLogger<CoverLoader>>(&CoverSource {
+                resource: resource.clone(),
+                edge: *edge,
+            });
+        }
+        // 本缓存里该资源的条目全部作废（含成功的：路径内容已被替换）。
+        let stale: Vec<Key> = self
+            .items
+            .keys()
+            .filter(|(res, _)| *res == resource)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(cached) = self.items.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(cached.bytes);
+                if let Ok(image) = cached.value {
+                    cx.drop_image(image, None);
+                }
+            }
+        }
+        // 已失效的查询记录清掉，touched 不无限增长；之后同边长的新查询会
+        // 重新入账。
+        self.touched.retain(|(res, _)| *res != resource);
     }
 
     fn budget(&self) -> usize {
@@ -198,6 +246,13 @@ impl CoverImageCache {
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let key = (resource.clone(), edge);
+        if !self
+            .touched
+            .iter()
+            .any(|seen| seen.0 == key.0 && seen.1 == key.1)
+        {
+            self.touched.push(key.clone());
+        }
         if let Some(cached) = self.items.get_mut(&key) {
             cached.used = Instant::now();
             cached.shown_at = SystemTime::now();
@@ -320,6 +375,7 @@ mod tests {
     fn empty_cache(screen: usize) -> CoverImageCache {
         CoverImageCache {
             items: HashMap::new(),
+            touched: Vec::new(),
             bytes: 0,
             screen,
         }

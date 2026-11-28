@@ -122,33 +122,54 @@ impl Root {
     /// 事务的边界就放在这个唯一的收口处：`begin_edit` 记下改动之前的完整状态，`end_edit`
     /// 按类别决定并入上一条还是新开一条。只动光标不动文本的按键（方向键、Shift 扩选）
     /// 会被 `end_edit` 整条丢弃，不会污染撤销历史。
+    ///
+    /// #321：焦点在哪个输入框就改哪一份（搜索框或签名服务表单的两个输入），
+    /// 动作本身不区分来源。表单输入不做横向滚动，也就不需要收光标进视图。
     fn edit_text(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut TextField) -> bool,
     ) {
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        let changed = edit(&mut self.search_field);
-        self.search_field.end_edit(now);
+        let Some(field) = self.focused_input_field(window) else {
+            return;
+        };
+        field.begin_edit();
+        let changed = edit(field);
+        field.end_edit(now);
         if changed {
-            self.search_fit_caret_in_view(window);
+            if search_slot {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
 
     /// 撤销与重做不走 `edit_text`：要恢复哪一份快照由状态层自己决定，不需要再开事务。
     pub(crate) fn text_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.undo() {
-            self.search_fit_caret_in_view(window);
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
+        let Some(field) = self.focused_input_field(window) else {
+            return;
+        };
+        if field.undo() {
+            if search_slot {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
 
     pub(crate) fn text_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.redo() {
-            self.search_fit_caret_in_view(window);
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
+        let Some(field) = self.focused_input_field(window) else {
+            return;
+        };
+        if field.redo() {
+            if search_slot {
+                self.search_fit_caret_in_view(window);
+            }
             cx.notify();
         }
     }
@@ -295,8 +316,13 @@ impl Root {
     }
 
     /// 无选区时什么都不复制：把整串查询悄悄写进剪贴板，用户下次粘贴时会吃个意外。
-    pub(crate) fn text_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.search_field.selected_text();
+    pub(crate) fn text_copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self
+            .focused_input_field(window)
+            .map(|field| field.selected_text())
+        else {
+            return;
+        };
         if selected.is_empty() {
             return;
         }
@@ -304,7 +330,10 @@ impl Root {
     }
 
     pub(crate) fn text_cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.search_field.selected_text();
+        let selected = self.focused_input_field(window).map(|f| f.selected_text());
+        let Some(selected) = selected else {
+            return;
+        };
         if selected.is_empty() {
             return;
         }
@@ -322,12 +351,43 @@ impl Root {
         self.edit_text(window, cx, |field| field.paste(&text));
     }
 
+    /// Enter：搜索框提交搜索；签名服务表单提交「添加服务」（#321）。
     pub(crate) fn text_submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.signer_input_focused(_window) {
+            self.submit_signer_form(cx);
+            return;
+        }
         self.run_search(cx);
     }
 
     /// Esc 的三级优先：先撤 IME 组合，再折叠选区，最后才清空整串（三者都不夺焦点）。
+    ///
+    /// 签名服务表单（#321）：同样三级处理，整串已空时收起面板交回焦点。
     pub(crate) fn text_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.signer_input_focused(window) {
+            let now = self.search_edit_time();
+            let Some(field) = self.focused_input_field(window) else {
+                return;
+            };
+            if field.clear_marked() {
+                cx.notify();
+                return;
+            }
+            if field.collapse_selection() {
+                cx.notify();
+                return;
+            }
+            if !field.is_empty() {
+                field.begin_edit();
+                field.clear();
+                field.end_edit(now);
+                cx.notify();
+                return;
+            }
+            self.settings_signers_open = false;
+            cx.notify();
+            return;
+        }
         if self.search_field.clear_marked() {
             cx.notify();
             return;

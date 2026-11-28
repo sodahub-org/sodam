@@ -6,7 +6,7 @@ use crate::ui::i18n::Language;
 use crate::ui::middle_drag::DragTarget;
 use crate::ui::theme::{self, ThemeKind};
 use gpui::prelude::*;
-use gpui::{Context, Window};
+use gpui::Context;
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::config::EnvCookieFill;
 use sodam_core::failure::{PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason};
@@ -54,6 +54,44 @@ fn urls_for_removed_paths<F: Fn(&std::path::Path) -> bool>(
     (pick(covers), pick(original_covers))
 }
 
+/// 测速与后台计时器赛跑（PR #348 二轮审查）：ureq 的超时管不住 DNS 解析
+/// （解析发生在超时生效之前），慢解析会拖住「测速中…」的行乃至整条顺序
+/// 「全部测速」队列。测速任务与 `MEASURE_TIMEOUT` 计时器赛跑，计时器先到
+/// 就记超时失败并继续；被卡住的后台线程直到解析返回才结束，结果弃掉
+/// （只能放弃 UI 等待，阻塞解析本身需要自定义 resolver，超出本次改动）。
+async fn measure_with_ui_timeout<F>(cx: &mut gpui::AsyncApp, probe: F) -> Result<u128, String>
+where
+    F: FnOnce() -> Result<u128, String> + Send + 'static,
+{
+    let probe_task = cx.background_executor().spawn(async move { probe() });
+    let timeout_task = cx
+        .background_executor()
+        .timer(sodam_core::signers::MEASURE_TIMEOUT);
+    // 手写竞速（crate 里的 futures-lite 是 Linux 目标专属依赖）：先探测速，
+    // 再探计时器，两边都没好就 Pending；先完成的一方胜出。
+    let mut probe_task = std::pin::pin!(probe_task);
+    let mut timeout_task = std::pin::pin!(timeout_task);
+    use std::future::Future as _;
+    std::future::poll_fn(|task_cx| {
+        use std::task::Poll;
+        if let Poll::Ready(result) = probe_task.as_mut().poll(task_cx) {
+            return Poll::Ready(result);
+        }
+        if let Poll::Ready(()) = timeout_task.as_mut().poll(task_cx) {
+            return Poll::Ready(Err("测速超时：DNS 解析或网络长时间无响应".to_string()));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// 签名动作的后台保存状态包（PR #348 二轮审查）：改动前的快照、改动后的
+/// 尝试值、改动前的镜像字段（供保存成功后判断要不要重建会话）。
+struct SignerSaveState {
+    snapshot: Settings,
+    attempted: Settings,
+}
+
 impl Root {
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
     ///
@@ -89,8 +127,448 @@ impl Root {
         .detach();
     }
 
-    pub(crate) fn search_input_focused(&self, window: &Window) -> bool {
-        self.search_focus.is_focused(window)
+    // -------------------------------------------------------------------
+    // 签名服务面板（#321）：列表维护、测延时与切换。
+    // 红线：token 只写本地配置文件；状态行、日志、错误提示里一律不出现。
+    // -------------------------------------------------------------------
+
+    /// 会话输入（签名地址/Token）变化时重建会话，路径与热重载一致
+    /// （`apply_external_settings` 的 adopt 分支）。当前曲目不断，
+    /// 下一次取流 / 搜索 / 上报用新签名服务。
+    ///
+    /// 同时推进签名服务纪元（PR #348 二轮审查）：旧服务出发的在途装载
+    /// 失败回来时不落闸、不挂预取、不写签名错误——用户已经换走了。
+    fn adopt_session_if_signer_changed(&mut self, old_url: &str, old_token: &str) {
+        if self.settings.signer_url != old_url || self.settings.signer_token != old_token {
+            match self.session.as_mut() {
+                Some(session) => session.adopt(self.settings.clone()),
+                None => self.session = Some(Session::new(self.settings.clone())),
+            }
+            self.signer_epoch = self.signer_epoch.wrapping_add(1);
+            // PlayReporter 持有自己的设置副本、上报时用它重建会话：切换激活
+            // 服务后不同步，上报会继续指向旧服务，直到下一次外部改动或设置
+            // 保存路径才更新。这里在同一分支里同步。
+            self.play_reporter.apply_settings(self.settings.clone());
+        }
+    }
+
+    /// 让会话与 PlayReporter 对齐**当前内存里的签名状态**（PR #348 三轮审查）：
+    /// 与会话现有的签名地址/Token 比较，不同才 adopt 并推进纪元。成功与失败
+    /// 的保存回调都用它收尾——回调不该读「改动作前的镜像」判断，该以
+    /// 「会话是否真的落后」为准，否则连环快速切换时中间态会被跳过或错 adopt。
+    fn adopt_session_to_current_signer(&mut self) {
+        let (session_url, session_token) = self
+            .session
+            .as_ref()
+            .map(|session| {
+                (
+                    session.settings().signer_url.clone(),
+                    session.settings().signer_token.clone(),
+                )
+            })
+            .unwrap_or_default();
+        self.adopt_session_if_signer_changed(&session_url, &session_token);
+    }
+
+    /// 两个设置值的**签名相关字段**是否一致（PR #348 三轮审查）：保存失败
+    /// 的回滚判定只看这四个字段——全量 `Settings` 对比会被音量这类无关编辑
+    /// 打破，导致该回滚的不回滚。
+    fn signer_fields_match(a: &Settings, b: &Settings) -> bool {
+        a.signers == b.signers
+            && a.active_signer == b.active_signer
+            && a.signer_url == b.signer_url
+            && a.signer_token == b.signer_token
+    }
+
+    /// 只把签名相关字段恢复成快照值（PR #348 三轮审查）：快照之后用户改过的
+    /// 音量、主题等无关编辑原样保留。
+    fn restore_signer_fields_from(&mut self, snapshot: &Settings) {
+        self.settings.signers = snapshot.signers.clone();
+        self.settings.active_signer = snapshot.active_signer;
+        self.settings.signer_url = snapshot.signer_url.clone();
+        self.settings.signer_token = snapshot.signer_token.clone();
+    }
+
+    /// 签名配置落盘 + 完成后回 UI（PR #348 二轮审查）：`save()` 拿的是全局
+    /// 写锁，登出保存这类后台写入进行中时不能卡住 UI 线程。四个签名动作
+    /// （切换 / 删除 / 添加 / 恢复内置）共用：改动先行（界面立即反映），
+    /// 保存进后台。
+    ///
+    /// 三轮审查的三条连环修正：
+    /// 1. **写入串行**（L182）：每个保存等待上一次签名保存完成后再写，杜绝
+    ///    「B 先提交、C 后提交，锁竞争让 B 最后写盘」的乱序——文件永远以
+    ///    最后一次用户操作收尾。
+    /// 2. **回调按代际裁决**（L187）：完成时只有自己仍是最新一次签名保存
+    ///    （`signer_save_seq` 未被超越）才动内存状态；过期的保存只完成落盘，
+    ///    adopt / 回滚交给最新回调。会话对齐用 `adopt_session_to_current_
+    ///    signer`（按会话现状判断），跳过中间态后也能落到最终服务上。
+    /// 3. **回滚按签名字段**（L192）：失败回滚只恢复签名相关四字段且仅在
+    ///    签名字段未被后续签名操作改过时执行——音量这类无关编辑不参与判定、
+    ///    也不被回滚波及。
+    fn save_signer_settings(
+        &mut self,
+        state: SignerSaveState,
+        context: &'static str,
+        error_key: &'static str,
+        on_success: impl FnOnce(&mut Self) + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let SignerSaveState {
+            snapshot,
+            attempted,
+        } = state;
+        self.signer_save_seq = self.signer_save_seq.wrapping_add(1);
+        let seq = self.signer_save_seq;
+        // 与上一次签名保存串行：拿住它的任务，本次先等它收尾再写盘。
+        let previous = self.signer_save_tail.take();
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            // save 用 attempted 的一份拷贝（值相同），attempted 原值留在闭包里
+            // 供失败回滚时按签名字段比对。
+            let settings_for_save = attempted.clone();
+            let saved = cx
+                .background_executor()
+                .spawn(async move { settings_for_save.save() })
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                if root.signer_save_seq != seq {
+                    // 已有更新的签名保存：本次只完成落盘，状态（会话 adopt、
+                    // 回滚、成功提示）全部交给最新那次回调收尾。
+                    cx.notify();
+                    return;
+                }
+                match saved {
+                    Ok(()) => {
+                        root.adopt_session_to_current_signer();
+                        on_success(root);
+                    }
+                    Err(err) => {
+                        // 只在签名字段仍是本次尝试值时回滚（音量等无关编辑
+                        // 不参与判定也不被覆盖）；会话与上报对齐回滚后的状态
+                        // ——快速连环切换里中间态可能从未 adopt 过。
+                        if Self::signer_fields_match(&root.settings, &attempted) {
+                            root.restore_signer_fields_from(&snapshot);
+                        }
+                        root.adopt_session_to_current_signer();
+                        let message = root.failure_text(context, &err, SAVE_TEXT);
+                        root.notify_error_once(error_key, message);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.signer_save_tail = Some(task);
+    }
+
+    /// 切换激活签名服务（#321）：改下标 → 归一化（镜像同步）→ 后台落盘 →
+    /// 重建会话。切换不强制重登，只在状态行提示一句。点击时按地址解析
+    /// （PR #348 二轮审查）：不捕获渲染时下标，外部重载后不会点错服务。
+    pub fn set_active_signer(&mut self, url: String, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .settings
+            .signers
+            .iter()
+            .position(|service| service.url.trim() == url.trim())
+        else {
+            return;
+        };
+        // 已经是**运行时实际服务**（镜像字段）就不用切：env 覆盖生效时镜像
+        // 可能指向别的服务，这时把保存行选回来是合法操作（PR #348 三轮审查）
+        // ——选中即撤销 env 覆盖，env 凭据只在内存、落盘前会被归一化剥掉。
+        if url.trim() == self.settings.signer_url.trim() {
+            return;
+        }
+        let snapshot = self.settings.clone();
+        self.settings.active_signer = index;
+        // 面板里的显式选择是最高优先级（PR #348 三轮审查）：撤销 env 覆盖
+        // 的资格标记，之后的启动/热重载不再拿环境变量覆盖镜像。
+        self.settings.signer_env_selected = false;
+        self.settings.normalize_signers();
+        let attempted = self.settings.clone();
+        self.save_signer_settings(
+            SignerSaveState {
+                snapshot,
+                attempted,
+            },
+            "签名服务切换保存失败",
+            "signer-switch-save-failed",
+            |root| {
+                root.set_status_text(root.tr("签名服务已切换，若播放异常请检查登录状态与设备指纹"));
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 删除一条签名服务（#321）。内置公共项不可删除。删除会移动下标，
+    /// 先按规则调整激活下标再归一化（PR #348 审查意见）：删激活项之前的项
+    /// 减一、删的就是激活项回 0、删激活项之后的项保持——否则归一化按移动后
+    /// 的下标会把别的服务当成激活项。按地址解析（见 `set_active_signer`）。
+    pub fn remove_signer(&mut self, url: String, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .settings
+            .signers
+            .iter()
+            .position(|service| service.url.trim() == url.trim())
+        else {
+            return;
+        };
+        let Some(service) = self.settings.signers.get(index) else {
+            return;
+        };
+        if sodam_core::Settings::is_builtin_signer(&service.url) {
+            return;
+        }
+        let removed_name = sodam_core::signers::signer_display_name(&service.url);
+        let snapshot = self.settings.clone();
+        // 删除 + 下标重映射收口在 core 纯函数里（PR #348 三轮审查）：规则
+        // 单点维护、场景矩阵有单测，归一化按地址重定位激活项。
+        let (signers, active) = sodam_core::signers::remove_signer_entry(
+            self.settings.signers.clone(),
+            self.settings.active_signer,
+            index,
+        );
+        self.settings.signers = signers;
+        self.settings.active_signer = active;
+        self.settings.normalize_signers();
+        let attempted = self.settings.clone();
+        self.save_signer_settings(
+            SignerSaveState {
+                snapshot,
+                attempted,
+            },
+            "签名服务删除保存失败",
+            "signer-remove-save-failed",
+            move |root| {
+                root.set_status("已删除签名服务 {}", &[removed_name]);
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 添加（或为同址服务补填）token（#321）。地址经共享校验（https 任意主机、
+    /// http 仅环回，与 `HttpSignature::sign` 的拒绝语义一致）；校验与保存失败的
+    /// 情况都不清表单（PR #348 二轮审查），成功后才清。
+    pub fn add_signer(
+        &mut self,
+        url: String,
+        token: String,
+        form_seq: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let url = url.trim().to_string();
+        let token = token.trim().to_string();
+        if let Err(key) = sodam_core::signers::validate_signer_url(&url) {
+            self.set_status_text(self.tr(key));
+            cx.notify();
+            return;
+        }
+        let name = sodam_core::signers::signer_display_name(&url);
+        let snapshot = self.settings.clone();
+        let existed = match self
+            .settings
+            .signers
+            .iter_mut()
+            .find(|service| service.url.trim() == url)
+        {
+            Some(existing) => {
+                // 同址只更新 token：用户最常见的是「地址不变，补填/换 token」。
+                existing.token = token;
+                true
+            }
+            None => {
+                self.settings
+                    .signers
+                    .push(sodam_core::config::SignerService { url, token });
+                false
+            }
+        };
+        self.settings.normalize_signers();
+        let attempted = self.settings.clone();
+        self.save_signer_settings(
+            SignerSaveState {
+                snapshot,
+                attempted,
+            },
+            "签名服务添加保存失败",
+            "signer-add-save-failed",
+            move |root| {
+                // 保存成功才清表单（写失败时地址和 token 留在输入框里，用户
+                // 修好保存问题直接再点「添加」），且只清**自己这代提交**的
+                // 草稿（PR #348 三轮审查）：A 的保存还在后台时用户已开始输
+                // B，A 的成功回调不能把 B 的输入清掉。
+                if root.signer_form_seq == form_seq {
+                    root.signer_url_field.clear();
+                    root.signer_token_field.clear();
+                }
+                if existed {
+                    root.set_status("已更新签名服务 {}", &[name]);
+                } else {
+                    root.set_status("已添加签名服务 {}", &[name]);
+                }
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 「添加服务」表单提交（Enter 或「添加」按钮，#321）：校验失败保留输入
+    /// 让用户改；清空表单推迟到保存成功（见 `add_signer`）。
+    pub(crate) fn submit_signer_form(&mut self, cx: &mut Context<Self>) {
+        let url = self.signer_url_field.text().trim().to_string();
+        let token = self.signer_token_field.text().trim().to_string();
+        if let Err(key) = sodam_core::signers::validate_signer_url(&url) {
+            self.set_status_text(self.tr(key));
+            cx.notify();
+            return;
+        }
+        // 提交即占一代：保存成功回调清表单前先核对代际，避免清掉用户
+        // 在等待期间开始输入的新草稿（PR #348 三轮审查）。
+        self.signer_form_seq = self.signer_form_seq.wrapping_add(1);
+        let form_seq = self.signer_form_seq;
+        self.add_signer(url, token, form_seq, cx);
+    }
+
+    /// 「全部测速」（#321）：手动触发，按列表顺序逐个测，服务之间留 300ms 间隔，
+    /// 避免并发轰炸别人的服务。每个服务各自走 `signer_latency` 的在测去重
+    /// （在测中不重复发起），失败的行标「失败」但不中断其余服务；
+    /// 全部结束后解除进行中，期间再次点击直接忽略。
+    ///
+    /// UI 等待有独立的 MEASURE_TIMEOUT 上限（PR #348 二轮审查）：ureq 的超时
+    /// 管不住 DNS 解析，慢解析会拖住整条顺序队列——每条测速与后台计时器
+    /// 赛跑，计时器先到就记失败并继续；被卡住的后台线程直到解析返回才结束，
+    /// 结果弃掉。
+    pub fn measure_all_signers(&mut self, cx: &mut Context<Self>) {
+        if self.signer_bulk_testing {
+            return;
+        }
+        let urls: Vec<String> = self
+            .settings
+            .signers
+            .iter()
+            .map(|service| service.url.trim().to_string())
+            .collect();
+        if urls.is_empty() {
+            return;
+        }
+        self.signer_bulk_testing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            for url in urls {
+                // 该服务的行先进入「测速中…」，测完一拍回写；已在测的跳过。
+                let skip = this
+                    .update(cx, |root, cx| {
+                        let in_flight = matches!(root.signer_latency.get(&url), Some(None));
+                        if !in_flight {
+                            root.signer_latency.insert(url.clone(), None);
+                            cx.notify();
+                        }
+                        in_flight
+                    })
+                    .unwrap_or(true);
+                if skip {
+                    continue;
+                }
+                let latency_url = url.clone();
+                let result = measure_with_ui_timeout(cx, move || {
+                    sodam_core::signers::measure_signer_latency(&latency_url)
+                })
+                .await;
+                let result = result.map(|ms| ms as u64);
+                let _ = this.update(cx, |root, cx| {
+                    root.signer_latency.insert(url.clone(), Some(result));
+                    cx.notify();
+                });
+                // 服务之间留一拍间隔：测的是别人的公共服务，别按着打。
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+            }
+            let _ = this.update(cx, |root, cx| {
+                root.signer_bulk_testing = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 测一条签名服务的延时（#321）：手动触发，同一地址在测中不重复发起，
+    /// 不自动轮询、不并发轰炸。结果缓存在会话内（`signer_latency`），不落盘。
+    /// UI 等待与后台计时器赛跑（见 `measure_all_signers` 注释）。
+    pub fn measure_signer_latency(&mut self, url: String, cx: &mut Context<Self>) {
+        let url = url.trim().to_string();
+        if url.is_empty() || matches!(self.signer_latency.get(&url), Some(None)) {
+            return;
+        }
+        self.signer_latency.insert(url.clone(), None);
+        cx.notify();
+        let latency_url = url.clone();
+        cx.spawn(async move |this, cx| {
+            let result = measure_with_ui_timeout(cx, move || {
+                sodam_core::signers::measure_signer_latency(&latency_url)
+            })
+            .await;
+            let result = result.map(|ms| ms as u64);
+            let _ = this.update(cx, |root, cx| {
+                root.signer_latency.insert(url.clone(), Some(result));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 一键恢复内置公共签名服务（#321）：两台内置项（默认服务、社区公共服务）
+    /// 都重置为出厂地址与内置 token；不改变激活项，除非内置项本来不在场
+    /// （归一化会补回）。
+    pub fn restore_builtin_signer(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.settings.clone();
+        for (url, token) in [
+            (
+                sodam_core::config::DEFAULT_SIGNER_URL,
+                sodam_core::config::DEFAULT_SIGNER_TOKEN,
+            ),
+            (
+                sodam_core::config::BUILTIN_COMMUNITY_SIGNER_URL,
+                sodam_core::config::BUILTIN_COMMUNITY_SIGNER_TOKEN,
+            ),
+        ] {
+            match self
+                .settings
+                .signers
+                .iter_mut()
+                .find(|service| service.url.trim() == url)
+            {
+                Some(builtin) => {
+                    builtin.url = url.to_string();
+                    builtin.token = token.to_string();
+                }
+                None => self
+                    .settings
+                    .signers
+                    .push(sodam_core::config::SignerService {
+                        url: url.to_string(),
+                        token: token.to_string(),
+                    }),
+            }
+        }
+        self.settings.normalize_signers();
+        let attempted = self.settings.clone();
+        self.save_signer_settings(
+            SignerSaveState {
+                snapshot,
+                attempted,
+            },
+            "签名服务恢复保存失败",
+            "signer-restore-save-failed",
+            |root| {
+                root.set_status_text(root.tr("已恢复内置签名服务"));
+            },
+            cx,
+        );
+        cx.notify();
     }
 
     /// 预取队列接下来几首到本地缓存（只落盘，不动界面状态）。
@@ -1379,6 +1857,9 @@ impl Root {
             let path = work.await;
             let _ = this.update(cx, |root, cx| {
                 if let Some(path) = path {
+                    // 同路径的失败缓存条目随重新下好一起失效（见 pump_covers）。
+                    crate::ui::cover_cache::CoverImageCache::entity(cx)
+                        .update(cx, |cache, cx| cache.invalidate_failed(&path, cx));
                     root.original_covers.insert(fetch_url.clone(), path.clone());
                     // 原图下载成功但缩略图失败时，列表 / 队列也能立刻拿到封面。
                     if !root.covers.contains_key(&fetch_url) {
@@ -3252,6 +3733,11 @@ impl Root {
                     }
                     let has_result = path.is_some() || color.is_some();
                     if let Some(path) = path {
+                        // 同路径之前留下的失败缓存条目随重新下好一起失效
+                        // （PR #348 二轮审查）：否则缓存清理删文件期间的失败
+                        // 读取会永久占住这个尺寸，封面再也回不来。
+                        crate::ui::cover_cache::CoverImageCache::entity(cx)
+                            .update(cx, |cache, cx| cache.invalidate_failed(&path, cx));
                         Arc::make_mut(&mut root.covers).insert(url.clone(), path);
                     }
                     if let Some(color) = color {
@@ -3969,6 +4455,9 @@ impl Root {
         let account_is_vip = self.account.as_ref().map(|a| a.vip);
         // 这次尝试属于哪一份登录身份：回来时若已经换过，结论不成立。
         let auth_epoch = self.auth_epoch;
+        // 这次尝试用的是哪一代签名服务（PR #348 二轮审查）：回来时若已换服
+        // 务，失败结论属于旧服务，不落闸、不挂预取、不写签名错误。
+        let signer_epoch = self.signer_epoch;
         let work_track = track.clone();
         // 单层预算：还要不要再来一次由**这次失败的分类**决定。
         // 之前是无条件 3 次线性退避，于是「这首已下架」「签名服务要求鉴权」这类
@@ -4083,6 +4572,19 @@ impl Root {
                         // 落闸、挂预取、写不可播集合，也别替用户跳歌。
                         if root.auth_epoch != auth_epoch {
                             root.playing = root.engine.snapshot().playing;
+                            return;
+                        }
+                        // 旧签名服务出发的失败（PR #348 二轮审查）：用户已经换走，
+                        // 这次失败不能落闸、挂预取、写签名错误。**不恢复
+                        // pending_track**（PR #348 三轮审查）：它已随失败清掉、
+                        // 也没有引擎装载在途，放回去会让 heartbeat 清不掉、
+                        // toggle_play 见到 pending_track 就空转——「点播放没反应」。
+                        // 队列选中项保持不变，用户点播放即用新服务重新装载。
+                        if root.signer_epoch != signer_epoch {
+                            root.playing = root.engine.snapshot().playing;
+                            root.set_status_text(
+                                root.tr("已切换签名服务；点播放即可用新服务装载这首歌"),
+                            );
                             return;
                         }
                         // 全局故障同样挂起预取：装载这条路先看见了故障，
@@ -4333,6 +4835,13 @@ impl Root {
             old.quality != incoming.quality || old.quality_source != incoming.quality_source;
         let session_changed = incoming.session_inputs_differ(&old);
         let cookie_changed = incoming.cookie != old.cookie;
+        // 签名服务在热重载里被换（PR #348 三轮审查，diff 外 Major）：推进签名
+        // 纪元——旧服务出发的在途装载失败不能落闸/挂预取/写签名错误。仅签名
+        // 字段变化时推进，无关偏好编辑不动。
+        let signer_changed = incoming.signer_url != old.signer_url
+            || incoming.signer_token != old.signer_token
+            || incoming.signers != old.signers
+            || incoming.active_signer != old.active_signer;
         self.settings = incoming.clone();
 
         // 主题：与 `set_ui_theme*` 同一套应用逻辑（认不得的值回到跟随系统），不落盘。
@@ -4373,6 +4882,9 @@ impl Root {
                 Some(session) => session.adopt(incoming.clone()),
                 None => self.session = Some(Session::new(incoming.clone())),
             }
+        }
+        if signer_changed && session_changed {
+            self.signer_epoch = self.signer_epoch.wrapping_add(1);
         }
         self.play_reporter.apply_settings(incoming.clone());
         // Cookie 变了就是换了身份：旧身份的结论全部作废，账号与「我喜欢的」按新身份刷新。

@@ -56,7 +56,10 @@ fn vip_badge() -> AnyElement {
 /// 宽度不够时的折叠顺序（按用户要求）：先专辑 → 再时长 → 再歌手。
 /// 列间距与行内左右内边距（与下面的 flex 设置保持一致）。
 const COL_GAP: f32 = 12.0;
-const ROW_PAD: f32 = 12.0;
+/// 列表行内容左右内边距：页面 XL(24) + 行内 SM(8) = 32，
+/// 与歌单卡片网格的左基准线一致（#93 §4 第 5 项：24/32/36 三条线统一为 32，
+/// 全部落在 space 梯度上；hero、表头、数据行共用这一个常量，列宽计算同步）。
+const ROW_PAD: f32 = theme::space::SM;
 /// 内联 VIP 徽章的宽度（含间距），标题文本需要先让出这一段。
 const VIP_WIDTH: f32 = 76.0;
 /// 不可播标记的宽度（图标 + 间距），标题文本同样要先让出这一段。
@@ -519,7 +522,7 @@ pub(crate) fn scrolling_detail_page(
                 .flex_row()
                 .items_start()
                 .gap(px(theme::space::XL))
-                // 左侧与曲目行的内容起点对齐（页面 24 + 行内 12）；底部留白避免首行贴住封面
+                // 左侧与曲目行的内容起点对齐（页面 24 + 行内 8 = 32）；底部留白避免首行贴住封面
                 .px(px(ROW_PAD))
                 .py(px(theme::space::SM))
                 .pb(px(theme::space::LG))
@@ -1227,7 +1230,7 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
         },
         Nav::Artist => search::artist_page(root, cx),
         Nav::Album => search::album_page(root, cx),
-        Nav::Settings => settings::settings_view(root, cx),
+        Nav::Settings => settings::settings_view(root, window, cx),
         Nav::Lyrics => lyrics::lyrics_view(root, window, cx),
     };
 

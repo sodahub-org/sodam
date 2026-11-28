@@ -35,7 +35,9 @@ impl QualitySource {
     pub const LABEL_UNKNOWN: &'static str = "来源未知";
     /// 「手动选择」在 i18n 词典中的稳定 key。
     pub const LABEL_USER: &'static str = "手动选择";
-    /// 「程序推导」在 i18n 词典中的稳定 key。
+    /// 「程序推导」在 i18n 词典中的稳定 key（#77：Derived = 程序写入档位，
+    /// 如 `SODAM_QUALITY` 环境变量覆盖；旧配置缺来源是 Unknown，不是 Derived）。
+    /// 徽章与 hint 用同一个语义（PR #348 审查意见）。
     pub const LABEL_DERIVED: &'static str = "程序推导";
 
     /// 来源在配置中的原始字符串表示。

@@ -288,8 +288,8 @@ pub(crate) fn localized_quality(raw: String, language: crate::ui::i18n::Language
             text = text.replace(label, translated);
         }
     }
-    // 旧缓存 sidecar 里 50 分档曾写作「标准」；按新名「流畅」的译法处理：
-    // 既不能在英文界面露出中文，也不能翻成 libresoda 的 Standard(70)。
+    // 旧缓存 sidecar 里 50 分档曾写作「标准」；按现行刻度它就是「流畅」：
+    // 英文名 Standard 归 50 分档，70 分档（较高）是 High，两者不会撞名（#93 §5.3）。
     text.replace("标准", language.text("流畅"))
 }
 
@@ -332,7 +332,7 @@ pub(crate) fn quality_menu(
         .map(|value| {
             let chosen = sodam_core::quality::QualityIntent::parse(value) == current;
             let hint = if value == sodam_core::quality::AUTO {
-                root.tr("不设上限，按账号权益和单曲可用档位取最高")
+                root.tr("自动选择账号可用的最高音质")
             } else {
                 ""
             };
@@ -433,7 +433,17 @@ pub(crate) fn quality_menu(
                             .child(notice),
                     )
                 })
-                .children(rows),
+                .children(rows)
+                // 回退规则只说一次（#93 §2.2）：档位是上限，曲库没有更低候选时由服务端回退。
+                // 菜单是档位意图的唯一入口，播放条与设置页共用，说明放这里不会重复。
+                .child(
+                    div()
+                        .px(px(theme::space::SM))
+                        .pt(px(theme::space::XS))
+                        .text_size(theme::Text::Tiny.size())
+                        .text_color(theme::text_faint())
+                        .child(root.tr("没有可用档位时自动回退可用档位")),
+                ),
         ),
     )
     .with_priority(2)
@@ -1275,9 +1285,10 @@ mod tests {
             ("Hi-Res 无损 871k", "Hi-Res Lossless 871k"),
             ("Hi-Res 320k", "Hi-Res 320k"),
             ("杜比全景声 768k", "Dolby Atmos 768k"),
-            ("极高 320k", "High 320k"),
-            ("较高 256k", "Medium 256k"),
-            ("标准 128k", "Low 128k"),
+            ("极高 320k", "Very High 320k"),
+            ("较高 256k", "High 256k"),
+            // 旧缓存 sidecar 里 50 分档曾写作「标准」；按现行刻度就是「流畅」（Standard）。
+            ("标准 128k", "Standard 128k"),
             ("省流 96k", "Data saver 96k"),
             ("未知", "Unknown"),
         ];

@@ -155,10 +155,12 @@ impl ReloadTracker {
                     return ReloadEvent::Quiet;
                 }
                 // 每次外部重载后重新补环境变量，优先级与启动时一致（#185）；
-                // 显式登出后只跳过 Cookie（#192）。
+                // 显式登出后只跳过 Cookie（#192）。签名服务的 env 补全只在
+                // 内存生效且只流向 env 指向的服务（见 Settings::apply_signer_env）。
                 // 这里故意不做 ensure_login_device：文件没带设备身份时不能在轮询里
                 // 现生成一份（会悄悄轮换身份），交给应用侧沿用当前身份。
-                let settings = settings.fill_empty_from_env(cookie_fill);
+                let mut settings = settings.fill_empty_from_env(cookie_fill);
+                settings.apply_signer_env();
                 // 第一次解析成功只记账：等指纹稳定跨过 APPLY_AFTER 再应用，
                 // 编辑器「截断 → 写全」的中间态不会被当成损坏，也不会应用半份。
                 let good_since = *self.pending.good_since.get_or_insert(now);
@@ -192,7 +194,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut tracker = ReloadTracker::new();
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         let now = Instant::now();
 
         // 没有文件：安静。
@@ -228,7 +232,9 @@ mod tests {
         let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         std::fs::write(&path, serde_json::to_string(&current).unwrap()).unwrap();
         let mut tracker = ReloadTracker::new();
 
@@ -250,7 +256,9 @@ mod tests {
         let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         std::fs::write(&path, serde_json::to_string(&current).unwrap()).unwrap();
         let mut tracker = ReloadTracker::new();
 
@@ -277,7 +285,9 @@ mod tests {
         let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         let mut tracker = ReloadTracker::new();
 
         std::fs::write(&path, r#"{"theme":"dar"#).unwrap();
@@ -304,7 +314,9 @@ mod tests {
         let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         let mut tracker = ReloadTracker::new();
 
         std::fs::write(&path, "{oops").unwrap();
@@ -342,7 +354,9 @@ mod tests {
         let _serial = crate::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         let mut tracker = ReloadTracker::new();
 
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
@@ -388,7 +402,9 @@ mod tests {
         std::env::set_var(crate::config::ENV_COOKIE_KEY, "cookie-from-env");
 
         // 登出后的磁盘与内存：Cookie 都是空的。
-        let current = Settings::default();
+        let mut current = Settings::default();
+        // #321：与真实加载路径一致——读进来的配置都经过签名服务列表归一化。
+        current.normalize_signers();
         let content = serde_json::to_string(&current).unwrap();
 
         // 记号置位：补全跳过 Cookie，与应用内一致，安静收尾，不会按「换身份」应用。

@@ -648,6 +648,38 @@ pub struct Root {
     pub contributors_image: Option<Arc<Image>>,
     pub(crate) contributors_fetching: bool,
     pub(crate) contributors_failed: bool,
+    /// 签名服务面板展开态（#321）：行默认收起，点「签名服务」行展开。
+    pub(crate) settings_signers_open: bool,
+    /// 「全部测速」进行中（#321）：期间面板按钮禁用；逐个测完一拍一拍回写，
+    /// 单行测速靠 `signer_latency` 的在测去重自然互斥。
+    pub(crate) signer_bulk_testing: bool,
+    /// 测延时结果的会话内缓存（#321）：URL → None=在测 / Some(Ok(毫秒)) / Some(Err(原因))。
+    /// 只活在本会话，不落盘；账号/服务列表变化时不清（结果是即时测出的，本来就短命）。
+    pub(crate) signer_latency: HashMap<String, Option<Result<u64, String>>>,
+    /// 签名服务纪元（PR #348 二轮审查）：每次会话因换签名服务而重建时推进。
+    /// 装载请求出发时记下当时的值，失败回来时对不上就说明这次尝试用的是
+    /// 旧服务——它的失败不能落闸、挂预取、写签名错误（用户已经换走了）。
+    pub(crate) signer_epoch: u64,
+    /// 签名保存的代际（PR #348 三轮审查）：每发出一次后台保存递增；完成回调
+    /// 只有自己仍是最新代际才动内存状态，过期的保存只落盘。
+    pub(crate) signer_save_seq: u64,
+    /// 上一次签名保存的任务（PR #348 三轮审查）：下一次保存先等它收尾再写盘，
+    /// 保证写入顺序与用户操作顺序一致，旧快照不会后写覆盖新状态。
+    pub(crate) signer_save_tail: Option<gpui::Task<()>>,
+    /// 「添加服务」表单的提交代际（PR #348 三轮审查）：保存成功回调清空表单
+    /// 前先核对代际，用户已经开始输下一份草稿时不清掉别人的输入。
+    pub(crate) signer_form_seq: u64,
+    /// 「添加服务」表单的地址输入框（#321）。与搜索框共用同一套按键动作，
+    /// 由焦点决定改哪一份（见 `Root::focused_input_field`）。
+    pub signer_url_field: TextField,
+    pub(crate) signer_url_focus: gpui::FocusHandle,
+    pub(crate) signer_url_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// 「添加服务」表单的 token 输入框（#321）。显示与回显一律走掩码，
+    /// 真实值只在「添加」时读出写入本地配置，不进日志、状态行或截图。
+    pub signer_token_field: TextField,
+    pub(crate) signer_token_focus: gpui::FocusHandle,
+    pub(crate) signer_token_bounds:
+        std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub ambient_colors: HashMap<String, (u8, u8, u8)>,
     pub(crate) cover_pool: CoverPool,
     /// 各列表当前渲染的行数（点「显示更多」时递增）。
@@ -1009,6 +1041,19 @@ impl Root {
             contributors_image: None,
             contributors_fetching: false,
             contributors_failed: false,
+            settings_signers_open: false,
+            signer_bulk_testing: false,
+            signer_latency: HashMap::new(),
+            signer_epoch: 0,
+            signer_save_seq: 0,
+            signer_save_tail: None,
+            signer_form_seq: 0,
+            signer_url_field: TextField::default(),
+            signer_url_focus: cx.focus_handle(),
+            signer_url_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            signer_token_field: TextField::default(),
+            signer_token_focus: cx.focus_handle(),
+            signer_token_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ambient_colors: HashMap::new(),
             cover_pool: CoverPool::new(),
             login: LoginState::Idle,
@@ -1308,6 +1353,20 @@ impl Root {
                 "queue" => root.queue_open = true,
                 // 固定锚点：截图核对菜单样式时不必真的点中徽章。
                 "quality" => root.quality_menu = Some(gpui::point(px(320.0), px(420.0))),
+                // 设置页签名服务面板（#321）：展开即可截图核对列表与表单。
+                // `signers-test` 额外触发一次「全部测速」（顺序逐个、带间隔，
+                // 开发自查用），仅在显式设置环境变量时生效。
+                "signers" => root.settings_signers_open = true,
+                "signers-test" => {
+                    root.settings_signers_open = true;
+                    root.measure_all_signers(cx);
+                }
+                // 「恢复内置」后的自查（#321）：展开面板、重置内置项、再全部测一次延时。
+                "signers-restore" => {
+                    root.settings_signers_open = true;
+                    root.restore_builtin_signer(cx);
+                    root.measure_all_signers(cx);
+                }
                 _ => {}
             }
         }
@@ -1496,6 +1555,50 @@ impl Root {
 
 /// gpui 的输入协议桥：把平台的 UTF-16 区间换算交给 [`TextField`]，
 /// 这里只留「平台说了什么」→「状态怎么变」这一层，外加焦点门禁。
+/// 正在接受键盘输入的输入框（#321）：搜索框，或签名服务表单的两个输入之一。
+///
+/// 三者共用同一套按键动作（`app_text` 的 text_*）与 IME 通道；动作里按焦点
+/// 分发到具体字段，新增输入框时在这里登记即可，不必再复制一套按键处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputSlot {
+    Search,
+    SignerUrl,
+    SignerToken,
+}
+
+impl Root {
+    /// 焦点落在哪个输入框上；都没有时返回 None。
+    pub(crate) fn focused_input_slot(&self, window: &Window) -> Option<InputSlot> {
+        if self.search_focus.is_focused(window) {
+            Some(InputSlot::Search)
+        } else if self.signer_url_focus.is_focused(window) {
+            Some(InputSlot::SignerUrl)
+        } else if self.signer_token_focus.is_focused(window) {
+            Some(InputSlot::SignerToken)
+        } else {
+            None
+        }
+    }
+
+    /// 当前聚焦输入框的可变借用；按键动作与 IME 都经由这里分发。
+    pub(crate) fn focused_input_field(&mut self, window: &Window) -> Option<&mut TextField> {
+        match self.focused_input_slot(window) {
+            Some(InputSlot::Search) => Some(&mut self.search_field),
+            Some(InputSlot::SignerUrl) => Some(&mut self.signer_url_field),
+            Some(InputSlot::SignerToken) => Some(&mut self.signer_token_field),
+            None => None,
+        }
+    }
+
+    /// 签名服务表单的两个输入框是否任一持有焦点（#321）。
+    pub(crate) fn signer_input_focused(&self, window: &Window) -> bool {
+        matches!(
+            self.focused_input_slot(window),
+            Some(InputSlot::SignerUrl) | Some(InputSlot::SignerToken)
+        )
+    }
+}
+
 impl EntityInputHandler for Root {
     fn text_for_range(
         &mut self,
@@ -1504,12 +1607,10 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
-        let range = self.search_field.byte_range_from_utf16(range_utf16);
-        actual_range.replace(self.search_field.utf16_range_from_byte(range.clone()));
-        Some(self.search_field.slice(range))
+        let field = self.focused_input_field(window)?;
+        let range = field.byte_range_from_utf16(range_utf16);
+        actual_range.replace(field.utf16_range_from_byte(range.clone()));
+        Some(field.slice(range))
     }
 
     fn selected_text_range(
@@ -1518,16 +1619,12 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
+        let field = self.focused_input_field(window)?;
         // 组合中上报组合区间，否则上报选区（无选区时是活动端的折叠区间）。
         // `reversed` 要照实给：方向决定 Shift 继续扩选时往哪边长，macOS 的候选窗也读它。
         Some(UTF16Selection {
-            range: self
-                .search_field
-                .utf16_range_from_byte(self.search_field.selection_range()),
-            reversed: self.search_field.is_reversed(),
+            range: field.utf16_range_from_byte(field.selection_range()),
+            reversed: field.is_reversed(),
         })
     }
 
@@ -1536,16 +1633,29 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        if !self.search_input_focused(window) {
-            return None;
+        let slot = self.focused_input_slot(window)?;
+        match slot {
+            crate::app::InputSlot::Search => self
+                .search_field
+                .marked()
+                .map(|range| self.search_field.utf16_range_from_byte(range)),
+            crate::app::InputSlot::SignerUrl => self
+                .signer_url_field
+                .marked()
+                .map(|range| self.signer_url_field.utf16_range_from_byte(range)),
+            crate::app::InputSlot::SignerToken => self
+                .signer_token_field
+                .marked()
+                .map(|range| self.signer_token_field.utf16_range_from_byte(range)),
         }
-        self.search_field
-            .marked()
-            .map(|range| self.search_field.utf16_range_from_byte(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_field.clear_marked() {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .focused_input_field(window)
+            .map(|field| field.clear_marked())
+            == Some(true)
+        {
             cx.notify();
         }
     }
@@ -1557,15 +1667,19 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
-            return;
-        }
-        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        self.search_field.replace(range, text);
-        self.search_field.end_edit(now);
-        self.search_fit_caret_in_view(window);
+        let Some(field) = self.focused_input_field(window) else {
+            return;
+        };
+        let range = range_utf16.map(|range| field.byte_range_from_utf16(range));
+        field.begin_edit();
+        field.replace(range, text);
+        field.end_edit(now);
+        // 表单输入不做横向滚动，光标永远在可见范围内，无需收进视图。
+        if search_slot {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
@@ -1577,15 +1691,18 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
-            return;
-        }
-        let range = range_utf16.map(|range| self.search_field.byte_range_from_utf16(range));
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
         let now = self.search_edit_time();
-        self.search_field.begin_edit();
-        self.search_field.replace_and_mark(range, new_text);
-        self.search_field.end_edit(now);
-        self.search_fit_caret_in_view(window);
+        let Some(field) = self.focused_input_field(window) else {
+            return;
+        };
+        let range = range_utf16.map(|range| field.byte_range_from_utf16(range));
+        field.begin_edit();
+        field.replace_and_mark(range, new_text);
+        field.end_edit(now);
+        if search_slot {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
@@ -1596,19 +1713,33 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
+        let slot = self.focused_input_slot(window)?;
         // 候选窗要贴在真正在编辑的那一段下面：整框宽度当锚点会让候选窗一直停在框的左下，
         // 滚过长文本之后更是完全对不上。这里与 `search_cursor_for_x` 共用同一条排版结果。
-        let range = self.search_field.byte_range_from_utf16(range_utf16);
-        let left = self.search_text_x(range.start, window) - self.search_scroll_x();
-        let right = self.search_text_x(range.end, window) - self.search_scroll_x();
-        let bounds = self.search_bounds.get().unwrap_or(element_bounds);
-        let width = gpui::px(1.0).max(right - left);
+        // 表单输入（#321）不做横向滚动，候选窗直接锚在整框上。
+        if let crate::app::InputSlot::Search = slot {
+            let range = self.search_field.byte_range_from_utf16(range_utf16);
+            let left = self.search_text_x(range.start, window) - self.search_scroll_x();
+            let right = self.search_text_x(range.end, window) - self.search_scroll_x();
+            let bounds = self.search_bounds.get().unwrap_or(element_bounds);
+            let width = gpui::px(1.0).max(right - left);
+            return Some(gpui::Bounds {
+                origin: gpui::point(bounds.origin.x + left, bounds.origin.y),
+                size: gpui::size(width, bounds.size.height.max(gpui::px(1.0))),
+            });
+        }
+        let bounds = match slot {
+            crate::app::InputSlot::SignerUrl => self.signer_url_bounds.get(),
+            crate::app::InputSlot::SignerToken => self.signer_token_bounds.get(),
+            crate::app::InputSlot::Search => unreachable!("上一分支已返回"),
+        }
+        .unwrap_or(element_bounds);
         Some(gpui::Bounds {
-            origin: gpui::point(bounds.origin.x + left, bounds.origin.y),
-            size: gpui::size(width, bounds.size.height.max(gpui::px(1.0))),
+            origin: gpui::point(bounds.origin.x, bounds.origin.y),
+            size: gpui::size(
+                bounds.size.width.max(gpui::px(1.0)),
+                bounds.size.height.max(gpui::px(1.0)),
+            ),
         })
     }
 
@@ -1618,12 +1749,23 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
+        let slot = self.focused_input_slot(window)?;
         // 语义是 UTF-16 偏移：按点击位置算出字节下标后再换算。
-        let byte = self.search_cursor_for_x(point.x, window);
-        Some(self.search_field.byte_to_utf16(byte))
+        // 表单输入不支持点击定位（点击只会把光标放到末尾，见面板实现）。
+        match slot {
+            crate::app::InputSlot::Search => {
+                let byte = self.search_cursor_for_x(point.x, window);
+                Some(self.search_field.byte_to_utf16(byte))
+            }
+            crate::app::InputSlot::SignerUrl => Some(
+                self.signer_url_field
+                    .byte_to_utf16(self.signer_url_field.len()),
+            ),
+            crate::app::InputSlot::SignerToken => Some(
+                self.signer_token_field
+                    .byte_to_utf16(self.signer_token_field.len()),
+            ),
+        }
     }
 
     fn set_selected_text_range(
@@ -1632,26 +1774,27 @@ impl EntityInputHandler for Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.search_input_focused(window) {
+        let search_slot = self.focused_input_slot(window) == Some(crate::app::InputSlot::Search);
+        let Some(field) = self.focused_input_field(window) else {
             return;
-        }
-        let range = self.search_field.byte_range_from_utf16(range_utf16);
+        };
+        let range = field.byte_range_from_utf16(range_utf16);
         // 平台交回的是整段区间，此前只取 `start` 会把选区丢掉；这里按真选区收下，
         // 活动端落在区间末尾（方向由两端的大小关系决定）。
-        self.search_field.set_position(range.end, range.start);
-        self.search_fit_caret_in_view(window);
+        field.set_position(range.end, range.start);
+        if search_slot {
+            self.search_fit_caret_in_view(window);
+        }
         cx.notify();
     }
 
     fn text_length_utf16(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
-        if !self.search_input_focused(window) {
-            return None;
-        }
-        Some(self.search_field.utf16_len())
+        let field = self.focused_input_field(window)?;
+        Some(field.utf16_len())
     }
 
     fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.search_input_focused(window)
+        self.focused_input_slot(window).is_some()
     }
 }
 
