@@ -2557,59 +2557,86 @@ impl Root {
                 work.detach();
             }
             let _ = this.update(cx, |root, cx| {
-                // 已有更新的装载请求：本次结果作废，但**不能碰 loading 与切换态**。
-                if root.recommendation_load_seq != load_seq {
-                    return;
-                }
-                root.loading_recommendation = false;
-                // 这轮已经不归自己了（用户自己换了队，或者更晚的装载接手了）：
-                // 成功也好失败也好都不许说话——失败报出去会写进 `recommendation_error`，
-                // 下次进推荐页反而要人手点重试。
-                if !root.clear_own_queue_switch(switch_seq) {
-                    cx.notify();
-                    return;
-                }
-                // 页面也是判据：从播放页出去别处、又自己绕回来，不是「他一直没走开」，
-                // 只是恰好停在同一页上。全程没换过页才接管。
-                let take_over = if root.nav_seq == load_nav_seq {
-                    ViewTakeover::Take
-                } else {
-                    ViewTakeover::Keep
-                };
-                match result {
-                    Some(Ok(start)) => {
-                        root.recommendation_error = None;
-                        root.activate_recommended_queue(
-                            start.source,
-                            start.tracks,
-                            root.tr("推荐"),
-                            autoplay,
-                            LoadTicket {
-                                take_over,
-                                switch_seq,
-                            },
-                            cx,
-                        );
-                    }
-                    Some(Err(err)) => {
-                        let message = root.failure_text("加载推荐队列失败", &err, REMOTE_TEXT);
-                        root.recommendation_failed(message, cached, take_over, cx);
-                    }
-                    None => {
-                        let message = root.tr(REMOTE_TEXT).to_string();
-                        // 超时是「界面不再等它」，不是请求已结束：底层请求会自己跑完，
-                        // 结果被 load_seq 丢弃。日志说清楚免得后续排查误读。
-                        root.log_failure(
-                            "加载推荐队列超时（界面已停止等待）",
-                            format_args!("deadline={}s", RECOMMENDATION_DEADLINE.as_secs()),
-                        );
-                        root.recommendation_failed(message, cached, take_over, cx);
-                    }
-                }
-                cx.notify();
+                root.recommendation_load_settled(
+                    load_seq,
+                    load_nav_seq,
+                    switch_seq,
+                    cached,
+                    autoplay,
+                    result,
+                    cx,
+                );
             });
         })
         .detach();
+    }
+
+    /// 推荐装载回调的落账：请求序号、换队认领、页面接管三级判定后，
+    /// 成功就换上推荐队列，失败 / 超时进可重试的终态。
+    ///
+    /// 从 `start_recommendation` 的回调体里整段搬出来，逻辑一行没改：
+    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
+    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    fn recommendation_load_settled(
+        &mut self,
+        load_seq: u64,
+        load_nav_seq: u64,
+        switch_seq: u64,
+        cached: bool,
+        autoplay: bool,
+        result: Option<anyhow::Result<sodam_core::library::RecommendedStart>>,
+        cx: &mut Context<Self>,
+    ) {
+        // 已有更新的装载请求：本次结果作废，但**不能碰 loading 与切换态**。
+        if self.recommendation_load_seq != load_seq {
+            return;
+        }
+        self.loading_recommendation = false;
+        // 这轮已经不归自己了（用户自己换了队，或者更晚的装载接手了）：
+        // 成功也好失败也好都不许说话——失败报出去会写进 `recommendation_error`，
+        // 下次进推荐页反而要人手点重试。
+        if !self.clear_own_queue_switch(switch_seq) {
+            cx.notify();
+            return;
+        }
+        // 页面也是判据：从播放页出去别处、又自己绕回来，不是「他一直没走开」，
+        // 只是恰好停在同一页上。全程没换过页才接管。
+        let take_over = if self.nav_seq == load_nav_seq {
+            ViewTakeover::Take
+        } else {
+            ViewTakeover::Keep
+        };
+        match result {
+            Some(Ok(start)) => {
+                self.recommendation_error = None;
+                self.activate_recommended_queue(
+                    start.source,
+                    start.tracks,
+                    self.tr("推荐"),
+                    autoplay,
+                    LoadTicket {
+                        take_over,
+                        switch_seq,
+                    },
+                    cx,
+                );
+            }
+            Some(Err(err)) => {
+                let message = self.failure_text("加载推荐队列失败", &err, REMOTE_TEXT);
+                self.recommendation_failed(message, cached, take_over, cx);
+            }
+            None => {
+                let message = self.tr(REMOTE_TEXT).to_string();
+                // 超时是「界面不再等它」，不是请求已结束：底层请求会自己跑完，
+                // 结果被 load_seq 丢弃。日志说清楚免得后续排查误读。
+                self.log_failure(
+                    "加载推荐队列超时（界面已停止等待）",
+                    format_args!("deadline={}s", RECOMMENDATION_DEADLINE.as_secs()),
+                );
+                self.recommendation_failed(message, cached, take_over, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// 推荐队列装载失败后的统一落地：进入**可重试的终端态**，而不是停在转圈页。
@@ -2685,56 +2712,78 @@ impl Root {
                 cx.spawn(async move |this, cx| {
                     let result = work.await;
                     let _ = this.update(cx, |root, cx| {
-                        // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
-                        if root.clear_own_queue_switch(switch_seq) {
-                            match result {
-                                Ok(tracks) if !tracks.is_empty() => {
-                                    root.queue.replace(tracks, 0);
-                                    root.played_history.clear();
-                                    root.playback_error = None;
-                                    root.new_playback_round();
-                                    root.queue_origin =
-                                        QueueOrigin::Radio(card.playlist.id.clone());
-                                    root.recommendation = None;
-                                    root.sync_queue_cache();
-                                    let covers: Vec<String> = root
-                                        .queue
-                                        .tracks()
-                                        .iter()
-                                        .map(|track| track.cover.clone())
-                                        .collect();
-                                    root.ensure_covers(&covers, cx);
-                                    root.open_lyrics(cx);
-                                    root.start_track(true, cx);
-                                }
-                                Ok(_) => {
-                                    // 引擎已经停了、队列没换：留在歌词页就是一首不响的旧歌，
-                                    // 页面上也没有重试入口。和歌单那条一致，回到有重试的页面。
-                                    if root.nav_seq == load_nav_seq {
-                                        root.set_nav(Nav::Scenes, cx);
-                                    }
-                                    let message = root.localized(
-                                        "电台「{}」没有可播放曲目",
-                                        std::slice::from_ref(&card.playlist.title),
-                                    );
-                                    root.notify_warning_once("radio-empty", message);
-                                }
-                                Err(err) => {
-                                    if root.nav_seq == load_nav_seq {
-                                        root.set_nav(Nav::Scenes, cx);
-                                    }
-                                    let message =
-                                        root.failure_text("加载电台失败", &err, REMOTE_TEXT);
-                                    root.notify_error_once("radio-load-failed", message);
-                                }
-                            }
-                        }
-                        cx.notify();
+                        root.scene_radio_load_settled(
+                            switch_seq,
+                            load_nav_seq,
+                            card.playlist.id.clone(),
+                            card.playlist.title.clone(),
+                            result,
+                            cx,
+                        );
                     });
                 })
                 .detach();
             }
         }
+    }
+
+    /// 电台装载回调的落账：认领到这次换队才换队列、进歌词页开播；
+    /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
+    ///
+    /// 从 `start_scene_card` 电台分支的回调体里整段搬出来，逻辑一行没改：
+    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
+    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    fn scene_radio_load_settled(
+        &mut self,
+        switch_seq: u64,
+        load_nav_seq: u64,
+        playlist_id: String,
+        playlist_title: String,
+        result: anyhow::Result<Vec<TrackItem>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.clear_own_queue_switch(switch_seq) {
+            match result {
+                Ok(tracks) if !tracks.is_empty() => {
+                    self.queue.replace(tracks, 0);
+                    self.played_history.clear();
+                    self.playback_error = None;
+                    self.new_playback_round();
+                    self.queue_origin = QueueOrigin::Radio(playlist_id);
+                    self.recommendation = None;
+                    self.sync_queue_cache();
+                    let covers: Vec<String> = self
+                        .queue
+                        .tracks()
+                        .iter()
+                        .map(|track| track.cover.clone())
+                        .collect();
+                    self.ensure_covers(&covers, cx);
+                    self.open_lyrics(cx);
+                    self.start_track(true, cx);
+                }
+                Ok(_) => {
+                    // 引擎已经停了、队列没换：留在歌词页就是一首不响的旧歌，
+                    // 页面上也没有重试入口。和歌单那条一致，回到有重试的页面。
+                    if self.nav_seq == load_nav_seq {
+                        self.set_nav(Nav::Scenes, cx);
+                    }
+                    let message = self.localized(
+                        "电台「{}」没有可播放曲目",
+                        std::slice::from_ref(&playlist_title),
+                    );
+                    self.notify_warning_once("radio-empty", message);
+                }
+                Err(err) => {
+                    if self.nav_seq == load_nav_seq {
+                        self.set_nav(Nav::Scenes, cx);
+                    }
+                    let message = self.failure_text("加载电台失败", &err, REMOTE_TEXT);
+                    self.notify_error_once("radio-load-failed", message);
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// 听歌模式探索卡：直接播放整张歌单，不进入详情页。
@@ -2760,52 +2809,68 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
-                // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
-                if root.clear_own_queue_switch(switch_seq) {
-                    match result {
-                        Ok(tracks) if !tracks.is_empty() => {
-                            root.queue.replace(tracks, 0);
-                            root.played_history.clear();
-                            root.playback_error = None;
-                            root.new_playback_round();
-                            root.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
-                            root.recommendation = None;
-                            root.sync_queue_cache();
-                            let covers: Vec<String> = root
-                                .queue
-                                .tracks()
-                                .iter()
-                                .map(|track| track.cover.clone())
-                                .collect();
-                            root.ensure_covers(&covers, cx);
-                            root.open_lyrics(cx);
-                            root.start_track(true, cx);
-                        }
-                        Ok(_) => {
-                            // 停在歌词页上既没声音也没入口，回有重试的听歌模式页。
-                            // 只在人还停在本次装载带出来的那一页时才跳：他要是自己去翻
-                            // 别的页面了，这一个迟到的结果不该把他拽回来。
-                            if root.nav_seq == load_nav_seq {
-                                root.set_nav(Nav::Scenes, cx);
-                            }
-                            root.set_status(
-                                "歌单「{}」没有可播放曲目",
-                                std::slice::from_ref(&playlist.title),
-                            );
-                        }
-                        Err(err) => {
-                            if root.nav_seq == load_nav_seq {
-                                root.set_nav(Nav::Scenes, cx);
-                            }
-                            let message = root.failure_text("加载歌单失败", &err, REMOTE_TEXT);
-                            root.notify_error_once("playlist-load-failed", message);
-                        }
-                    }
-                }
-                cx.notify();
+                root.scene_playlist_load_settled(switch_seq, load_nav_seq, playlist, result, cx);
             });
         })
         .detach();
+    }
+
+    /// 歌单装载回调的落账：认领到这次换队才换队列、进歌词页开播；
+    /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
+    ///
+    /// 从 `start_scene_playlist` 的回调体里整段搬出来，逻辑一行没改：
+    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
+    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    fn scene_playlist_load_settled(
+        &mut self,
+        switch_seq: u64,
+        load_nav_seq: u64,
+        playlist: PlaylistItem,
+        result: anyhow::Result<Vec<TrackItem>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.clear_own_queue_switch(switch_seq) {
+            match result {
+                Ok(tracks) if !tracks.is_empty() => {
+                    self.queue.replace(tracks, 0);
+                    self.played_history.clear();
+                    self.playback_error = None;
+                    self.new_playback_round();
+                    self.queue_origin = QueueOrigin::Playlist(playlist.id.clone());
+                    self.recommendation = None;
+                    self.sync_queue_cache();
+                    let covers: Vec<String> = self
+                        .queue
+                        .tracks()
+                        .iter()
+                        .map(|track| track.cover.clone())
+                        .collect();
+                    self.ensure_covers(&covers, cx);
+                    self.open_lyrics(cx);
+                    self.start_track(true, cx);
+                }
+                Ok(_) => {
+                    // 停在歌词页上既没声音也没入口，回有重试的听歌模式页。
+                    // 只在人还停在本次装载带出来的那一页时才跳：他要是自己去翻
+                    // 别的页面了，这一个迟到的结果不该把他拽回来。
+                    if self.nav_seq == load_nav_seq {
+                        self.set_nav(Nav::Scenes, cx);
+                    }
+                    self.set_status(
+                        "歌单「{}」没有可播放曲目",
+                        std::slice::from_ref(&playlist.title),
+                    );
+                }
+                Err(err) => {
+                    if self.nav_seq == load_nav_seq {
+                        self.set_nav(Nav::Scenes, cx);
+                    }
+                    let message = self.failure_text("加载歌单失败", &err, REMOTE_TEXT);
+                    self.notify_error_once("playlist-load-failed", message);
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// 官方推荐队列的动态加载：当前歌后方少于 6 首时由心跳触发。
@@ -6151,7 +6216,11 @@ mod view_takeover_tests {
             .split("pub fn start_recommendation")
             .nth(1)
             .expect("start_recommendation 应当存在");
-        let body = &body[..body.find("fn recommendation_failed").unwrap_or(body.len())];
+        // 落账体搬进 `recommendation_load_settled` 后，start_recommendation
+        // 的下一站就是它（票 #340）。
+        let body = &body[..body
+            .find("fn recommendation_load_settled")
+            .unwrap_or(body.len())];
 
         let switch_at = body
             .find("begin_queue_switch(QueueOrigin::Feed")
@@ -6211,12 +6280,17 @@ mod view_takeover_tests {
     #[test]
     fn queue_switch_state_is_never_cleared_bare_in_load_paths() {
         let source = include_str!("app_actions.rs");
+        // 落账体搬进 `*_load_settled` 后，写切换态的地方跟着搬：入口不再直接碰，
+        // 守卫盯住落账方法本身（认领走 `clear_own_queue_switch`，这里查的是不裸清）。
         for owner in [
             "pub fn start_recommendation",
             "pub(crate) fn activate_recommended_queue",
             "pub fn start_scene_queue",
             "pub fn start_scene_card",
             "pub fn start_scene_playlist",
+            "fn recommendation_load_settled",
+            "fn scene_radio_load_settled",
+            "fn scene_playlist_load_settled",
         ] {
             assert!(
                 !body_of(source, owner).contains("switching_queue = None"),
@@ -6233,10 +6307,12 @@ mod view_takeover_tests {
     #[test]
     fn load_results_only_land_when_they_still_own_the_switch() {
         let source = include_str!("app_actions.rs");
+        // 电台 / 歌单的落账体已经搬进各自的 `*_load_settled`（回调装配留在入口里），
+        // 守卫跟着搬：`queue.replace` 现在只出现在落账方法与激活方法里（票 #340）。
         for owner in [
             "pub(crate) fn activate_recommended_queue",
-            "pub fn start_scene_card",
-            "pub fn start_scene_playlist",
+            "fn scene_radio_load_settled",
+            "fn scene_playlist_load_settled",
         ] {
             let body = body_of(source, owner);
             let claim_at = [
@@ -6920,5 +6996,363 @@ mod scene_modes_gate_tests {
             "探索卡请求不该写常用模式的状态"
         );
         assert!(!cards.contains("scene_modes_state"), "探索卡请求只动探索卡");
+    }
+}
+
+/// 装载回调对换队认领的使用：票还在才落账，被推走整份丢掉（票 #340）。
+///
+/// 源码守卫只能证明「`queue.replace` 写在认领后面」，证明不了「认领失败真的
+/// 不落账」——那条控制流只有真跑回调落账体才压得住。三条装载路径的落账体
+/// 已经搬进 `recommendation_load_settled` / `scene_radio_load_settled` /
+/// `scene_playlist_load_settled`，这里在 `TestAppContext` 里真跑它们。
+///
+/// fixture 的边界：
+///
+/// * `Root::new` 读盘走 `SODAM_CONFIG_PATH`（进程内一次性指向临时目录），
+///   不碰用户真实配置；音频线程起不来只是记录错误，不会 panic。
+/// * 构造后清掉 Cookie，保持「未登录」：换页就不会触发 `on_nav_changed`
+///   的自动装载，测试永远碰不到网络。
+/// * 不推进 executor：落账里 spawn 的下载、封面、心跳任务都只排队不执行。
+#[cfg(test)]
+mod queue_switch_callback_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    /// 每个测试进程一个临时配置目录。`Root::new` 在构造时读一次环境变量，
+    /// 测试进程内不再改它；其余测试都不读配置，互相不踩。
+    fn test_config_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("建立测试配置目录");
+            std::env::set_var("SODAM_CONFIG_PATH", &dir);
+            dir
+        })
+        .as_path()
+    }
+
+    fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
+        test_config_dir();
+        let root = cx.new(|cx| Root::new(cx));
+        cx.update_entity(&root, |root, _cx| {
+            // 环境变量可能补进真实 Cookie（SODA_COOKIE 等）：测试必须保持「未登录」，
+            // 否则换页会触发 on_nav_changed 的自动装载，测试就会碰真网络。
+            root.settings.cookie = String::new();
+        });
+        root
+    }
+
+    fn track(id: &str) -> TrackItem {
+        TrackItem {
+            id: id.to_string(),
+            title: format!("曲目{id}"),
+            ..Default::default()
+        }
+    }
+
+    fn playlist(id: &str, title: &str) -> PlaylistItem {
+        PlaylistItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 被顶掉的电台装载回来：用户已选的队列一个字节都不许动。
+    ///
+    /// 旧装载发起后，更晚的装载接手（换队代数被推走）；旧结果再回来，
+    /// 认领不到就整份丢——队列、来源、切换态（归新装载）、页面都不动。
+    #[gpui::test]
+    async fn a_superseded_radio_load_leaves_the_selected_queue_alone(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue_origin = QueueOrigin::Playlist("user-pick".to_string());
+            root.queue.replace(vec![track("user-1")], 0);
+            let stale_seq =
+                root.begin_queue_switch(QueueOrigin::Radio("radio-a".to_string()), "电台A", cx);
+            root.begin_queue_switch(QueueOrigin::Playlist("late".to_string()), "歌单B", cx);
+
+            let nav_before = root.nav_seq;
+            let queue_before = root.queue.len();
+            let origin_before = root.queue_origin.clone();
+            let switching_before = root.switching_queue.clone();
+
+            root.scene_radio_load_settled(
+                stale_seq,
+                nav_before,
+                "radio-a".to_string(),
+                "电台A".to_string(),
+                Ok(vec![track("r-1"), track("r-2")]),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), queue_before, "旧结果不许换掉用户的队列");
+            assert_eq!(root.queue_origin, origin_before, "来源不许被旧结果改写");
+            assert_eq!(
+                root.switching_queue, switching_before,
+                "切换态归更晚那次装载，旧回调不许收走"
+            );
+            assert_eq!(root.nav_seq, nav_before, "旧回调不许挪页面");
+        });
+    }
+
+    /// 现行代数的电台装载落地：队列换成电台内容，切换态收干净。
+    #[gpui::test]
+    async fn a_current_radio_load_replaces_the_queue(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue.replace(vec![track("user-1")], 0);
+            let switch_seq =
+                root.begin_queue_switch(QueueOrigin::Radio("radio-a".to_string()), "电台A", cx);
+            let load_nav_seq = root.nav_seq;
+
+            root.scene_radio_load_settled(
+                switch_seq,
+                load_nav_seq,
+                "radio-a".to_string(),
+                "电台A".to_string(),
+                Ok(vec![track("r-1"), track("r-2")]),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), 2, "认领到的装载必须真的换队列");
+            assert_eq!(root.queue.tracks()[0].id, "r-1");
+            assert_eq!(
+                root.queue_origin,
+                QueueOrigin::Radio("radio-a".to_string()),
+                "来源改成这次装载的电台"
+            );
+            assert_eq!(root.switching_queue, None, "自己留下的切换态由自己收");
+        });
+    }
+
+    /// 用户点了别的歌（作废换队）之后，迟到的歌单装载回来不许顶掉他正在听的队列。
+    #[gpui::test]
+    async fn a_superseded_playlist_load_leaves_the_user_queue_alone(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue_origin = QueueOrigin::Playlist("user-pick".to_string());
+            root.queue.replace(vec![track("user-1")], 0);
+            let stale_seq = root.begin_queue_switch(
+                QueueOrigin::Playlist("late-playlist".to_string()),
+                "歌单A",
+                cx,
+            );
+            // 用户显式换队：作废在飞装载，切换态也由这一下收走。
+            root.abandon_queue_switch();
+
+            let queue_before = root.queue.len();
+            let origin_before = root.queue_origin.clone();
+
+            root.scene_playlist_load_settled(
+                stale_seq,
+                root.nav_seq,
+                playlist("late-playlist", "歌单A"),
+                Ok(vec![track("p-1"), track("p-2")]),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), queue_before, "用户选的队列不许被顶掉");
+            assert_eq!(root.queue_origin, origin_before, "来源还是他自己那份");
+            assert_eq!(root.switching_queue, None, "加载态由作废方收，回调不许碰");
+        });
+    }
+
+    /// 现行代数的歌单装载落地：队列换成歌单内容，切换态收干净。
+    #[gpui::test]
+    async fn a_current_playlist_load_replaces_the_queue(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue.replace(vec![track("user-1")], 0);
+            let switch_seq = root.begin_queue_switch(
+                QueueOrigin::Playlist("late-playlist".to_string()),
+                "歌单A",
+                cx,
+            );
+            let load_nav_seq = root.nav_seq;
+
+            root.scene_playlist_load_settled(
+                switch_seq,
+                load_nav_seq,
+                playlist("late-playlist", "歌单A"),
+                Ok(vec![track("p-1"), track("p-2")]),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), 2, "认领到的装载必须真的换队列");
+            assert_eq!(
+                root.queue_origin,
+                QueueOrigin::Playlist("late-playlist".to_string())
+            );
+            assert_eq!(root.switching_queue, None, "自己留下的切换态由自己收");
+        });
+    }
+
+    /// 请求序号被推走后，迟到的推荐成功结果什么都不许写：loading 与切换态
+    /// 归更晚那次装载，队列也不动。
+    #[gpui::test]
+    async fn a_superseded_recommendation_lands_nothing(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.loading_recommendation = true;
+            let switch_seq = root.begin_queue_switch(QueueOrigin::Feed, "推荐队列", cx);
+            let load_nav_seq = root.nav_seq;
+            let load_seq = root.recommendation_load_seq;
+            // 生产里由 start_recommendation / 换源动作推：更晚的装载接手。
+            root.recommendation_load_seq = root.recommendation_load_seq.wrapping_add(1);
+
+            let loading_before = root.loading_recommendation;
+            let switching_before = root.switching_queue.clone();
+            let queue_before = root.queue.len();
+
+            root.recommendation_load_settled(
+                load_seq,
+                load_nav_seq,
+                switch_seq,
+                false,
+                true,
+                Some(Ok(sodam_core::library::RecommendedStart {
+                    source: RecommendationSource::new(),
+                    tracks: vec![track("r-1")],
+                })),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), queue_before, "过期结果不许换队列");
+            assert_eq!(root.loading_recommendation, loading_before, "加载态不许碰");
+            assert_eq!(
+                root.switching_queue, switching_before,
+                "切换态归更晚那次装载"
+            );
+            assert_eq!(root.recommendation_error, None);
+        });
+    }
+
+    /// 序号过期的推荐回调连**失败**也要丢：错误写进 `recommendation_error`
+    /// 会把推荐页顶进终态，替别人报错（#331 的审查结论）。
+    #[gpui::test]
+    async fn a_superseded_recommendation_discards_errors(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.loading_recommendation = true;
+            let switch_seq = root.begin_queue_switch(QueueOrigin::Feed, "推荐队列", cx);
+            let load_nav_seq = root.nav_seq;
+            let load_seq = root.recommendation_load_seq;
+            root.recommendation_load_seq = root.recommendation_load_seq.wrapping_add(1);
+
+            let nav_before = root.nav_seq;
+
+            root.recommendation_load_settled(
+                load_seq,
+                load_nav_seq,
+                switch_seq,
+                false,
+                true,
+                Some(Err(anyhow::anyhow!("网络断开"))),
+                cx,
+            );
+
+            assert_eq!(root.recommendation_error, None, "过期失败不许写错误终态");
+            assert_eq!(root.nav_seq, nav_before, "过期失败不许挪页面");
+        });
+    }
+
+    /// 现行代数的推荐装载落地：队列换成推荐内容，切换态与加载态都收干净。
+    #[gpui::test]
+    async fn a_current_recommendation_replaces_the_queue(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue.replace(vec![track("user-1")], 0);
+            root.loading_recommendation = true;
+            let load_seq = root.recommendation_load_seq;
+            let switch_seq = root.begin_queue_switch(QueueOrigin::Feed, "推荐队列", cx);
+            let load_nav_seq = root.nav_seq;
+
+            root.recommendation_load_settled(
+                load_seq,
+                load_nav_seq,
+                switch_seq,
+                false,
+                false,
+                Some(Ok(sodam_core::library::RecommendedStart {
+                    source: RecommendationSource::new(),
+                    tracks: vec![track("r-1"), track("r-2")],
+                })),
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), 2, "认领到的装载必须真的换队列");
+            assert_eq!(root.queue_origin, QueueOrigin::Feed);
+            assert_eq!(root.switching_queue, None, "自己留下的切换态由自己收");
+            assert_eq!(root.loading_recommendation, false);
+            assert!(root.recommendation.is_some(), "分页源要跟着就位");
+        });
+    }
+
+    /// 激活推荐队列前同样要认领：票被推走时队列一个字节都不许动。
+    ///
+    /// `start_recommendation` 与 `start_scene_queue` 的成功结果都从这条路落地。
+    #[gpui::test]
+    async fn a_superseded_ticket_never_lands_in_activate_recommended_queue(
+        cx: &mut TestAppContext,
+    ) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue.replace(vec![track("user-1")], 0);
+            let stale_seq = root.begin_queue_switch(QueueOrigin::Feed, "旧", cx);
+            root.begin_queue_switch(QueueOrigin::Playlist("late".to_string()), "歌单B", cx);
+
+            let queue_before = root.queue.len();
+
+            root.activate_recommended_queue(
+                RecommendationSource::new(),
+                vec![track("r-1")],
+                "推荐",
+                false,
+                LoadTicket {
+                    take_over: ViewTakeover::Take,
+                    switch_seq: stale_seq,
+                },
+                cx,
+            );
+
+            assert_eq!(root.queue.len(), queue_before, "旧票不许换队列");
+            assert_eq!(
+                root.switching_queue,
+                Some(QueueOrigin::Playlist("late".to_string())),
+                "切换态还是新装载的"
+            );
+        });
+    }
+
+    /// 页面被人换走（`ViewTakeover::Keep`）时结果整份丢掉：认领照样成功
+    /// （切换态收走），但队列不许换——这份结果不属于他此刻在看的页面。
+    #[gpui::test]
+    async fn activate_recommended_queue_honors_a_kept_view(cx: &mut TestAppContext) {
+        let root = open_root(&mut cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue.replace(vec![track("user-1")], 0);
+            let switch_seq = root.begin_queue_switch(QueueOrigin::Feed, "推荐队列", cx);
+
+            let queue_before = root.queue.len();
+
+            root.activate_recommended_queue(
+                RecommendationSource::new(),
+                vec![track("r-1")],
+                "推荐",
+                false,
+                LoadTicket {
+                    take_over: ViewTakeover::Keep,
+                    switch_seq,
+                },
+                cx,
+            );
+
+            assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
+            assert_eq!(root.queue.len(), queue_before, "Keep 的结果不许换队列");
+            assert_eq!(root.queue.tracks()[0].id, "user-1");
+        });
     }
 }
