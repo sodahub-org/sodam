@@ -209,12 +209,13 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
         return None;
     }
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        let read_bytes = bytes.len().to_string();
+        // 这一支 read_bytes 恒为门槛 + 1（被 take 卡死），报门槛本身才有信息。
+        let cap_bytes = MAX_IMAGE_BYTES.to_string();
         log_event(
             LogLevel::Warn,
             LogTopic::App,
             "contributors_read_over_cap",
-            &[("read_bytes", read_bytes.as_str())],
+            &[("cap_bytes", cap_bytes.as_str())],
         );
         return None;
     }
@@ -226,7 +227,8 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
 /// 三段超时各自生效（#336）：DNS [`DNS_TIMEOUT`]（解析自己兜，见
 /// [`DeadlineResolver`]）、TCP 建连 [`CONNECT_TIMEOUT`]、整体
 /// [`TOTAL_TIMEOUT`]；读不单独设，响应体跟着整体截止时间走。
-/// 请求失败记一条 Warn（哪个阶段挂的看错误串），退避节奏下不会刷屏。
+/// 四种失败各记一条 Warn：请求失败、读出错、超限、拿到的东西不是 SVG
+/// （服务端给错误页、提前断流最常见的坏法），退避节奏下不会刷屏。
 pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .resolver(DeadlineResolver)
@@ -247,7 +249,17 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
         }
     };
     let bytes = read_capped(response.into_reader())?;
-    is_svg(&bytes).then_some(bytes)
+    if !is_svg(&bytes) {
+        let read_bytes = bytes.len().to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_body_rejected",
+            &[("read_bytes", read_bytes.as_str())],
+        );
+        return None;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
