@@ -390,6 +390,11 @@ pub struct Root {
     pub(crate) titlebar_anchor: ui::titlebar::DragAnchor,
     /// 页面返回栈；详情页统一使用返回组件。
     pub(crate) nav_history: Vec<Nav>,
+    /// 换页计数：`set_nav` / `go_back` 每换一次页面 +1（记在 `on_nav_changed`），
+    /// 后台装载回来比一下快照，变了就把结果丢掉。
+    ///
+    /// 快照取在装载自己那次切页**之后**：装载把界面带到加载页不算用户走开。
+    pub(crate) nav_seq: u64,
     pub lyrics_return_nav: Option<Nav>,
     pub theme: ThemeKind,
     pub theme_follows_system: bool,
@@ -420,10 +425,18 @@ pub struct Root {
     /// 还是真实内容，属于视图归属的导航状态，不该被一次超时或旧请求回写（#55）。
     pub switching_queue: Option<QueueOrigin>,
     pub switching_label: String,
+    /// 第几次换队列：`begin_queue_switch` 与 `abandon_queue_switch` 各自 +1，
+    /// 和 `nav_seq` 一样只是个只增的计数。装载回来拿自己那次比一下，对不上就说明
+    /// 这次切换已经不归自己了（同源连点也认得出）。
+    pub(crate) queue_switch_seq: u64,
     /// 推荐队列请求的序号（装载与分页共用）。
     ///
-    /// **只在真正发起新请求时递增**：拿它判断「结果是否过期」，所以超时兜底不能动它，
-    /// 否则在途请求回来时会被当成过期结果静默丢弃。
+    /// 发起新请求时递增；整条线作废时也递增——用户自己换了队（`play_from`）、退出登录 /
+    /// 换号、或者换到电台 / 歌单 / 听歌模式这类别的源。拿它判断「结果是否过期」，
+    /// 所以超时兜底不能动它，否则在途请求回来时会被当成过期结果静默丢弃。
+    ///
+    /// 装载和分页共用一格，所以推它等于把在飞的分页也一起作废：那一页属于已经被换走的
+    /// 源，本来就该丢掉。
     pub(crate) recommendation_request_seq: u64,
     /// 推荐队列「装载」请求序号；与分页序号分开，两者可以同时在途。
     pub(crate) recommendation_load_seq: u64,
@@ -561,7 +574,10 @@ pub struct Root {
     pub volume_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 打开中的歌单（点卡片后展示曲目）。
     pub open_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
-    pub loading_playlist: bool,
+    /// 歌单详情请求在飞，Library 页据此画加载态。
+    pub loading_playlist_detail: bool,
+    /// 歌单详情请求的代数：关掉详情页就把在飞的那次作废。
+    pub playlist_detail_seq: u64,
     /// 搜索结果里的歌单详情；保留在 Search 上下文，不切去「我的歌单」。
     pub search_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
     pub loading_search_playlist: bool,
@@ -860,6 +876,7 @@ impl Root {
                 Nav::Settings
             },
             nav_history: Vec::new(),
+            nav_seq: 0,
             lyrics_return_nav: if logged_in { Some(Nav::Home) } else { None },
             theme,
             theme_follows_system,
@@ -890,6 +907,7 @@ impl Root {
             loading_recommendation: false,
             recommendation_error: None,
             switching_queue: None,
+            queue_switch_seq: 0,
             switching_label: language.text("推荐队列").to_string(),
             recommendation_request_seq: 0,
             recommendation_load_seq: 0,
@@ -988,7 +1006,8 @@ impl Root {
             list_width: Arc::new(Mutex::new(1200.0)),
             queue_scroll: gpui::UniformListScrollHandle::new(),
             open_playlist: None,
-            loading_playlist: false,
+            loading_playlist_detail: false,
+            playlist_detail_seq: 0,
             search_playlist: None,
             loading_search_playlist: false,
             open_artist: None,
@@ -1081,6 +1100,9 @@ impl Root {
             if !query.trim().is_empty() {
                 root.search_field.set_text(query);
                 root.nav = Nav::Search;
+                // 直接写 `nav` 要自己补这一步：换页计数记在 `on_nav_changed` 里，
+                // 漏了它，启动那轮推荐装载回来就判不出人已经在搜索页。
+                root.on_nav_changed(cx);
                 root.run_search(cx);
             }
         }

@@ -448,10 +448,7 @@ pub fn render(root: &Root, cx: &mut Context<Root>) -> impl IntoElement {
     let loading = root.pending_track.is_some();
     // 加载中显示「正在准备的这首」，而不是还在响的上一首 —— 否则会出现
     // 「界面显示 A、耳朵听到 B」的错位。
-    let track = root
-        .pending_track
-        .clone()
-        .or_else(|| root.queue.current().cloned());
+    let track = root.current_track();
     let title = track
         .as_ref()
         .map(|track| track.title.clone())
