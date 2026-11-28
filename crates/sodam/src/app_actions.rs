@@ -2665,9 +2665,11 @@ impl Root {
                 let switch_seq = self.begin_queue_switch(switch_origin, &card.playlist.title, cx);
                 let load_nav_seq = self.nav_seq;
                 // 换到别的源：推荐流那条线的在飞请求（装载和分页）一起作废，否则
-                // 迟到的下一页会把推荐歌追进电台队列，心跳还会接着往里加。
+                // 迟到的下一页会把推荐歌追进电台队列，心跳还会接着往里加。被作废的
+                // 装载回来会直接 return，不会替我们清加载态，所以这里自己收。
                 self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
                 self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
+                self.loading_recommendation = false;
                 self.set_status(
                     "正在加载电台「{}」…",
                     std::slice::from_ref(&card.playlist.title),
@@ -2741,9 +2743,11 @@ impl Root {
         let switch_seq = self.begin_queue_switch(switch_origin, &playlist.title, cx);
         let load_nav_seq = self.nav_seq;
         // 换到别的源：推荐流那条线的在飞请求（装载和分页）一起作废，否则迟到的
-        // 下一页会把推荐歌追进这张歌单的队列。
+        // 下一页会把推荐歌追进这张歌单的队列。被作废的装载回来会直接 return，
+        // 不会替我们清加载态，所以这里自己收。
         self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
         self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
+        self.loading_recommendation = false;
         self.set_status("正在加载歌单「{}」…", std::slice::from_ref(&playlist.title));
         cx.notify();
 
@@ -2806,6 +2810,11 @@ impl Root {
 
     /// 官方推荐队列的动态加载：当前歌后方少于 6 首时由心跳触发。
     pub(crate) fn load_more_recommendation(&mut self, cx: &mut Context<Self>) {
+        // 队列正在换：这一页现在发出去，回来时队列已经是别人的了（电台 / 歌单也算
+        // feed-like，`is_feed_like` 拦不住）。等换完再分页。
+        if self.switching_queue.is_some() {
+            return;
+        }
         let Some(source) = self.recommendation.clone() else {
             return;
         };
@@ -6302,16 +6311,24 @@ mod view_takeover_tests {
         let source = include_str!("app_actions.rs");
         for owner in ["pub fn start_scene_card", "pub fn start_scene_playlist"] {
             let body = body_of(source, owner);
-            for seq in [
+            for needle in [
                 "self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);",
                 "self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);",
+                // 被作废的装载回来会直接 return，加载态得由换源的一方收。
+                "self.loading_recommendation = false;",
             ] {
                 assert!(
-                    body.contains(seq),
-                    "{owner} 换到别的源，推荐那条线的在飞请求必须一起作废：{seq}"
+                    body.contains(needle),
+                    "{owner} 换到别的源，推荐那条线的在飞请求必须一起作废：{needle}"
                 );
             }
         }
+        // 另一个方向：换队在飞时不许起分页，否则这一页回来队列已经换完了。
+        assert!(
+            body_of(source, "pub(crate) fn load_more_recommendation")
+                .contains("if self.switching_queue.is_some()"),
+            "换队在飞期间不许发起推荐分页"
+        );
     }
 
     /// 守 #330：歌单详情的加载态和队列装载的加载态是两件事，不能共用一个 flag。
