@@ -382,6 +382,12 @@ pub fn fetch_and_store_contributors_svg() -> Option<Vec<u8>> {
 
 fn fetch_and_store_contributors_svg_in(root: &Path) -> Option<Vec<u8>> {
     let bytes = fetch_contributors_svg()?;
+    Some(store_contributors_svg_in(root, bytes))
+}
+
+/// 落盘成不成都把字节交回调用方：写失败只记一条 Warn，这一轮的图照常显示，
+/// 下次重拉成功再补写。写盘只决定「下次启动要不要出网」。
+fn store_contributors_svg_in(root: &Path, bytes: Vec<u8>) -> Vec<u8> {
     if let Err(err) = save_contributors_svg_in(root, &bytes) {
         log_event(
             LogLevel::Warn,
@@ -390,7 +396,7 @@ fn fetch_and_store_contributors_svg_in(root: &Path) -> Option<Vec<u8>> {
             &[("error", err.to_string().as_str())],
         );
     }
-    Some(bytes)
+    bytes
 }
 
 /// 把图写进缓存根：同目录临时文件 + rename，半截文件不会被读成图（#342）。
@@ -776,6 +782,17 @@ mod tests {
         let root = dir.path().join("occupied-by-a-file");
         std::fs::write(&root, b"a file, not a directory").unwrap();
         assert!(save_contributors_svg_in(&root, SVG).is_err());
+    }
+
+    /// 落盘失败不能连累这一轮出图：字节原样交回，盘上什么都没留下。
+    #[test]
+    fn store_keeps_the_bytes_when_the_cache_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("occupied-by-a-file");
+        std::fs::write(&root, b"a file, not a directory").unwrap();
+        let kept = store_contributors_svg_in(&root, SVG.to_vec());
+        assert_eq!(kept, SVG.to_vec());
+        assert!(!contributors_svg_path_in(&root).exists());
     }
 
     /// 同名覆盖：第二份整份换掉第一份，不留两份也不留半份。
