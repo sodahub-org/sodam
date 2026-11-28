@@ -7073,8 +7073,9 @@ mod queue_switch_callback_tests {
 
     /// 在首个用例构造 `Root` 之前写沙箱 config.json。
     ///
-    /// 写盘不进 ctor：ctor 里做文件写入在 Windows 上崩过一次（进程收尾
-    /// `STATUS_ACCESS_VIOLATION`，其余平台全绿）。
+    /// config.json 的写入放在这里跑，环境改动留在 ctor：ctor 阶段做
+    /// `fs::write` 时 Windows 上崩过一次（进程收尾 `STATUS_ACCESS_VIOLATION`，
+    /// 其余平台全绿）。
     ///
     /// config.json 写死签名器不可达、不留 Cookie，`Root::new` 读它之后
     /// 就是「未登录 + 签名器不通」。写不进去（磁盘满等）就 panic：与其让
