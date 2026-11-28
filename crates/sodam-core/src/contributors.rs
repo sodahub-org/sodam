@@ -209,7 +209,8 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
         return None;
     }
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        // 这一支 read_bytes 恒为门槛 + 1（被 take 卡死），报门槛本身才有信息。
+        // take 把上限卡死了：走到这一支说明读满还没结束，读到的必定是
+        // 上限 + 1 字节，读多少报不出来，所以直接报上限本身。
         let cap_bytes = MAX_IMAGE_BYTES.to_string();
         log_event(
             LogLevel::Warn,
@@ -248,6 +249,12 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
             return None;
         }
     };
+    // content-type 必须在 into_reader 之前抓：那一步会把响应体消费掉。
+    // text/html 多半是错误页，image/svg+xml 才是断了流的图。
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("unknown")
+        .to_owned();
     let bytes = read_capped(response.into_reader())?;
     if !is_svg(&bytes) {
         let read_bytes = bytes.len().to_string();
@@ -255,7 +262,10 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
             LogLevel::Warn,
             LogTopic::App,
             "contributors_body_rejected",
-            &[("read_bytes", read_bytes.as_str())],
+            &[
+                ("content_type", content_type.as_str()),
+                ("read_bytes", read_bytes.as_str()),
+            ],
         );
         return None;
     }
