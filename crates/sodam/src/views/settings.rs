@@ -1566,8 +1566,8 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
         )
         .child({
             let repository = env!("CARGO_PKG_REPOSITORY");
-            let contributors = root.contributors_image.clone();
-            // 渲染路径：失败态下不自动重试，否则 notify → 重绘 → 再拉取成死循环。
+            let contributors = root.contributors.image().cloned();
+            // 渲染路径每帧问一次该不该拉：在飞不叠加，失败按表退避，三次用完停手。
             root.ensure_contributors(cx, false);
             div()
                 .id("about-footer")
@@ -1687,7 +1687,7 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                         .object_fit(ObjectFit::Contain),
                                 )
                                 .into_any_element()
-                        } else if root.contributors_failed {
+                        } else if root.contributors.shows_retry() {
                             div()
                                 .id("retry-contributors")
                                 .h(px(64.0))
@@ -1701,7 +1701,8 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                 .text_size(theme::Text::Tiny.size())
                                 .text_color(theme::text_muted())
                                 .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-                                    // 用户显式重试：force 越过失败态再拉一次。
+                                    // 用户显式重试：force 越过停手与新鲜图，begin 重开一整轮；
+                                    // 在飞时 should_fetch 拦住，不叠请求。
                                     root.ensure_contributors(cx, true);
                                 }))
                                 .child(root.tr("加载失败，点击重试"))

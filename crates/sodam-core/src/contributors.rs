@@ -1,41 +1,142 @@
-//! 设置页贡献者墙：直接复用 contrib.rocks 的仓库组合图。
+//! 设置页贡献者墙：contrib.rocks 组合图的生命周期状态机与拉取。
 
 use std::io::Read;
+use std::time::{Duration, SystemTime};
+
+use crate::cache::aged_out;
 
 const CONTRIBUTORS_URL: &str = "https://contrib.rocks/image?repo=sodahub-org/sodam&columns=8";
 const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
-fn is_svg(bytes: &[u8]) -> bool {
-    let body = bytes.trim_ascii_start();
-    body.starts_with(b"<svg") || body.starts_with(b"<?xml")
+/// 一张图算新鲜多久：拿到后满一天才允许自动重拉（#334）。
+pub const CONTRIBUTORS_TTL: Duration = Duration::from_secs(86_400);
+/// 一轮最多自动试几次；用完停手，只等用户点重试或图过期重开（#336）。
+pub const MAX_ATTEMPTS: u8 = 3;
+/// 第 1、2 次失败之后分别等多久再自动试。表长绑死为 `MAX_ATTEMPTS - 1`：
+/// 改次数不改这张表，编译先不过（#339 Testing Decisions 的变异验收）。
+pub const RETRY_DELAYS: [Duration; (MAX_ATTEMPTS - 1) as usize] =
+    [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// 贡献者墙的全部状态：图、在飞、这一轮的账、下次允许自动再试的时刻。
+///
+/// 「该不该拉」只有这一个判定来源（#339 实现决策 1）。不碰网络、不碰磁盘、
+/// 不碰 GPUI，时间一律由调用方传入，单测可以穷举重绘风暴。
+/// `Img` 是图本体，应用层放 `Arc<gpui::Image>`。
+pub struct ContributorsState<Img> {
+    image: Option<(Img, SystemTime)>,
+    loading: bool,
+    attempts: u8,
+    next_try_at: Option<SystemTime>,
 }
 
-/// 是否发起一次贡献者图拉取（#135 C 的反死循环决策）。
-///
-/// 纯函数、无副作用，UI 层与单测共用。设置页每次重绘都会问一次，
-/// 所以「失败后默认停手」是关键：否则失败 → `cx.notify()` → 重绘 → 再拉取，
-/// 会形成无限请求循环，同时让失败态一闪而过、永远显示不出来。
-///
-/// * `has_image`：已缓存图片，不再拉；
-/// * `fetching`：正在拉，不重复发起；
-/// * `failed`：上次拉取失败；
-/// * `force`：用户显式点击「重试」，此时允许越过 `failed` 再拉一次。
-pub fn should_fetch_contributors(
-    has_image: bool,
-    fetching: bool,
-    failed: bool,
-    force: bool,
-) -> bool {
-    if has_image || fetching {
-        return false;
+impl<Img> Default for ContributorsState<Img> {
+    fn default() -> Self {
+        Self {
+            image: None,
+            loading: false,
+            attempts: 0,
+            next_try_at: None,
+        }
     }
-    !failed || force
+}
+
+impl<Img> ContributorsState<Img> {
+    /// 当前要显示的图（有的话）。
+    pub fn image(&self) -> Option<&Img> {
+        self.image.as_ref().map(|(image, _)| image)
+    }
+
+    /// 现在该不该拉，优先级从高到低：在飞 → 人点重试 → 三次用完 → 退避期 → 图的新鲜度。
+    ///
+    /// * 在飞时连 `force` 也不放行：点重试点得再快也不会叠出第二个请求；
+    /// * `force` 是用户点「重试」，越过停手与新鲜图，`begin(true)` 给它重开一整轮；
+    /// * 有截止时间时「到点即拉」：没到就等，热失败冷却一天也走这一条；
+    /// * 没图就该拉；有图满 [`CONTRIBUTORS_TTL`] 才拉，时钟回拨按还没过期算。
+    ///
+    /// 设置页每帧问一次，所以「三次用完就停手」是反死循环的关键
+    /// （#135 C：失败 → `cx.notify()` → 重绘 → 再拉取的循环就靠它断掉）。
+    pub fn should_fetch(&self, now: SystemTime, force: bool) -> bool {
+        if self.loading {
+            return false;
+        }
+        if force {
+            return true;
+        }
+        if self.attempts >= MAX_ATTEMPTS {
+            return false;
+        }
+        if let Some(next_try_at) = self.next_try_at {
+            return now >= next_try_at;
+        }
+        match self.image.as_ref() {
+            None => true,
+            Some((_, image_at)) => aged_out(*image_at, CONTRIBUTORS_TTL, now),
+        }
+    }
+
+    /// 开跑一次拉取：置在飞。`force`（用户点重试）额外重开一整轮——
+    /// 账清零、截止时间清空，点一次拿到的是完整的三次机会，不是第 4 次。
+    pub fn begin(&mut self, force: bool) {
+        self.loading = true;
+        if force {
+            self.attempts = 0;
+            self.next_try_at = None;
+        }
+    }
+
+    /// 手上有图（缓存命中）先挂出来；不动在飞标记，这一轮可能还要接着问网络。
+    pub fn show_cached(&mut self, image: Img, image_at: SystemTime) {
+        self.image = Some((image, image_at));
+    }
+
+    /// 拉取成功：换图，账擦干净。截止时间必须一起清，否则旧截止时间一到，
+    /// 判定无视新鲜图直接放行，成功路径自己变成新的死循环。
+    pub fn finish_ok(&mut self, image: Img, image_at: SystemTime) {
+        self.image = Some((image, image_at));
+        self.loading = false;
+        self.attempts = 0;
+        self.next_try_at = None;
+    }
+
+    /// 拉取失败：记一笔账，绝不碰图——有旧图时用户看到的还是上一张。
+    ///
+    /// 账没用完：按第几次失败等 [`RETRY_DELAYS`] 里对应的时长再自动试；
+    /// 用完三次：有图（热失败）把账归零、等一天重开一轮，没图（冷失败）
+    /// 停手，只等用户点重试。
+    pub fn finish_err(&mut self, now: SystemTime) {
+        self.loading = false;
+        // 账最多记到停手为止，正常路径到 3 就封顶，这里不该 panic。
+        self.attempts = self.attempts.saturating_add(1);
+        if self.attempts < MAX_ATTEMPTS {
+            self.next_try_at = Some(now + RETRY_DELAYS[(self.attempts - 1) as usize]);
+        } else if self.image.is_some() {
+            // 热失败：图还在，等一天重开一轮；账归零，否则下一轮一开
+            // 就被「三次用完」挡住，永远轮不到。
+            self.attempts = 0;
+            self.next_try_at = Some(now + CONTRIBUTORS_TTL);
+        } else {
+            // 冷失败：停手等人，没有自动重试了。
+            self.next_try_at = None;
+        }
+    }
+
+    /// 界面要不要亮出「重试」：没图、且这一轮真的失败过。
+    /// 有旧图时失败完全不打扰（热失败）；点完重试账清零，这句话立刻收起。
+    pub fn shows_retry(&self) -> bool {
+        self.image.is_none() && self.attempts > 0
+    }
+}
+
+/// SVG 门槛：只看开头还不够，截断的文档一律当没图，必须有 `</svg>` 收尾。
+fn is_svg(bytes: &[u8]) -> bool {
+    let body = bytes.trim_ascii();
+    (body.starts_with(b"<svg") || body.starts_with(b"<?xml")) && body.ends_with(b"</svg>")
 }
 
 /// 下载 contrib.rocks 动态生成的 SVG；返回原始矢量字节。
 pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
     let response = ureq::get(CONTRIBUTORS_URL)
-        .timeout(std::time::Duration::from_secs(12))
+        .timeout(Duration::from_secs(12))
         .call()
         .ok()?;
     let mut bytes = Vec::new();
@@ -51,52 +152,232 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const IMG: u8 = 7;
+    const HOUR: u64 = 3_600;
+    const DAY: u64 = 86_400;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// 测试用空状态；`Img` 用 u8 占位，`default()` 不带图时推不出图类型。
+    fn empty() -> ContributorsState<u8> {
+        ContributorsState::default()
+    }
+
+    /// 完整 SVG 收，截断的不收，空的不收，不是 SVG 的不收。
     #[test]
-    fn accepts_svg_documents_only() {
-        let svg = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>";
-        let direct_svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
-        assert!(is_svg(svg));
-        assert!(is_svg(direct_svg));
+    fn accepts_complete_svg_documents_only() {
+        assert!(is_svg(
+            b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+        ));
+        assert!(is_svg(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"));
+        // 有开头没收尾：截断。
+        assert!(!is_svg(
+            b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\""
+        ));
+        assert!(!is_svg(b""));
         assert!(!is_svg(b"<html>not an image</html>"));
     }
 
-    /// 首次进设置页：无图、未在拉、未失败 —— 应当拉取一次。
+    /// 首次进设置页：没图、没账 —— 该拉一次；开跑之后同一帧再问就不拉。
     #[test]
     fn first_visit_fetches_once() {
-        assert!(should_fetch_contributors(false, false, false, false));
+        let mut state = empty();
+        assert!(state.should_fetch(at(0), false));
+        state.begin(false);
+        assert!(!state.should_fetch(at(0), false));
     }
 
-    /// 已缓存图片：再多次重绘也不重复拉取。
+    /// 图没满一天：再多次重绘也不重拉。
     #[test]
-    fn cached_image_never_refetches() {
-        assert!(!should_fetch_contributors(true, false, false, false));
-        assert!(!should_fetch_contributors(true, false, true, true));
+    fn fresh_image_stays_idle() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        assert!(!state.should_fetch(at(1), false));
+        assert!(!state.should_fetch(at(23 * HOUR), false));
+        assert!(!state.should_fetch(at(DAY - 1), false));
     }
 
-    /// 拉取进行中：重绘不得再发起第二个请求。
+    /// 图满 24 小时（含整点）就该重拉；超过更是。
+    #[test]
+    fn expired_image_refetches() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        assert!(state.should_fetch(at(DAY), false));
+        assert!(state.should_fetch(at(30 * DAY), false));
+    }
+
+    /// 在飞时不重拉：渲染路径的自动询问和用户点重试都不叠第二个请求。
     #[test]
     fn in_flight_never_refetches() {
-        assert!(!should_fetch_contributors(false, true, false, false));
-        assert!(!should_fetch_contributors(false, true, true, true));
+        let mut state = empty();
+        state.begin(false);
+        assert!(!state.should_fetch(at(0), false));
+        assert!(!state.should_fetch(at(0), true));
     }
 
-    /// 反死循环核心：失败后，渲染路径的自动询问必须停手。
-    /// 否则「失败 → notify → 重绘 → 再拉取」无限循环。
+    /// 第 1 次失败后进入 10 秒退避：9 秒不拉，10 秒整到点就拉。
     #[test]
-    fn failure_without_force_stays_idle() {
-        assert!(!should_fetch_contributors(false, false, true, false));
+    fn failure_waits_ten_seconds() {
+        let mut state = empty();
+        state.begin(false);
+        state.finish_err(at(0));
+        assert!(!state.should_fetch(at(9), false));
+        assert!(state.should_fetch(at(10), false));
     }
 
-    /// 用户点击「重试」：force 越过失败态，允许再拉一次。
+    /// 第 2 次失败后进入 30 秒退避：29 秒不拉，30 秒整到点就拉。
     #[test]
-    fn failure_with_force_retries() {
-        assert!(should_fetch_contributors(false, false, true, true));
+    fn second_failure_waits_thirty_seconds() {
+        let mut state = empty();
+        state.begin(false);
+        state.finish_err(at(0));
+        state.begin(false);
+        state.finish_err(at(10));
+        assert!(!state.should_fetch(at(39), false));
+        assert!(state.should_fetch(at(40), false));
     }
 
-    /// force 只越过 failed，不越过「已有图」或「正在拉」。
+    /// force 越过新鲜图：用户点重试，图再新也放行。
     #[test]
-    fn force_does_not_override_cache_or_inflight() {
-        assert!(!should_fetch_contributors(true, false, false, true));
-        assert!(!should_fetch_contributors(false, true, false, true));
+    fn force_overrides_fresh_image() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        assert!(state.should_fetch(at(1), true));
+    }
+
+    /// 三次用完停手之后，只有 force 能重开；点完是新一轮三次，不是第 4 次。
+    #[test]
+    fn force_starts_a_new_round_from_exhausted() {
+        let mut state = empty();
+        for t in [0, 10, 40] {
+            state.begin(false);
+            state.finish_err(at(t));
+        }
+        assert!(!state.should_fetch(at(40), false));
+        assert!(state.should_fetch(at(40), true));
+        state.begin(true);
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.next_try_at, None);
+        // 新一轮的第 1 次失败照样按表等 10 秒，而不是被旧账撑成停手。
+        state.finish_err(at(100));
+        assert_eq!(state.next_try_at, Some(at(110)));
+        assert!(state.should_fetch(at(110), false));
+    }
+
+    /// 成功把账擦干净：旧截止时间到了也不再放行，成功路径不变成死循环。
+    #[test]
+    fn success_clears_the_deadline() {
+        let mut state = empty();
+        state.begin(false);
+        state.finish_err(at(0));
+        state.begin(false);
+        state.finish_ok(IMG, at(10));
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.next_try_at, None);
+        assert!(!state.should_fetch(at(10), false));
+        assert!(!state.should_fetch(at(11), false));
+    }
+
+    /// 冷失败三次用完停手：一年之后也不自动拉，只等用户点重试。
+    #[test]
+    fn cold_round_exhausted_stops_for_good() {
+        let mut state = empty();
+        for t in [0, 10, 40] {
+            state.begin(false);
+            state.finish_err(at(t));
+        }
+        assert!(!state.should_fetch(at(3_600), false));
+        assert!(!state.should_fetch(at(365 * DAY), false));
+    }
+
+    /// 热失败三次用完：图还在，退避一天后重开一轮；冷却期内就算图已过期也不拉。
+    #[test]
+    fn hot_round_exhausted_waits_a_day() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        // 图放了一天才到期自动重拉，连败三次。
+        assert!(state.should_fetch(at(25 * DAY), false));
+        for extra in [0, 10, 40] {
+            state.begin(false);
+            state.finish_err(at(25 * DAY + extra));
+        }
+        assert!(state.image.is_some());
+        assert!(!state.should_fetch(at(25 * DAY + 40 + 3_600), false));
+        assert!(!state.should_fetch(at(25 * DAY + 40 + 23 * HOUR), false));
+        assert!(state.should_fetch(at(25 * DAY + 40 + DAY), false));
+    }
+
+    /// 热失败不抹图、也不亮重试文案：有旧图时失败一个字都不写。
+    #[test]
+    fn hot_failure_keeps_the_image() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        state.begin(false);
+        state.finish_err(at(1));
+        assert_eq!(state.image.as_ref().map(|(image, _)| *image), Some(IMG));
+        assert!(!state.shows_retry());
+    }
+
+    /// 重试文案只在「没图 + 这一轮失败过」出现；点完立刻收起；热失败不出现。
+    #[test]
+    fn retry_prompt_needs_a_failure_and_no_image() {
+        let mut state = empty();
+        assert!(!state.shows_retry());
+        state.begin(false);
+        state.finish_err(at(0));
+        assert!(state.shows_retry());
+        // 用户点了重试：账清零，这句话先收起。
+        state.begin(true);
+        assert!(!state.shows_retry());
+        // 这次重试成功了；之后过期重拉再失败：有图，照样不亮。
+        state.finish_ok(IMG, at(5));
+        state.begin(false);
+        state.finish_err(at(6));
+        assert!(!state.shows_retry());
+        // 热失败之后用户点重试：begin(true) 连旧截止时间一起清掉。
+        state.begin(true);
+        assert!(!state.shows_retry());
+        assert_eq!(state.next_try_at, None);
+    }
+
+    /// 一小时按 1 毫秒重绘（360 万次询问），冷路径恰好 3 次请求就停手。
+    #[test]
+    fn redraw_storm_cold_fetch_count_is_exactly_three() {
+        let mut state = empty();
+        let mut fetches = 0;
+        for ms in 0..(HOUR * 1_000) {
+            let now = SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+            if state.should_fetch(now, false) {
+                fetches += 1;
+                state.begin(false);
+                state.finish_err(now);
+            }
+        }
+        assert_eq!(fetches, 3);
+    }
+
+    /// 两天按 1 秒重绘：图常在（热路径），每 24 小时恰好重试 3 次。
+    #[test]
+    fn redraw_storm_hot_fetch_count_is_exactly_three_per_day() {
+        let mut state = empty();
+        state.show_cached(IMG, at(0));
+        let mut fetches = 0;
+        let mut fetched_in_first_day = 0;
+        for s in 0..(2 * DAY + 120) {
+            let now = at(s);
+            if state.should_fetch(now, false) {
+                fetches += 1;
+                if s < DAY {
+                    fetched_in_first_day += 1;
+                }
+                state.begin(false);
+                state.finish_err(now);
+            }
+        }
+        // 到期前一次都不拉；之后每 24 小时一轮，一轮恰好 3 次。
+        assert_eq!(fetched_in_first_day, 0);
+        assert_eq!(fetches, 6);
     }
 }

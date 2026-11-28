@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::{
     apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
@@ -144,24 +145,20 @@ fn should_auto_load_scene_page(
 }
 
 impl Root {
-    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
+    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取，状态记在
+    /// `ContributorsState` 一处。
     ///
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
     ///
     /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
-    /// 失败态由 `sodam_core::contributors::should_fetch_contributors` 判定是否停手，
-    /// 避免「失败 → notify → 重绘 → 再拉取」的死循环（#135 C）。
+    /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：在飞不叠加、
+    /// 失败按表退避、三次用完停手（#135 C 的反死循环决策靠「三次用完」
+    /// 与在飞闸共同守住）。
     pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
-        if !sodam_core::contributors::should_fetch_contributors(
-            self.contributors_image.is_some(),
-            self.contributors_fetching,
-            self.contributors_failed,
-            force,
-        ) {
+        if !self.contributors.should_fetch(SystemTime::now(), force) {
             return;
         }
-        self.contributors_failed = false;
-        self.contributors_fetching = true;
+        self.contributors.begin(force);
         let work =
             cx.background_spawn(async { sodam_core::contributors::fetch_contributors_svg() });
         cx.spawn(async move |this, cx| {
@@ -169,9 +166,11 @@ impl Root {
                 .await
                 .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, bytes)));
             let _ = this.update(cx, |root, cx| {
-                root.contributors_fetching = false;
-                root.contributors_failed = image.is_none();
-                root.contributors_image = image;
+                match image {
+                    Some(image) => root.contributors.finish_ok(image, SystemTime::now()),
+                    // 失败只记账，图留在状态机里不动。
+                    None => root.contributors.finish_err(SystemTime::now()),
+                }
                 cx.notify();
             });
         })
