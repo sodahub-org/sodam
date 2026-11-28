@@ -2586,9 +2586,8 @@ impl Root {
     /// 推荐装载回调的落账：请求序号、换队认领、页面接管三级判定后，
     /// 成功就换上推荐队列，失败 / 超时进可重试的终态。
     ///
-    /// 从 `start_recommendation` 的回调体里整段搬出来，逻辑一行没改：
-    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
-    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    /// 装配（等结果 → update）留在 `start_recommendation` 的回调里；
+    /// 真跑覆盖见 `queue_switch_callback_tests`（票 #340）。
     fn recommendation_load_settled(
         &mut self,
         ticket: RecommendationLoadTicket,
@@ -2744,9 +2743,8 @@ impl Root {
     /// 电台装载回调的落账：认领到这次换队才换队列、进歌词页开播；
     /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
     ///
-    /// 从 `start_scene_card` 电台分支的回调体里整段搬出来，逻辑一行没改：
-    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
-    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    /// 装配留在 `start_scene_card` 的电台分支里；真跑覆盖见
+    /// `queue_switch_callback_tests`（票 #340）。
     fn scene_radio_load_settled(
         &mut self,
         switch_seq: u64,
@@ -2820,9 +2818,8 @@ impl Root {
     /// 歌单装载回调的落账：认领到这次换队才换队列、进歌词页开播；
     /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
     ///
-    /// 从 `start_scene_playlist` 的回调体里整段搬出来，逻辑一行没改：
-    /// 回调闭包只留装配（等结果 → update），判定和落账都在这里真跑，
-    /// 是 `queue_switch_callback_tests` 的测试对象（票 #340）。
+    /// 装配留在 `start_scene_playlist` 的回调里；真跑覆盖见
+    /// `queue_switch_callback_tests`（票 #340）。
     fn scene_playlist_load_settled(
         &mut self,
         switch_seq: u64,
@@ -6171,9 +6168,10 @@ mod recommendation_gate_tests {
     /// 超时分支必须 `detach()` 后台任务，而不是让它在 select 结构里被丢掉。
     ///
     /// 第一版实现真犯过这个错：`gpui::Task` drop 时会走到 `async_task::Task::drop`
-    /// 的 `set_canceled()`，于是「界面不再等」连带把请求也取消了。gpui 没有暴露
-    /// 可离线构造 `Task` 的测试设施（需要 `test-support` feature），所以这里用源码
-    /// 约束代替运行时断言：超时分支的代码里必须出现 `detach()`。
+    /// 的 `set_canceled()`，于是「界面不再等」连带把请求也取消了。写这条守卫时
+    /// `test-support` 还没进依赖、造不出真 `Task`；现在它已在 dev-dependencies 里
+    /// （票 #340），升级成运行时断言留给后续票，这里先保持源码约束：超时分支的
+    /// 代码里必须出现 `detach()`。
     #[test]
     fn timeout_branch_detaches_instead_of_dropping_the_task() {
         let source = include_str!("app_actions.rs");
@@ -6228,7 +6226,9 @@ mod view_takeover_tests {
     ///
     /// 快照必须取在 `begin_queue_switch` 之后。取在前面的话，启动那一下就会被判成
     /// "界面已经换了"，用户什么都没做也进不了播放页——正好是要修的症状的反面。
-    /// 窗口里造不出 `Root`（gpui 的 `test-support` 不在依赖里），只能盯源码顺序。
+    /// 真跑的认领覆盖在 `queue_switch_callback_tests`（`test-support` 已进
+    /// dev-dependencies，票 #340）；那个 fixture 不压「快照取的位置」这一点，
+    /// 这里继续用源码顺序守住。
     #[test]
     fn snapshot_is_taken_after_the_switch_this_load_does() {
         let source = include_str!("app_actions.rs");
@@ -7072,6 +7072,10 @@ mod queue_switch_callback_tests {
     fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
         test_config_file();
         let root = cx.new(Root::new);
+        // Root::new 会按窗口外观把全局主题写掉（生产行为），而 theme.rs 的测试
+        // 读的就是这个全局——构造完立刻恢复进程默认值，别让并行的 theme 用例
+        // 撞上被改掉的全局。
+        theme::set_theme(ThemeKind::Dark);
         cx.update_entity(&root, |root, _cx| {
             // 环境变量可能补进真实 Cookie（SODA_COOKIE 等）：测试必须保持「未登录」，
             // 否则换页会触发 on_nav_changed 的自动装载，测试就会碰真网络。
@@ -7360,11 +7364,13 @@ mod queue_switch_callback_tests {
         });
     }
 
-    /// 换队票过期但请求代数还在位：认领失败的分支必须整份丢。
+    /// 换队票过期但请求代数还在位：认领失败的分支不许落账。
     ///
     /// 现在生产里所有推走换队票的动作都会顺手推请求代数，这道分支是纵深
-    /// 防御；守住它，将来谁改了序号推进的时序，这里立刻见红。成功也好
-    /// 失败也好（`Some(Err)` / 超时的 `None`）都不许碰队列和更晚的切换态。
+    /// 防御；守住它，将来谁改了序号推进的时序，这里立刻见红。落账顺序是
+    /// 先收**自己请求**的加载态（代数还在位，loading 归它），再到认领那步
+    /// 被推走——所以 `Some(Err)` / 超时的 `None` 都不许碰队列、页面和
+    /// 更晚那次装载的切换态，错误也不许写进终态。
     #[gpui::test]
     async fn a_stale_switch_ticket_discards_the_result_even_with_a_current_load_seq(
         cx: &mut TestAppContext,
@@ -7402,7 +7408,12 @@ mod queue_switch_callback_tests {
             );
 
             assert_eq!(root.recommendation_error, None, "过期失败不许写错误终态");
-            assert!(root.loading_recommendation, "加载态归更晚那次装载");
+            // 落账顺序：请求代数还在位时，这次回调先收掉**自己请求**的加载态，
+            // 然后在认领那一步被推走——loading 归它，switching 归更晚那次装载。
+            assert!(
+                !root.loading_recommendation,
+                "请求代数还在位，加载态由这次回调自己收"
+            );
             assert_eq!(root.switching_queue, switching_before, "切换态还是歌单B的");
 
             // 超时的 `None` 结果：同样整份丢。
@@ -7510,6 +7521,72 @@ mod queue_switch_callback_tests {
             assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
             assert_eq!(root.queue.len(), queue_before, "Keep 的结果不许换队列");
             assert_eq!(root.queue.tracks()[0].id, "user-1");
+        });
+    }
+
+    /// 电台装载失败回来，人已经翻去了别的页面：只汇报一次，不许拽回听歌模式页。
+    ///
+    /// 失败分支同样先认领：票还在才谈得上落地；`nav_seq` 变了说明他自己走开，
+    /// 这一个迟到的失败不该把页面顶掉。
+    #[gpui::test]
+    async fn a_failed_radio_load_does_not_drag_the_user_back(cx: &mut TestAppContext) {
+        let root = open_root(cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue_origin = QueueOrigin::Playlist("user-pick".to_string());
+            root.queue.replace(vec![track("user-1")], 0);
+            let switch_seq =
+                root.begin_queue_switch(QueueOrigin::Radio("radio-a".to_string()), "电台A", cx);
+            let load_nav_seq = root.nav_seq;
+            // 用户翻去了别处：比装载记下的快照新（Cookie 为空，换页不带自动装载）。
+            root.set_nav(Nav::Home, cx);
+            let nav_after_user = root.nav_seq;
+
+            root.scene_radio_load_settled(
+                switch_seq,
+                load_nav_seq,
+                playlist("radio-a", "电台A"),
+                Err(anyhow::anyhow!("网络断开")),
+                cx,
+            );
+
+            assert_eq!(root.nav, Nav::Home, "用户自己走开的页面不许被失败顶掉");
+            assert_eq!(root.nav_seq, nav_after_user, "失败不许挪页面");
+            assert_eq!(root.queue_origin, QueueOrigin::Playlist("user-pick"));
+            assert_eq!(root.queue.len(), 1, "失败的电台不许换队列");
+            assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
+            assert_eq!(root.messages.len(), 1, "失败要汇报一次，但只许汇报一次");
+        });
+    }
+
+    /// 空歌单落地：队列不换、状态行给提示，把人带回有重试入口的听歌模式页。
+    ///
+    /// 人还停在这次装载带出来的歌词页上：停在一首不响的旧歌上没有出口，
+    /// 回到 `Nav::Scenes` 才有重试。
+    #[gpui::test]
+    async fn an_empty_playlist_load_leaves_the_queue_alone(cx: &mut TestAppContext) {
+        let root = open_root(cx);
+        cx.update_entity(&root, |root, cx| {
+            root.queue_origin = QueueOrigin::Playlist("user-pick".to_string());
+            root.queue.replace(vec![track("user-1")], 0);
+            let switch_seq = root.begin_queue_switch(
+                QueueOrigin::Playlist("late-playlist".to_string()),
+                "歌单A",
+                cx,
+            );
+            let load_nav_seq = root.nav_seq;
+
+            root.scene_playlist_load_settled(
+                switch_seq,
+                load_nav_seq,
+                playlist("late-playlist", "歌单A"),
+                Ok(vec![]),
+                cx,
+            );
+
+            assert_eq!(root.queue_origin, QueueOrigin::Playlist("user-pick"));
+            assert_eq!(root.queue.len(), 1, "空结果不许换掉队列");
+            assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
+            assert_eq!(root.nav, Nav::Scenes, "回有重试入口的页面");
         });
     }
 }
