@@ -7050,11 +7050,15 @@ mod queue_switch_callback_tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
 
-    /// 每个测试进程一个临时配置**文件**。`cargo test` 按 crate 分进程，本 crate
-    /// 的测试二进制里读环境变量的只有 `Root::new`（只在 fixture 里被调用），
-    /// 所以 `set_var` 与读之间存在 `OnceLock::get_or_init` 的屏障、且进程内没有
-    /// 别的读者——不会与并行的其他用例互相踩。sodam-core 里那把
-    /// `env_test_lock` 是 `pub(crate)`，跨 crate 拿不到，这里用屏障达成同一目的。
+    /// 每个测试进程一个临时目录：配置文件与缓存根都圈在里面。`cargo test`
+    /// 按 crate 分进程，本 crate 的测试二进制里读环境变量的只有 `Root::new`
+    /// （只在 fixture 里被调用），所以 `set_var` 与读之间存在
+    /// `OnceLock::get_or_init` 的屏障、且进程内没有别的读者——不会与并行的
+    /// 其他用例互相踩。sodam-core 里那把 `env_test_lock` 是 `pub(crate)`，
+    /// 跨 crate 拿不到，这里用屏障达成同一目的。
+    ///
+    /// 缓存根也要隔离：`Root::new` 会在维护标记缺失 / 过期时排缓存维护，
+    /// 不圈的话 teardown flush 会把标记写进开发者真实缓存、还可能驱逐文件。
     fn test_config_file() -> &'static std::path::Path {
         static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         FILE.get_or_init(|| {
@@ -7064,6 +7068,7 @@ mod queue_switch_callback_tests {
             std::fs::create_dir_all(&dir).expect("建立测试配置目录");
             let file = dir.join("config.json");
             std::env::set_var("SODAM_CONFIG_PATH", &file);
+            std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
             file
         })
         .as_path()
