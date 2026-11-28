@@ -218,9 +218,9 @@ impl Root {
     ///
     /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
     /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：失败按 10s/30s
-    /// 退避，到点后的下一次设置页重绘才真正发起（空闲期不主动唤醒，
-    /// 这是已接受的代价）；三次用完就停手——#135 C 的请求风暴靠这一条
-    /// 断掉，在飞闸只负责不叠加并发请求。
+    /// 退避，到点后的下一次设置页重绘才真正发起，空闲期不主动唤醒；
+    /// 没图时三次用完停手（#135 C 的请求风暴靠这一条断掉），有旧图时
+    /// 清账等一天重开一轮；在飞闸只负责不叠加并发请求。
     pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
         if !self.contributors.should_fetch(SystemTime::now(), force) {
             return;
