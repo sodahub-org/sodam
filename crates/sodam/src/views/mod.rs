@@ -1172,9 +1172,15 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
             })
             .into_any_element(),
         Nav::Library => match (&root.open_playlist, logged_in) {
-            (Some(_), _) if root.loading_playlist_detail => {
-                loading_state(root.tr("正在读取歌单曲目…"))
-            }
+            (Some(_), _) if root.loading_playlist_detail => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap(px(theme::space::MD))
+                .child(back_button(cx))
+                .child(loading_state(root.tr("正在读取歌单曲目…")))
+                .into_any_element(),
             (Some((id, title, tracks)), _) => {
                 let cover_url = root
                     .playlists

@@ -203,6 +203,12 @@ impl Root {
         // 谁在等的那次装载已经作废，它留下的加载态也一起收掉：被顶掉的回调认领不到，
         // 不会再去清这个 flag，留着它就是永久卡住下一次点歌单 / 电台。
         self.loading_playlist = false;
+        // 听歌模式 / 推荐那条路认的是请求序号，请求本身又没有截止时间：序号不推，
+        // 被作废的装载回来之前 `loading_recommendation` 一直挂着，「推荐」和「重试」
+        // 都会被直接拦掉，什么提示也没有。推两格让它回来就判过期，加载态由这里收。
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+        self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
+        self.loading_recommendation = false;
     }
 
     /// 关掉歌单详情页：在飞的那次详情请求到此为止。
@@ -3037,15 +3043,10 @@ impl Root {
         // 推进播放请求序号：正在下载的旧身份装载回来会被序号检查拒绝，
         // 否则清空队列后旧下载成功仍会把旧曲目塞回引擎（#185）。
         self.play_seq = self.play_seq.wrapping_add(1);
-        // 在途的队列请求（推荐/听歌模式/加载更多）一并作废：旧回调过了序号
-        // 检查仍会重建队列并开始装载，退出/换号后还能把旧队列播起来。
-        self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
-        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
-        self.loading_recommendation = false;
         self.recommendation_error = None;
-        // 清空队列也要把在飞的装载作废：歌单 / 电台回调不看 `recommendation_load_seq`，
-        // 它们回来照样会 `queue.replace` + 开播，把旧账号的曲目塞回空队列，人也被从
-        // 设置页拽回歌词页。这里同时清掉 `switching_queue`。
+        // 在飞的队列请求（推荐 / 听歌模式 / 歌单 / 电台）一并作废：旧回调过了自己的
+        // 检查仍会重建队列并开始装载，退出/换号后还能把旧队列播起来，人也被从设置页
+        // 拽回歌词页。请求序号、加载态、`switching_queue` 都由这一处收。
         self.abandon_queue_switch();
         // 不可播结论与逐曲冷却按账号 × 会话隔离：退出后旧账号的结论一条都不留。
         // 在途预取回来后按代数丢弃，不能再写回这些已经清空的表。
@@ -6302,15 +6303,31 @@ mod view_takeover_tests {
 
     /// 守 #330：用户自己换队之后，被顶掉的装载留下的加载态也要一起收掉。
     ///
-    /// `loading_playlist` 是进门守卫：不复位就等于永久拉闸，之后点歌单 / 电台一律被
-    /// 静默拦掉。被顶掉的回调认领不到代数，它自己不会清，所以必须由作废的一方收。
+    /// 歌单 / 电台的 `loading_playlist` 是进门守卫，不复位就等于永久拉闸；听歌模式 /
+    /// 推荐的 `loading_recommendation` 同样没有截止时间，序号不推的话，被作废的装载
+    /// 回来之前「推荐」和「重试」都被拦掉。被顶掉的回调认领不到，这两格只能由作废的
+    /// 一方收。
     #[test]
     fn abandoning_a_queue_switch_drops_the_loading_state() {
         let body = body_of(include_str!("app_actions.rs"), "fn abandon_queue_switch");
-        assert!(
-            body.contains("self.loading_playlist = false;"),
-            "作废在飞装载的同时必须复位加载态，否则下一次点歌单 / 电台被永久拦掉"
-        );
+        for flag in [
+            "self.loading_playlist = false;",
+            "self.loading_recommendation = false;",
+        ] {
+            assert!(
+                body.contains(flag),
+                "作废在飞装载的同时必须复位加载态：{flag} 缺了，下一次点歌单 / 电台 / 推荐被永久拦掉"
+            );
+        }
+        for seq in [
+            "self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);",
+            "self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);",
+        ] {
+            assert!(
+                body.contains(seq),
+                "作废时要把请求序号推走，否则旧回调回来照样写状态：{seq}"
+            );
+        }
     }
 
     /// 守 #330：歌单详情的加载态和队列装载的加载态是两件事，不能共用一个 flag。
