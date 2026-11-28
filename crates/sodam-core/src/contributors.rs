@@ -191,7 +191,7 @@ fn spawn_with_timeout<T: Send + 'static>(
 
 /// 读门槛（#343）：「最多 4 MiB」，所以多读一字节才能分清「正好读满」和
 /// 「读满还没结束」；后者是截断，返回 None，调用方不会把截断的图写进缓存。
-/// 读出错与截断各记一条 Warn，带上已读字节数，失败不再是无声的 None。
+/// 读出错与超限各记一条 Warn，失败不再是无声的 None。
 fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     if let Err(err) = reader.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes) {
@@ -209,8 +209,8 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
         return None;
     }
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        // take 把上限卡死了：走到这一支说明读满还没结束，读到的必定是
-        // 上限 + 1 字节，读多少报不出来，所以直接报上限本身。
+        // 超过上限就丢。take 已经把读到的量卡死，真实长度报不出来，
+        // 所以日志只报上限本身。
         let cap_bytes = MAX_IMAGE_BYTES.to_string();
         log_event(
             LogLevel::Warn,
@@ -249,8 +249,9 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
             return None;
         }
     };
-    // content-type 必须在 into_reader 之前抓：那一步会把响应体消费掉。
-    // text/html 多半是错误页，image/svg+xml 才是断了流的图。
+    // content-type 必须在 into_reader 之前抓：那一步会把整个 response
+    // 收走，之后拿不到头。text/html 多半是错误页，image/svg+xml 才是
+    // 断了流的图。
     let content_type = response
         .header("content-type")
         .unwrap_or("unknown")
