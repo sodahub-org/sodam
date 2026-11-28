@@ -1171,9 +1171,9 @@ mod tests {
         }
     }
 
-    /// 贡献者墙冷失败重试文案的中英文按 #344 契约精确对应（扫描守卫只查存在性，不核原文）。
+    /// 钉死贡献者墙重试文案的英文原文，防止词典被改错字。
     #[test]
-    fn contributors_retry_copy_matches_contract() {
+    fn contributors_retry_english_text() {
         assert_eq!(
             Language::english_text("图没出来，点一下重试"),
             Some("Image didn't load. Click to retry.")
