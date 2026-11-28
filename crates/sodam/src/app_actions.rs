@@ -2864,8 +2864,8 @@ impl Root {
                     return;
                 }
                 root.loading_recommendation = false;
-                // 换队之后这条源就作废了：`play_from` 不推请求序号，迟到的这一页
-                // 会 append 进用户自己挑的队列里。
+                // 换队之后这条源就作废了：队列已经换成用户自己挑的那份，迟到的这一页
+                // 不许再 append 进去。
                 if !root.queue_origin.is_feed_like() {
                     return;
                 }
@@ -6227,8 +6227,9 @@ mod view_takeover_tests {
 
     /// 装载结果落地前先确认：这次换队还是不是它发起的。
     ///
-    /// `play_from` 只推 `queue_switch_seq`、不动请求序号，所以「请求序号还对」不等于
-    /// 「这份结果还有人要」。少了这步确认，用户自己挑的队列会被一个迟到的装载顶掉。
+    /// 请求序号对得上，只说明没有更晚的同类请求。换队序号是另一条账——任何一次
+    /// `begin_queue_switch` 都会把它推走，所以「请求序号还对」不等于「这次换队还是
+    /// 自己那一轮」。少了这步确认，用户自己挑的队列会被一个迟到的装载顶掉。
     #[test]
     fn load_results_only_land_when_they_still_own_the_switch() {
         let source = include_str!("app_actions.rs");
