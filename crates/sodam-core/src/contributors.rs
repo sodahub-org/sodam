@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::cache::aged_out;
+use crate::log_outlet::{log_event, LogLevel, LogTopic};
 
 const CONTRIBUTORS_URL: &str = "https://contrib.rocks/image?repo=sodahub-org/sodam&columns=8";
 const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
@@ -189,14 +190,32 @@ fn spawn_with_timeout<T: Send + 'static>(
 }
 
 /// 读门槛（#343）：「最多 4 MiB」，所以多读一字节才能分清「正好读满」和
-/// 「读满还没结束」——后者是截断，判失败，不写缓存（写盘只在成功路径发生）。
+/// 「读满还没结束」；后者是截断，返回 None，调用方不会把截断的图写进缓存。
+/// 读出错与截断各记一条 Warn，带上已读字节数，失败不再是无声的 None。
 fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader
-        .take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    if let Err(err) = reader.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes) {
+        let error = err.to_string();
+        let read_bytes = bytes.len().to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_read_failed",
+            &[
+                ("error", error.as_str()),
+                ("read_bytes", read_bytes.as_str()),
+            ],
+        );
+        return None;
+    }
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        let read_bytes = bytes.len().to_string();
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_read_over_cap",
+            &[("read_bytes", read_bytes.as_str())],
+        );
         return None;
     }
     Some(bytes)
@@ -207,13 +226,26 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
 /// 三段超时各自生效（#336）：DNS [`DNS_TIMEOUT`]（解析自己兜，见
 /// [`DeadlineResolver`]）、TCP 建连 [`CONNECT_TIMEOUT`]、整体
 /// [`TOTAL_TIMEOUT`]；读不单独设，响应体跟着整体截止时间走。
+/// 请求失败记一条 Warn（哪个阶段挂的看错误串），退避节奏下不会刷屏。
 pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .resolver(DeadlineResolver)
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
         .build();
-    let response = agent.get(CONTRIBUTORS_URL).call().ok()?;
+    let response = match agent.get(CONTRIBUTORS_URL).call() {
+        Ok(response) => response,
+        Err(err) => {
+            let error = err.to_string();
+            log_event(
+                LogLevel::Warn,
+                LogTopic::App,
+                "contributors_fetch_failed",
+                &[("error", error.as_str())],
+            );
+            return None;
+        }
+    };
     let bytes = read_capped(response.into_reader())?;
     is_svg(&bytes).then_some(bytes)
 }
