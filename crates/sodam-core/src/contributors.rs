@@ -189,9 +189,8 @@ fn spawn_with_timeout<T: Send + 'static>(
     }
 }
 
-/// 读门槛（#343）：「最多 4 MiB」，所以多读一字节才能分清「正好读满」和
-/// 「读满还没结束」；后者是截断，返回 None，调用方不会把截断的图写进缓存。
-/// 读出错与超限各记一条 Warn，失败不再是无声的 None。
+/// 读门槛（#343）：最多读 4 MiB，超了就丢，返回 None，调用方不会把
+/// 它写进缓存。读出错与超限各记一条 Warn，失败不再是无声的 None。
 fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     if let Err(err) = reader.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes) {
