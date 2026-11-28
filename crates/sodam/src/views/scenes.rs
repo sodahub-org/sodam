@@ -362,11 +362,7 @@ pub(crate) fn retry_button(
 ) -> AnyElement {
     compact_retry_pill("retry-playback-assets", language.text("重试加载"))
         .on_click(cx.listener(|root, _event: &ClickEvent, _window, cx| {
-            if let Some(track) = root
-                .pending_track
-                .clone()
-                .or_else(|| root.queue.current().cloned())
-            {
+            if let Some(track) = root.current_track() {
                 root.retry_playback_assets(track, cx);
             }
         }))

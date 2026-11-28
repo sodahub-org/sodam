@@ -1116,7 +1116,10 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
         // 所以它必须能变成带「重试」的失败终态（#55）。
         Nav::Home => match &root.recommendation_error {
             Some(message) => recommendation_error_state(root, message.clone(), cx),
-            None => loading_state(root.tr("正在准备推荐队列…")),
+            // 装载已经收场就不能再转圈：转圈页没有出口，停在这儿等于把人锁死在
+            // 推荐页上。装载被人换走判成 Keep 时也是这条路。
+            None if root.loading_recommendation => loading_state(root.tr("正在准备推荐队列…")),
+            None => recommendation_error_state(root, root.tr("推荐队列还没有加载").to_string(), cx),
         },
         Nav::Scenes => scenes::scenes_view(root, cx),
         Nav::Search => search::search_page(root, window, cx),
@@ -1169,7 +1172,15 @@ pub fn render(root: &mut Root, window: &Window, cx: &mut Context<Root>) -> impl 
             })
             .into_any_element(),
         Nav::Library => match (&root.open_playlist, logged_in) {
-            (Some(_), _) if root.loading_playlist => loading_state(root.tr("正在读取歌单曲目…")),
+            (Some(_), _) if root.loading_playlist_detail => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap(px(theme::space::MD))
+                .child(back_button(cx))
+                .child(loading_state(root.tr("正在读取歌单曲目…")))
+                .into_any_element(),
             (Some((id, title, tracks)), _) => {
                 let cover_url = root
                     .playlists
