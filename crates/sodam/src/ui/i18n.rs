@@ -398,8 +398,7 @@ impl Language {
             "其他" => "Other",
             "维护者" => "Maintainer",
             "贡献者" => "Contributors",
-            "正在加载贡献者…" => "Loading contributors…",
-            "加载失败，点击重试" => "Failed to load. Click to retry.",
+            "图没出来，点一下重试" => "Image didn't load. Click to retry.",
             "签名服务：{}" => "Signer: {}",
             "（未配置）" => "(not configured)",
             "配置：{}" => "Config: {}",
@@ -1170,5 +1169,14 @@ mod tests {
                 source.label_key()
             );
         }
+    }
+
+    /// 钉死贡献者墙重试文案的英文原文，防止词典被改错字。
+    #[test]
+    fn contributors_retry_english_text() {
+        assert_eq!(
+            Language::english_text("图没出来，点一下重试"),
+            Some("Image didn't load. Click to retry.")
+        );
     }
 }

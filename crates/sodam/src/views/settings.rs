@@ -1705,19 +1705,14 @@ pub(crate) fn settings_view(root: &mut Root, cx: &mut Context<Root>) -> AnyEleme
                                     // 在飞时 should_fetch 拦住，不叠请求。
                                     root.ensure_contributors(cx, true);
                                 }))
-                                .child(root.tr("加载失败，点击重试"))
+                                .child(root.tr("图没出来，点一下重试"))
                                 .into_any_element()
                         } else {
+                            // 没图且这一轮没失败过：只留 64px 灰底，不写「正在加载」，不可点。
                             div()
                                 .h(px(64.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
                                 .rounded(px(theme::radius::ROW))
                                 .bg(theme::surface_hover())
-                                .text_size(theme::Text::Tiny.size())
-                                .text_color(theme::text_faint())
-                                .child(root.tr("正在加载贡献者…"))
                                 .into_any_element()
                         }),
                 )
