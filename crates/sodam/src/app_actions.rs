@@ -2810,9 +2810,8 @@ impl Root {
 
     /// 官方推荐队列的动态加载：当前歌后方少于 6 首时由心跳触发。
     pub(crate) fn load_more_recommendation(&mut self, cx: &mut Context<Self>) {
-        // 队列正在换：这一页现在发出去，回来时队列已经是别人的了。电台算 feed-like，
-        // 下面那道 `is_feed_like` 拦不住它，所以换队在飞时先不分页；歌单不是 feed-like，
-        // 本来就过不去，这里一并收手。
+        // 换队没落地之前，不管换到哪都先不分页：这一页发出去，回来时队列已经
+        // 不属于它了。
         if self.switching_queue.is_some() {
             return;
         }
@@ -6226,10 +6225,10 @@ mod view_takeover_tests {
         }
     }
 
-    /// 装载结果只有在还认领得到自己那次换队时才许动队列。
+    /// 装载结果落地前先确认：这次换队还是不是它发起的。
     ///
     /// `play_from` 只推 `queue_switch_seq`、不动请求序号，所以「请求序号还对」不等于
-    /// 「这份结果还有人要」。少了这道认领，用户自己挑的队列会被一个迟到的装载顶掉。
+    /// 「这份结果还有人要」。少了这步确认，用户自己挑的队列会被一个迟到的装载顶掉。
     #[test]
     fn load_results_only_land_when_they_still_own_the_switch() {
         let source = include_str!("app_actions.rs");
@@ -6246,11 +6245,11 @@ mod view_takeover_tests {
             .iter()
             .filter_map(|call| body.find(*call))
             .min()
-            .unwrap_or_else(|| panic!("{owner} 必须先按代数认领再落账"));
+            .unwrap_or_else(|| panic!("{owner} 必须先确认换队还是不是自己发起的，再动队列"));
             for (at, _) in body.match_indices("queue.replace(") {
                 assert!(
                     at > claim_at,
-                    "{owner} 里 queue.replace 必须在认领之后：认领不到就不许动队列"
+                    "{owner} 里 queue.replace 必须在确认之后：不是自己那次就不许动队列"
                 );
             }
         }
