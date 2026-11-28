@@ -7036,9 +7036,10 @@ mod queue_switch_callback_tests {
     /// 环境操作全部集中在 ctor：测试线程起来之前，全进程没有并发读者，
     /// 这是唯一能安全改环境的时刻。
     ///
-    /// 摘掉的固定名单是 `Settings::merged_with_env` 与 `Root::new` 真正读的
-    /// 键（登录身份、签名器、设备指纹、开发便利开关），不做前缀扫描——
-    /// 扫描要收集整个环境，把改动面放大；有新键走名单补一行。
+    /// 名单是会改登录身份、签名器、设备指纹和构造期开关的键，不做前缀扫描
+    /// （扫描要收集整个环境，把改动面放大；有新键走名单补一行）。
+    /// `SODAM_QUALITY` / `SODAM_VOLUME` 构造期也读，但只影响初始音质 / 音量，
+    /// 与零出网防线无关，故意留在名单外。
     /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
     #[ctor(unsafe)]
     fn point_test_env_at_the_sandbox() {
@@ -7072,10 +7073,8 @@ mod queue_switch_callback_tests {
 
     /// 在首个用例构造 `Root` 之前写沙箱 config.json。
     ///
-    /// 写盘不放在 ctor：`#[ctor(unsafe)]` 可能在 std runtime 就绪之前执行，
-    /// 依赖堆与 panic 路径的文件写入曾在 Windows 上以进程崩溃收场
-    /// （`STATUS_ACCESS_VIOLATION`，其余平台全绿）。文件操作挪到这里，
-    /// 此时 runtime 已就绪；环境改动仍留在 ctor（见上）。
+    /// 写盘放在这里（runtime 已就绪），环境改动留在 ctor——两段职责只按
+    /// 位置分，不承担对崩溃原因的解释。
     ///
     /// config.json 写死签名器不可达、不留 Cookie，`Root::new` 读它之后
     /// 就是「未登录 + 签名器不通」。写不进去（磁盘满等）就 panic：与其让
