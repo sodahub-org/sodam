@@ -163,14 +163,6 @@ pub(crate) struct LoadTicket {
     pub switch_seq: u64,
 }
 
-/// 这张票还归不归自己：代数没被推走才算数。
-///
-/// 剥成纯函数是为了能脱离 `Root` 测——`Root` 要 gpui 的 `Context`，单测里造不出来，
-/// 而「认领不到就不许落账」正是最该钉住的那条。
-fn owns_queue_switch(current: u64, ticket: u64) -> bool {
-    current == ticket
-}
-
 impl Root {
     /// 只收自己那一次切换态，并回答「这次装载还在台上吗」。
     ///
@@ -185,7 +177,7 @@ impl Root {
     /// （`play_from`）。这种结果整份作废：队列和页面都不许动，动了盖掉的正是他
     /// 此刻在听的那一份。
     fn clear_own_queue_switch(&mut self, switch_seq: u64) -> bool {
-        if !owns_queue_switch(self.queue_switch_seq, switch_seq) {
+        if self.queue_switch_seq != switch_seq {
             return false;
         }
         self.switching_queue = None;
@@ -200,9 +192,6 @@ impl Root {
     fn abandon_queue_switch(&mut self) {
         self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
         self.switching_queue = None;
-        // 谁在等的那次装载已经作废，它留下的加载态也一起收掉：被顶掉的回调认领不到，
-        // 不会再去清这个 flag，留着它就是永久卡住下一次点歌单 / 电台。
-        self.loading_playlist = false;
         // 听歌模式 / 推荐那条路认的是请求序号，请求本身又没有截止时间：序号不推，
         // 被作废的装载回来之前 `loading_recommendation` 一直挂着，「推荐」和「重试」
         // 都会被直接拦掉，什么提示也没有。推两格让它回来就判过期，加载态由这里收。
@@ -2305,9 +2294,6 @@ impl Root {
         }
         self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
         let switch_seq = self.queue_switch_seq;
-        // 新一次换队从干净的加载态开始：歌单 / 电台共用一个 `loading_playlist`，
-        // 上一轮那个已经被这次顶掉，它回来也没资格再动这个 flag。
-        self.loading_playlist = false;
         self.switching_queue = Some(origin.clone());
         self.switching_label = label.to_string();
         self.set_nav(Nav::Lyrics, cx);
@@ -2673,15 +2659,15 @@ impl Root {
                 let Some(radio) = card.radio.clone() else {
                     return;
                 };
-                // 一次只装一份：和 `start_scene_playlist` 同一条进门规矩。少了这道，
-                // 第二次点卡会和第一次同时跑，`loading_playlist` 归谁说不清。
-                if self.loading_playlist {
-                    return;
-                }
+                // 连着点第二张卡不算错：每次装载有自己的票，先回来那次认领不到就整份
+                // 丢掉，用不着在门口把用户的点击拦掉（拦了也不给提示，像是没反应）。
                 let switch_origin = QueueOrigin::Radio(radio.radio_id.clone());
                 let switch_seq = self.begin_queue_switch(switch_origin, &card.playlist.title, cx);
                 let load_nav_seq = self.nav_seq;
-                self.loading_playlist = true;
+                // 换到别的源：推荐流那条线的在飞请求（装载和分页）一起作废，否则
+                // 迟到的下一页会把推荐歌追进电台队列，心跳还会接着往里加。
+                self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+                self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
                 self.set_status(
                     "正在加载电台「{}」…",
                     std::slice::from_ref(&card.playlist.title),
@@ -2699,7 +2685,6 @@ impl Root {
                     let _ = this.update(cx, |root, cx| {
                         // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
                         if root.clear_own_queue_switch(switch_seq) {
-                            root.loading_playlist = false;
                             match result {
                                 Ok(tracks) if !tracks.is_empty() => {
                                     root.queue.replace(tracks, 0);
@@ -2752,13 +2737,13 @@ impl Root {
 
     /// 听歌模式探索卡：直接播放整张歌单，不进入详情页。
     pub fn start_scene_playlist(&mut self, playlist: PlaylistItem, cx: &mut Context<Self>) {
-        if self.loading_playlist {
-            return;
-        }
         let switch_origin = QueueOrigin::Playlist(playlist.id.clone());
         let switch_seq = self.begin_queue_switch(switch_origin, &playlist.title, cx);
         let load_nav_seq = self.nav_seq;
-        self.loading_playlist = true;
+        // 换到别的源：推荐流那条线的在飞请求（装载和分页）一起作废，否则迟到的
+        // 下一页会把推荐歌追进这张歌单的队列。
+        self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);
+        self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);
         self.set_status("正在加载歌单「{}」…", std::slice::from_ref(&playlist.title));
         cx.notify();
 
@@ -2773,7 +2758,6 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 // 认领不到就整份丢掉：加载态归更晚那次装载，队列和页面也别动。
                 if root.clear_own_queue_switch(switch_seq) {
-                    root.loading_playlist = false;
                     match result {
                         Ok(tracks) if !tracks.is_empty() => {
                             root.queue.replace(tracks, 0);
@@ -6146,8 +6130,6 @@ mod recommendation_gate_tests {
 
 #[cfg(test)]
 mod view_takeover_tests {
-    use super::owns_queue_switch;
-
     /// 守 #330：装载自己那次切页不能算进"用户走开了"。
     ///
     /// 快照必须取在 `begin_queue_switch` 之后。取在前面的话，启动那一下就会被判成
@@ -6234,20 +6216,6 @@ mod view_takeover_tests {
         }
     }
 
-    /// 守 #330：票被推走之后，旧装载一张都不许落账。
-    ///
-    /// 这条是真跑判定的：`clear_own_queue_switch` 只做一件事——用 `owns_queue_switch`
-    /// 比代数，比不过就整份丢掉。源码守卫管「调用点有没有用它」，这里管「它自己认不认
-    /// 旧票」。
-    #[test]
-    fn a_superseded_ticket_never_lands() {
-        assert!(owns_queue_switch(7, 7), "票是自己的才落账");
-        assert!(
-            !owns_queue_switch(8, 7),
-            "代数被推走之后，旧装载的票一张都不许落账"
-        );
-    }
-
     /// 守 #330：装载结果只有在还认领得到自己那次换队时才许动队列。
     ///
     /// `play_from` 只推 `queue_switch_seq`、不动请求序号，所以「请求序号还对」不等于
@@ -6303,22 +6271,16 @@ mod view_takeover_tests {
 
     /// 守 #330：用户自己换队之后，被顶掉的装载留下的加载态也要一起收掉。
     ///
-    /// 歌单 / 电台的 `loading_playlist` 是进门守卫，不复位就等于永久拉闸；听歌模式 /
-    /// 推荐的 `loading_recommendation` 同样没有截止时间，序号不推的话，被作废的装载
-    /// 回来之前「推荐」和「重试」都被拦掉。被顶掉的回调认领不到，这两格只能由作废的
-    /// 一方收。
+    /// 推荐 / 听歌模式那条请求没有截止时间，序号不推的话，被作废的装载回来之前
+    /// `loading_recommendation` 一直挂着，「推荐」和「重试」都被拦掉。被顶掉的回调
+    /// 认领不到，这一格只能由作废的一方收。
     #[test]
     fn abandoning_a_queue_switch_drops_the_loading_state() {
         let body = body_of(include_str!("app_actions.rs"), "fn abandon_queue_switch");
-        for flag in [
-            "self.loading_playlist = false;",
-            "self.loading_recommendation = false;",
-        ] {
-            assert!(
-                body.contains(flag),
-                "作废在飞装载的同时必须复位加载态：{flag} 缺了，下一次点歌单 / 电台 / 推荐被永久拦掉"
-            );
-        }
+        assert!(
+            body.contains("self.loading_recommendation = false;"),
+            "作废在飞装载的同时必须复位加载态，否则「推荐」/「重试」被永久拦掉"
+        );
         for seq in [
             "self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);",
             "self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);",
@@ -6330,6 +6292,28 @@ mod view_takeover_tests {
         }
     }
 
+    /// 守 #330：换到电台 / 歌单之后，在飞的推荐分页不许再追进来。
+    ///
+    /// 分页只认请求序号，而电台 / 歌单这两条路不走 `abandon_queue_switch`。不推的话，
+    /// 电台先落地、分页随后到，序号还对得上，`is_feed_like()` 也认电台是自己人——
+    /// 这一页推荐就被 append 进电台队列，心跳接着往里加。
+    #[test]
+    fn switching_to_another_source_invalidates_pending_pagination() {
+        let source = include_str!("app_actions.rs");
+        for owner in ["pub fn start_scene_card", "pub fn start_scene_playlist"] {
+            let body = body_of(source, owner);
+            for seq in [
+                "self.recommendation_load_seq = self.recommendation_load_seq.wrapping_add(1);",
+                "self.recommendation_request_seq = self.recommendation_request_seq.wrapping_add(1);",
+            ] {
+                assert!(
+                    body.contains(seq),
+                    "{owner} 换到别的源，推荐那条线的在飞请求必须一起作废：{seq}"
+                );
+            }
+        }
+    }
+
     /// 守 #330：歌单详情的加载态和队列装载的加载态是两件事，不能共用一个 flag。
     ///
     /// 共用的话两个方向都说不清归谁：一次换队会把详情请求的加载态一起复位；详情请求
@@ -6338,12 +6322,6 @@ mod view_takeover_tests {
     fn playlist_detail_loading_has_its_own_flag() {
         let source = include_str!("app_actions.rs");
         let detail = body_of(source, "pub fn open_playlist");
-        for bare in ["self.loading_playlist =", "root.loading_playlist ="] {
-            assert!(
-                !detail.contains(bare),
-                "详情请求不许再动队列装载的加载态：{bare}"
-            );
-        }
         assert!(
             detail.contains("loading_playlist_detail"),
             "详情请求用自己的加载态"

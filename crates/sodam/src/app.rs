@@ -430,8 +430,12 @@ pub struct Root {
     pub(crate) queue_switch_seq: u64,
     /// 推荐队列请求的序号（装载与分页共用）。
     ///
-    /// **只在真正发起新请求时递增**：拿它判断「结果是否过期」，所以超时兜底不能动它，
-    /// 否则在途请求回来时会被当成过期结果静默丢弃。
+    /// 发起新请求时递增；整条线作废时也递增——用户自己换了队（`play_from`）、退出登录 /
+    /// 换号、或者换到电台 / 歌单 / 听歌模式这类别的源。拿它判断「结果是否过期」，
+    /// 所以超时兜底不能动它，否则在途请求回来时会被当成过期结果静默丢弃。
+    ///
+    /// 装载和分页共用一格，所以推它等于把在飞的分页也一起作废：那一页属于已经被换走的
+    /// 源，本来就该丢掉。
     pub(crate) recommendation_request_seq: u64,
     /// 推荐队列「装载」请求序号；与分页序号分开，两者可以同时在途。
     pub(crate) recommendation_load_seq: u64,
@@ -569,8 +573,6 @@ pub struct Root {
     pub volume_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 打开中的歌单（点卡片后展示曲目）。
     pub open_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
-    /// 队列装载（歌单 / 电台）在飞，只作进门守卫：一次换队就把它复位。
-    pub loading_playlist: bool,
     /// 歌单详情请求在飞，Library 页据此画加载态。
     pub loading_playlist_detail: bool,
     /// 歌单详情请求的代数：关掉详情页就把在飞的那次作废。
@@ -1003,7 +1005,6 @@ impl Root {
             list_width: Arc::new(Mutex::new(1200.0)),
             queue_scroll: gpui::UniformListScrollHandle::new(),
             open_playlist: None,
-            loading_playlist: false,
             loading_playlist_detail: false,
             playlist_detail_seq: 0,
             search_playlist: None,
