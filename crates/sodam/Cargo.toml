@@ -44,7 +44,7 @@ gpui = { workspace = true, features = ["windows-manifest"] }
 raw-window-handle = "0.6"
 
 # 测试里真跑 GPUI 实体：TestAppContext / #[gpui::test] 都在这个 feature 后面。
-# 只进测试构建，产品二进制不带 test-support。
+# 只在 `cargo test` 时生效：`cargo build` 不读 dev-dependencies，产品二进制不带 test-support。
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 # 与 gpui 依赖树同版本（lockfile 已锁），测试进程加载时先把环境指进沙箱。

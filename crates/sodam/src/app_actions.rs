@@ -2585,9 +2585,6 @@ impl Root {
 
     /// 推荐装载回调的落账：请求序号、换队认领、页面接管三级判定后，
     /// 成功就换上推荐队列，失败 / 超时进可重试的终态。
-    ///
-    /// 装配（等结果 → update）留在 `start_recommendation` 的回调里；
-    /// 真跑覆盖见 `queue_switch_callback_tests`（票 #340）。
     fn recommendation_load_settled(
         &mut self,
         ticket: RecommendationLoadTicket,
@@ -2742,9 +2739,6 @@ impl Root {
 
     /// 电台装载回调的落账：认领到这次换队才换队列、进歌词页开播；
     /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
-    ///
-    /// 装配留在 `start_scene_card` 的电台分支里；真跑覆盖见
-    /// `queue_switch_callback_tests`（票 #340）。
     fn scene_radio_load_settled(
         &mut self,
         switch_seq: u64,
@@ -2817,9 +2811,6 @@ impl Root {
 
     /// 歌单装载回调的落账：认领到这次换队才换队列、进歌词页开播；
     /// 认领不到整份丢掉——加载态归更晚那次装载，队列和页面都不动。
-    ///
-    /// 装配留在 `start_scene_playlist` 的回调里；真跑覆盖见
-    /// `queue_switch_callback_tests`（票 #340）。
     fn scene_playlist_load_settled(
         &mut self,
         switch_seq: u64,
@@ -2863,9 +2854,8 @@ impl Root {
 
     /// 装载成功的共同落账：换队列、清播放账、记来源、收封面、进歌词页、开播。
     ///
-    /// 电台 / 歌单两条路的成功分支本来就是同一段代码，搬运落账体时各自复制了一份
-    /// （保住「逐行零改动」可审）；现在合并到一处。`origin` 是这次装载自己的来源，
-    /// 由调用方在认领成功之后传入——helper 本身不认领，谁调它谁已经认领过了。
+    /// `origin` 是这次装载自己的来源，由调用方在认领成功之后传入——
+    /// helper 本身不认领，谁调它谁已经认领过了。
     fn replace_queue_with_loaded_tracks(
         &mut self,
         tracks: Vec<TrackItem>,
@@ -6169,9 +6159,9 @@ mod recommendation_gate_tests {
     ///
     /// 第一版实现真犯过这个错：`gpui::Task` drop 时会走到 `async_task::Task::drop`
     /// 的 `set_canceled()`，于是「界面不再等」连带把请求也取消了。写这条守卫时
-    /// `test-support` 还没进依赖、造不出真 `Task`；现在它已在 dev-dependencies 里
-    /// （票 #340），升级成运行时断言留给后续票，这里先保持源码约束：超时分支的
-    /// 代码里必须出现 `detach()`。
+    /// `test-support` 还没进依赖、造不出真 `Task`；现在它已在 dev-dependencies 里，
+    /// 升级成运行时断言留给后续票，这里先保持源码约束：超时分支的代码里必须
+    /// 出现 `detach()`。
     #[test]
     fn timeout_branch_detaches_instead_of_dropping_the_task() {
         let source = include_str!("app_actions.rs");
@@ -6227,7 +6217,7 @@ mod view_takeover_tests {
     /// 快照必须取在 `begin_queue_switch` 之后。取在前面的话，启动那一下就会被判成
     /// "界面已经换了"，用户什么都没做也进不了播放页——正好是要修的症状的反面。
     /// 真跑的认领覆盖在 `queue_switch_callback_tests`（`test-support` 已进
-    /// dev-dependencies，票 #340）；那个 fixture 不压「快照取的位置」这一点，
+    /// dev-dependencies）；那个 fixture 不压「快照取的位置」这一点，
     /// 这里继续用源码顺序守住。
     #[test]
     fn snapshot_is_taken_after_the_switch_this_load_does() {
@@ -6237,7 +6227,7 @@ mod view_takeover_tests {
             .nth(1)
             .expect("start_recommendation 应当存在");
         // 落账体搬进 `recommendation_load_settled` 后，start_recommendation
-        // 的下一站就是它（票 #340）。
+        // 的下一站就是它。
         let body = &body[..body
             .find("fn recommendation_load_settled")
             .unwrap_or(body.len())];
@@ -6328,7 +6318,7 @@ mod view_takeover_tests {
     fn load_results_only_land_when_they_still_own_the_switch() {
         let source = include_str!("app_actions.rs");
         // 电台 / 歌单的落账体搬进各自的 `*_load_settled`，成功的换队列又收进了
-        // `replace_queue_with_loaded_tracks`（票 #340）：落账动作必须仍写在认领
+        // `replace_queue_with_loaded_tracks`：落账动作必须仍写在认领
         // 之后——helper 本身不认领，谁调它谁已经认领过了。
         for owner in [
             "fn scene_radio_load_settled",
@@ -7026,42 +7016,67 @@ mod scene_modes_gate_tests {
     }
 }
 
-/// 装载回调对换队认领的使用：票还在才落账，被推走整份丢掉（票 #340）。
+/// 装载回调对换队认领的使用：票还在才落账，被推走整份丢掉。
 ///
 /// 源码守卫只能证明「`queue.replace` 写在认领后面」，证明不了「认领失败真的
 /// 不落账」——那条控制流只有真跑回调落账体才压得住。三条装载路径的落账体
 /// 已经搬进 `recommendation_load_settled` / `scene_radio_load_settled` /
 /// `scene_playlist_load_settled`，这里在 `TestAppContext` 里真跑它们。
 ///
-/// fixture 的边界：
+/// fixture 的前提与清场：
 ///
-/// * 进程加载时（ctor，先于一切测试线程）把 `SODAM_CONFIG_PATH` 指向沙箱里
-///   的 config.json **文件**、`SODAM_CACHE_DIR` 指向沙箱内的缓存根：配置与
-///   缓存的读写全部圈进临时目录，运行时**没有** `set_var`，不存在设读竞态
-///   窗口，Rust 2024 把 `set_var` 标 unsafe 也不影响这里。
-/// * 构造后清掉 Cookie，保持「未登录」：换页就不会触发 `on_nav_changed`
-///   的自动装载。
+/// * ctor 在测试线程起来之前，把 `SODAM_CONFIG_PATH` / `SODAM_CACHE_DIR`
+///   指到临时沙箱，沙箱里的 config.json 写死签名器不可达、不留 Cookie，
+///   环境里的登录身份与便利开关一并摘掉——`Root::new` 一出生就是未登录、
+///   构造期发不出请求。
 /// * `#[gpui::test]` 的 teardown 会 `run_until_parked()` 把在飞的后台任务
-///   flush 掉（下载 / 封面 / 歌词都会真跑），所以签名器指到不可达地址：
-///   签名是每个请求的前置，签名器连不上，请求组装不出来，网络不出机器。
-///   这条防线靠配置担保，配置由 `fixture_defenses_are_in_place` 断言守着。
+///   flush 掉（下载 / 封面 / 歌词都会真跑），请求被沙箱的签名器地址挡在
+///   签名一步；防线由 `fixture_defenses_are_in_place` 断言守着。
 #[cfg(test)]
 mod queue_switch_callback_tests {
     use super::*;
     use ctor::ctor;
     use gpui::{AppContext, TestAppContext};
 
-    /// 在任何测试线程启动之前把环境指进沙箱。此时进程还是单线程，`set_var`
-    /// 没有读者，天然无竞态；crate 里其余 `#[ctor]` 也不读这些变量。
+    /// 在任何测试线程启动之前把环境指进沙箱，并让 `Root::new` 一出生就是
+    /// 「未登录 + 签名器不通」。此时进程还是单线程，环境操作没有读者。
     ///
+    /// `Root::new` 尾部在登录态会拉账户 / 收藏 / 推荐、还会读 `SODAM_QUERY`
+    /// 等便利开关——全靠沙箱 config.json 与这里摘掉的环境变量挡住。
     /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
     #[ctor(unsafe)]
     fn point_test_env_at_the_sandbox() {
         let dir = std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建立测试沙箱目录");
-        std::env::set_var("SODAM_CONFIG_PATH", dir.join("config.json"));
+        let config = dir.join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"signer_url": "http://127.0.0.1:1", "cookie": ""}"#,
+        )
+        .expect("写入沙箱配置");
+        std::env::set_var("SODAM_CONFIG_PATH", &config);
         std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
+        for key in [
+            "SODA_COOKIE",
+            "QISHUI_SIGNER_URL",
+            "QISHUI_SIGNER_TOKEN",
+            "SODA_DEVICE_ID",
+            "SODA_IID",
+            "SODA_LOGIN_DEVICE_ID",
+            "SODA_LOGIN_INSTALL_ID",
+            "SODAM_QUERY",
+            "SODAM_NAV",
+            "SODAM_LYRICS_DEMO",
+            "SODAM_SCROLL_TEST",
+            "SODAM_AUTOLOGIN",
+            "SODAM_AUTOPLAY",
+            "SODAM_RACE_TEST",
+            "SODAM_JUMP_TEST",
+            "SODAM_POPUP",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
@@ -7070,14 +7085,6 @@ mod queue_switch_callback_tests {
         // 读的就是这个全局——构造完立刻恢复进程默认值，别让并行的 theme 用例
         // 撞上被改掉的全局。
         theme::set_theme(ThemeKind::Dark);
-        cx.update_entity(&root, |root, _cx| {
-            // 环境变量可能补进真实 Cookie（SODA_COOKIE 等）：测试必须保持「未登录」，
-            // 否则换页会触发 on_nav_changed 的自动装载，测试就会碰真网络。
-            root.settings.cookie = String::new();
-            // teardown 会 flush 在飞的后台任务（见模块注释）：签名器指到必失败的
-            // 地址，把这些任务的请求挡在签名一步，网络不出机器。
-            root.settings.signer_url = "http://127.0.0.1:1".to_string();
-        });
         root
     }
 
@@ -7264,7 +7271,6 @@ mod queue_switch_callback_tests {
             // 生产里由 start_recommendation / 换源动作推：更晚的装载接手。
             root.recommendation_load_seq = root.recommendation_load_seq.wrapping_add(1);
 
-            let loading_before = root.loading_recommendation;
             let switching_before = root.switching_queue.clone();
             let queue_before = root.queue.len();
 
@@ -7284,7 +7290,10 @@ mod queue_switch_callback_tests {
             );
 
             assert_eq!(root.queue.len(), queue_before, "过期结果不许换队列");
-            assert_eq!(root.loading_recommendation, loading_before, "加载态不许碰");
+            assert!(
+                root.loading_recommendation,
+                "加载态由更晚那次装载保管，过期回调不许碰"
+            );
             assert_eq!(
                 root.switching_queue, switching_before,
                 "切换态归更晚那次装载"
@@ -7590,23 +7599,24 @@ mod queue_switch_callback_tests {
         });
     }
 
-    /// fixture 防线自检：未登录 + 签名器不可达。
+    /// fixture 防线自检：断言的是 `Root::new` **构造时的真实状态**。
     ///
-    /// teardown flush 会真跑在飞任务，出网与否完全压在这两个配置上——配置一旦
-    /// 漂移（有人挪走清 Cookie / 改签名器地址的代码），这里先红，提醒回模块
-    /// 注释重新审一遍边界假设，而不是靠注释担保。
+    /// 沙箱 config.json 由 ctor 在构造之前写好，所以这里的字段就是构造的输入；
+    /// `nav` 断言未登录的初始页——若沙箱失效、`SODA_COOKIE` 被环境补全回来，
+    /// 构造期会发账户 / 收藏 / 推荐请求且初始页变成 Lyrics，这里先红。
     #[gpui::test]
     async fn fixture_defenses_are_in_place(cx: &mut TestAppContext) {
         let root = open_root(cx);
         cx.update_entity(&root, |root, _cx| {
             assert!(
                 root.settings.cookie.is_empty(),
-                "fixture 必须保持未登录，否则换页触发自动装载碰真网络"
+                "构造输入必须未登录：登录态会在构造期发账户 / 收藏 / 推荐请求"
             );
             assert_eq!(
                 root.settings.signer_url, "http://127.0.0.1:1",
                 "签名器必须不可达：teardown flush 的在飞请求靠它挡在签名一步"
             );
+            assert_eq!(root.nav, Nav::Settings, "未登录初始页是设置页");
         });
         // 环境指进沙箱：Root::new 读到的配置文件路径与缓存根都在临时目录里。
         let config_path = std::env::var("SODAM_CONFIG_PATH").expect("沙箱已由 ctor 指定");
