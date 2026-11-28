@@ -12,6 +12,7 @@ use gpui::{Context, Window};
 use sodam_core::audio::PlaybackSnapshot;
 use sodam_core::cache_check::{Blockers, MaintenanceAsk, MaintenanceDecision, MaintenanceTrigger};
 use sodam_core::config::EnvCookieFill;
+use sodam_core::contributors::ContributorsLoad;
 use sodam_core::cover::CoverOutcome;
 use sodam_core::failure::{
     PlayBudget, PlaybackFailure, RecoveryAction, Stage, UnplayableReason, UnplayableTracks,
@@ -211,7 +212,7 @@ impl Root {
         self.loading_playlist_detail = false;
     }
 
-    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取，状态记在
+    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台读盘/拉取，状态记在
     /// `ContributorsState` 一处。
     ///
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
@@ -219,19 +220,59 @@ impl Root {
     /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
     /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：失败按 10s/30s
     /// 退避，到点后的下一次设置页重绘才真正发起，空闲期不主动唤醒；
-    /// 没图时三次用完停手（#135 C 的请求风暴靠这一条断掉），有旧图时
-    /// 清账等一天重开一轮；在飞闸只负责不叠加并发请求。
+    /// 没图时三次用完就停手，设置页每帧重绘也不会再发起请求（#135 的
+    /// 请求风暴靠这一条断掉）；有旧图时把次数和截止时间清掉，等一天
+    /// 重开一轮；正在请求时不放行，不叠加并发。
+    ///
+    /// 没图先读盘，盘上的图没满一天直接用；满了先挂旧图再出网，落盘
+    /// 在出网那次后台任务里完成。「清空缓存」只删盘上的文件：进程内的
+    /// 图照常显示，下一次落盘要等过期重拉成功之后。
     pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
         if !self.contributors.should_fetch(SystemTime::now(), force) {
             return;
         }
         self.contributors.begin(force);
-        let work =
-            cx.background_spawn(async { sodam_core::contributors::fetch_contributors_svg() });
+        // 手上已有图（过期重拉、重试）时盘上那份就是手里这张的旧拷贝，
+        // 跳过读盘：后台阶段返回 None，只有真读了盘才有 Some。
+        let want_disk = self.contributors.image().is_none();
+        let disk = cx.background_spawn(async move {
+            if want_disk {
+                Some(sodam_core::contributors::load_contributors_svg())
+            } else {
+                None
+            }
+        });
         cx.spawn(async move |this, cx| {
-            let image = work
-                .await
-                .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, bytes)));
+            let loaded = disk.await;
+            let proceed = this.update(cx, |root, cx| match loaded {
+                // 盘上这份就是最新的：年龄从 mtime 起算，本轮不出网。
+                Some(ContributorsLoad::Fresh(bytes, modified)) => {
+                    root.contributors
+                        .finish_ok(contributor_image(bytes), modified);
+                    cx.notify();
+                    false
+                }
+                // 先把旧图挂出来；在飞标记不动，出网还在这一轮里。
+                Some(ContributorsLoad::Stale(bytes, modified)) => {
+                    root.contributors
+                        .show_cached(contributor_image(bytes), modified);
+                    cx.notify();
+                    true
+                }
+                // 盘上没命中。
+                Some(ContributorsLoad::Missing) => true,
+                // 这次没读盘（手上已有图），直接出网。
+                None => true,
+            });
+            if !matches!(proceed, Ok(true)) {
+                return;
+            }
+            let bytes = cx
+                .background_spawn(async {
+                    sodam_core::contributors::fetch_and_store_contributors_svg()
+                })
+                .await;
+            let image = bytes.map(contributor_image);
             let _ = this.update(cx, |root, cx| {
                 match image {
                     Some(image) => root.contributors.finish_ok(image, SystemTime::now()),
@@ -5118,6 +5159,11 @@ impl Root {
         self.set_status_text(self.tr("配置文件已更新，改动已生效"));
         cx.notify();
     }
+}
+
+/// SVG 字节包成 gpui 图；SVG 的解析发生在渲染时，这里只包一层。
+fn contributor_image(bytes: Vec<u8>) -> Arc<gpui::Image> {
+    Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, bytes))
 }
 
 /// 外部打开的两种语义，不可互换。

@@ -1524,20 +1524,12 @@ mod tests {
     const DEVICE_ID: &str = "1234567890123456";
     const INSTALL_ID: &str = "123456789012345";
 
-    /// 设置登录身份环境变量，离开作用域时清掉，避免污染同进程的其它用例。
-    struct EnvGuard(&'static str);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
-
-    fn set_login_device_env(device: &str, install: &str) -> (EnvGuard, EnvGuard) {
-        let device_guard = EnvGuard(ENV_LOGIN_DEVICE_ID);
-        let install_guard = EnvGuard(ENV_LOGIN_INSTALL_ID);
-        std::env::set_var(ENV_LOGIN_DEVICE_ID, device);
-        std::env::set_var(ENV_LOGIN_INSTALL_ID, install);
-        (device_guard, install_guard)
+    /// 设置登录身份环境变量，离开作用域时还原原值（照 [`crate::EnvGuard`]）。
+    fn set_login_device_env(device: &str, install: &str) -> (crate::EnvGuard, crate::EnvGuard) {
+        (
+            crate::EnvGuard::set(ENV_LOGIN_DEVICE_ID, device),
+            crate::EnvGuard::set(ENV_LOGIN_INSTALL_ID, install),
+        )
     }
 
     #[test]
@@ -1973,17 +1965,7 @@ mod tests {
         use crate::quality::{QualityIntent, QualitySource};
 
         let _lock = crate::env_test_lock();
-
-        struct EnvGuard(&'static str);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
-
-        let env_key = "SODAM_QUALITY";
-        let _guard = EnvGuard(env_key);
-        std::env::set_var(env_key, "lossless");
+        let _guard = crate::EnvGuard::set("SODAM_QUALITY", "lossless");
         let merged = Settings::default().merged_with_env();
         assert_eq!(merged.quality, "lossless");
         assert_eq!(merged.quality_source(), QualitySource::Derived);
@@ -2000,30 +1982,9 @@ mod tests {
     /// 显式登出后只停用 Cookie 的环境变量补全，签名地址等其余字段照常补（#192）。
     #[test]
     fn env_fill_can_skip_cookie_only() {
-        /// 离开作用域时还原到设值前的状态（本机原本设过这个变量也不丢）。
-        struct EnvGuard {
-            key: &'static str,
-            previous: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, previous }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-
         let _lock = crate::env_test_lock();
-        let _cookie_guard = EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
-        let _signer_guard = EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
+        let _cookie_guard = crate::EnvGuard::set(ENV_COOKIE_KEY, "cookie-from-env");
+        let _signer_guard = crate::EnvGuard::set("QISHUI_SIGNER_URL", "https://signer.example");
 
         // 签名地址有内置默认值，先清空，才能验证「Skip 只跳过 Cookie、其余字段照补」。
         let mut base = Settings::default();

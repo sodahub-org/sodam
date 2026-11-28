@@ -882,12 +882,16 @@ pub fn cache_stats() -> crate::cache::CacheUsageSummary {
     }
 }
 
-/// 清空缓存（音频 + 封面），返回删除的文件数与这轮读没读全。
+/// 清空缓存（音频 + 封面 + 贡献者图），返回删除的文件数与这轮读没读全（#342）。
+///
+/// 贡献者图是缓存根下的单个文件，不在音频/封面的统计和清理范围里；这里
+/// 单独删，删掉了才计数，删不掉不改「没读全」的提示。
 pub fn clear_cache() -> crate::cache::ClearReport {
     let audio = crate::cache::clear_in(&cache_dir());
     let covers = crate::cache::clear_in(&cover_cache_dir());
+    let contributors = usize::from(crate::contributors::remove_contributors_svg());
     crate::cache::ClearReport {
-        removed: audio.removed + covers.removed,
+        removed: audio.removed + covers.removed + contributors,
         incomplete: audio.incomplete || covers.incomplete,
     }
 }
@@ -895,6 +899,56 @@ pub fn clear_cache() -> crate::cache::ClearReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「清空缓存」连贡献者图一起删、删除数算一份；图不在时不再计数，
+    /// 也不影响 incomplete 口径（#342）。
+    #[test]
+    fn clear_cache_counts_the_contributors_image_once() {
+        let _lock = crate::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // root_dir() 每次调用都读环境变量，整轮清空都落在临时目录里。
+        let _guard = crate::EnvGuard::set(crate::cache::CACHE_DIR_ENV_KEY, dir.path().as_os_str());
+
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        std::fs::create_dir_all(&audio).unwrap();
+        std::fs::create_dir_all(&covers).unwrap();
+        std::fs::write(audio.join("song.m4a"), b"audio").unwrap();
+        std::fs::write(covers.join("cover.img"), b"cover").unwrap();
+        let image = dir.path().join("contributors.svg");
+        std::fs::write(&image, b"<svg></svg>").unwrap();
+
+        let report = clear_cache();
+        assert_eq!(report.removed, 3);
+        assert!(!report.incomplete);
+        assert!(!image.exists());
+
+        // 图已经不在：这一轮不再计数，也算删干净。
+        let report = clear_cache();
+        assert_eq!(report.removed, 0);
+        assert!(!report.incomplete);
+    }
+
+    /// 图删不掉（位置上是个目录，remove_file 必然失败）时：不计入 removed，
+    /// 也不把 incomplete 弄成 true——删失败不改「读全了」的口径（#342）。
+    #[test]
+    fn clear_cache_keeps_the_count_when_the_image_cannot_be_deleted() {
+        let _lock = crate::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::EnvGuard::set(crate::cache::CACHE_DIR_ENV_KEY, dir.path().as_os_str());
+
+        let audio = dir.path().join("audio");
+        let covers = dir.path().join("covers");
+        std::fs::create_dir_all(&audio).unwrap();
+        std::fs::create_dir_all(&covers).unwrap();
+        std::fs::write(audio.join("song.m4a"), b"audio").unwrap();
+        std::fs::write(covers.join("cover.img"), b"cover").unwrap();
+        std::fs::create_dir(dir.path().join("contributors.svg")).unwrap();
+
+        let report = clear_cache();
+        assert_eq!(report.removed, 2);
+        assert!(!report.incomplete);
+    }
 
     /// 跑满一个轮询周期，返回每个 tick 的 `poll` 结果。
     fn advance(

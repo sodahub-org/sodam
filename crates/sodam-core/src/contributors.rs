@@ -2,15 +2,18 @@
 
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crate::cache::aged_out;
+use crate::cache::{aged_out, write_cache_file_atomic};
 use crate::log_outlet::{log_event, LogLevel, LogTopic};
 
 const CONTRIBUTORS_URL: &str = "https://contrib.rocks/image?repo=sodahub-org/sodam&columns=8";
 const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// 落盘文件名：缓存根下与 `audio/`、`covers/` 同级的单文件，同名覆盖（#334）。
+const CONTRIBUTORS_FILE_NAME: &str = "contributors.svg";
 
 /// 一张图算新鲜多久：拿到后满一天才允许自动重拉（#334）。
 pub const CONTRIBUTORS_TTL: Duration = Duration::from_secs(86_400);
@@ -27,7 +30,7 @@ pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一轮最多自动试几次；用完停手，只等用户点重试或图过期重开（#336）。
 pub const MAX_ATTEMPTS: u8 = 3;
 /// 第 1、2 次失败之后分别等多久再自动试。表长绑死为 `MAX_ATTEMPTS - 1`：
-/// 改次数不改这张表，编译先不过（#339 Testing Decisions 的变异验收）。
+/// 改次数不改这张表，编译先不过（#339）。
 pub const RETRY_DELAYS: [Duration; (MAX_ATTEMPTS - 1) as usize] =
     [Duration::from_secs(10), Duration::from_secs(30)];
 
@@ -68,7 +71,7 @@ impl<Img> ContributorsState<Img> {
     /// * 没图就该拉；有图满 [`CONTRIBUTORS_TTL`] 才拉，时钟回拨按还没过期算。
     ///
     /// 设置页每帧问一次，所以「三次用完就停手」是反死循环的关键
-    /// （#135 C：失败 → `cx.notify()` → 重绘 → 再拉取的循环就靠它断掉）。
+    /// （失败 → `cx.notify()` → 重绘 → 再拉取的循环就靠它断掉，#135）。
     pub fn should_fetch(&self, now: SystemTime, force: bool) -> bool {
         if self.loading {
             return false;
@@ -141,6 +144,100 @@ impl<Img> ContributorsState<Img> {
     }
 }
 
+/// 盘上那张图的路径：缓存数据目录根下，与 `audio/`、`covers/` 同级（#342）。
+fn contributors_svg_path_in(root: &Path) -> PathBuf {
+    root.join(CONTRIBUTORS_FILE_NAME)
+}
+
+/// 读盘的三种结论：命中且新、命中但旧、没命中（#342）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum ContributorsLoad {
+    /// 盘上命中且 mtime 没满一天：直接显示，整轮到此收工，不出网。
+    Fresh(Vec<u8>, SystemTime),
+    /// 盘上命中但 mtime 满了一天：先把旧图挂出来，这一轮接着出网。
+    Stale(Vec<u8>, SystemTime),
+    /// 盘上没命中（没成功写过，或内容过不了门槛）：直接出网。
+    Missing,
+}
+
+/// 读盘：成功拿到过一次的图直接从盘上回来，第二次启动不用等跨境请求。
+///
+/// 「拿到图的时刻」取文件 mtime，读只做读操作、不刷新它——年龄因此与进程无关，
+/// 一天后真到了才重拉（#342）。判新旧走 cache 模块共享的 `aged_out`，与缓存
+/// 淘汰同一套时钟回拨口径：mtime 在未来按还没过期算。
+pub fn load_contributors_svg() -> ContributorsLoad {
+    load_contributors_svg_in(&crate::cache::root_dir())
+}
+
+fn load_contributors_svg_in(root: &Path) -> ContributorsLoad {
+    let Some((bytes, modified)) = read_cached_svg(&contributors_svg_path_in(root)) else {
+        return ContributorsLoad::Missing;
+    };
+    if aged_out(modified, CONTRIBUTORS_TTL, SystemTime::now()) {
+        ContributorsLoad::Stale(bytes, modified)
+    } else {
+        ContributorsLoad::Fresh(bytes, modified)
+    }
+}
+
+/// 门槛内的盘上图。五种不合格各记一条 Warn（reason: empty / oversize /
+/// read_error / no_mtime / not_svg，read_error 另带错误串），与抓取那条路
+/// 「失败不再是无声的 None」同一口径，排查时看得出为什么第二次启动又出网；
+/// 文件不存在不算不合格，那是首次启动的正常状态。尺寸先看元数据，超限的
+/// 文件不读进内存；恰好 4 MiB 放行，与抓取那条路「超上限一律丢」的口径
+/// 一致。元数据和读内容之间若被并发换掉，会拿新字节配旧 mtime：最坏是
+/// 年龄偏差、多拉一次，不加锁。
+fn read_cached_svg(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return None;
+    };
+    if meta.len() == 0 {
+        contributors_disk_rejected("empty", None);
+        return None;
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        contributors_disk_rejected("oversize", None);
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let error = err.to_string();
+            contributors_disk_rejected("read_error", Some(error.as_str()));
+            return None;
+        }
+    };
+    let modified = match meta.modified() {
+        Ok(modified) => modified,
+        Err(_) => {
+            contributors_disk_rejected("no_mtime", None);
+            return None;
+        }
+    };
+    if !is_svg(&bytes) {
+        contributors_disk_rejected("not_svg", None);
+        return None;
+    }
+    Some((bytes, modified))
+}
+
+fn contributors_disk_rejected(reason: &str, error: Option<&str>) {
+    match error {
+        Some(error) => log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_disk_rejected",
+            &[("reason", reason), ("error", error)],
+        ),
+        None => log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_disk_rejected",
+            &[("reason", reason)],
+        ),
+    }
+}
+
 /// SVG 门槛：只看开头还不够，截断的文档一律当没图，必须有 `</svg>` 收尾。
 fn is_svg(bytes: &[u8]) -> bool {
     let body = bytes.trim_ascii();
@@ -173,9 +270,13 @@ fn spawn_with_timeout<T: Send + 'static>(
     timeout: Duration,
 ) -> std::io::Result<T> {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
+    // thread::spawn 建不出线程会 panic（系统配额、sandbox 限制），别把一次
+    // 普通的拉图失败升成任务内的 panic；按 io::Error 往上传，与其它失败
+    // 同路（log_outlet / audio / settings_writer 同款写法）。
+    let handle = thread::Builder::new().spawn(move || {
         let _ = sender.send(work());
     });
+    handle?;
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => {
@@ -226,7 +327,7 @@ fn read_capped(reader: impl Read) -> Option<Vec<u8>> {
 /// 下载 contrib.rocks 动态生成的 SVG；返回原始矢量字节。
 ///
 /// 三段超时各自生效（#336）：DNS [`DNS_TIMEOUT`]（解析自己兜，见
-/// [`DeadlineResolver`]）、TCP 建连 [`CONNECT_TIMEOUT`]、整体
+/// `DeadlineResolver`）、TCP 建连 [`CONNECT_TIMEOUT`]、整体
 /// [`TOTAL_TIMEOUT`]；读不单独设，响应体跟着整体截止时间走。
 /// 四种失败各记一条 Warn：请求失败、读出错、超限、拿到的东西不是 SVG
 /// （服务端给错误页、提前断流最常见的坏法），退避节奏下不会刷屏。
@@ -273,6 +374,68 @@ pub fn fetch_contributors_svg() -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// 拉取 contrib.rocks 的组合图；成功就落盘，返回通过门槛的字节。
+/// 落盘失败的口径见 `save_contributors_svg_in`。
+pub fn fetch_and_store_contributors_svg() -> Option<Vec<u8>> {
+    fetch_and_store_contributors_svg_in(&crate::cache::root_dir())
+}
+
+fn fetch_and_store_contributors_svg_in(root: &Path) -> Option<Vec<u8>> {
+    let bytes = fetch_contributors_svg()?;
+    if let Err(err) = save_contributors_svg_in(root, &bytes) {
+        log_event(
+            LogLevel::Warn,
+            LogTopic::App,
+            "contributors_cache_write_failed",
+            &[("error", err.to_string().as_str())],
+        );
+    }
+    Some(bytes)
+}
+
+/// 把图写进缓存根：同目录临时文件 + rename，半截文件不会被读成图（#342）。
+/// 与音频、封面目录同级的单文件，同名覆盖；测试与出网落盘共用这一个入口。
+///
+/// 写之前先建目录：缓存根可能还不存在——它目前由维护轮收尾的
+/// `save_mark_in` 创建，与这条落盘路没有先后保证，首次安装时抓取先完成
+/// 的那次写入会扑空。建失败照 `io::Result` 往上传，走既有的 Warn 分支。
+fn save_contributors_svg_in(root: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    write_cache_file_atomic(&contributors_svg_path_in(root), bytes)
+}
+
+/// 「清空缓存」连这张图一起删（#342）；删除数只数图本体，`.part` 残留不算。
+/// 返回 `true` = 删掉了；`false` = 没删成（文件本来就不在，或被占用、
+/// 无权限这类删失败）。删失败不影响其他缓存、也不弹错误。
+///
+/// 不拿写者锁：清空和落盘并发时，写者可能在清空之后把图写回缓存根，
+/// 多出来的那一份等下次清空。清空只删盘上的文件，进程内那张图还在，
+/// 状态机不重置。
+pub fn remove_contributors_svg() -> bool {
+    remove_contributors_svg_in(&crate::cache::root_dir())
+}
+
+/// 收掉缓存根上写一半留下的 `contributors.svg.*.part`：进程被 kill 或断电
+/// 时 `write_cache_file_atomic` 的临时文件会留在缓存根上，缓存根这一层
+/// 没有别的清扫会碰它。图本体不带 `.part` 尾巴，不会被误伤；清到正在写
+/// 的那个，写者就换不上了，图照常显示。
+fn sweep_orphaned_parts_in(root: &Path) {
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_str().unwrap_or_default();
+            if name.starts_with(CONTRIBUTORS_FILE_NAME) && name.ends_with(".part") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn remove_contributors_svg_in(root: &Path) -> bool {
+    sweep_orphaned_parts_in(root);
+    std::fs::remove_file(contributors_svg_path_in(root)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,7 +469,7 @@ mod tests {
         assert!(!is_svg(b"<html>not an image</html>"));
     }
 
-    /// 三段超时钉死数值（#336 / #339 Testing Decisions：每个数值只有一处定义）。
+    /// 三段超时钉死数值（#336 / #339：每个数值只有一处定义）。
     #[test]
     fn three_timeouts_are_pinned() {
         assert_eq!(DNS_TIMEOUT, Duration::from_secs(3));
@@ -559,5 +722,160 @@ mod tests {
         // 到期前一次都不拉；之后每 24 小时一轮，一轮恰好 3 次。
         assert_eq!(fetched_in_first_day, 0);
         assert_eq!(fetches, 6);
+    }
+
+    // ---- 盘上缓存（#342）----
+
+    const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><g/></svg>";
+
+    /// 往测试根写一份图，把 mtime 拨回 `age_seconds` 之前；0 表示保持写入时刻。
+    /// 返回文件路径与**从盘上读回来**的 mtime：拿自己设置的值当断言基准
+    /// 只能证明 set_modified 生效，测不出读取走的是文件自己的 mtime；
+    /// 读回也避开文件系统 mtime 精度不足时的抖动。
+    fn stored(root: &Path, bytes: &[u8], age_seconds: u64) -> (PathBuf, SystemTime) {
+        save_contributors_svg_in(root, bytes).unwrap();
+        let path = contributors_svg_path_in(root);
+        if age_seconds != 0 {
+            let backdated = SystemTime::now() - Duration::from_secs(age_seconds);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(backdated)
+                .unwrap();
+        }
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        (path, modified)
+    }
+
+    /// 写入后读回来一致，mtime 就是文件自己的。
+    #[test]
+    fn saved_image_round_trips_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, modified) = stored(dir.path(), SVG, 0);
+        assert_eq!(read_cached_svg(&path).unwrap(), (SVG.to_vec(), modified));
+    }
+
+    /// 根目录还不存在也能落盘：首次安装时维护轮还没来得及建目录，
+    /// 抓取先完成的那次写入不能就那样丢掉。
+    #[test]
+    fn save_creates_a_missing_cache_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache-root-not-yet");
+        save_contributors_svg_in(&root, SVG).unwrap();
+        let path = contributors_svg_path_in(&root);
+        assert!(path.is_file());
+        assert_eq!(read_cached_svg(&path).unwrap().0, SVG.to_vec());
+    }
+
+    /// 缓存根落在一个普通文件上时建目录必然失败，`io::Result` 要把
+    /// 这笔账往上传，不能静默吞掉。
+    #[test]
+    fn save_fails_when_the_cache_root_is_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("occupied-by-a-file");
+        std::fs::write(&root, b"a file, not a directory").unwrap();
+        assert!(save_contributors_svg_in(&root, SVG).is_err());
+    }
+
+    /// 同名覆盖：第二份整份换掉第一份，不留两份也不留半份。
+    #[test]
+    fn same_name_overwrites_previous_image() {
+        let dir = tempfile::tempdir().unwrap();
+        stored(dir.path(), SVG, 0);
+        let (path, modified) = stored(dir.path(), b"<svg></svg>", 0);
+        assert_eq!(
+            read_cached_svg(&path).unwrap(),
+            (b"<svg></svg>".to_vec(), modified)
+        );
+    }
+
+    /// 空文件、超过 4 MiB、截断、不是 SVG，都当没图；恰好 4 MiB 的完整 SVG 放行。
+    #[test]
+    fn empty_oversized_truncated_and_foreign_files_are_not_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = contributors_svg_path_in(dir.path());
+        stored(dir.path(), b"", 0);
+        assert!(read_cached_svg(&path).is_none());
+        stored(dir.path(), b"<svg xmlns=\"http://www.w3.org/2000/svg\"", 0);
+        assert!(read_cached_svg(&path).is_none());
+        stored(dir.path(), b"<html>not an image</html>", 0);
+        assert!(read_cached_svg(&path).is_none());
+        // 超限的一个字节都不读进内存。堆上造数据，不往栈上摆 4 MiB。
+        let oversized = vec![b'x'; (MAX_IMAGE_BYTES + 1) as usize];
+        stored(dir.path(), &oversized, 0);
+        assert!(read_cached_svg(&path).is_none());
+        // 恰好 4 MiB 放行，与抓取那条路「超上限一律丢」的口径一致。
+        let mut full = Vec::with_capacity(MAX_IMAGE_BYTES as usize);
+        full.extend_from_slice(b"<svg>");
+        full.resize(MAX_IMAGE_BYTES as usize - b"</svg>".len(), b' ');
+        full.extend_from_slice(b"</svg>");
+        assert_eq!(full.len() as u64, MAX_IMAGE_BYTES);
+        stored(dir.path(), &full, 0);
+        assert!(read_cached_svg(&path).is_some());
+    }
+
+    /// 读盘命中的年龄取文件 mtime，读不刷新它：拨回两天前，读多少次都是两天前。
+    #[test]
+    fn disk_hit_ages_from_mtime_and_read_does_not_refresh_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, backdated) = stored(dir.path(), SVG, 2 * DAY);
+        assert_eq!(read_cached_svg(&path).unwrap().1, backdated);
+        assert_eq!(read_cached_svg(&path).unwrap().1, backdated);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            backdated
+        );
+    }
+
+    /// 命中按 mtime 分新旧：不满一天 Fresh，满一天 Stale；文件不在就是没命中。
+    #[test]
+    fn disk_hit_splits_fresh_and_stale_by_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        stored(dir.path(), SVG, HOUR);
+        assert!(matches!(
+            load_contributors_svg_in(dir.path()),
+            ContributorsLoad::Fresh(..)
+        ));
+        let (path, backdated) = stored(dir.path(), SVG, 2 * DAY);
+        match load_contributors_svg_in(dir.path()) {
+            ContributorsLoad::Stale(bytes, modified) => {
+                assert_eq!(bytes, SVG.to_vec());
+                assert_eq!(modified, backdated);
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_contributors_svg_in(dir.path()),
+            ContributorsLoad::Missing
+        );
+    }
+
+    /// 「清空缓存」删掉它：删掉之后读不到；文件不在时再删一次不算失败。
+    #[test]
+    fn removal_makes_the_image_missing_and_second_removal_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        stored(dir.path(), SVG, 0);
+        assert!(remove_contributors_svg_in(dir.path()));
+        assert_eq!(
+            load_contributors_svg_in(dir.path()),
+            ContributorsLoad::Missing
+        );
+        assert!(!remove_contributors_svg_in(dir.path()));
+    }
+
+    /// `.part` 残留清扫只收临时名：图本体不带 `.part` 尾巴，扫完还在。
+    #[test]
+    fn orphaned_part_residue_sweep_spares_the_image_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let residue = dir
+            .path()
+            .join(format!("{CONTRIBUTORS_FILE_NAME}.99999-3.part"));
+        std::fs::write(&residue, b"half-written").unwrap();
+        stored(dir.path(), SVG, 0);
+        sweep_orphaned_parts_in(dir.path());
+        assert!(!residue.exists());
+        assert!(contributors_svg_path_in(dir.path()).exists());
     }
 }
