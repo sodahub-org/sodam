@@ -151,9 +151,10 @@ impl Root {
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
     ///
     /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
-    /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：在飞不叠加、
-    /// 失败按表退避、三次用完停手（#135 C 的反死循环决策靠「三次用完」
-    /// 与在飞闸共同守住）。
+    /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：失败按 10s/30s
+    /// 退避，到点后的下一次设置页重绘才真正发起（空闲期不主动唤醒，
+    /// 这是已接受的代价）；三次用完就停手——#135 C 的请求风暴靠这一条
+    /// 断掉，在飞闸只负责不叠加并发请求。
     pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
         if !self.contributors.should_fetch(SystemTime::now(), force) {
             return;
