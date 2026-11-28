@@ -44,9 +44,8 @@ gpui = { workspace = true, features = ["windows-manifest"] }
 raw-window-handle = "0.6"
 
 # 测试里真跑 GPUI 实体：TestAppContext / #[gpui::test] 都在这个 feature 后面。
-# 只进测试构建，产品二进制不会带上 test-support。同一 crate 的 features 在各
-# 依赖段是并集（本仓库 workspace 用 resolver = "2"）：普通构建仍是
-# font-kit / wayland / x11，谁改 resolver 要回头看这条注释。
+# 只进测试构建：产品构建不带 test-support（前提是 workspace 的 resolver = "2"，
+# 改回 "1" 会把 dev-dependencies 的 feature 漏进产品构建）。
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 

@@ -7551,7 +7551,10 @@ mod queue_switch_callback_tests {
 
             assert_eq!(root.nav, Nav::Home, "用户自己走开的页面不许被失败顶掉");
             assert_eq!(root.nav_seq, nav_after_user, "失败不许挪页面");
-            assert_eq!(root.queue_origin, QueueOrigin::Playlist("user-pick"));
+            assert_eq!(
+                root.queue_origin,
+                QueueOrigin::Playlist("user-pick".to_string())
+            );
             assert_eq!(root.queue.len(), 1, "失败的电台不许换队列");
             assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
             assert_eq!(root.messages.len(), 1, "失败要汇报一次，但只许汇报一次");
@@ -7583,7 +7586,10 @@ mod queue_switch_callback_tests {
                 cx,
             );
 
-            assert_eq!(root.queue_origin, QueueOrigin::Playlist("user-pick"));
+            assert_eq!(
+                root.queue_origin,
+                QueueOrigin::Playlist("user-pick".to_string())
+            );
             assert_eq!(root.queue.len(), 1, "空结果不许换掉队列");
             assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
             assert_eq!(root.nav, Nav::Scenes, "回有重试入口的页面");
