@@ -14,6 +14,7 @@ use gpui::{
 };
 use sodam_core::{
     config::{CloseAction, EnvCookieFill},
+    contributors::ContributorsState,
     cover::{CoverStore, CoverWant, MAX_QUEUE},
     failure::UnplayableTracks,
     library::{RecommendationSource, SceneCard, SearchScope},
@@ -717,10 +718,10 @@ pub struct Root {
     /// 封面状态：一条 URL 一份账，缩略图和原图各一格。
     /// 渲染路径只读，下载由后台任务完成后回填。
     pub cover_store: CoverStore,
-    /// “其他”里的贡献者图（contrib.rocks 组合 SVG）；独立缓存，不参与歌曲封面统计。
-    pub contributors_image: Option<Arc<Image>>,
-    pub(crate) contributors_fetching: bool,
-    pub(crate) contributors_failed: bool,
+    /// “其他”里的贡献者墙（contrib.rocks 组合 SVG）：图、在飞、账本一处收拢，
+    /// 该不该拉由 `ContributorsState::should_fetch` 一处判定；独立缓存，
+    /// 不参与歌曲封面统计。
+    pub contributors: ContributorsState<Arc<Image>>,
     /// 各列表当前渲染的行数（点「显示更多」时递增）。
     /// 扫码登录状态与轮询中的 token。
     pub login: LoginState,
@@ -1052,9 +1053,7 @@ impl Root {
             cover_store: CoverStore::default(),
             cover_mailbox,
             heartbeat_wake_tx,
-            contributors_image: None,
-            contributors_fetching: false,
-            contributors_failed: false,
+            contributors: ContributorsState::default(),
             login: LoginState::Idle,
             account: None,
             engine,

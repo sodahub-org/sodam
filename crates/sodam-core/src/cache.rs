@@ -640,7 +640,8 @@ impl<'a> Family<'a> {
 }
 
 /// 这一条过了 `max_age` 没；mtime 在未来说明时钟回拨，按还没到算。
-fn aged_out(modified: SystemTime, max_age: Duration, now: SystemTime) -> bool {
+/// 贡献者图的 TTL 判定走同一套口径（#341），所以做成 crate 内共享。
+pub(crate) fn aged_out(modified: SystemTime, max_age: Duration, now: SystemTime) -> bool {
     now.duration_since(modified).is_ok_and(|age| age >= max_age)
 }
 

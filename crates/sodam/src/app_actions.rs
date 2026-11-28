@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::{
     apply_verify_window_result, status_label, verify_window_step, BatchUpgradeProgress, LoginState,
@@ -210,24 +211,21 @@ impl Root {
         self.loading_playlist_detail = false;
     }
 
-    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
+    /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取，状态记在
+    /// `ContributorsState` 一处。
     ///
     /// 不用 GitHub API，因此没有 token / 请求配额问题；贡献者增减由服务自动更新。
     ///
     /// `force` 只在用户点击「重试」时为 true；渲染路径一律传 false。
-    /// 失败态由 `sodam_core::contributors::should_fetch_contributors` 判定是否停手，
-    /// 避免「失败 → notify → 重绘 → 再拉取」的死循环（#135 C）。
+    /// 该不该拉由 `ContributorsState::should_fetch` 一处判定：失败按 10s/30s
+    /// 退避，到点后的下一次设置页重绘才真正发起，空闲期不主动唤醒；
+    /// 没图时三次用完停手（#135 C 的请求风暴靠这一条断掉），有旧图时
+    /// 清账等一天重开一轮；在飞闸只负责不叠加并发请求。
     pub fn ensure_contributors(&mut self, cx: &mut Context<Self>, force: bool) {
-        if !sodam_core::contributors::should_fetch_contributors(
-            self.contributors_image.is_some(),
-            self.contributors_fetching,
-            self.contributors_failed,
-            force,
-        ) {
+        if !self.contributors.should_fetch(SystemTime::now(), force) {
             return;
         }
-        self.contributors_failed = false;
-        self.contributors_fetching = true;
+        self.contributors.begin(force);
         let work =
             cx.background_spawn(async { sodam_core::contributors::fetch_contributors_svg() });
         cx.spawn(async move |this, cx| {
@@ -235,9 +233,11 @@ impl Root {
                 .await
                 .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, bytes)));
             let _ = this.update(cx, |root, cx| {
-                root.contributors_fetching = false;
-                root.contributors_failed = image.is_none();
-                root.contributors_image = image;
+                match image {
+                    Some(image) => root.contributors.finish_ok(image, SystemTime::now()),
+                    // 失败只记账，图留在状态机里不动。
+                    None => root.contributors.finish_err(SystemTime::now()),
+                }
                 cx.notify();
             });
         })
