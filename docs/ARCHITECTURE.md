@@ -23,6 +23,7 @@
 │ Queue          当前曲目、历史、下一首、列表循环 / 单曲循环 / 随机             │
 │ PlaybackEngine rodio 线程；接收 Load / Play / Pause / Seek / Volume 命令       │
 │ CoverStore     封面缩略图 / 原图状态 + 主色（纯状态机）                       │
+│ contributors   设置页贡献者墙：纯状态机、盘上缓存与三段超时拉取               │
 └───────────────────────────────────────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -217,6 +218,38 @@ TrackItem + cache path
 - 封面（缩略图与原图）落盘走 `cache::write_cache_file_atomic`：先写同目录的 `.part` 临时
   文件，整份写好再一次性换到正式文件（`rename` 在三个平台上都是覆盖式的）。换不动时只删
   自己的临时文件，旧封面一动不动；所以正式路径上要么是旧封面，要么是整份新封面。
+- 设置页底部的贡献者墙（`sodam_core::contributors`，拉取 `contrib.rocks` 组合 SVG）独立于
+  音频与封面树，不进两棵树的用量统计与 LRU 淘汰，生命周期由纯状态机 `ContributorsState`
+  管理（#339）：
+  - **缓存位置与读写**：落在缓存根目录单文件 `contributors.svg`（`cache::root_dir()` 下，
+    与 `audio/`、`covers/` 同级，同名覆盖；设置 `SODAM_CACHE_DIR` 时跟着迁移）。写盘先确保
+    缓存根目录存在，再走 `cache::write_cache_file_atomic`；写失败只记 Warn 日志
+    `contributors_cache_write_failed`，内存里的图照常显示。读盘与拉取共用同一门槛：非空、
+    不超过 4 MiB（恰好 4 MiB 放行），且以 `<svg` 或 `<?xml` 开头、以 `</svg>` 结尾（截断
+    文档当没图）；读盘拒收记 Warn `contributors_disk_rejected`（`empty` / `oversize` /
+    `read_error` / `no_mtime` / `not_svg`）。
+  - **过期时间（TTL）与清理**：TTL 为 86400 秒（24 小时，`CONTRIBUTORS_TTL`），年龄取文件
+    `mtime` 且读盘不刷新它，新鲜度复用 `cache::aged_out`（时钟回拨按未过期算）。启动时不
+    预取；手头没图进入设置页先读盘，未满 86400 秒直接显示不出网，满 86400 秒先挂旧图再出网
+    刷新，没命中直接出网。「清空缓存」（`audio::clear_cache`）会一并删掉 `contributors.svg`
+    并顺手清扫缓存根下残留的 `contributors.svg.*.part`；只有图本体确实删掉才计入删除数
+    +1，删失败不改 `incomplete` 标志，也不重置当前进程内存里的图（重启后再联网进设置页会重
+    拉落盘）。登出或换号不清。
+  - **三段超时与退避**：拉取（`fetch_contributors_svg`）设三段超时——DNS 解析 3 秒
+    （`DNS_TIMEOUT`，`ureq 2.12` 整体超时盖不住慢解析，由自定义 `DeadlineResolver` 丢进
+    辅助线程再用 `recv_timeout(3s)` 兜底）、TCP 建连 3 秒（`CONNECT_TIMEOUT`）、整体请求
+    10 秒（`TOTAL_TIMEOUT`，不单设 `timeout_read`，读响应体跟随整体截止时间）；拉取失败按
+    原因记 Warn（`contributors_fetch_failed` / `contributors_read_failed` /
+    `contributors_read_over_cap` / `contributors_body_rejected`）。自动刷新只在设置页渲染时
+    问 `should_fetch(now, false)`，判定优先级为「在飞不叠加 → 用户点重试 → 一轮三次用完停
+    手 → 退避截止时刻 → 无图或满 86400 秒」。一轮最多自动试 3 次（`MAX_ATTEMPTS`），第 1、
+    2 次失败后分别等 10 秒、30 秒（`RETRY_DELAYS`），到点后的下一次设置页重绘才继续（不另
+    起定时器，离开设置页即暂停）。用完 3 次后分两路：没图（冷失败）停手，只等用户点重试或
+    重启；有旧图（热失败）保留旧图不弹错，次数归零并等 86400 秒后再开新一轮。
+  - **界面三态**：有图（含热失败）只显示图、不写错误字；没图且本轮没失败过显示 64px 灰底
+    空白、不写「正在加载」、不可点；没图且本轮失败过（`shows_retry()`）显示整块可点的
+    「图没出来，点一下重试」，点击走 `force = true` 立即归零次数并重绘收起文案，新一轮第
+    一次失败后再出现。
 - 预取巡检约每 5 秒补一次。全局故障（登录过期 / 签名服务不可用 / 磁盘写满 / 缺 Cookie）
   期间整条管线挂起，恢复信号按故障类分：重新登录成功、用户主动播放、或 60 秒兜底冷却。
   冷却从挂起时刻算，`expire_cooldown` 只在**未落闸**的预取巡检拍上调用；落闸期间这条巡检
