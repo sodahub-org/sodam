@@ -242,6 +242,10 @@ impl Root {
             return;
         }
         self.contributors.begin(force);
+        if force {
+            // 点重试把 attempts 归零后马上通知重绘，把提示语先收起来，不等网络回来。
+            cx.notify();
+        }
         // 手上已有图（过期重拉、重试）时盘上那份就是手里这张的旧拷贝，
         // 跳过读盘：后台阶段返回 None，只有真读了盘才有 Some。
         let want_disk = self.contributors.image().is_none();

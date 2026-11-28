@@ -669,18 +669,23 @@ mod tests {
         assert!(!state.shows_retry());
     }
 
-    /// 重试文案只在「没图 + 这一轮失败过」出现；点完立刻收起；热失败不出现。
+    /// 重试文案只在「没图 + 这一轮失败过」出现；点完立刻收起，新一轮第一次失败再出现；热失败不出现。
     #[test]
     fn retry_prompt_needs_a_failure_and_no_image() {
         let mut state = empty();
         assert!(!state.shows_retry());
         state.begin(false);
+        assert!(!state.shows_retry());
         state.finish_err(at(0));
         assert!(state.shows_retry());
-        // 用户点了重试：账清零，这句话先收起。
+        // 用户点了重试：账清零，这句话先收起；新一轮第一次失败再出现。
         state.begin(true);
         assert!(!state.shows_retry());
-        // 这次重试成功了；之后过期重拉再失败：有图，照样不亮。
+        state.finish_err(at(1));
+        assert!(state.shows_retry());
+        // 再点重试这次成功；之后过期重拉再失败：有图，照样不亮。
+        state.begin(true);
+        assert!(!state.shows_retry());
         state.finish_ok(IMG, at(5));
         state.begin(false);
         state.finish_err(at(6));
