@@ -44,10 +44,11 @@ gpui = { workspace = true, features = ["windows-manifest"] }
 raw-window-handle = "0.6"
 
 # 测试里真跑 GPUI 实体：TestAppContext / #[gpui::test] 都在这个 feature 后面。
-# 只进测试构建：产品构建不带 test-support（前提是 workspace 的 resolver = "2"，
-# 改回 "1" 会把 dev-dependencies 的 feature 漏进产品构建）。
+# 只进测试构建，产品二进制不带 test-support。
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# 与 gpui 依赖树同版本（lockfile 已锁），测试进程加载时先把环境指进沙箱。
+ctor = "1.0.13"
 
 # 把应用图标嵌入 sodam.exe（快捷方式 / 资源管理器显示）。
 [build-dependencies]

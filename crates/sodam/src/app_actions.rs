@@ -7035,47 +7035,36 @@ mod scene_modes_gate_tests {
 ///
 /// fixture 的边界：
 ///
-/// * `Root::new` 读盘走 `SODAM_CONFIG_PATH` 指向的配置**文件**（进程内一次性
-///   指到临时目录里的 config.json），不碰用户真实配置；音频线程起不来只是
-///   记录错误，不会 panic。
-/// * `OnceLock::get_or_init` 是屏障：`set_var` 只发生一次，且先于任何
-///   `Root::new` 的 env 读取——本 crate 其余测试不读配置，互相不踩。
+/// * 进程加载时（ctor，先于一切测试线程）把 `SODAM_CONFIG_PATH` 指向沙箱里
+///   的 config.json **文件**、`SODAM_CACHE_DIR` 指向沙箱内的缓存根：配置与
+///   缓存的读写全部圈进临时目录，运行时**没有** `set_var`，不存在设读竞态
+///   窗口，Rust 2024 把 `set_var` 标 unsafe 也不影响这里。
 /// * 构造后清掉 Cookie，保持「未登录」：换页就不会触发 `on_nav_changed`
 ///   的自动装载。
 /// * `#[gpui::test]` 的 teardown 会 `run_until_parked()` 把在飞的后台任务
 ///   flush 掉（下载 / 封面 / 歌词都会真跑），所以签名器指到不可达地址：
 ///   签名是每个请求的前置，签名器连不上，请求组装不出来，网络不出机器。
+///   这条防线靠配置担保，配置由 `fixture_defenses_are_in_place` 断言守着。
 #[cfg(test)]
 mod queue_switch_callback_tests {
     use super::*;
+    use ctor::ctor;
     use gpui::{AppContext, TestAppContext};
 
-    /// 每个测试进程一个临时目录：配置文件与缓存根都圈在里面。`cargo test`
-    /// 按 crate 分进程，本 crate 的测试二进制里读环境变量的只有 `Root::new`
-    /// （只在 fixture 里被调用），所以 `set_var` 与读之间存在
-    /// `OnceLock::get_or_init` 的屏障、且进程内没有别的读者——不会与并行的
-    /// 其他用例互相踩。sodam-core 里那把 `env_test_lock` 是 `pub(crate)`，
-    /// 跨 crate 拿不到，这里用屏障达成同一目的。
+    /// 在任何测试线程启动之前把环境指进沙箱。此时进程还是单线程，`set_var`
+    /// 没有读者，天然无竞态；crate 里其余 `#[ctor]` 也不读这些变量。
     ///
-    /// 缓存根也要隔离：`Root::new` 会在维护标记缺失 / 过期时排缓存维护，
-    /// 不圈的话 teardown flush 会把标记写进开发者真实缓存、还可能驱逐文件。
-    fn test_config_file() -> &'static std::path::Path {
-        static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        FILE.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("建立测试配置目录");
-            let file = dir.join("config.json");
-            std::env::set_var("SODAM_CONFIG_PATH", &file);
-            std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
-            file
-        })
-        .as_path()
+    /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
+    #[ctor]
+    fn point_test_env_at_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建立测试沙箱目录");
+        std::env::set_var("SODAM_CONFIG_PATH", dir.join("config.json"));
+        std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
     }
 
     fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
-        test_config_file();
         let root = cx.new(Root::new);
         // Root::new 会按窗口外观把全局主题写掉（生产行为），而 theme.rs 的测试
         // 读的就是这个全局——构造完立刻恢复进程默认值，别让并行的 theme 用例
@@ -7599,5 +7588,31 @@ mod queue_switch_callback_tests {
             assert_eq!(root.switching_queue, None, "认领成功，切换态照常收走");
             assert_eq!(root.nav, Nav::Scenes, "回有重试入口的页面");
         });
+    }
+
+    /// fixture 防线自检：未登录 + 签名器不可达。
+    ///
+    /// teardown flush 会真跑在飞任务，出网与否完全压在这两个配置上——配置一旦
+    /// 漂移（有人挪走清 Cookie / 改签名器地址的代码），这里先红，提醒回模块
+    /// 注释重新审一遍边界假设，而不是靠注释担保。
+    #[gpui::test]
+    async fn fixture_defenses_are_in_place(cx: &mut TestAppContext) {
+        let root = open_root(cx);
+        cx.update_entity(&root, |root, _cx| {
+            assert!(
+                root.settings.cookie.is_empty(),
+                "fixture 必须保持未登录，否则换页触发自动装载碰真网络"
+            );
+            assert_eq!(
+                root.settings.signer_url, "http://127.0.0.1:1",
+                "签名器必须不可达：teardown flush 的在飞请求靠它挡在签名一步"
+            );
+        });
+        // 环境指进沙箱：Root::new 读到的配置文件路径与缓存根都在临时目录里。
+        let config_path = std::env::var("SODAM_CONFIG_PATH").expect("沙箱已由 ctor 指定");
+        assert!(
+            std::path::Path::new(&config_path).starts_with(std::env::temp_dir()),
+            "配置路径必须落在临时目录，不许指向用户真实配置"
+        );
     }
 }
