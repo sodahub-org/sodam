@@ -147,8 +147,12 @@ pub(crate) fn invalidate_audio(path: &Path) {
     let _ = std::fs::remove_file(path.with_extension("quality"));
 }
 
+/// 缓存根目录的环境变量键。[`root_dir`] 与改环境变量的测试共用这一个名字：
+/// 两边对不上不会报错、只会悄悄落到真实缓存目录，所以不手写第二遍。
+pub(crate) const CACHE_DIR_ENV_KEY: &str = "SODAM_CACHE_DIR";
+
 pub fn root_dir() -> PathBuf {
-    std::env::var_os("SODAM_CACHE_DIR")
+    std::env::var_os(CACHE_DIR_ENV_KEY)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {

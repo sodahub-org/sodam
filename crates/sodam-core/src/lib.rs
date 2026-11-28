@@ -43,3 +43,31 @@ pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
+
+/// 测试用：把环境变量设到指定值，离开作用域时还原到设值前的状态——
+/// 本机原本就设过这个变量的也不丢。与 [`env_test_lock`] 搭配：
+/// 改环境变量的用例先拿锁再设值（#192）。
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
