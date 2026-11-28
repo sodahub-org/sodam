@@ -7023,26 +7023,23 @@ mod scene_modes_gate_tests {
 /// 已经搬进 `recommendation_load_settled` / `scene_radio_load_settled` /
 /// `scene_playlist_load_settled`，这里在 `TestAppContext` 里真跑它们。
 ///
-/// fixture 的前提与清场：
-///
-/// * ctor 在测试线程起来之前把 `SODAM_CONFIG_PATH` / `SODAM_CACHE_DIR` 指到
-///   临时沙箱；首个用例构造 `Root` 之前（OnceLock 屏障内）往沙箱写 config.json
-///   （签名器不可达、不留 Cookie）并摘掉环境里的登录身份与便利开关——
-///   `Root::new` 一出生就是未登录、构造期发不出请求。
-/// * `#[gpui::test]` 的 teardown 会 `run_until_parked()` 把在飞的后台任务
-///   flush 掉（下载 / 封面 / 歌词都会真跑），请求被沙箱的签名器地址挡在
-///   签名一步；防线由 `fixture_defenses_are_in_place` 断言守着。
+/// fixture 的前提：`Root` 一出生就是未登录（构造期发不出账户 / 收藏 /
+/// 推荐请求）、签名器不可达（teardown flush 的在飞请求被挡在签名一步）、
+/// 配置与缓存读写全在临时沙箱。前提由 ctor 与 `write_sandbox_config`
+/// 落实，防线由 `fixture_defenses_are_in_place` 断言守着。
 #[cfg(test)]
 mod queue_switch_callback_tests {
     use super::*;
     use ctor::ctor;
     use gpui::{AppContext, TestAppContext};
 
-    /// 在任何测试线程启动之前把环境指进沙箱（Windows 上只做这两次 `set_var`：
-    /// 对既有变量成批 `remove_var` / 大规模改环境，在测试收尾阶段触发过
-    /// `STATUS_ACCESS_VIOLATION`，别加回 ctor 里）。沙箱内容（config.json、
-    /// 摘登录身份环境变量）由 `prepare_sandbox_contents` 在首个用例构造
-    /// `Root` 之前补齐。
+    /// 环境操作全部集中在 ctor：测试线程起来之前，全进程没有并发读者，
+    /// 这是唯一能安全改环境的时刻。
+    ///
+    /// 摘掉的固定名单是 `Settings::merged_with_env` 与 `Root::new` 真正读的
+    /// 键（登录身份、签名器、设备指纹、开发便利开关），不做前缀扫描——
+    /// 扫描要收集整个环境，把改动面放大；有新键走名单补一行。
+    /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
     #[ctor(unsafe)]
     fn point_test_env_at_the_sandbox() {
         let dir = std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
@@ -7050,44 +7047,54 @@ mod queue_switch_callback_tests {
         std::fs::create_dir_all(&dir).expect("建立测试沙箱目录");
         std::env::set_var("SODAM_CONFIG_PATH", dir.join("config.json"));
         std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
+        for key in [
+            "SODA_COOKIE",
+            "QISHUI_SIGNER_URL",
+            "QISHUI_SIGNER_TOKEN",
+            "SODA_FP",
+            "SODA_DEVICE_ID",
+            "SODA_IID",
+            "SODA_LOGIN_DEVICE_ID",
+            "SODA_LOGIN_INSTALL_ID",
+            "SODAM_QUERY",
+            "SODAM_NAV",
+            "SODAM_LYRICS_DEMO",
+            "SODAM_SCROLL_TEST",
+            "SODAM_AUTOLOGIN",
+            "SODAM_AUTOPLAY",
+            "SODAM_RACE_TEST",
+            "SODAM_JUMP_TEST",
+            "SODAM_POPUP",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
-    /// 首个用例构造 `Root` 之前调用一次：补齐沙箱内容。libtest 的并行线程
-    /// 刚起、还没有别的代码读环境，`Root::new` 之前的这一步 OnceLock 屏障
-    /// 内完成写盘与摘身份（其余用例都要先过它才碰 `Root::new`）。
+    /// 在首个用例构造 `Root` 之前写沙箱 config.json。
     ///
-    /// 摘登录身份是硬要求：`Root::new` 尾部在登录态会拉账户 / 收藏 / 推荐、
-    /// 还读 `SODAM_QUERY` 等便利开关——开发机设了真实 Cookie 时构造期也会
-    /// 碰真网络，全靠这里挡住，让 `Root::new` 一出生就是未登录 + 签名器不通。
-    /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
-    fn prepare_sandbox_contents() {
+    /// 写盘不放在 ctor：`#[ctor(unsafe)]` 可能在 std runtime 就绪之前执行，
+    /// 依赖堆与 panic 路径的文件写入曾在 Windows 上以进程崩溃收场
+    /// （`STATUS_ACCESS_VIOLATION`，其余平台全绿）。文件操作挪到这里，
+    /// 此时 runtime 已就绪；环境改动仍留在 ctor（见上）。
+    ///
+    /// config.json 写死签名器不可达、不留 Cookie，`Root::new` 读它之后
+    /// 就是「未登录 + 签名器不通」。写不进去（磁盘满等）就 panic：与其让
+    /// 用例读真实配置，不如直接崩。
+    fn write_sandbox_config() {
         static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         DONE.get_or_init(|| {
             let dir =
                 std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
-            let config = dir.join("config.json");
             std::fs::write(
-                &config,
+                dir.join("config.json"),
                 r#"{"signer_url": "http://127.0.0.1:1", "cookie": ""}"#,
             )
             .expect("写入沙箱配置");
-            // 扫描式摘掉全部 `SODA_*` / `SODAM_*` 键（登录身份、签名器、设备、
-            // 开发开关都走这两个前缀），以后新加开关不用记得回来补名单；
-            // 摘完再把沙箱自己的两个指回。
-            let own_keys: Vec<String> = std::env::vars()
-                .map(|(key, _)| key)
-                .filter(|key| key.starts_with("SODA_") || key.starts_with("SODAM_"))
-                .collect();
-            for key in own_keys {
-                std::env::remove_var(&key);
-            }
-            std::env::set_var("SODAM_CONFIG_PATH", dir.join("config.json"));
-            std::env::set_var("SODAM_CACHE_DIR", dir.join("cache"));
         });
     }
 
     fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
-        prepare_sandbox_contents();
+        write_sandbox_config();
         let root = cx.new(Root::new);
         // Root::new 会按窗口外观把全局主题写掉（生产行为），而 theme.rs 的测试
         // 读的就是这个全局——构造完立刻恢复进程默认值，别让并行的 theme 用例
