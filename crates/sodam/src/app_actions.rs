@@ -7071,7 +7071,7 @@ mod queue_switch_callback_tests {
 
     fn open_root(cx: &mut TestAppContext) -> gpui::Entity<Root> {
         test_config_file();
-        let root = cx.new(|cx| Root::new(cx));
+        let root = cx.new(Root::new);
         cx.update_entity(&root, |root, _cx| {
             // 环境变量可能补进真实 Cookie（SODA_COOKIE 等）：测试必须保持「未登录」，
             // 否则换页会触发 on_nav_changed 的自动装载，测试就会碰真网络。
