@@ -569,7 +569,12 @@ pub struct Root {
     pub volume_track_bounds: Arc<Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 打开中的歌单（点卡片后展示曲目）。
     pub open_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
+    /// 队列装载（歌单 / 电台）在飞，只作进门守卫：一次换队就把它复位。
     pub loading_playlist: bool,
+    /// 歌单详情请求在飞，Library 页据此画加载态。
+    pub loading_playlist_detail: bool,
+    /// 歌单详情请求的代数：关掉详情页就把在飞的那次作废。
+    pub playlist_detail_seq: u64,
     /// 搜索结果里的歌单详情；保留在 Search 上下文，不切去「我的歌单」。
     pub search_playlist: Option<(String, String, Arc<Vec<TrackItem>>)>,
     pub loading_search_playlist: bool,
@@ -999,6 +1004,8 @@ impl Root {
             queue_scroll: gpui::UniformListScrollHandle::new(),
             open_playlist: None,
             loading_playlist: false,
+            loading_playlist_detail: false,
+            playlist_detail_seq: 0,
             search_playlist: None,
             loading_search_playlist: false,
             open_artist: None,

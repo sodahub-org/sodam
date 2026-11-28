@@ -200,6 +200,19 @@ impl Root {
     fn abandon_queue_switch(&mut self) {
         self.queue_switch_seq = self.queue_switch_seq.wrapping_add(1);
         self.switching_queue = None;
+        // 谁在等的那次装载已经作废，它留下的加载态也一起收掉：被顶掉的回调认领不到，
+        // 不会再去清这个 flag，留着它就是永久卡住下一次点歌单 / 电台。
+        self.loading_playlist = false;
+    }
+
+    /// 关掉歌单详情页：在飞的那次详情请求到此为止。
+    ///
+    /// 推一格代数，晚到的回调认领不到就整份丢掉——退出详情页之后它不许再把这一页
+    /// 顶回来，也不许替别人收加载态。退出登录、换号同样走这里：那份曲目属于旧身份。
+    fn close_playlist_detail(&mut self) {
+        self.open_playlist = None;
+        self.playlist_detail_seq = self.playlist_detail_seq.wrapping_add(1);
+        self.loading_playlist_detail = false;
     }
 
     /// 设置页贡献者墙：用 contrib.rocks 的组合图，后台拉取并缓存在内存。
@@ -3054,7 +3067,7 @@ impl Root {
         self.liked_ids = Arc::new(HashSet::new());
         self.liked_ids_failed = false;
         self.liked_loaded = false;
-        self.open_playlist = None;
+        self.close_playlist_detail();
         self.track_menu = None;
         self.queue_menu = None;
         // 听歌模式是按账号给的内容：换号不清，新账号会先看到上一个账号的常用模式。
@@ -3770,8 +3783,7 @@ impl Root {
             return;
         }
         if self.nav == Nav::Library && self.open_playlist.is_some() {
-            self.open_playlist = None;
-            self.loading_playlist = false;
+            self.close_playlist_detail();
             cx.notify();
             return;
         }
@@ -4326,7 +4338,7 @@ impl Root {
         known_title: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.loading_playlist {
+        if self.loading_playlist_detail {
             return;
         }
         // 从歌单网格点进详情，可拖的列表换了，旧起点作废。
@@ -4348,7 +4360,10 @@ impl Root {
         ));
         self.finish_middle_drag_for(DragTarget::LibraryDetail);
         self.library_detail_list.reset(1);
-        self.loading_playlist = true;
+        // 详情页的加载态只归这一次请求：退出详情页或再开一张歌单，这次就作废了。
+        self.playlist_detail_seq = self.playlist_detail_seq.wrapping_add(1);
+        let detail_seq = self.playlist_detail_seq;
+        self.loading_playlist_detail = true;
         self.set_status_text(self.tr("正在读取歌单曲目…"));
         cx.notify();
 
@@ -4361,7 +4376,12 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |root, cx| {
-                root.loading_playlist = false;
+                // 这一份已经不归自己（退出了详情页，或又开了别的歌单）：加载态和页面
+                // 都别动，动了顶掉的正是人此刻在等的那一份。
+                if root.playlist_detail_seq != detail_seq {
+                    return;
+                }
+                root.loading_playlist_detail = false;
                 match result {
                     Ok(tracks) => {
                         // 系统歌单「Ta喜欢的音乐」在部分账号上普通详情接口会返回空；
@@ -5074,7 +5094,7 @@ impl Root {
                 self.liked_ids = Arc::new(HashSet::new());
                 self.liked_ids_failed = false;
                 self.liked_loaded = false;
-                self.open_playlist = None;
+                self.close_playlist_detail();
                 // 常用模式/探索歌单同样属于上一个账号：清掉；正停在这一页就用新身份重读，
                 // 否则页面会空到用户离开再回来。
                 self.reset_scene_state();
@@ -6277,6 +6297,76 @@ mod view_takeover_tests {
         assert!(
             bump_at < capture_at,
             "序号先推进再记，否则本次装载自己就被判成过期"
+        );
+    }
+
+    /// 守 #330：用户自己换队之后，被顶掉的装载留下的加载态也要一起收掉。
+    ///
+    /// `loading_playlist` 是进门守卫：不复位就等于永久拉闸，之后点歌单 / 电台一律被
+    /// 静默拦掉。被顶掉的回调认领不到代数，它自己不会清，所以必须由作废的一方收。
+    #[test]
+    fn abandoning_a_queue_switch_drops_the_loading_state() {
+        let body = body_of(include_str!("app_actions.rs"), "fn abandon_queue_switch");
+        assert!(
+            body.contains("self.loading_playlist = false;"),
+            "作废在飞装载的同时必须复位加载态，否则下一次点歌单 / 电台被永久拦掉"
+        );
+    }
+
+    /// 守 #330：歌单详情的加载态和队列装载的加载态是两件事，不能共用一个 flag。
+    ///
+    /// 共用的话两个方向都说不清归谁：一次换队会把详情请求的加载态一起复位；详情请求
+    /// 回来又会替新的歌单 / 电台装载把加载态清掉，进门守卫就形同虚设。
+    #[test]
+    fn playlist_detail_loading_has_its_own_flag() {
+        let source = include_str!("app_actions.rs");
+        let detail = body_of(source, "pub fn open_playlist");
+        for bare in ["self.loading_playlist =", "root.loading_playlist ="] {
+            assert!(
+                !detail.contains(bare),
+                "详情请求不许再动队列装载的加载态：{bare}"
+            );
+        }
+        assert!(
+            detail.contains("loading_playlist_detail"),
+            "详情请求用自己的加载态"
+        );
+        for owner in ["fn begin_queue_switch", "fn abandon_queue_switch"] {
+            assert!(
+                !body_of(source, owner).contains("loading_playlist_detail"),
+                "{owner} 只处理队列装载，不许碰详情请求的加载态"
+            );
+        }
+        assert!(
+            include_str!("views/mod.rs").contains("root.loading_playlist_detail"),
+            "Library 页的加载态要读详情请求自己的 flag"
+        );
+    }
+
+    /// 守 #330：退掉详情页之后，在飞的那次详情请求回来不许把这一页顶回来。
+    ///
+    /// 认的是代数：关掉详情页就推一格，回调比不过就整份丢掉，加载态和
+    /// `open_playlist` 都不动。少了这道，退出后几秒页面又自己跳回详情页。
+    #[test]
+    fn a_superseded_playlist_detail_never_lands() {
+        let source = include_str!("app_actions.rs");
+        let body = body_of(source, "pub fn open_playlist");
+        let claim_at = body
+            .find("root.playlist_detail_seq != detail_seq")
+            .expect("详情回调必须先按代数认领");
+        for later in [
+            "root.loading_playlist_detail = false;",
+            "root.open_playlist = Some(",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} 应当存在"));
+            assert!(at > claim_at, "{later} 必须在认领之后");
+        }
+        assert!(
+            body_of(source, "fn close_playlist_detail")
+                .contains("self.playlist_detail_seq = self.playlist_detail_seq.wrapping_add(1);"),
+            "关掉详情页要把在飞的那次请求作废"
         );
     }
 }
