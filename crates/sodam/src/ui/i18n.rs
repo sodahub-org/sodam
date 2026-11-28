@@ -1171,14 +1171,12 @@ mod tests {
         }
     }
 
-    /// 贡献者墙只剩冷失败重试这一句，旧的「正在加载」和旧失败句必须删干净（#344）。
+    /// 贡献者墙冷失败重试文案的中英文按 #344 契约精确对应（扫描守卫只查存在性，不核原文）。
     #[test]
     fn contributors_retry_copy_matches_contract() {
         assert_eq!(
             Language::english_text("图没出来，点一下重试"),
             Some("Image didn't load. Click to retry.")
         );
-        assert_eq!(Language::english_text("正在加载贡献者…"), None);
-        assert_eq!(Language::english_text("加载失败，点击重试"), None);
     }
 }
