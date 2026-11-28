@@ -7055,7 +7055,7 @@ mod queue_switch_callback_tests {
     /// 没有读者，天然无竞态；crate 里其余 `#[ctor]` 也不读这些变量。
     ///
     /// 沙箱建不出来（磁盘满等）就 panic：与其让用例写进真实配置，不如直接崩。
-    #[ctor]
+    #[ctor(unsafe)]
     fn point_test_env_at_the_sandbox() {
         let dir = std::env::temp_dir().join(format!("sodam-test-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
